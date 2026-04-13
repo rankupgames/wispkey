@@ -50,6 +50,9 @@ dirs = "6"
 glob-match = "0.2"
 rpassword = "7"
 regex = "1"
+hyper-rustls = { version = "0.27.8", features = ["http1", "http2", "ring"] }
+open = "5.3.3"
+urlencoding = "2.1.3"
 
 [dev-dependencies]
 tempfile = "3"

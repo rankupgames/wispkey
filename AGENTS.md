@@ -77,7 +77,7 @@ wispkey serve --all-projects
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
 | `wispkey remove <name>` | Delete credential |
 | `wispkey rotate <name>` | Regenerate wisp token |
-| `wispkey serve [--port 7700]` | Start proxy |
+| `wispkey serve [--port 7700] [--all-projects] [--daemon]` | Start proxy (HTTP + HTTPS reverse) |
 | `wispkey import <path> [--prefix P] [--partition P]` | Import .env file |
 | `wispkey status` | Vault + session + proxy status |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Audit log |
@@ -94,6 +94,8 @@ wispkey serve --all-projects
 | Basic Auth | `basic_auth` | `user:pass` format |
 | Custom Header | `custom_header` | Requires `--header-name` |
 | Query Param | `query_param` | Requires `--param-name` |
+
+The proxy scans and replaces wisp tokens in three locations: **headers**, **request body** (text/json/form only), and **URL query parameters**.
 
 ## MCP Tools (for IDE agents)
 
@@ -115,6 +117,18 @@ Available tools:
 - **`wispkey_get_token`** -- Get wisp token for a credential by `name`
 - **`wispkey_proxy_status`** -- Check vault/session/proxy state
 - **`wispkey_project_list`** -- List all projects with partition counts and active indicator
+
+## HTTPS Proxy (Reverse Proxy Mode)
+
+For HTTPS targets, add the `X-Target-Url` header:
+```bash
+curl http://localhost:7700 \
+  -H "X-Target-Url: https://api.openai.com/v1/chat/completions" \
+  -H "Authorization: Bearer wk_openai_prod_a7x9m2k4" \
+  -d '{"model": "gpt-4", "messages": [...]}'
+```
+
+The proxy terminates TLS upstream, swaps wisp tokens, and forwards. The agent never sees the real credential.
 
 ## Proxy Management API
 

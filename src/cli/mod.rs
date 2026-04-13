@@ -8,7 +8,6 @@
  * Last Modified: 2026-04-12
  */
 
-use std::io::{self, Write};
 
 use crate::audit;
 use crate::cloud::{self, CloudClient, CloudError, CloudTier};
@@ -18,6 +17,7 @@ use crate::migrate;
 use crate::partition;
 use crate::proxy;
 
+/// Creates a new vault after prompting for and confirming the master password.
 pub async fn handle_init() {
     if Vault::exists() {
         eprintln!(
@@ -67,6 +67,7 @@ pub async fn handle_init() {
     }
 }
 
+/// Unlocks the vault with the master password and optional session timeout.
 pub async fn handle_unlock(timeout: Option<i64>) {
     let mut vault = match Vault::open() {
         Ok(v) => v,
@@ -112,6 +113,7 @@ pub async fn handle_unlock(timeout: Option<i64>) {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Adds a credential to the vault with the given type, value, and optional scope fields.
 pub async fn handle_add(
     name: &str,
     type_str: &str,
@@ -192,6 +194,7 @@ pub async fn handle_add(
     }
 }
 
+/// Lists credentials for a partition, the active or named project, or all projects.
 pub async fn handle_list(partition: Option<&str>, project: Option<&str>, all_projects: bool) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -251,6 +254,7 @@ pub async fn handle_list(partition: Option<&str>, project: Option<&str>, all_pro
     }
 }
 
+/// Prints metadata for a credential, optionally including its wisp token.
 pub async fn handle_get(name: &str, show_token: bool) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -292,6 +296,7 @@ pub async fn handle_get(name: &str, show_token: bool) {
     }
 }
 
+/// Removes a credential from the vault by name.
 pub async fn handle_remove(name: &str) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -325,6 +330,7 @@ pub async fn handle_remove(name: &str) {
     }
 }
 
+/// Rotates the wisp token for the named credential.
 pub async fn handle_rotate(name: &str) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -359,6 +365,7 @@ pub async fn handle_rotate(name: &str) {
     }
 }
 
+/// Starts the HTTP proxy in the foreground or as a background daemon.
 pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -369,7 +376,7 @@ pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
     };
 
     if daemon {
-        spawn_daemon(port);
+        spawn_daemon(port, all_projects);
         return;
     }
 
@@ -423,7 +430,7 @@ pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
     }
 }
 
-fn spawn_daemon(port: u16) {
+fn spawn_daemon(port: u16, all_projects: bool) {
     let executable = std::env::current_exe().unwrap_or_else(|e| {
         eprintln!("Error: cannot find executable path: {}", e);
         std::process::exit(1);
@@ -452,6 +459,9 @@ fn spawn_daemon(port: u16) {
         args.push("--port".into());
         args.push(port.to_string());
     }
+    if all_projects {
+        args.push("--all-projects".into());
+    }
 
     match std::process::Command::new(executable)
         .args(&args)
@@ -473,6 +483,7 @@ fn spawn_daemon(port: u16) {
     }
 }
 
+/// Imports entries from a `.env` file into the vault with optional prefix and partition.
 pub async fn handle_import(path: &str, prefix: Option<&str>, partition: Option<&str>) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -502,6 +513,7 @@ pub async fn handle_import(path: &str, prefix: Option<&str>, partition: Option<&
     }
 }
 
+/// Prints vault initialization, session, credential count, and proxy process status.
 pub async fn handle_status() {
     if !Vault::exists() {
         println!("Vault: not initialized");
@@ -545,6 +557,7 @@ pub async fn handle_status() {
     }
 }
 
+/// Prints audit log entries with optional credential filter and time window.
 pub async fn handle_log(last: usize, credential: Option<&str>, since: Option<&str>) {
     let vault = match Vault::open() {
         Ok(v) => v,
@@ -596,6 +609,7 @@ pub async fn handle_log(last: usize, credential: Option<&str>, since: Option<&st
     println!("{} entries", entries.len());
 }
 
+/// Runs the Model Context Protocol server backed by an unlocked vault session.
 pub async fn handle_mcp_serve() {
     let _vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -611,6 +625,7 @@ pub async fn handle_mcp_serve() {
     }
 }
 
+/// Creates a partition in the active or explicitly named project.
 pub async fn handle_partition_create(name: &str, description: &str, project: Option<&str>) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -645,6 +660,7 @@ pub async fn handle_partition_create(name: &str, description: &str, project: Opt
     }
 }
 
+/// Lists partitions in the active project or across every project.
 pub async fn handle_partition_list(all_projects: bool) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -688,6 +704,7 @@ pub async fn handle_partition_list(all_projects: bool) {
     }
 }
 
+/// Deletes a partition and moves its credentials into the personal partition.
 pub async fn handle_partition_delete(name: &str) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -723,6 +740,7 @@ pub async fn handle_partition_delete(name: &str) {
     }
 }
 
+/// Assigns a credential to the named partition.
 pub async fn handle_partition_assign(credential: &str, partition_name: &str) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -745,6 +763,7 @@ pub async fn handle_partition_assign(credential: &str, partition_name: &str) {
     }
 }
 
+/// Exports an encrypted bundle of a partition's credentials to a file path.
 pub async fn handle_partition_export(name: &str, output: &str) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -788,6 +807,7 @@ pub async fn handle_partition_export(name: &str, output: &str) {
     }
 }
 
+/// Imports credentials from an encrypted partition bundle file.
 pub async fn handle_partition_import(path: &str) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -826,6 +846,7 @@ pub async fn handle_partition_import(path: &str) {
     }
 }
 
+/// Creates a new project within the vault.
 pub async fn handle_project_create(name: &str, description: &str) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -858,6 +879,7 @@ pub async fn handle_project_create(name: &str, description: &str) {
     }
 }
 
+/// Lists all projects and highlights the active one.
 pub async fn handle_project_list() {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -896,6 +918,7 @@ pub async fn handle_project_list() {
     }
 }
 
+/// Deletes a project and moves its partitions into the default project.
 pub async fn handle_project_delete(name: &str) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -931,6 +954,7 @@ pub async fn handle_project_delete(name: &str) {
     }
 }
 
+/// Sets the active project used by default for subsequent CLI commands.
 pub async fn handle_project_use(name: &str) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -956,6 +980,7 @@ pub async fn handle_project_use(name: &str) {
     }
 }
 
+/// Prints the active project and whether it came from env, file, or default.
 pub async fn handle_project_current() {
     let active = core::resolve_active_project();
     println!("Active project: {}", active);
@@ -968,6 +993,7 @@ pub async fn handle_project_current() {
     }
 }
 
+/// Prints WispKey Cloud auth state, tier, and local sync summary.
 pub async fn handle_cloud_status() {
     let config = match cloud::load_config() {
         Ok(c) => c,
@@ -1009,30 +1035,8 @@ pub async fn handle_cloud_status() {
     );
 }
 
+/// Opens an interactive WispKey Cloud login and persists the local session.
 pub async fn handle_cloud_login() {
-    print!("Email: ");
-    if io::stdout().flush().is_err() {
-        eprintln!("Error: could not write prompt");
-        std::process::exit(1);
-    }
-    let mut email_line = String::new();
-    if io::stdin().read_line(&mut email_line).is_err() {
-        eprintln!("Error: could not read email");
-        std::process::exit(1);
-    }
-    let email = email_line.trim();
-    if email.is_empty() {
-        eprintln!("Error: email required");
-        std::process::exit(1);
-    }
-    let password = if let Ok(password_from_env) = std::env::var("WISPKEY_PASSWORD") {
-        password_from_env
-    } else {
-        rpassword::prompt_password("Password: ").unwrap_or_else(|e| {
-            eprintln!("Error reading password: {}", e);
-            std::process::exit(1);
-        })
-    };
     let config = match cloud::load_config() {
         Ok(c) => c,
         Err(e) => {
@@ -1040,13 +1044,9 @@ pub async fn handle_cloud_login() {
             std::process::exit(1);
         }
     };
-    let client = CloudClient::new(config);
-    match client.login(email, &password).await {
-        Ok(updated) => {
-            if let Err(e) = cloud::save_config(&updated) {
-                eprintln!("Error: {}", e);
-                std::process::exit(1);
-            }
+    let mut client = CloudClient::new(config);
+    match client.login().await {
+        Ok(_) => {
             println!("Logged in to WispKey Cloud.");
         }
         Err(e) => {
@@ -1056,6 +1056,7 @@ pub async fn handle_cloud_login() {
     }
 }
 
+/// Clears the stored WispKey Cloud session from local configuration.
 pub async fn handle_cloud_logout() {
     let config = match cloud::load_config() {
         Ok(c) => c,
@@ -1074,6 +1075,7 @@ pub async fn handle_cloud_logout() {
     }
 }
 
+/// Uploads the named partition from the vault to WispKey Cloud.
 pub async fn handle_cloud_push(partition_name: &str) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -1102,6 +1104,7 @@ pub async fn handle_cloud_push(partition_name: &str) {
     }
 }
 
+/// Downloads the named partition from WispKey Cloud into the vault.
 pub async fn handle_cloud_pull(partition_name: &str) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -1130,6 +1133,7 @@ pub async fn handle_cloud_pull(partition_name: &str) {
     }
 }
 
+/// Syncs every cloud-backed partition between the vault and WispKey Cloud.
 pub async fn handle_cloud_sync() {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -1175,6 +1179,97 @@ fn print_cloud_error(error: &CloudError) {
     match error {
         CloudError::Vault(vault_error) => eprintln!("Error: {}", vault_error),
         other => eprintln!("Error: {}", other),
+    }
+}
+
+/// Prints proxy access policies loaded from `policies.toml` on disk.
+pub async fn handle_policy_list() {
+    let config = crate::policy::load_policies_from_disk();
+    if config.policy.is_empty() {
+        println!("No policies configured.");
+        println!("Run `wispkey policy init` to create a template policies.toml");
+        return;
+    }
+    println!("{} policies loaded from {}", config.policy.len(), crate::policy::policies_path().display());
+    println!();
+    for policy in &config.policy {
+        println!("  [{}]", policy.name);
+        if let Some(ref cred) = policy.credential { println!("    credential: {}", cred); }
+        if let Some(ref agent) = policy.agent { println!("    agent: {}", agent); }
+        if !policy.allowed_methods.is_empty() { println!("    allowed_methods: {}", policy.allowed_methods.join(", ")); }
+        if !policy.allowed_hosts.is_empty() { println!("    allowed_hosts: {}", policy.allowed_hosts.join(", ")); }
+        if !policy.denied_hosts.is_empty() { println!("    denied_hosts: {}", policy.denied_hosts.join(", ")); }
+        if !policy.denied_paths.is_empty() { println!("    denied_paths: {}", policy.denied_paths.join(", ")); }
+        if !policy.allowed_paths.is_empty() { println!("    allowed_paths: {}", policy.allowed_paths.join(", ")); }
+        if let Some(ref rl) = policy.rate_limit { println!("    rate_limit: {}", rl); }
+        if let Some(ref tw) = policy.time_window { println!("    time_window: {}", tw); }
+        if policy.deny { println!("    deny: true"); }
+        println!();
+    }
+}
+
+/// Writes a commented `policies.toml` template when the file does not exist.
+pub async fn handle_policy_init() {
+    let path = crate::policy::policies_path();
+    if path.exists() {
+        println!("Policies file already exists at {}", path.display());
+        return;
+    }
+    let template = r#"# WispKey Policy Configuration
+# Each [[policy]] block defines an access rule evaluated on every proxied request.
+# Policies are evaluated in order; the first match that denies wins.
+
+# Example: restrict production AWS credentials to GET-only
+# [[policy]]
+# name = "restrict-aws-prod"
+# credential = "aws-prod"
+# allowed_methods = ["GET"]
+# denied_paths = ["/admin*", "/delete*"]
+# rate_limit = "10/minute"
+
+# Example: block all access to a credential
+# [[policy]]
+# name = "block-deprecated"
+# credential = "old-api-key"
+# deny = true
+
+# Example: time-windowed access
+# [[policy]]
+# name = "business-hours-only"
+# credential = "billing-api"
+# time_window = "09:00-17:00"
+"#;
+    std::fs::write(&path, template).unwrap_or_else(|e| {
+        eprintln!("Error writing {}: {}", path.display(), e);
+        std::process::exit(1);
+    });
+    println!("Created policies template at {}", path.display());
+}
+
+/// Parses `policies.toml` and reports success or TOML validation errors.
+pub async fn handle_policy_check() {
+    let path = crate::policy::policies_path();
+    if !path.exists() {
+        eprintln!("No policies file at {}", path.display());
+        eprintln!("Run `wispkey policy init` to create one.");
+        std::process::exit(1);
+    }
+    let content = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        eprintln!("Error reading {}: {}", path.display(), e);
+        std::process::exit(1);
+    });
+    match toml::from_str::<crate::policy::PolicyConfig>(&content) {
+        Ok(config) => {
+            println!("OK -- {} policies parsed from {}", config.policy.len(), path.display());
+            for policy in &config.policy {
+                println!("  [{}] ok", policy.name);
+            }
+        }
+        Err(e) => {
+            eprintln!("INVALID -- parse error in {}", path.display());
+            eprintln!("{}", e);
+            std::process::exit(1);
+        }
     }
 }
 

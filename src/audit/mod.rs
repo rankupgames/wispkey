@@ -5,13 +5,14 @@
  * Description: Audit log -- records credential usage, denials, and CRUD events
  *              to SQLite. Supports filtered queries by credential, date, and count.
  * Created: 2026-04-07
- * Last Modified: 2026-04-12
+ * Last Modified: 2026-04-13
  */
 
 use chrono::Utc;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
+/// Single row from the audit log.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {
     pub id: i64,
@@ -28,6 +29,7 @@ pub struct AuditEntry {
     pub project_name: Option<String>,
 }
 
+/// Writes an audit event to the SQLite audit_log table.
 #[allow(clippy::too_many_arguments)]
 pub fn log_event(
     db: &Connection,
@@ -51,6 +53,7 @@ pub fn log_event(
     }
 }
 
+/// Queries the audit log with optional filters for credential name, date range, and row limit.
 pub fn query_log(
     db: &Connection,
     last: usize,
@@ -60,7 +63,7 @@ pub fn query_log(
     let mut query = String::from(
         "SELECT id, timestamp, event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied, deny_reason, project_name FROM audit_log WHERE 1=1",
     );
-    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(3);
 
     if let Some(cred) = credential {
         query.push_str(" AND credential_name = ?");
@@ -110,4 +113,74 @@ pub fn query_log(
     };
 
     rows.filter_map(|r| r.ok()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    fn test_db() -> Connection {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                credential_name TEXT,
+                wisp_token TEXT,
+                target_host TEXT,
+                target_path TEXT,
+                http_method TEXT,
+                response_status INTEGER,
+                denied INTEGER NOT NULL DEFAULT 0,
+                deny_reason TEXT,
+                project_name TEXT
+            );",
+        )
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn log_event_inserts_row() {
+        let db = test_db();
+        log_event(&db, "credential_accessed", Some("my-key"), Some("wk_my_key_abc"), Some("api.example.com"), Some("/v1/data"), Some("GET"), Some(200), false, None, None);
+        let entries = query_log(&db, 10, None, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event_type, "credential_accessed");
+        assert_eq!(entries[0].credential_name.as_deref(), Some("my-key"));
+        assert_eq!(entries[0].response_status, Some(200));
+        assert_eq!(entries[0].denied, false);
+    }
+
+    #[test]
+    fn log_event_denied() {
+        let db = test_db();
+        log_event(&db, "proxy_denied", Some("secret"), Some("wk_secret_xyz"), Some("evil.com"), Some("/steal"), Some("POST"), None, true, Some("host not allowed"), None);
+        let entries = query_log(&db, 10, None, None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].denied, true);
+        assert_eq!(entries[0].deny_reason.as_deref(), Some("host not allowed"));
+    }
+
+    #[test]
+    fn query_log_filters_by_credential() {
+        let db = test_db();
+        log_event(&db, "accessed", Some("key-a"), None, None, None, None, None, false, None, None);
+        log_event(&db, "accessed", Some("key-b"), None, None, None, None, None, false, None, None);
+        let entries = query_log(&db, 10, Some("key-a"), None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].credential_name.as_deref(), Some("key-a"));
+    }
+
+    #[test]
+    fn query_log_respects_limit() {
+        let db = test_db();
+        for index in 0..20 {
+            log_event(&db, &format!("event_{index}"), None, None, None, None, None, None, false, None, None);
+        }
+        let entries = query_log(&db, 5, None, None);
+        assert_eq!(entries.len(), 5);
+    }
 }

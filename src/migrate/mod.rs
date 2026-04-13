@@ -18,6 +18,7 @@ use regex::Regex;
 use crate::audit;
 use crate::core::{CredentialType, Vault, VaultError};
 
+/// Summary of a `.env` file import operation.
 pub struct ImportResults {
     pub imported: usize,
     pub skipped: usize,
@@ -30,6 +31,7 @@ struct EnvEntry {
     value: String,
 }
 
+/// Parses a `.env` file, auto-detects credential types, and imports each entry into the vault.
 pub fn import_env_file(
     vault: &Vault,
     path: &str,
@@ -51,7 +53,7 @@ pub fn import_env_file(
     let mut imported = 0;
     let mut skipped = 0;
     let mut errors = 0;
-    let mut output_lines: Vec<String> = Vec::new();
+    let mut output_lines: Vec<String> = Vec::with_capacity(entries.len());
 
     let prefix_str = prefix.unwrap_or("");
 
@@ -176,14 +178,14 @@ static CREDENTIAL_PATTERNS: OnceLock<CredentialPatterns> = OnceLock::new();
 
 fn get_patterns() -> &'static CredentialPatterns {
     CREDENTIAL_PATTERNS.get_or_init(|| CredentialPatterns {
-        openai: Regex::new(r"^sk-[a-zA-Z0-9]{20,}$").unwrap(),
-        github_pat: Regex::new(r"^ghp_[a-zA-Z0-9]{36}$").unwrap(),
-        github_app: Regex::new(r"^ghs_[a-zA-Z0-9]{36}$").unwrap(),
-        slack_bot: Regex::new(r"^xoxb-[0-9]+-[a-zA-Z0-9]+$").unwrap(),
-        slack_user: Regex::new(r"^xoxp-[0-9]+-[a-zA-Z0-9]+$").unwrap(),
-        aws_access: Regex::new(r"^AKIA[A-Z0-9]{16}$").unwrap(),
-        basic_auth: Regex::new(r"^Basic [A-Za-z0-9+/=]+$").unwrap(),
-        bearer: Regex::new(r"^Bearer [a-zA-Z0-9._\-]+$").unwrap(),
+        openai: Regex::new(r"^sk-[a-zA-Z0-9]{20,}$").expect("static regex"),
+        github_pat: Regex::new(r"^ghp_[a-zA-Z0-9]{36}$").expect("static regex"),
+        github_app: Regex::new(r"^ghs_[a-zA-Z0-9]{36}$").expect("static regex"),
+        slack_bot: Regex::new(r"^xoxb-[0-9]+-[a-zA-Z0-9]+$").expect("static regex"),
+        slack_user: Regex::new(r"^xoxp-[0-9]+-[a-zA-Z0-9]+$").expect("static regex"),
+        aws_access: Regex::new(r"^AKIA[A-Z0-9]{16}$").expect("static regex"),
+        basic_auth: Regex::new(r"^Basic [A-Za-z0-9+/=]+$").expect("static regex"),
+        bearer: Regex::new(r"^Bearer [a-zA-Z0-9._\-]+$").expect("static regex"),
     })
 }
 

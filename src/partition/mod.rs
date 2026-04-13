@@ -44,6 +44,7 @@ struct BundlePayload {
     credentials: Vec<BundleCredential>,
 }
 
+/// Summary of a `.wkbundle` partition import operation.
 #[derive(Debug, Clone)]
 pub struct ImportResults {
     pub imported: usize,
@@ -51,6 +52,7 @@ pub struct ImportResults {
     pub errors: usize,
 }
 
+/// Encrypts and exports a partition's credentials to a `.wkbundle` file.
 pub fn export_partition(
     vault: &Vault,
     partition_name: &str,
@@ -96,7 +98,7 @@ pub fn export_partition(
     let argon2 = Argon2::new(
         argon2::Algorithm::Argon2id,
         argon2::Version::V0x13,
-        argon2::Params::new(65536, 3, 4, Some(32)).unwrap(),
+        argon2::Params::new(65536, 3, 4, Some(32)).expect("valid argon2 params"),
     );
     argon2
         .hash_password_into(passphrase.as_bytes(), &salt, &mut derived_key)
@@ -116,6 +118,7 @@ pub fn export_partition(
     Ok(credentials.len())
 }
 
+/// Decrypts and imports credentials from a `.wkbundle` file into the vault.
 pub fn import_partition(
     vault: &Vault,
     bundle_path: &str,
@@ -145,7 +148,7 @@ pub fn import_partition(
     let argon2 = Argon2::new(
         argon2::Algorithm::Argon2id,
         argon2::Version::V0x13,
-        argon2::Params::new(65536, 3, 4, Some(32)).unwrap(),
+        argon2::Params::new(65536, 3, 4, Some(32)).expect("valid argon2 params"),
     );
     argon2
         .hash_password_into(passphrase.as_bytes(), salt, &mut derived_key)

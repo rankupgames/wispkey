@@ -4,8 +4,11 @@
  * Project: WispKey
  * Description: Entry point -- CLI argument parsing and subcommand dispatch.
  * Created: 2026-04-07
- * Last Modified: 2026-04-12
+ * Last Modified: 2026-04-13
  */
+
+#![deny(clippy::correctness)]
+#![warn(clippy::suspicious, clippy::style, clippy::perf, clippy::complexity)]
 
 mod audit;
 mod cli;
@@ -14,6 +17,7 @@ mod core;
 mod mcp;
 mod migrate;
 mod partition;
+mod policy;
 mod proxy;
 
 use clap::{Parser, Subcommand};
@@ -181,6 +185,12 @@ enum Commands {
         command: ProjectCommands,
     },
 
+    /// Manage access policies
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
+    },
+
     /// Cloud sync (WispKey Cloud)
     Cloud {
         #[command(subcommand)]
@@ -256,6 +266,16 @@ enum ProjectCommands {
 }
 
 #[derive(Subcommand)]
+enum PolicyCommands {
+    /// List all policies
+    List,
+    /// Show the policies file path (create if missing)
+    Init,
+    /// Validate the policies file
+    Check,
+}
+
+#[derive(Subcommand)]
 enum CloudCommands {
     /// Show cloud sync status
     Status,
@@ -282,7 +302,7 @@ async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("wispkey=info".parse().unwrap()),
+                .add_directive("wispkey=info".parse().expect("static directive must parse")),
         )
         .init();
 
@@ -389,6 +409,11 @@ async fn main() {
             ProjectCommands::Delete { name } => cli::handle_project_delete(&name).await,
             ProjectCommands::Use { name } => cli::handle_project_use(&name).await,
             ProjectCommands::Current => cli::handle_project_current().await,
+        },
+        Commands::Policy { command } => match command {
+            PolicyCommands::List => cli::handle_policy_list().await,
+            PolicyCommands::Init => cli::handle_policy_init().await,
+            PolicyCommands::Check => cli::handle_policy_check().await,
         },
         Commands::Cloud { command } => match command {
             CloudCommands::Status => cli::handle_cloud_status().await,

@@ -24,10 +24,14 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Default partition name used when none is specified (`personal`).
 pub const DEFAULT_PARTITION_NAME: &str = "personal";
+/// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
 
+/// Errors returned by vault operations (I/O, crypto, schema, and business rules).
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum VaultError {
     #[error("vault already exists at {0}")]
     AlreadyExists(PathBuf),
@@ -67,9 +71,12 @@ pub enum VaultError {
     InvalidBundle(String),
 }
 
+/// Convenient `Result` alias using [`VaultError`] as the error type.
 pub type Result<T> = std::result::Result<T, VaultError>;
 
+/// Stored credential kind (bearer, API key, auth schemes, and parameterized variants).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
 pub enum CredentialType {
     BearerToken,
     ApiKey,
@@ -79,6 +86,7 @@ pub enum CredentialType {
 }
 
 impl CredentialType {
+    /// Parses a wire/type string into a [`CredentialType`], using optional header or query param names when required.
     pub fn from_str_with_params(
         type_str: &str,
         header_name: Option<&str>,
@@ -108,6 +116,7 @@ impl CredentialType {
         }
     }
 
+    /// Stable snake_case label for this variant (for CLI and persistence).
     #[must_use]
     pub fn display_name(&self) -> &str {
         match self {
@@ -120,6 +129,7 @@ impl CredentialType {
     }
 }
 
+/// Metadata for one stored credential (no secret value; use decrypt helpers when unlocked).
 #[derive(Debug, Clone, Serialize)]
 pub struct Credential {
     pub id: String,
@@ -134,6 +144,7 @@ pub struct Credential {
     pub partition_id: Option<String>,
 }
 
+/// A named bucket of credentials within a project.
 #[derive(Debug, Clone, Serialize)]
 pub struct Partition {
     pub id: String,
@@ -144,6 +155,7 @@ pub struct Partition {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Top-level grouping for partitions and credentials.
 #[derive(Debug, Clone, Serialize)]
 pub struct Project {
     pub id: String,
@@ -153,6 +165,7 @@ pub struct Project {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Open encrypted vault backed by SQLite; holds DB handle and optional in-memory master key when unlocked.
 pub struct Vault {
     db: Connection,
     master_key: Option<[u8; 32]>,
@@ -160,6 +173,7 @@ pub struct Vault {
 }
 
 impl Vault {
+    /// Resolves the vault directory (`WISPKEY_VAULT_PATH` or `~/.wispkey`).
     #[must_use]
     pub fn vault_dir() -> PathBuf {
         if let Ok(path) = std::env::var("WISPKEY_VAULT_PATH") {
@@ -178,11 +192,13 @@ impl Vault {
         Self::vault_dir().join("session")
     }
 
+    /// Whether the vault database file already exists on disk.
     #[must_use]
     pub fn exists() -> bool {
         Self::db_path().exists()
     }
 
+    /// Creates a new vault on disk with schema, default project/partition, and an unlocked session.
     pub fn init(password: &str) -> Result<Self> {
         let vault_dir = Self::vault_dir();
         let db_path = Self::db_path();
@@ -200,7 +216,7 @@ impl Vault {
         let argon2 = Argon2::new(
             argon2::Algorithm::Argon2id,
             argon2::Version::V0x13,
-            argon2::Params::new(65536, 3, 4, Some(32)).unwrap(),
+            argon2::Params::new(65536, 3, 4, Some(32)).expect("valid argon2 params"),
         );
         let password_hash = argon2
             .hash_password(password.as_bytes(), &salt)
@@ -243,6 +259,7 @@ impl Vault {
         Ok(vault)
     }
 
+    /// Opens an existing vault database without loading or verifying a session (locked until [`Self::unlock`]).
     pub fn open() -> Result<Self> {
         let db_path = Self::db_path();
         if !db_path.exists() {
@@ -257,6 +274,7 @@ impl Vault {
         })
     }
 
+    /// Opens the vault and restores the master key from a valid, non-expired session file if present.
     pub fn open_with_session() -> Result<Self> {
         let mut vault = Self::open()?;
         vault.load_session()?;
@@ -370,11 +388,13 @@ impl Vault {
         Ok(())
     }
 
+    /// Unlocks with the master password using the default session timeout from env.
     #[allow(dead_code)]
     pub fn unlock(&mut self, password: &str) -> Result<()> {
         self.unlock_with_timeout(password, None)
     }
 
+    /// Unlocks with the master password and optional per-call session timeout override (minutes).
     pub fn unlock_with_timeout(
         &mut self,
         password: &str,
@@ -391,7 +411,7 @@ impl Vault {
         let argon2 = Argon2::new(
             argon2::Algorithm::Argon2id,
             argon2::Version::V0x13,
-            argon2::Params::new(65536, 3, 4, Some(32)).unwrap(),
+            argon2::Params::new(65536, 3, 4, Some(32)).expect("valid argon2 params"),
         );
         argon2
             .verify_password(password.as_bytes(), &parsed_hash)
@@ -409,6 +429,7 @@ impl Vault {
         Ok(())
     }
 
+    /// Whether the derived master key is currently loaded in memory.
     #[allow(dead_code)]
     pub fn is_unlocked(&self) -> bool {
         self.master_key.is_some()
@@ -422,7 +443,7 @@ impl Vault {
         let argon2 = Argon2::new(
             argon2::Algorithm::Argon2id,
             argon2::Version::V0x13,
-            argon2::Params::new(65536, 3, 4, Some(32)).unwrap(),
+            argon2::Params::new(65536, 3, 4, Some(32)).expect("valid argon2 params"),
         );
         let mut key = [0u8; 32];
         argon2
@@ -431,6 +452,7 @@ impl Vault {
         key
     }
 
+    /// Default session lifetime in minutes (`WISPKEY_SESSION_TIMEOUT`, else 30).
     #[must_use]
     pub fn session_timeout_minutes() -> i64 {
         std::env::var("WISPKEY_SESSION_TIMEOUT")
@@ -519,6 +541,7 @@ impl Vault {
         Ok(id)
     }
 
+    /// Inserts a new credential (encrypted secret, wisp token, optional hosts/tags/partition).
     pub fn add_credential(
         &self,
         name: &str,
@@ -544,7 +567,7 @@ impl Vault {
         let id = Uuid::new_v4().to_string();
         let encrypted_value = self.encrypt_bytes(key, value.as_bytes())?;
         let wisp_token = self.generate_wisp_token(name)?;
-        let type_json = serde_json::to_string(&credential_type).unwrap();
+        let type_json = serde_json::to_string(&credential_type).expect("CredentialType serializes to json");
         let hosts_csv = hosts.unwrap_or("");
         let tags_csv = tags.unwrap_or("");
         let now = Utc::now().to_rfc3339();
@@ -568,6 +591,7 @@ impl Vault {
         })
     }
 
+    /// Creates a partition; uses `project` or the active project when unset.
     pub fn create_partition(&self, name: &str, description: &str, project: Option<&str>) -> Result<Partition> {
         let _ = self.ensure_unlocked()?;
 
@@ -594,6 +618,7 @@ impl Vault {
         self.get_partition(name)
     }
 
+    /// Lists all partitions across every project, sorted by name.
     pub fn list_partitions(&self) -> Result<Vec<Partition>> {
         let _ = self.ensure_unlocked()?;
         let mut stmt = self.db.prepare(
@@ -603,6 +628,7 @@ impl Vault {
         Ok(partitions)
     }
 
+    /// Lists partitions belonging to the named project.
     pub fn list_partitions_in_project(&self, project_name: &str) -> Result<Vec<Partition>> {
         let _ = self.ensure_unlocked()?;
         let project_id = self.resolve_project_id(project_name)?;
@@ -613,6 +639,7 @@ impl Vault {
         Ok(partitions)
     }
 
+    /// Loads a partition by unique name.
     pub fn get_partition(&self, name: &str) -> Result<Partition> {
         let _ = self.ensure_unlocked()?;
         let mut stmt = self.db.prepare(
@@ -622,6 +649,7 @@ impl Vault {
             .map_err(|_| VaultError::PartitionNotFound(name.to_string()))
     }
 
+    /// Deletes a partition (not `personal`); reassigns its credentials to the default partition.
     pub fn delete_partition(&self, name: &str) -> Result<()> {
         let _ = self.ensure_unlocked()?;
 
@@ -650,6 +678,7 @@ impl Vault {
         Ok(())
     }
 
+    /// Moves a credential to another partition by name.
     pub fn assign_credential_to_partition(
         &self,
         credential_name: &str,
@@ -674,6 +703,7 @@ impl Vault {
         Ok(())
     }
 
+    /// Lists credentials in the given partition, sorted by name.
     pub fn list_credentials_in_partition(&self, partition_name: &str) -> Result<Vec<Credential>> {
         let _ = self.ensure_unlocked()?;
         let partition_id = self.resolve_partition_id_for_insert(Some(partition_name))?;
@@ -684,6 +714,7 @@ impl Vault {
         Ok(credentials)
     }
 
+    /// Counts credentials assigned to a partition by partition id.
     pub fn partition_credential_count(&self, partition_id: &str) -> Result<usize> {
         let count: usize = self.db.query_row(
             "SELECT COUNT(*) FROM credentials WHERE partition_id = ?1",
@@ -693,6 +724,7 @@ impl Vault {
         Ok(count)
     }
 
+    /// Lists every credential in the vault, sorted by name.
     pub fn list_credentials(&self) -> Result<Vec<Credential>> {
         let _ = self.ensure_unlocked()?;
         let mut stmt = self.db.prepare("SELECT id, name, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials ORDER BY name")?;
@@ -700,6 +732,7 @@ impl Vault {
         Ok(credentials)
     }
 
+    /// Fetches credential metadata by unique name.
     pub fn get_credential(&self, name: &str) -> Result<Credential> {
         let _ = self.ensure_unlocked()?;
         let mut stmt = self.db.prepare("SELECT id, name, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials WHERE name = ?1")?;
@@ -707,6 +740,7 @@ impl Vault {
             .map_err(|_| VaultError::CredentialNotFound(name.to_string()))
     }
 
+    /// Decrypts and returns the stored secret for a credential by name.
     #[allow(dead_code)]
     pub fn decrypt_credential_value(&self, name: &str) -> Result<String> {
         let key = self.ensure_unlocked()?;
@@ -725,6 +759,7 @@ impl Vault {
         String::from_utf8(decrypted).map_err(|e| VaultError::Encryption(e.to_string()))
     }
 
+    /// Deletes a credential row by name.
     pub fn remove_credential(&self, name: &str) -> Result<()> {
         let _ = self.ensure_unlocked()?;
         let affected = self
@@ -736,6 +771,7 @@ impl Vault {
         Ok(())
     }
 
+    /// Issues a new unique wisp token for an existing credential.
     pub fn rotate_wisp_token(&self, name: &str) -> Result<String> {
         let _ = self.ensure_unlocked()?;
 
@@ -756,6 +792,7 @@ impl Vault {
         Ok(new_token)
     }
 
+    /// Resolves a wisp token to credential metadata and decrypted secret; updates `last_used_at`.
     pub fn lookup_by_wisp_token(&self, token: &str) -> Result<(Credential, String)> {
         let key = self.ensure_unlocked()?;
 
@@ -783,6 +820,7 @@ impl Vault {
         Ok((cred, value))
     }
 
+    /// Creates a new project with the given name and description.
     pub fn create_project(&self, name: &str, description: &str) -> Result<Project> {
         let _ = self.ensure_unlocked()?;
 
@@ -805,6 +843,7 @@ impl Vault {
         self.get_project(name)
     }
 
+    /// Lists all projects, sorted by name.
     pub fn list_projects(&self) -> Result<Vec<Project>> {
         let _ = self.ensure_unlocked()?;
         let mut stmt = self.db.prepare(
@@ -814,6 +853,7 @@ impl Vault {
         Ok(projects)
     }
 
+    /// Loads a project by unique name.
     pub fn get_project(&self, name: &str) -> Result<Project> {
         let _ = self.ensure_unlocked()?;
         let mut stmt = self.db.prepare(
@@ -823,6 +863,7 @@ impl Vault {
             .map_err(|_| VaultError::ProjectNotFound(name.to_string()))
     }
 
+    /// Deletes a project (not `default`); reassigns its partitions to the default project.
     pub fn delete_project(&self, name: &str) -> Result<()> {
         let _ = self.ensure_unlocked()?;
 
@@ -851,6 +892,7 @@ impl Vault {
         Ok(())
     }
 
+    /// Counts partitions in a project by project id.
     pub fn project_partition_count(&self, project_id: &str) -> Result<usize> {
         let count: usize = self.db.query_row(
             "SELECT COUNT(*) FROM partitions WHERE project_id = ?1",
@@ -872,6 +914,7 @@ impl Vault {
         Ok(id)
     }
 
+    /// Lists credentials whose partition belongs to the named project.
     pub fn list_credentials_in_project(&self, project_name: &str) -> Result<Vec<Credential>> {
         let _ = self.ensure_unlocked()?;
         let project_id = self.resolve_project_id(project_name)?;
@@ -882,6 +925,7 @@ impl Vault {
         Ok(credentials)
     }
 
+    /// Project name for a partition id, if the join resolves.
     pub fn get_partition_project_name(&self, partition_id: &str) -> Result<Option<String>> {
         let result: Option<String> = self.db.query_row(
             "SELECT p.name FROM projects p JOIN partitions pt ON pt.project_id = p.id WHERE pt.id = ?1",
@@ -891,6 +935,7 @@ impl Vault {
         Ok(result)
     }
 
+    /// Total number of credential rows in the vault.
     pub fn credential_count(&self) -> Result<usize> {
         let count: usize = self
             .db
@@ -898,6 +943,7 @@ impl Vault {
         Ok(count)
     }
 
+    /// RFC3339 timestamp from vault metadata when the vault was created.
     pub fn vault_created_at(&self) -> Result<String> {
         let created: String = self.db.query_row(
             "SELECT value FROM vault_meta WHERE key = 'created_at'",
@@ -1035,6 +1081,7 @@ impl Vault {
         Ok(plaintext.to_vec())
     }
 
+    /// Borrow the underlying SQLite connection (read-only use recommended when locked).
     #[must_use]
     pub fn db(&self) -> &Connection {
         &self.db
@@ -1075,6 +1122,7 @@ fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
     })
 }
 
+/// Active project name: `WISPKEY_PROJECT`, else `active_project` file, else [`DEFAULT_PROJECT_NAME`].
 pub fn resolve_active_project() -> String {
     if let Ok(project) = std::env::var("WISPKEY_PROJECT")
         && !project.is_empty()
@@ -1093,6 +1141,7 @@ pub fn resolve_active_project() -> String {
     DEFAULT_PROJECT_NAME.to_string()
 }
 
+/// Writes the active project name to `active_project` under [`Vault::vault_dir`].
 pub fn set_active_project(name: &str) -> Result<()> {
     let vault_dir = Vault::vault_dir();
     fs::create_dir_all(&vault_dir)?;
@@ -1155,7 +1204,7 @@ mod tests {
         let argon2_hasher = Argon2::new(
             argon2::Algorithm::Argon2id,
             argon2::Version::V0x13,
-            argon2::Params::new(65536, 3, 4, Some(32)).unwrap(),
+            argon2::Params::new(65536, 3, 4, Some(32)).expect("valid argon2 params"),
         );
         let password_hash = argon2_hasher
             .hash_password(password.as_bytes(), &salt)

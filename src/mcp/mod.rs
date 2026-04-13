@@ -3,9 +3,10 @@
  * Company: RankUp Games LLC
  * Project: WispKey
  * Description: MCP (Model Context Protocol) server over stdio. Exposes wispkey_list,
- *              wispkey_get_token, and wispkey_proxy_status tools via JSON-RPC 2.0.
+ *              wispkey_get_token, wispkey_proxy_status, and wispkey_project_list tools
+ *              via JSON-RPC 2.0. Handles full MCP lifecycle (initialize, ping, tools).
  * Created: 2026-04-07
- * Last Modified: 2026-04-12
+ * Last Modified: 2026-04-13
  */
 
 use std::io::{self, BufRead, Write};
@@ -14,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::core::{self, Vault};
 
+/// Runs the WispKey MCP server over stdio transport (JSON-RPC 2.0).
 pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let stdin = io::stdin();
     let mut stdout = io::stdout();
@@ -28,7 +30,16 @@ pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error + Send + S
 
         let request: Value = match serde_json::from_str(&line) {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                let error_resp = json!({
+                    "jsonrpc": "2.0",
+                    "id": Value::Null,
+                    "error": { "code": -32700, "message": format!("parse error: {}", e) }
+                });
+                writeln!(stdout, "{}", serde_json::to_string(&error_resp)?)?;
+                stdout.flush()?;
+                continue;
+            }
         };
 
         if let Some(response) = handle_jsonrpc(&request) {
@@ -41,11 +52,10 @@ pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error + Send + S
     Ok(())
 }
 
-/// Returns None for notifications (no `id` field or known notification methods).
 fn handle_jsonrpc(request: &Value) -> Option<Value> {
     let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
-    if method == "notifications/initialized" || request.get("id").is_none() {
+    if method.starts_with("notifications/") || (request.get("id").is_none() && method != "initialize") {
         return None;
     }
 
@@ -68,6 +78,15 @@ fn handle_jsonrpc(request: &Value) -> Option<Value> {
                 }
             })
         }
+        "ping" => {
+            json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+        }
+        "resources/list" => {
+            json!({ "jsonrpc": "2.0", "id": id, "result": { "resources": [] } })
+        }
+        "prompts/list" => {
+            json!({ "jsonrpc": "2.0", "id": id, "result": { "prompts": [] } })
+        }
         "tools/list" => {
             json!({
                 "jsonrpc": "2.0",
@@ -80,46 +99,31 @@ fn handle_jsonrpc(request: &Value) -> Option<Value> {
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "tag": {
-                                        "type": "string",
-                                        "description": "Filter by tag"
-                                    },
-                                    "project": {
-                                        "type": "string",
-                                        "description": "Filter by project name (default: active project, \"*\" for all)"
-                                    }
+                                    "tag": { "type": "string", "description": "Filter by tag" },
+                                    "project": { "type": "string", "description": "Filter by project name (default: active project, \"*\" for all)" }
                                 }
                             }
                         },
                         {
                             "name": "wispkey_get_token",
-                            "description": "Get the wisp token for a named credential. Use this token in API calls through the WispKey proxy (HTTP_PROXY=http://localhost:7700) which will swap it for the real credential.",
+                            "description": "Get the wisp token for a named credential. Use this token in API calls through the WispKey proxy which will swap it for the real credential. For HTTPS targets, add the X-Target-Url header.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
-                                    "name": {
-                                        "type": "string",
-                                        "description": "Credential name"
-                                    }
+                                    "name": { "type": "string", "description": "Credential name" }
                                 },
                                 "required": ["name"]
                             }
                         },
                         {
                             "name": "wispkey_proxy_status",
-                            "description": "Check if the WispKey proxy is running and accepting connections.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {}
-                            }
+                            "description": "Check if the WispKey proxy is running and accepting connections. Returns vault state, session state, proxy address, and port.",
+                            "inputSchema": { "type": "object", "properties": {} }
                         },
                         {
                             "name": "wispkey_project_list",
                             "description": "List all projects. Shows project name, partition count, and whether it is the active project.",
-                            "inputSchema": {
-                                "type": "object",
-                                "properties": {}
-                            }
+                            "inputSchema": { "type": "object", "properties": {} }
                         }
                     ]
                 }
@@ -138,20 +142,20 @@ fn handle_jsonrpc(request: &Value) -> Option<Value> {
                 _ => tool_error(&format!("unknown tool: {}", tool_name)),
             };
 
+            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+        }
+        "" => {
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": result
+                "error": { "code": -32600, "message": "invalid request: missing method" }
             })
         }
         _ => {
             json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "error": {
-                    "code": -32601,
-                    "message": format!("method not found: {}", method)
-                }
+                "error": { "code": -32601, "message": format!("method not found: {}", method) }
             })
         }
     };
@@ -211,7 +215,7 @@ fn handle_tool_list(arguments: &Value) -> Value {
                         "credentials": list,
                         "count": list.len(),
                         "project": project_filter.unwrap_or(&active),
-                    })).unwrap()
+                    })).expect("json serialization of credential list")
                 }]
             })
         }
@@ -245,7 +249,7 @@ fn handle_tool_project_list() -> Value {
             json!({
                 "content": [{
                     "type": "text",
-                    "text": serde_json::to_string_pretty(&json!({"projects": list, "count": list.len(), "active_project": active})).unwrap()
+                    "text": serde_json::to_string_pretty(&json!({"projects": list, "count": list.len(), "active_project": active})).expect("json serialization of project list")
                 }]
             })
         }
@@ -264,12 +268,17 @@ fn handle_tool_get_token(arguments: &Value) -> Value {
         Err(e) => return tool_error(&format!("vault error: {}", e)),
     };
 
+    let proxy_address = read_proxy_address();
+
     match vault.get_credential(name) {
         Ok(cred) => {
             json!({
                 "content": [{
                     "type": "text",
-                    "text": format!("Wisp token for '{}': {}\n\nUse this token in API requests through the WispKey proxy (HTTP_PROXY=http://localhost:7700). The proxy will swap it for the real credential.", name, cred.wisp_token)
+                    "text": format!(
+                        "Wisp token for '{}': {}\n\nUse this token in API requests through the WispKey proxy ({}).\nFor HTTP targets: set HTTP_PROXY={}\nFor HTTPS targets: add header X-Target-Url: <url> to your request.",
+                        name, cred.wisp_token, proxy_address, proxy_address
+                    )
                 }]
             })
         }
@@ -278,21 +287,21 @@ fn handle_tool_get_token(arguments: &Value) -> Value {
 }
 
 fn handle_tool_proxy_status() -> Value {
-    let pid_path = Vault::vault_dir().join("proxy.pid");
+    let vault_dir = Vault::vault_dir();
+    let pid_path = vault_dir.join("proxy.pid");
     let proxy_running = pid_path.exists();
+
+    let proxy_address = read_proxy_address();
 
     let vault_exists = Vault::exists();
     let session_active = Vault::open_with_session().is_ok();
 
     let status_text = format!(
-        "Vault: {}\nSession: {}\nProxy: {}\nProxy address: http://localhost:7700",
-        if vault_exists {
-            "initialized"
-        } else {
-            "not initialized"
-        },
+        "Vault: {}\nSession: {}\nProxy: {}\nProxy address: {}\nHTTPS: supported (use X-Target-Url header)",
+        if vault_exists { "initialized" } else { "not initialized" },
         if session_active { "active" } else { "locked" },
         if proxy_running { "running" } else { "stopped" },
+        proxy_address,
     );
 
     json!({
@@ -301,6 +310,15 @@ fn handle_tool_proxy_status() -> Value {
             "text": status_text
         }]
     })
+}
+
+fn read_proxy_address() -> String {
+    let info_path = Vault::vault_dir().join("proxy.json");
+    std::fs::read_to_string(&info_path)
+        .ok()
+        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
+        .and_then(|v| v.get("address").and_then(|a| a.as_str().map(String::from)))
+        .unwrap_or_else(|| "http://localhost:7700".to_string())
 }
 
 fn tool_error(message: &str) -> Value {
