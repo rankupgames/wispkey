@@ -5,7 +5,7 @@
  * Description: Partition management -- key grouping, encrypted .wkbundle export/import
  *              for sharing credential sets between team members.
  * Created: 2026-04-08
- * Last Modified: 2026-04-08
+ * Last Modified: 2026-04-12
  */
 
 use std::fs;
@@ -18,7 +18,7 @@ use ring::aead::{AES_256_GCM, Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
-use crate::core::{CredentialType, Vault, VaultError};
+use crate::core::{self, CredentialType, Vault, VaultError};
 
 const BUNDLE_MAGIC: &[u8; 4] = b"WKBX";
 const BUNDLE_VERSION: u8 = 1;
@@ -38,6 +38,8 @@ struct BundleCredential {
 struct BundlePayload {
     partition: String,
     description: String,
+    #[serde(default)]
+    project: String,
     exported_at: String,
     credentials: Vec<BundleCredential>,
 }
@@ -72,9 +74,14 @@ pub fn export_partition(
         });
     }
 
+    let project_name = partition.project_id.as_ref()
+        .and_then(|pid| vault.get_partition_project_name(pid).ok().flatten())
+        .unwrap_or_else(core::resolve_active_project);
+
     let payload = BundlePayload {
         partition: partition.name.clone(),
         description: partition.description.clone(),
+        project: project_name,
         exported_at: Utc::now().to_rfc3339(),
         credentials: bundle_credentials,
     };
@@ -152,10 +159,24 @@ pub fn import_partition(
     let payload: BundlePayload =
         serde_json::from_slice(&plaintext).map_err(|e| VaultError::InvalidBundle(e.to_string()))?;
 
+    let project_name = if payload.project.is_empty() {
+        core::resolve_active_project()
+    } else {
+        payload.project.clone()
+    };
+
+    match vault.get_project(&project_name) {
+        Ok(_) => {}
+        Err(VaultError::ProjectNotFound(_)) => {
+            vault.create_project(&project_name, "")?;
+        }
+        Err(error) => return Err(error),
+    }
+
     match vault.get_partition(&payload.partition) {
         Ok(_) => {}
         Err(VaultError::PartitionNotFound(_)) => {
-            vault.create_partition(&payload.partition, &payload.description)?;
+            vault.create_partition(&payload.partition, &payload.description, Some(&project_name))?;
         }
         Err(error) => return Err(error),
     }

@@ -5,7 +5,7 @@
  * Description: Vault engine -- encrypted credential storage, AES-256-GCM encrypt/decrypt,
  *              Argon2id key derivation, phantom token generation, session management.
  * Created: 2026-04-07
- * Last Modified: 2026-04-08
+ * Last Modified: 2026-04-12
  */
 
 use std::fs;
@@ -25,6 +25,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub const DEFAULT_PARTITION_NAME: &str = "personal";
+pub const DEFAULT_PROJECT_NAME: &str = "default";
 
 #[derive(Error, Debug)]
 pub enum VaultError {
@@ -56,6 +57,12 @@ pub enum VaultError {
     PartitionNotFound(String),
     #[error("cannot delete the default 'personal' partition")]
     CannotDeleteDefaultPartition,
+    #[error("project '{0}' already exists")]
+    DuplicateProject(String),
+    #[error("project '{0}' not found")]
+    ProjectNotFound(String),
+    #[error("cannot delete the default project")]
+    CannotDeleteDefaultProject,
     #[error("invalid bundle: {0}")]
     InvalidBundle(String),
 }
@@ -101,6 +108,7 @@ impl CredentialType {
         }
     }
 
+    #[must_use]
     pub fn display_name(&self) -> &str {
         match self {
             Self::BearerToken => "bearer_token",
@@ -131,6 +139,16 @@ pub struct Partition {
     pub id: String,
     pub name: String,
     pub description: String,
+    pub project_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    pub description: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -142,6 +160,7 @@ pub struct Vault {
 }
 
 impl Vault {
+    #[must_use]
     pub fn vault_dir() -> PathBuf {
         if let Ok(path) = std::env::var("WISPKEY_VAULT_PATH") {
             return PathBuf::from(path);
@@ -159,6 +178,7 @@ impl Vault {
         Self::vault_dir().join("session")
     }
 
+    #[must_use]
     pub fn exists() -> bool {
         Self::db_path().exists()
     }
@@ -192,7 +212,7 @@ impl Vault {
             params![password_hash],
         )?;
         db.execute(
-            "INSERT INTO vault_meta (key, value) VALUES ('version', '2')",
+            "INSERT INTO vault_meta (key, value) VALUES ('version', '3')",
             [],
         )?;
         db.execute(
@@ -202,7 +222,11 @@ impl Vault {
 
         let now = Utc::now().to_rfc3339();
         db.execute(
-			"INSERT INTO partitions (id, name, description, created_at, updated_at) VALUES ('personal', 'personal', '', ?1, ?2)",
+			"INSERT INTO projects (id, name, description, created_at, updated_at) VALUES ('default', 'default', 'Default project', ?1, ?2)",
+			params![now, now],
+		)?;
+        db.execute(
+			"INSERT INTO partitions (id, name, description, project_id, created_at, updated_at) VALUES ('personal', 'personal', '', 'default', ?1, ?2)",
 			params![now, now],
 		)?;
 
@@ -247,39 +271,101 @@ impl Vault {
                 |row| row.get(0),
             )
             .unwrap_or_else(|_| "1".to_string());
-        if version.as_str() != "1" {
-            return Ok(());
+
+        if version.as_str() == "1" {
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS partitions (
+					id TEXT PRIMARY KEY,
+					name TEXT UNIQUE NOT NULL,
+					description TEXT NOT NULL DEFAULT '',
+					created_at TEXT NOT NULL,
+					updated_at TEXT NOT NULL
+				);",
+            )?;
+
+            let now = Utc::now().to_rfc3339();
+            db.execute(
+				"INSERT OR IGNORE INTO partitions (id, name, description, created_at, updated_at) VALUES ('personal', 'personal', '', ?1, ?2)",
+				params![now, now],
+			)?;
+
+            db.execute(
+                "ALTER TABLE credentials ADD COLUMN partition_id TEXT REFERENCES partitions(id)",
+                [],
+            )?;
+
+            db.execute(
+                "UPDATE credentials SET partition_id = 'personal' WHERE partition_id IS NULL",
+                [],
+            )?;
+            db.execute(
+                "UPDATE vault_meta SET value = '2' WHERE key = 'version'",
+                [],
+            )?;
         }
 
-        db.execute_batch(
-            "CREATE TABLE IF NOT EXISTS partitions (
-				id TEXT PRIMARY KEY,
-				name TEXT UNIQUE NOT NULL,
-				description TEXT NOT NULL DEFAULT '',
-				created_at TEXT NOT NULL,
-				updated_at TEXT NOT NULL
-			);",
-        )?;
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "2".to_string());
 
-        let now = Utc::now().to_rfc3339();
-        db.execute(
-			"INSERT OR IGNORE INTO partitions (id, name, description, created_at, updated_at) VALUES ('personal', 'personal', '', ?1, ?2)",
-			params![now, now],
-		)?;
+        if version.as_str() == "2" {
+            db.execute_batch(
+                "CREATE TABLE IF NOT EXISTS projects (
+					id TEXT PRIMARY KEY,
+					name TEXT UNIQUE NOT NULL,
+					description TEXT NOT NULL DEFAULT '',
+					created_at TEXT NOT NULL,
+					updated_at TEXT NOT NULL
+				);",
+            )?;
 
-        db.execute(
-            "ALTER TABLE credentials ADD COLUMN partition_id TEXT REFERENCES partitions(id)",
-            [],
-        )?;
+            let now = Utc::now().to_rfc3339();
+            db.execute(
+				"INSERT OR IGNORE INTO projects (id, name, description, created_at, updated_at) VALUES ('default', 'default', 'Default project', ?1, ?2)",
+				params![now, now],
+			)?;
 
-        db.execute(
-            "UPDATE credentials SET partition_id = 'personal' WHERE partition_id IS NULL",
-            [],
-        )?;
-        db.execute(
-            "UPDATE vault_meta SET value = '2' WHERE key = 'version'",
-            [],
-        )?;
+            let has_project_id: bool = db
+                .prepare("PRAGMA table_info(partitions)")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(1))
+                        .map(|rows| rows.filter_map(|r| r.ok()).any(|col| col == "project_id"))
+                })
+                .unwrap_or(false);
+
+            if !has_project_id {
+                db.execute(
+                    "ALTER TABLE partitions ADD COLUMN project_id TEXT REFERENCES projects(id)",
+                    [],
+                )?;
+            }
+
+            db.execute(
+                "UPDATE partitions SET project_id = 'default' WHERE project_id IS NULL",
+                [],
+            )?;
+
+            let has_project_name: bool = db
+                .prepare("PRAGMA table_info(audit_log)")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(1))
+                        .map(|rows| rows.filter_map(|r| r.ok()).any(|col| col == "project_name"))
+                })
+                .unwrap_or(false);
+
+            if !has_project_name {
+                db.execute("ALTER TABLE audit_log ADD COLUMN project_name TEXT", [])?;
+            }
+
+            db.execute(
+                "UPDATE vault_meta SET value = '3' WHERE key = 'version'",
+                [],
+            )?;
+        }
 
         Ok(())
     }
@@ -345,6 +431,7 @@ impl Vault {
         key
     }
 
+    #[must_use]
     pub fn session_timeout_minutes() -> i64 {
         std::env::var("WISPKEY_SESSION_TIMEOUT")
             .ok()
@@ -481,7 +568,7 @@ impl Vault {
         })
     }
 
-    pub fn create_partition(&self, name: &str, description: &str) -> Result<Partition> {
+    pub fn create_partition(&self, name: &str, description: &str, project: Option<&str>) -> Result<Partition> {
         let _ = self.ensure_unlocked()?;
 
         let exists: bool = self.db.query_row(
@@ -493,11 +580,15 @@ impl Vault {
             return Err(VaultError::DuplicatePartition(name.to_string()));
         }
 
+        let active = resolve_active_project();
+        let project_name = project.unwrap_or(&active);
+        let project_id = self.resolve_project_id(project_name)?;
+
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         self.db.execute(
-			"INSERT INTO partitions (id, name, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-			params![id, name, description, now, now],
+			"INSERT INTO partitions (id, name, description, project_id, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+			params![id, name, description, project_id, now, now],
 		)?;
 
         self.get_partition(name)
@@ -506,21 +597,26 @@ impl Vault {
     pub fn list_partitions(&self) -> Result<Vec<Partition>> {
         let _ = self.ensure_unlocked()?;
         let mut stmt = self.db.prepare(
-            "SELECT id, name, description, created_at, updated_at FROM partitions ORDER BY name",
+            "SELECT id, name, description, project_id, created_at, updated_at FROM partitions ORDER BY name",
         )?;
-        let rows = stmt.query_map([], partition_from_row)?;
+        let partitions = stmt.query_map([], partition_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(partitions)
+    }
 
-        let mut partitions = Vec::new();
-        for row in rows {
-            partitions.push(row?);
-        }
+    pub fn list_partitions_in_project(&self, project_name: &str) -> Result<Vec<Partition>> {
+        let _ = self.ensure_unlocked()?;
+        let project_id = self.resolve_project_id(project_name)?;
+        let mut stmt = self.db.prepare(
+            "SELECT id, name, description, project_id, created_at, updated_at FROM partitions WHERE project_id = ?1 ORDER BY name",
+        )?;
+        let partitions = stmt.query_map(params![project_id], partition_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(partitions)
     }
 
     pub fn get_partition(&self, name: &str) -> Result<Partition> {
         let _ = self.ensure_unlocked()?;
         let mut stmt = self.db.prepare(
-            "SELECT id, name, description, created_at, updated_at FROM partitions WHERE name = ?1",
+            "SELECT id, name, description, project_id, created_at, updated_at FROM partitions WHERE name = ?1",
         )?;
         stmt.query_row(params![name], partition_from_row)
             .map_err(|_| VaultError::PartitionNotFound(name.to_string()))
@@ -584,12 +680,7 @@ impl Vault {
         let mut stmt = self.db.prepare(
 			"SELECT id, name, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials WHERE partition_id = ?1 ORDER BY name",
 		)?;
-        let rows = stmt.query_map(params![partition_id], credential_from_row)?;
-
-        let mut credentials = Vec::new();
-        for row in rows {
-            credentials.push(row?);
-        }
+        let credentials = stmt.query_map(params![partition_id], credential_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(credentials)
     }
 
@@ -605,12 +696,7 @@ impl Vault {
     pub fn list_credentials(&self) -> Result<Vec<Credential>> {
         let _ = self.ensure_unlocked()?;
         let mut stmt = self.db.prepare("SELECT id, name, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials ORDER BY name")?;
-        let rows = stmt.query_map([], credential_from_row)?;
-
-        let mut credentials = Vec::new();
-        for row in rows {
-            credentials.push(row?);
-        }
+        let credentials = stmt.query_map([], credential_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(credentials)
     }
 
@@ -697,6 +783,114 @@ impl Vault {
         Ok((cred, value))
     }
 
+    pub fn create_project(&self, name: &str, description: &str) -> Result<Project> {
+        let _ = self.ensure_unlocked()?;
+
+        let exists: bool = self.db.query_row(
+            "SELECT COUNT(*) > 0 FROM projects WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )?;
+        if exists {
+            return Err(VaultError::DuplicateProject(name.to_string()));
+        }
+
+        let id = Uuid::new_v4().to_string();
+        let now = Utc::now().to_rfc3339();
+        self.db.execute(
+			"INSERT INTO projects (id, name, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+			params![id, name, description, now, now],
+		)?;
+
+        self.get_project(name)
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<Project>> {
+        let _ = self.ensure_unlocked()?;
+        let mut stmt = self.db.prepare(
+            "SELECT id, name, description, created_at, updated_at FROM projects ORDER BY name",
+        )?;
+        let projects = stmt.query_map([], project_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(projects)
+    }
+
+    pub fn get_project(&self, name: &str) -> Result<Project> {
+        let _ = self.ensure_unlocked()?;
+        let mut stmt = self.db.prepare(
+            "SELECT id, name, description, created_at, updated_at FROM projects WHERE name = ?1",
+        )?;
+        stmt.query_row(params![name], project_from_row)
+            .map_err(|_| VaultError::ProjectNotFound(name.to_string()))
+    }
+
+    pub fn delete_project(&self, name: &str) -> Result<()> {
+        let _ = self.ensure_unlocked()?;
+
+        if name == DEFAULT_PROJECT_NAME {
+            return Err(VaultError::CannotDeleteDefaultProject);
+        }
+
+        let project = self.get_project(name)?;
+        let default_id: String = self.db.query_row(
+            "SELECT id FROM projects WHERE name = ?1",
+            params![DEFAULT_PROJECT_NAME],
+            |row| row.get(0),
+        )?;
+
+        self.db.execute(
+            "UPDATE partitions SET project_id = ?1, updated_at = ?2 WHERE project_id = ?3",
+            params![default_id, Utc::now().to_rfc3339(), project.id],
+        )?;
+        let affected = self.db.execute(
+            "DELETE FROM projects WHERE id = ?1",
+            params![project.id],
+        )?;
+        if affected == 0 {
+            return Err(VaultError::ProjectNotFound(name.to_string()));
+        }
+        Ok(())
+    }
+
+    pub fn project_partition_count(&self, project_id: &str) -> Result<usize> {
+        let count: usize = self.db.query_row(
+            "SELECT COUNT(*) FROM partitions WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        Ok(count)
+    }
+
+    fn resolve_project_id(&self, project_name: &str) -> Result<String> {
+        let id: String = self
+            .db
+            .query_row(
+                "SELECT id FROM projects WHERE name = ?1",
+                params![project_name],
+                |row| row.get(0),
+            )
+            .map_err(|_| VaultError::ProjectNotFound(project_name.to_string()))?;
+        Ok(id)
+    }
+
+    pub fn list_credentials_in_project(&self, project_name: &str) -> Result<Vec<Credential>> {
+        let _ = self.ensure_unlocked()?;
+        let project_id = self.resolve_project_id(project_name)?;
+        let mut stmt = self.db.prepare(
+			"SELECT c.id, c.name, c.credential_type, c.wisp_token, c.hosts, c.tags, c.created_at, c.updated_at, c.last_used_at, c.partition_id FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 ORDER BY c.name",
+		)?;
+        let credentials = stmt.query_map(params![project_id], credential_from_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(credentials)
+    }
+
+    pub fn get_partition_project_name(&self, partition_id: &str) -> Result<Option<String>> {
+        let result: Option<String> = self.db.query_row(
+            "SELECT p.name FROM projects p JOIN partitions pt ON pt.project_id = p.id WHERE pt.id = ?1",
+            params![partition_id],
+            |row| row.get(0),
+        ).ok();
+        Ok(result)
+    }
+
     pub fn credential_count(&self) -> Result<usize> {
         let count: usize = self
             .db
@@ -719,10 +913,18 @@ impl Vault {
 				key TEXT PRIMARY KEY,
 				value TEXT NOT NULL
 			);
+			CREATE TABLE IF NOT EXISTS projects (
+				id TEXT PRIMARY KEY,
+				name TEXT UNIQUE NOT NULL,
+				description TEXT NOT NULL DEFAULT '',
+				created_at TEXT NOT NULL,
+				updated_at TEXT NOT NULL
+			);
 			CREATE TABLE IF NOT EXISTS partitions (
 				id TEXT PRIMARY KEY,
 				name TEXT UNIQUE NOT NULL,
 				description TEXT NOT NULL DEFAULT '',
+				project_id TEXT REFERENCES projects(id),
 				created_at TEXT NOT NULL,
 				updated_at TEXT NOT NULL
 			);
@@ -750,7 +952,8 @@ impl Vault {
 				http_method TEXT,
 				response_status INTEGER,
 				denied INTEGER NOT NULL DEFAULT 0,
-				deny_reason TEXT
+				deny_reason TEXT,
+				project_name TEXT
 			);",
         )?;
         Ok(())
@@ -832,15 +1035,34 @@ impl Vault {
         Ok(plaintext.to_vec())
     }
 
+    #[must_use]
     pub fn db(&self) -> &Connection {
         &self.db
     }
 }
 
 fn partition_from_row(row: &Row<'_>) -> rusqlite::Result<Partition> {
+    let project_id: Option<String> = row.get(3)?;
+    let created_str: String = row.get(4)?;
+    let updated_str: String = row.get(5)?;
+    Ok(Partition {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        project_id,
+        created_at: DateTime::parse_from_rfc3339(&created_str)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+        updated_at: DateTime::parse_from_rfc3339(&updated_str)
+            .map(|d| d.with_timezone(&Utc))
+            .unwrap_or_else(|_| Utc::now()),
+    })
+}
+
+fn project_from_row(row: &Row<'_>) -> rusqlite::Result<Project> {
     let created_str: String = row.get(3)?;
     let updated_str: String = row.get(4)?;
-    Ok(Partition {
+    Ok(Project {
         id: row.get(0)?,
         name: row.get(1)?,
         description: row.get(2)?,
@@ -851,6 +1073,31 @@ fn partition_from_row(row: &Row<'_>) -> rusqlite::Result<Partition> {
             .map(|d| d.with_timezone(&Utc))
             .unwrap_or_else(|_| Utc::now()),
     })
+}
+
+pub fn resolve_active_project() -> String {
+    if let Ok(project) = std::env::var("WISPKEY_PROJECT")
+        && !project.is_empty()
+    {
+        return project;
+    }
+
+    let active_path = Vault::vault_dir().join("active_project");
+    if let Ok(content) = fs::read_to_string(&active_path) {
+        let trimmed = content.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+
+    DEFAULT_PROJECT_NAME.to_string()
+}
+
+pub fn set_active_project(name: &str) -> Result<()> {
+    let vault_dir = Vault::vault_dir();
+    fs::create_dir_all(&vault_dir)?;
+    fs::write(vault_dir.join("active_project"), name)?;
+    Ok(())
 }
 
 fn credential_from_row(row: &Row<'_>) -> rusqlite::Result<Credential> {
@@ -884,6 +1131,7 @@ fn credential_from_row(row: &Row<'_>) -> rusqlite::Result<Credential> {
     })
 }
 
+#[inline]
 fn parse_csv(csv: &str) -> Vec<String> {
     csv.split(',')
         .filter(|s| !s.is_empty())
@@ -919,7 +1167,7 @@ mod tests {
         )
         .unwrap();
         db.execute(
-            "INSERT INTO vault_meta (key, value) VALUES ('version', '2')",
+            "INSERT INTO vault_meta (key, value) VALUES ('version', '3')",
             [],
         )
         .unwrap();
@@ -929,7 +1177,8 @@ mod tests {
         )
         .unwrap();
         let now = Utc::now().to_rfc3339();
-        db.execute("INSERT INTO partitions (id, name, description, created_at, updated_at) VALUES ('personal', 'personal', '', ?1, ?2)", params![now, now]).unwrap();
+        db.execute("INSERT INTO projects (id, name, description, created_at, updated_at) VALUES ('default', 'default', 'Default project', ?1, ?2)", params![now, now]).unwrap();
+        db.execute("INSERT INTO partitions (id, name, description, project_id, created_at, updated_at) VALUES ('personal', 'personal', '', 'default', ?1, ?2)", params![now, now]).unwrap();
 
         let master_key = Vault::derive_key(password, salt.as_ref());
         std::mem::forget(dir);
@@ -1055,12 +1304,12 @@ mod tests {
         assert_eq!(partitions[0].name, "personal");
 
         vault
-            .create_partition("infra", "infrastructure creds")
+            .create_partition("infra", "infrastructure creds", Some("default"))
             .unwrap();
         let partitions = vault.list_partitions().unwrap();
         assert_eq!(partitions.len(), 2);
 
-        let dup = vault.create_partition("infra", "dup");
+        let dup = vault.create_partition("infra", "dup", Some("default"));
         assert!(matches!(dup, Err(VaultError::DuplicatePartition(_))));
 
         vault
@@ -1089,6 +1338,159 @@ mod tests {
             result,
             Err(VaultError::CannotDeleteDefaultPartition)
         ));
+    }
+
+    #[test]
+    fn project_crud_basics() {
+        let vault = test_vault("pw");
+
+        let projects = vault.list_projects().unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "default");
+
+        let proj = vault.create_project("team-alpha", "Alpha team creds").unwrap();
+        assert_eq!(proj.name, "team-alpha");
+        assert_eq!(proj.description, "Alpha team creds");
+
+        let fetched = vault.get_project("team-alpha").unwrap();
+        assert_eq!(fetched.id, proj.id);
+
+        let projects = vault.list_projects().unwrap();
+        assert_eq!(projects.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_project_rejected() {
+        let vault = test_vault("pw");
+        vault.create_project("dup-proj", "").unwrap();
+        let result = vault.create_project("dup-proj", "");
+        assert!(matches!(result, Err(VaultError::DuplicateProject(_))));
+    }
+
+    #[test]
+    fn cannot_delete_default_project() {
+        let vault = test_vault("pw");
+        let result = vault.delete_project("default");
+        assert!(matches!(result, Err(VaultError::CannotDeleteDefaultProject)));
+    }
+
+    #[test]
+    fn project_delete_moves_partitions_to_default() {
+        let vault = test_vault("pw");
+        vault.create_project("ephemeral", "").unwrap();
+        vault.create_partition("eph-part", "temp", Some("ephemeral")).unwrap();
+
+        vault.add_credential("eph-cred", CredentialType::ApiKey, "val", None, None, Some("eph-part")).unwrap();
+
+        vault.delete_project("ephemeral").unwrap();
+
+        let partition = vault.get_partition("eph-part").unwrap();
+        let default_proj = vault.get_project("default").unwrap();
+        assert_eq!(partition.project_id.as_deref(), Some(default_proj.id.as_str()));
+
+        let cred = vault.get_credential("eph-cred").unwrap();
+        assert_eq!(cred.partition_id.as_deref(), Some(partition.id.as_str()));
+    }
+
+    #[test]
+    fn partition_linked_to_project() {
+        let vault = test_vault("pw");
+        vault.create_project("proj-b", "").unwrap();
+        let partition = vault.create_partition("proj-b-part", "", Some("proj-b")).unwrap();
+
+        let project = vault.get_project("proj-b").unwrap();
+        assert_eq!(partition.project_id.as_deref(), Some(project.id.as_str()));
+    }
+
+    #[test]
+    fn list_partitions_in_project_scoping() {
+        let vault = test_vault("pw");
+        vault.create_project("alpha", "").unwrap();
+        vault.create_project("beta", "").unwrap();
+        vault.create_partition("alpha-keys", "", Some("alpha")).unwrap();
+        vault.create_partition("beta-keys", "", Some("beta")).unwrap();
+
+        let alpha_parts = vault.list_partitions_in_project("alpha").unwrap();
+        assert_eq!(alpha_parts.len(), 1);
+        assert_eq!(alpha_parts[0].name, "alpha-keys");
+
+        let beta_parts = vault.list_partitions_in_project("beta").unwrap();
+        assert_eq!(beta_parts.len(), 1);
+        assert_eq!(beta_parts[0].name, "beta-keys");
+
+        let default_parts = vault.list_partitions_in_project("default").unwrap();
+        assert_eq!(default_parts.len(), 1);
+        assert_eq!(default_parts[0].name, "personal");
+
+        let all = vault.list_partitions().unwrap();
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn list_credentials_in_project_scoping() {
+        let vault = test_vault("pw");
+        vault.create_project("proj-x", "").unwrap();
+        vault.create_partition("x-part", "", Some("proj-x")).unwrap();
+
+        vault.add_credential("default-cred", CredentialType::ApiKey, "v1", None, None, None).unwrap();
+        vault.add_credential("x-cred", CredentialType::ApiKey, "v2", None, None, Some("x-part")).unwrap();
+
+        let default_creds = vault.list_credentials_in_project("default").unwrap();
+        assert_eq!(default_creds.len(), 1);
+        assert_eq!(default_creds[0].name, "default-cred");
+
+        let x_creds = vault.list_credentials_in_project("proj-x").unwrap();
+        assert_eq!(x_creds.len(), 1);
+        assert_eq!(x_creds[0].name, "x-cred");
+
+        let all_creds = vault.list_credentials().unwrap();
+        assert_eq!(all_creds.len(), 2);
+    }
+
+    #[test]
+    fn get_partition_project_name_returns_correct_name() {
+        let vault = test_vault("pw");
+        vault.create_project("named-proj", "").unwrap();
+        let partition = vault.create_partition("named-part", "", Some("named-proj")).unwrap();
+
+        let project_name = vault.get_partition_project_name(&partition.id).unwrap();
+        assert_eq!(project_name.as_deref(), Some("named-proj"));
+    }
+
+    #[test]
+    fn project_partition_count_tracks_correctly() {
+        let vault = test_vault("pw");
+        let default_proj = vault.get_project("default").unwrap();
+        assert_eq!(vault.project_partition_count(&default_proj.id).unwrap(), 1);
+
+        vault.create_project("counted", "").unwrap();
+        let counted = vault.get_project("counted").unwrap();
+        assert_eq!(vault.project_partition_count(&counted.id).unwrap(), 0);
+
+        vault.create_partition("c-part-1", "", Some("counted")).unwrap();
+        vault.create_partition("c-part-2", "", Some("counted")).unwrap();
+        assert_eq!(vault.project_partition_count(&counted.id).unwrap(), 2);
+    }
+
+    #[test]
+    fn get_nonexistent_project_fails() {
+        let vault = test_vault("pw");
+        let result = vault.get_project("ghost-project");
+        assert!(matches!(result, Err(VaultError::ProjectNotFound(_))));
+    }
+
+    #[test]
+    fn delete_nonexistent_project_fails() {
+        let vault = test_vault("pw");
+        let result = vault.delete_project("ghost-project");
+        assert!(matches!(result, Err(VaultError::ProjectNotFound(_))));
+    }
+
+    #[test]
+    fn partition_in_nonexistent_project_fails() {
+        let vault = test_vault("pw");
+        let result = vault.create_partition("orphan", "", Some("no-such-project"));
+        assert!(matches!(result, Err(VaultError::ProjectNotFound(_))));
     }
 
     #[test]

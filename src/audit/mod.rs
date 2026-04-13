@@ -5,7 +5,7 @@
  * Description: Audit log -- records credential usage, denials, and CRUD events
  *              to SQLite. Supports filtered queries by credential, date, and count.
  * Created: 2026-04-07
- * Last Modified: 2026-04-08
+ * Last Modified: 2026-04-12
  */
 
 use chrono::Utc;
@@ -25,6 +25,7 @@ pub struct AuditEntry {
     pub response_status: Option<u16>,
     pub denied: bool,
     pub deny_reason: Option<String>,
+    pub project_name: Option<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -39,10 +40,11 @@ pub fn log_event(
     response_status: Option<u16>,
     denied: bool,
     deny_reason: Option<&str>,
+    project_name: Option<&str>,
 ) {
     let result = db.execute(
-		"INSERT INTO audit_log (timestamp, event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied, deny_reason) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-		params![Utc::now().to_rfc3339(), event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied as i32, deny_reason],
+		"INSERT INTO audit_log (timestamp, event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied, deny_reason, project_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+		params![Utc::now().to_rfc3339(), event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied as i32, deny_reason, project_name],
 	);
     if let Err(e) = result {
         tracing::error!("Failed to write audit log: {}", e);
@@ -56,7 +58,7 @@ pub fn query_log(
     since: Option<&str>,
 ) -> Vec<AuditEntry> {
     let mut query = String::from(
-        "SELECT id, timestamp, event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied, deny_reason FROM audit_log WHERE 1=1",
+        "SELECT id, timestamp, event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied, deny_reason, project_name FROM audit_log WHERE 1=1",
     );
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
 
@@ -97,6 +99,7 @@ pub fn query_log(
             response_status: row.get::<_, Option<i32>>(8)?.map(|v| v as u16),
             denied: row.get::<_, i32>(9)? != 0,
             deny_reason: row.get(10)?,
+            project_name: row.get(11)?,
         })
     }) {
         Ok(r) => r,

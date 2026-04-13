@@ -5,8 +5,12 @@
  * Description: HTTP forward proxy -- intercepts requests containing wk_* wisp tokens,
  *              swaps them for real credentials, enforces host restrictions, logs audit events.
  *              Also serves the management API at /api/ endpoints for the desktop app.
+ *
+ * TODO: Add local HTTPS via self-signed cert or mkcert -- needed once cloud sync lands so
+ *       agents can securely reach the proxy without plaintext token exposure on shared machines.
+ *
  * Created: 2026-04-07
- * Last Modified: 2026-04-08
+ * Last Modified: 2026-04-12
  */
 
 use std::net::SocketAddr;
@@ -26,36 +30,60 @@ use regex::Regex;
 use tokio::net::TcpListener;
 
 use crate::audit;
-use crate::core::{CredentialType, Vault};
+use crate::core::{self, CredentialType, Vault};
 
-pub async fn start_proxy(port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+/// Starts the HTTP proxy on the given port. Pass `0` for an OS-assigned random port.
+/// Returns the actual port the proxy bound to (useful when `port == 0`).
+/// Writes `proxy.json` to the vault directory for agent/tool discovery.
+pub async fn start_proxy(port: u16, all_projects: bool) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr).await?;
+    let actual_addr = listener.local_addr()?;
+    let actual_port = actual_addr.port();
 
-    tracing::info!("WispKey proxy listening on http://{}", addr);
+    tracing::info!("WispKey proxy listening on http://{}", actual_addr);
 
-    let pid_path = crate::core::Vault::vault_dir().join("proxy.pid");
+    let vault_dir = crate::core::Vault::vault_dir();
+    let pid_path = vault_dir.join("proxy.pid");
+    let info_path = vault_dir.join("proxy.json");
+
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
-    let pid_path_cleanup = pid_path.clone();
+    let proxy_info = serde_json::json!({
+        "pid": std::process::id(),
+        "port": actual_port,
+        "address": format!("http://{}", actual_addr),
+    });
+    std::fs::write(&info_path, serde_json::to_string_pretty(&proxy_info)?)?;
+
+    let pid_cleanup = pid_path.clone();
+    let info_cleanup = info_path.clone();
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
-        let _ = std::fs::remove_file(&pid_path_cleanup);
+        let _ = std::fs::remove_file(&pid_cleanup);
+        let _ = std::fs::remove_file(&info_cleanup);
         std::process::exit(0);
     });
 
     let wisp_pattern = Arc::new(Regex::new(r"wk_[a-z0-9_]+").unwrap());
+    let project_scope: Arc<Option<String>> = if all_projects {
+        Arc::new(None)
+    } else {
+        Arc::new(Some(core::resolve_active_project()))
+    };
 
     loop {
         let (stream, remote_addr) = listener.accept().await?;
         let pattern = wisp_pattern.clone();
+        let scope = project_scope.clone();
 
         let io = hyper_util::rt::TokioIo::new(stream);
 
         tokio::task::spawn(async move {
             let service = service_fn(move |req| {
                 let pattern = pattern.clone();
-                handle_request(req, remote_addr, pattern)
+                let scope = scope.clone();
+                handle_request(req, remote_addr, pattern, scope)
             });
 
             if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
@@ -69,6 +97,7 @@ async fn handle_request(
     req: Request<Incoming>,
     _remote_addr: SocketAddr,
     wisp_pattern: Arc<Regex>,
+    project_scope: Arc<Option<String>>,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -111,6 +140,11 @@ async fn handle_request(
                 let token = token_match.as_str();
                 match vault.lookup_by_wisp_token(token) {
                     Ok((cred, real_value)) => {
+                        if let Some(reason) = check_project_scope(&vault, &cred, &project_scope) {
+                            let active = project_scope.as_deref().unwrap_or("unknown");
+                            audit::log_event(vault.db(), "CredentialDenied", Some(&cred.name), Some(token), Some(&target_host), Some(parts.uri.path()), Some(parts.method.as_str()), None, true, Some(&reason), Some(active));
+                            return Ok(error_response(StatusCode::FORBIDDEN, &reason));
+                        }
                         if !check_host_restriction(&cred.hosts, &target_host) {
                             let reason = format!(
                                 "host '{}' not allowed for credential '{}'",
@@ -127,6 +161,7 @@ async fn handle_request(
                                 None,
                                 true,
                                 Some(&reason),
+                                None,
                             );
                             return Ok(error_response(StatusCode::FORBIDDEN, &reason));
                         }
@@ -153,6 +188,11 @@ async fn handle_request(
             let token = token_match.as_str();
             match vault.lookup_by_wisp_token(token) {
                 Ok((cred, real_value)) => {
+                    if let Some(reason) = check_project_scope(&vault, &cred, &project_scope) {
+                        let active = project_scope.as_deref().unwrap_or("unknown");
+                        audit::log_event(vault.db(), "CredentialDenied", Some(&cred.name), Some(token), Some(&target_host), Some(parts.uri.path()), Some(parts.method.as_str()), None, true, Some(&reason), Some(active));
+                        return Ok(error_response(StatusCode::FORBIDDEN, &reason));
+                    }
                     if !check_host_restriction(&cred.hosts, &target_host) {
                         let reason = format!(
                             "host '{}' not allowed for credential '{}'",
@@ -169,6 +209,7 @@ async fn handle_request(
                             None,
                             true,
                             Some(&reason),
+                            None,
                         );
                         return Ok(error_response(StatusCode::FORBIDDEN, &reason));
                     }
@@ -229,6 +270,7 @@ async fn handle_request(
                     Some(response_status),
                     false,
                     None,
+                    None,
                 );
             }
 
@@ -252,6 +294,7 @@ async fn handle_request(
                     None,
                     false,
                     Some(&e.to_string()),
+                    None,
                 );
             }
 
@@ -260,6 +303,20 @@ async fn handle_request(
                 &format!("Upstream error: {}", e),
             ))
         }
+    }
+}
+
+/// Checks if a credential's project matches the active project scope.
+/// Returns `Some(reason)` with the denial reason if the credential is out of scope,
+/// or `None` if access is allowed.
+fn check_project_scope(vault: &Vault, cred: &crate::core::Credential, project_scope: &Option<String>) -> Option<String> {
+    let active_project = project_scope.as_ref()?;
+    let partition_id = cred.partition_id.as_ref()?;
+    let cred_project = vault.get_partition_project_name(partition_id).ok().flatten()?;
+    if cred_project != *active_project {
+        Some(format!("credential '{}' belongs to project '{}', not active project '{}'", cred.name, cred_project, active_project))
+    } else {
+        None
     }
 }
 
@@ -282,15 +339,8 @@ fn inject_credential(
 }
 
 fn check_host_restriction(allowed_hosts: &[String], target_host: &str) -> bool {
-    if allowed_hosts.is_empty() {
-        return true;
-    }
-    for pattern in allowed_hosts {
-        if glob_match::glob_match(pattern, target_host) {
-            return true;
-        }
-    }
-    false
+    allowed_hosts.is_empty()
+        || allowed_hosts.iter().any(|pattern| glob_match::glob_match(pattern, target_host))
 }
 
 fn extract_target_host(uri: &Uri, headers: &hyper::HeaderMap) -> String {
@@ -344,7 +394,10 @@ async fn handle_management_api(
             let created = vault
                 .vault_created_at()
                 .unwrap_or_else(|_| "unknown".to_string());
-            let pid_running = Vault::vault_dir().join("proxy.pid").exists();
+
+            let proxy_info = Vault::vault_dir().join("proxy.json");
+            let proxy_port: Option<u64> = std::fs::read_to_string(&proxy_info).ok().and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok()).and_then(|v| v.get("port").and_then(|p| p.as_u64()));
+
             json_response(
                 StatusCode::OK,
                 &serde_json::json!({
@@ -352,7 +405,8 @@ async fn handle_management_api(
                     "created_at": created,
                     "credential_count": count,
                     "session_active": true,
-                    "proxy_running": pid_running
+                    "proxy_running": true,
+                    "proxy_port": proxy_port,
                 }),
             )
         }
@@ -386,6 +440,7 @@ async fn handle_management_api(
                             "id": p.id,
                             "name": p.name,
                             "description": p.description,
+                            "project_id": p.project_id,
                             "credential_count": count,
                             "created_at": p.created_at.to_rfc3339(),
                             "updated_at": p.updated_at.to_rfc3339(),
@@ -451,6 +506,7 @@ async fn handle_management_api(
                         None,
                         false,
                         None,
+                        None,
                     );
                     json_response(StatusCode::OK, &serde_json::json!({"deleted": name}))
                 }
@@ -475,12 +531,63 @@ async fn handle_management_api(
                         None,
                         false,
                         None,
+                        None,
                     );
                     json_response(StatusCode::OK, &serde_json::json!({"deleted": name}))
                 }
                 Err(e) => json_response(
                     StatusCode::NOT_FOUND,
                     &serde_json::json!({"error": e.to_string()}),
+                ),
+            }
+        }
+        ("GET", "/api/projects") => match vault.list_projects() {
+            Ok(projects) => {
+                let active = core::resolve_active_project();
+                let list: Vec<serde_json::Value> = projects
+                    .iter()
+                    .map(|p| {
+                        let count = vault.project_partition_count(&p.id).unwrap_or(0);
+                        serde_json::json!({
+                            "id": p.id,
+                            "name": p.name,
+                            "description": p.description,
+                            "partition_count": count,
+                            "active": p.name == active,
+                            "created_at": p.created_at.to_rfc3339(),
+                            "updated_at": p.updated_at.to_rfc3339(),
+                        })
+                    })
+                    .collect();
+                json_response(StatusCode::OK, &serde_json::json!({"projects": list}))
+            }
+            Err(e) => json_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &serde_json::json!({"error": e.to_string()}),
+            ),
+        },
+        ("GET", path) if path.starts_with("/api/projects/") => {
+            let name = &path["/api/projects/".len()..];
+            match vault.get_project(name) {
+                Ok(p) => {
+                    let count = vault.project_partition_count(&p.id).unwrap_or(0);
+                    let active = core::resolve_active_project();
+                    json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({
+                            "id": p.id,
+                            "name": p.name,
+                            "description": p.description,
+                            "partition_count": count,
+                            "active": p.name == active,
+                            "created_at": p.created_at.to_rfc3339(),
+                            "updated_at": p.updated_at.to_rfc3339(),
+                        }),
+                    )
+                }
+                Err(_) => json_response(
+                    StatusCode::NOT_FOUND,
+                    &serde_json::json!({"error": "project not found"}),
                 ),
             }
         }

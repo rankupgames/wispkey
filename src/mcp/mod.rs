@@ -5,14 +5,14 @@
  * Description: MCP (Model Context Protocol) server over stdio. Exposes wispkey_list,
  *              wispkey_get_token, and wispkey_proxy_status tools via JSON-RPC 2.0.
  * Created: 2026-04-07
- * Last Modified: 2026-04-08
+ * Last Modified: 2026-04-12
  */
 
 use std::io::{self, BufRead, Write};
 
 use serde_json::{Value, json};
 
-use crate::core::Vault;
+use crate::core::{self, Vault};
 
 pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let stdin = io::stdin();
@@ -76,13 +76,17 @@ fn handle_jsonrpc(request: &Value) -> Option<Value> {
                     "tools": [
                         {
                             "name": "wispkey_list",
-                            "description": "List available credentials by name and type. Never exposes actual credential values.",
+                            "description": "List available credentials by name and type. Scoped to the active project by default. Pass project: \"*\" to list all.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
                                     "tag": {
                                         "type": "string",
                                         "description": "Filter by tag"
+                                    },
+                                    "project": {
+                                        "type": "string",
+                                        "description": "Filter by project name (default: active project, \"*\" for all)"
                                     }
                                 }
                             }
@@ -108,6 +112,14 @@ fn handle_jsonrpc(request: &Value) -> Option<Value> {
                                 "type": "object",
                                 "properties": {}
                             }
+                        },
+                        {
+                            "name": "wispkey_project_list",
+                            "description": "List all projects. Shows project name, partition count, and whether it is the active project.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {}
+                            }
                         }
                     ]
                 }
@@ -122,6 +134,7 @@ fn handle_jsonrpc(request: &Value) -> Option<Value> {
                 "wispkey_list" => handle_tool_list(&arguments),
                 "wispkey_get_token" => handle_tool_get_token(&arguments),
                 "wispkey_proxy_status" => handle_tool_proxy_status(),
+                "wispkey_project_list" => handle_tool_project_list(),
                 _ => tool_error(&format!("unknown tool: {}", tool_name)),
             };
 
@@ -153,8 +166,18 @@ fn handle_tool_list(arguments: &Value) -> Value {
     };
 
     let tag_filter = arguments.get("tag").and_then(|t| t.as_str());
+    let project_filter = arguments.get("project").and_then(|p| p.as_str());
 
-    match vault.list_credentials() {
+    let creds_result = match project_filter {
+        Some("*") => vault.list_credentials(),
+        Some(name) => vault.list_credentials_in_project(name),
+        None => {
+            let active = core::resolve_active_project();
+            vault.list_credentials_in_project(&active)
+        }
+    };
+
+    match creds_result {
         Ok(creds) => {
             let filtered: Vec<_> = creds
                 .iter()
@@ -167,6 +190,7 @@ fn handle_tool_list(arguments: &Value) -> Value {
                 })
                 .collect();
 
+            let active = core::resolve_active_project();
             let list: Vec<Value> = filtered
                 .iter()
                 .map(|c| {
@@ -175,6 +199,7 @@ fn handle_tool_list(arguments: &Value) -> Value {
                         "type": c.credential_type.display_name(),
                         "tags": c.tags,
                         "hosts": c.hosts,
+                        "partition_id": c.partition_id,
                     })
                 })
                 .collect();
@@ -182,11 +207,49 @@ fn handle_tool_list(arguments: &Value) -> Value {
             json!({
                 "content": [{
                     "type": "text",
-                    "text": serde_json::to_string_pretty(&json!({"credentials": list, "count": list.len()})).unwrap()
+                    "text": serde_json::to_string_pretty(&json!({
+                        "credentials": list,
+                        "count": list.len(),
+                        "project": project_filter.unwrap_or(&active),
+                    })).unwrap()
                 }]
             })
         }
         Err(e) => tool_error(&format!("failed to list: {}", e)),
+    }
+}
+
+fn handle_tool_project_list() -> Value {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => return tool_error(&format!("vault error: {}", e)),
+    };
+
+    let active = core::resolve_active_project();
+
+    match vault.list_projects() {
+        Ok(projects) => {
+            let list: Vec<Value> = projects
+                .iter()
+                .map(|p| {
+                    let count = vault.project_partition_count(&p.id).unwrap_or(0);
+                    json!({
+                        "name": p.name,
+                        "description": p.description,
+                        "partition_count": count,
+                        "active": p.name == active,
+                    })
+                })
+                .collect();
+
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&json!({"projects": list, "count": list.len(), "active_project": active})).unwrap()
+                }]
+            })
+        }
+        Err(e) => tool_error(&format!("failed to list projects: {}", e)),
     }
 }
 

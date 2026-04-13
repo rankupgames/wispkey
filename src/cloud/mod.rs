@@ -15,7 +15,7 @@ use thiserror::Error;
 
 use crate::core::{Vault, VaultError};
 
-const COMING_SOON: &str = "WispKey Cloud is coming soon. Pro $1.99/mo | Team $9.99/user/mo";
+const COMING_SOON: &str = "WispKey Cloud is coming soon. Cloud $1.99/mo | Enterprise: contact us";
 
 // INTEGRATION NOTE: Login flow will use Clerk browser-based auth.
 // 1. Start localhost callback server on random port
@@ -26,7 +26,9 @@ const COMING_SOON: &str = "WispKey Cloud is coming soon. Pro $1.99/mo | Team $9.
 
 pub type CloudResult<T> = std::result::Result<T, CloudError>;
 
+/// Errors from cloud sync operations.
 #[derive(Error, Debug)]
+#[non_exhaustive]
 pub enum CloudError {
     #[error("not authenticated -- run `wispkey cloud login` first")]
     NotAuthenticated,
@@ -44,12 +46,14 @@ pub enum CloudError {
     Vault(#[from] VaultError),
 }
 
+/// Subscription tier for WispKey Cloud.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "PascalCase")]
+#[non_exhaustive]
 pub enum CloudTier {
-    Free,
-    Pro,
-    Team,
+    Personal,
+    Cloud,
+    Enterprise,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -71,7 +75,7 @@ impl Default for CloudConfig {
             refresh_token: None,
             user_id: None,
             org_id: None,
-            tier: CloudTier::Free,
+            tier: CloudTier::Personal,
             last_sync: None,
         }
     }
@@ -145,7 +149,7 @@ impl CloudClient {
         self.config.user_id = None;
         self.config.org_id = None;
         self.config.last_sync = None;
-        self.config.tier = CloudTier::Free;
+        self.config.tier = CloudTier::Personal;
         save_config(&self.config)
     }
 
@@ -185,19 +189,19 @@ impl CloudClient {
     }
 
     pub fn check_tier_limit(&self, operation: &str) -> CloudResult<()> {
-        if self.config.tier == CloudTier::Free {
+        if self.config.tier == CloudTier::Personal {
             return Err(CloudError::TierLimit(format!(
-                "{operation}: free tier allows 0 cloud partitions; upgrade to Pro ($1.99/mo) or Team ($9.99/user/mo)"
+                "{operation}: personal tier is local-only; upgrade to Cloud ($1.99/mo) for sync"
             )));
         }
-        if self.config.tier == CloudTier::Team {
+        if self.config.tier == CloudTier::Enterprise {
             return Ok(());
         }
         if operation == "push_partition" {
             let manifests = load_sync_manifests()?;
             if manifests.len() >= 10 {
                 return Err(CloudError::TierLimit(format!(
-                    "{operation}: Pro tier allows up to 10 cloud partitions; upgrade to Team for unlimited"
+                    "{operation}: Cloud tier allows up to 10 partitions; contact us for Enterprise"
                 )));
             }
         }
@@ -271,9 +275,9 @@ pub fn load_sync_manifests() -> CloudResult<Vec<SyncManifest>> {
 
 pub fn storage_limit_bytes_for_tier(tier: &CloudTier) -> u64 {
     match tier {
-        CloudTier::Free => 0,
-        CloudTier::Pro => 100 * 1024 * 1024,
-        CloudTier::Team => 1024 * 1024 * 1024 * 1024,
+        CloudTier::Personal => 0,
+        CloudTier::Cloud => 100 * 1024 * 1024,
+        CloudTier::Enterprise => 1024 * 1024 * 1024 * 1024,
     }
 }
 

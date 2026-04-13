@@ -4,7 +4,7 @@
  * Project: WispKey
  * Description: Entry point -- CLI argument parsing and subcommand dispatch.
  * Created: 2026-04-07
- * Last Modified: 2026-04-08
+ * Last Modified: 2026-04-12
  */
 
 mod audit;
@@ -75,6 +75,10 @@ enum Commands {
         /// Partition to add to (default: personal)
         #[arg(long)]
         partition: Option<String>,
+
+        /// Project override (default: active project)
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// List all credentials (names only, never values)
@@ -82,6 +86,14 @@ enum Commands {
         /// Filter by partition
         #[arg(long)]
         partition: Option<String>,
+
+        /// Filter by project (default: active project)
+        #[arg(long)]
+        project: Option<String>,
+
+        /// Show credentials across all projects
+        #[arg(long)]
+        all_projects: bool,
     },
 
     /// Get details for a credential
@@ -108,13 +120,21 @@ enum Commands {
 
     /// Start the wisp token proxy
     Serve {
-        /// Port to listen on
+        /// Port to listen on (ignored when --random-port is set)
         #[arg(long, default_value = "7700")]
         port: u16,
+
+        /// Let the OS pick a random available port (written to proxy.json for discovery)
+        #[arg(long)]
+        random_port: bool,
 
         /// Run as a background daemon
         #[arg(long)]
         daemon: bool,
+
+        /// Allow credentials from all projects (default: active project only)
+        #[arg(long)]
+        all_projects: bool,
     },
 
     /// Import credentials from a .env file
@@ -155,6 +175,12 @@ enum Commands {
         command: PartitionCommands,
     },
 
+    /// Manage projects (credential isolation by team/project)
+    Project {
+        #[command(subcommand)]
+        command: ProjectCommands,
+    },
+
     /// Cloud sync (WispKey Cloud)
     Cloud {
         #[command(subcommand)]
@@ -175,9 +201,16 @@ enum PartitionCommands {
         name: String,
         #[arg(long, default_value = "")]
         description: String,
+        /// Project to create partition in (default: active project)
+        #[arg(long)]
+        project: Option<String>,
     },
     /// List all partitions
-    List,
+    List {
+        /// Show partitions across all projects
+        #[arg(long)]
+        all_projects: bool,
+    },
     /// Delete a partition (moves credentials to 'personal')
     Delete { name: String },
     /// Assign a credential to a partition
@@ -201,6 +234,25 @@ enum PartitionCommands {
         /// Path to .wkbundle file
         path: String,
     },
+}
+
+#[derive(Subcommand)]
+enum ProjectCommands {
+    /// Create a new project
+    Create {
+        name: String,
+        /// Project description
+        #[arg(long, default_value = "")]
+        description: String,
+    },
+    /// List all projects
+    List,
+    /// Delete a project (moves partitions to 'default')
+    Delete { name: String },
+    /// Set the active project for this machine
+    Use { name: String },
+    /// Show the currently active project
+    Current,
 }
 
 #[derive(Subcommand)]
@@ -253,6 +305,7 @@ async fn main() {
             header_name,
             param_name,
             partition,
+            project,
         } => {
             let resolved_value = match (&value, &value_file) {
                 (Some(_), Some(_)) => {
@@ -277,11 +330,12 @@ async fn main() {
                 header_name.as_deref(),
                 param_name.as_deref(),
                 partition.as_deref(),
+                project.as_deref(),
             )
             .await;
         }
-        Commands::List { partition } => {
-            cli::handle_list(partition.as_deref()).await;
+        Commands::List { partition, project, all_projects } => {
+            cli::handle_list(partition.as_deref(), project.as_deref(), all_projects).await;
         }
         Commands::Get { name, show_token } => {
             cli::handle_get(&name, show_token).await;
@@ -292,8 +346,9 @@ async fn main() {
         Commands::Rotate { name } => {
             cli::handle_rotate(&name).await;
         }
-        Commands::Serve { port, daemon } => {
-            cli::handle_serve(port, daemon).await;
+        Commands::Serve { port, random_port, daemon, all_projects } => {
+            let effective_port = if random_port { 0 } else { port };
+            cli::handle_serve(effective_port, daemon, all_projects).await;
         }
         Commands::Import {
             path,
@@ -313,10 +368,10 @@ async fn main() {
             cli::handle_log(last, credential.as_deref(), since.as_deref()).await;
         }
         Commands::Partition { command } => match command {
-            PartitionCommands::Create { name, description } => {
-                cli::handle_partition_create(&name, &description).await
+            PartitionCommands::Create { name, description, project } => {
+                cli::handle_partition_create(&name, &description, project.as_deref()).await
             }
-            PartitionCommands::List => cli::handle_partition_list().await,
+            PartitionCommands::List { all_projects } => cli::handle_partition_list(all_projects).await,
             PartitionCommands::Delete { name } => cli::handle_partition_delete(&name).await,
             PartitionCommands::Assign { credential, to } => {
                 cli::handle_partition_assign(&credential, &to).await
@@ -325,6 +380,15 @@ async fn main() {
                 cli::handle_partition_export(&name, &output).await
             }
             PartitionCommands::Import { path } => cli::handle_partition_import(&path).await,
+        },
+        Commands::Project { command } => match command {
+            ProjectCommands::Create { name, description } => {
+                cli::handle_project_create(&name, &description).await
+            }
+            ProjectCommands::List => cli::handle_project_list().await,
+            ProjectCommands::Delete { name } => cli::handle_project_delete(&name).await,
+            ProjectCommands::Use { name } => cli::handle_project_use(&name).await,
+            ProjectCommands::Current => cli::handle_project_current().await,
         },
         Commands::Cloud { command } => match command {
             CloudCommands::Status => cli::handle_cloud_status().await,

@@ -5,14 +5,14 @@
  * Description: CLI command handlers -- wires user-facing subcommands to vault operations.
  *              Handles interactive password prompts with WISPKEY_PASSWORD env var fallback.
  * Created: 2026-04-07
- * Last Modified: 2026-04-08
+ * Last Modified: 2026-04-12
  */
 
 use std::io::{self, Write};
 
 use crate::audit;
 use crate::cloud::{self, CloudClient, CloudError, CloudTier};
-use crate::core::{CredentialType, Vault, VaultError};
+use crate::core::{self, CredentialType, Vault, VaultError};
 use crate::mcp;
 use crate::migrate;
 use crate::partition;
@@ -49,6 +49,7 @@ pub async fn handle_init() {
                 None,
                 None,
                 false,
+                None,
                 None,
             );
             println!("Vault created at {}", Vault::vault_dir().display());
@@ -90,6 +91,7 @@ pub async fn handle_unlock(timeout: Option<i64>) {
                 None,
                 false,
                 None,
+                None,
             );
             let effective_timeout = timeout.unwrap_or_else(Vault::session_timeout_minutes);
             if effective_timeout > 0 {
@@ -119,6 +121,7 @@ pub async fn handle_add(
     header_name: Option<&str>,
     param_name: Option<&str>,
     partition: Option<&str>,
+    project: Option<&str>,
 ) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
@@ -151,6 +154,8 @@ pub async fn handle_add(
         }
     };
 
+    let active_project = project.map(String::from).unwrap_or_else(core::resolve_active_project);
+
     match vault.add_credential(
         name,
         credential_type,
@@ -171,6 +176,7 @@ pub async fn handle_add(
                 None,
                 false,
                 None,
+                Some(&active_project),
             );
             println!("Credential '{}' added.", name);
             println!("Wisp token: {}", cred.wisp_token);
@@ -186,7 +192,7 @@ pub async fn handle_add(
     }
 }
 
-pub async fn handle_list(partition: Option<&str>) {
+pub async fn handle_list(partition: Option<&str>, project: Option<&str>, all_projects: bool) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
         Err(e) => {
@@ -197,14 +203,22 @@ pub async fn handle_list(partition: Option<&str>) {
 
     let list_result = if let Some(partition_name) = partition {
         vault.list_credentials_in_partition(partition_name)
-    } else {
+    } else if all_projects {
         vault.list_credentials()
+    } else {
+        let active = project.map(String::from).unwrap_or_else(core::resolve_active_project);
+        vault.list_credentials_in_project(&active)
     };
 
     match list_result {
         Ok(credentials) => {
             if credentials.is_empty() {
-                println!("No credentials stored.");
+                let active = core::resolve_active_project();
+                if !all_projects {
+                    println!("No credentials in project '{}'. Use --all-projects to see all.", active);
+                } else {
+                    println!("No credentials stored.");
+                }
                 println!(
                     "Add one with: wispkey add \"name\" --type bearer_token --value \"secret\""
                 );
@@ -300,6 +314,7 @@ pub async fn handle_remove(name: &str) {
                 None,
                 false,
                 None,
+                None,
             );
             println!("Credential '{}' removed.", name);
         }
@@ -332,6 +347,7 @@ pub async fn handle_rotate(name: &str) {
                 None,
                 false,
                 None,
+                None,
             );
             println!("Wisp token rotated for '{}'.", name);
             println!("New token: {}", new_token);
@@ -343,7 +359,7 @@ pub async fn handle_rotate(name: &str) {
     }
 }
 
-pub async fn handle_serve(port: u16, daemon: bool) {
+pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
         Err(e) => {
@@ -357,6 +373,7 @@ pub async fn handle_serve(port: u16, daemon: bool) {
         return;
     }
 
+    let active = core::resolve_active_project();
     audit::log_event(
         vault.db(),
         "ProxyStarted",
@@ -368,29 +385,41 @@ pub async fn handle_serve(port: u16, daemon: bool) {
         None,
         false,
         None,
+        Some(&active),
     );
-    println!("Starting WispKey proxy on localhost:{}...", port);
-    println!(
-        "Set HTTP_PROXY=http://localhost:{} in your agent's environment.",
-        port
-    );
-    println!();
 
-    if let Err(e) = proxy::start_proxy(port).await {
-        audit::log_event(
-            vault.db(),
-            "ProxyStopped",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            Some(&e.to_string()),
-        );
-        eprintln!("Proxy error: {}", e);
-        std::process::exit(1);
+    if port == 0 {
+        println!("Starting WispKey proxy on a random port...");
+    } else {
+        println!("Starting WispKey proxy on localhost:{}...", port);
+    }
+    if all_projects {
+        println!("Project scope: ALL (no project filtering)");
+    } else {
+        println!("Project scope: '{}' (use --all-projects to allow all)", active);
+    }
+
+    match proxy::start_proxy(port, all_projects).await {
+        Ok(actual_port) => {
+            println!("Set HTTP_PROXY=http://localhost:{} in your agent's environment.", actual_port);
+        }
+        Err(e) => {
+            audit::log_event(
+                vault.db(),
+                "ProxyStopped",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                Some(&e.to_string()),
+                None,
+            );
+            eprintln!("Proxy error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -416,8 +445,16 @@ fn spawn_daemon(port: u16) {
         std::process::exit(1);
     });
 
+    let mut args: Vec<String> = vec!["serve".into()];
+    if port == 0 {
+        args.push("--random-port".into());
+    } else {
+        args.push("--port".into());
+        args.push(port.to_string());
+    }
+
     match std::process::Command::new(executable)
-        .args(["serve", "--port", &port.to_string()])
+        .args(&args)
         .stdout(log_file)
         .stderr(stderr_file)
         .stdin(std::process::Stdio::null())
@@ -425,6 +462,7 @@ fn spawn_daemon(port: u16) {
     {
         Ok(child) => {
             println!("WispKey proxy daemonized (PID {}).", child.id());
+            println!("Discovery: {}", Vault::vault_dir().join("proxy.json").display());
             println!("Logs: {}", log_path.display());
             println!("Stop: kill {}", child.id());
         }
@@ -488,10 +526,14 @@ pub async fn handle_status() {
                 if session_active { "active" } else { "locked" }
             );
 
-            let pid_path = Vault::vault_dir().join("proxy.pid");
-            if pid_path.exists() {
-                if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
-                    println!("Proxy:       running (PID {})", pid_str.trim());
+            let info_path = Vault::vault_dir().join("proxy.json");
+            if info_path.exists() {
+                if let Ok(contents) = std::fs::read_to_string(&info_path)
+                    && let Ok(info) = serde_json::from_str::<serde_json::Value>(&contents)
+                {
+                    let pid = info.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
+                    let port = info.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
+                    println!("Proxy:       running (PID {}, port {})", pid, port);
                 }
             } else {
                 println!("Proxy:       stopped");
@@ -569,7 +611,7 @@ pub async fn handle_mcp_serve() {
     }
 }
 
-pub async fn handle_partition_create(name: &str, description: &str) {
+pub async fn handle_partition_create(name: &str, description: &str, project: Option<&str>) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
         Err(e) => {
@@ -577,8 +619,9 @@ pub async fn handle_partition_create(name: &str, description: &str) {
             std::process::exit(1);
         }
     };
-    match vault.create_partition(name, description) {
+    match vault.create_partition(name, description, project) {
         Ok(p) => {
+            let active = core::resolve_active_project();
             audit::log_event(
                 vault.db(),
                 "PartitionCreated",
@@ -590,8 +633,10 @@ pub async fn handle_partition_create(name: &str, description: &str) {
                 None,
                 false,
                 None,
+                Some(&active),
             );
-            println!("Partition '{}' created.", p.name);
+            let project_name = project.unwrap_or(&active);
+            println!("Partition '{}' created in project '{}'.", p.name, project_name);
         }
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -600,7 +645,7 @@ pub async fn handle_partition_create(name: &str, description: &str) {
     }
 }
 
-pub async fn handle_partition_list() {
+pub async fn handle_partition_list(all_projects: bool) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
         Err(e) => {
@@ -608,7 +653,15 @@ pub async fn handle_partition_list() {
             std::process::exit(1);
         }
     };
-    match vault.list_partitions() {
+
+    let list_result = if all_projects {
+        vault.list_partitions()
+    } else {
+        let active = core::resolve_active_project();
+        vault.list_partitions_in_project(&active)
+    };
+
+    match list_result {
         Ok(partitions) => {
             println!(
                 "{:<20} {:<10} {:<30} CREATED",
@@ -655,6 +708,7 @@ pub async fn handle_partition_delete(name: &str) {
                 None,
                 None,
                 false,
+                None,
                 None,
             );
             println!(
@@ -720,6 +774,7 @@ pub async fn handle_partition_export(name: &str, output: &str) {
                 None,
                 false,
                 None,
+                None,
             );
             println!(
                 "Exported {} credential(s) from partition '{}' to {}",
@@ -755,6 +810,7 @@ pub async fn handle_partition_import(path: &str) {
                 None,
                 false,
                 None,
+                None,
             );
             println!("Import complete:");
             println!("  Imported:  {}", results.imported);
@@ -767,6 +823,148 @@ pub async fn handle_partition_import(path: &str) {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+pub async fn handle_project_create(name: &str, description: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    match vault.create_project(name, description) {
+        Ok(p) => {
+            audit::log_event(
+                vault.db(),
+                "ProjectCreated",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                Some(&p.name),
+            );
+            println!("Project '{}' created.", p.name);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_project_list() {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let active = core::resolve_active_project();
+    match vault.list_projects() {
+        Ok(projects) => {
+            println!(
+                "{:<3} {:<20} {:<10} {:<30} CREATED",
+                "", "NAME", "PARTS", "DESCRIPTION"
+            );
+            println!("{}", "-".repeat(80));
+            for p in &projects {
+                let count = vault.project_partition_count(&p.id).unwrap_or(0);
+                let marker = if p.name == active { " *" } else { "  " };
+                println!(
+                    "{:<3} {:<20} {:<10} {:<30} {}",
+                    marker,
+                    p.name,
+                    count,
+                    p.description,
+                    p.created_at.format("%Y-%m-%d %H:%M")
+                );
+            }
+            println!();
+            println!("{} project(s)  (* = active)", projects.len());
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_project_delete(name: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    match vault.delete_project(name) {
+        Ok(()) => {
+            audit::log_event(
+                vault.db(),
+                "ProjectDeleted",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                Some(name),
+            );
+            println!(
+                "Project '{}' deleted. Partitions moved to 'default'.",
+                name
+            );
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_project_use(name: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    match vault.get_project(name) {
+        Ok(_) => {
+            if let Err(e) = core::set_active_project(name) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+            println!("Active project set to '{}'.", name);
+            println!("All commands will now default to this project.");
+            println!("Override per-terminal with: export WISPKEY_PROJECT={}", name);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_project_current() {
+    let active = core::resolve_active_project();
+    println!("Active project: {}", active);
+    if std::env::var("WISPKEY_PROJECT").is_ok() {
+        println!("  (set via WISPKEY_PROJECT env var)");
+    } else if Vault::vault_dir().join("active_project").exists() {
+        println!("  (set via `wispkey project use`)");
+    } else {
+        println!("  (default)");
     }
 }
 
@@ -967,9 +1165,9 @@ pub async fn handle_cloud_sync() {
 
 fn cloud_tier_label(tier: &CloudTier) -> &'static str {
     match tier {
-        CloudTier::Free => "Free",
-        CloudTier::Pro => "Pro",
-        CloudTier::Team => "Team",
+        CloudTier::Personal => "Personal",
+        CloudTier::Cloud => "Cloud",
+        CloudTier::Enterprise => "Enterprise",
     }
 }
 

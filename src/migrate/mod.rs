@@ -84,6 +84,7 @@ pub fn import_env_file(
                     None,
                     false,
                     None,
+                    None,
                 );
                 output_lines.push(format!("{}={}", entry.key, cred.wisp_token));
                 println!(
