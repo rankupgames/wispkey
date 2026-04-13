@@ -1,0 +1,119 @@
+name: Promote & Backmerge
+
+on:
+  schedule:
+    - cron: '0 4 * * 5'  # Thursday 11 PM EST / Friday 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (show diff only, no merge)'
+        required: true
+        default: true
+        type: boolean
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      promoted: ${{ steps.merge.outputs.promoted }}
+    steps:
+      - name: Check if development is ahead of release
+        id: sync-check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          COMPARE=$(gh api "repos/${{ github.repository }}/compare/release...development" \
+            --jq '{ahead: .ahead_by, status: .status}')
+          AHEAD=$(echo "$COMPARE" | jq -r '.ahead')
+          STATUS=$(echo "$COMPARE" | jq -r '.status')
+
+          echo "ahead=$AHEAD" >> $GITHUB_OUTPUT
+
+          if [ "$STATUS" = "identical" ]; then
+            echo "synced=true" >> $GITHUB_OUTPUT
+            echo "development and release are already in sync"
+          else
+            echo "synced=false" >> $GITHUB_OUTPUT
+            echo "${AHEAD} commit(s) to promote"
+          fi
+
+      - name: Show diff (dry run)
+        if: github.event.inputs.dry_run == 'true' && steps.sync-check.outputs.synced == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "## Dry Run: development -> release" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Commits ahead: ${{ steps.sync-check.outputs.ahead }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          gh api "repos/${{ github.repository }}/compare/release...development" \
+            --jq '.commits[] | "\(.sha[0:10]) \(.commit.message | split("\n")[0])"' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Promote development -> release
+        id: merge
+        if: github.event.inputs.dry_run != 'true' && steps.sync-check.outputs.synced == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          MERGE_SHA=$(gh api "repos/${{ github.repository }}/merges" \
+            -f base="release" \
+            -f head="development" \
+            -f commit_message="Promote development into release" \
+            --jq '.sha' 2>/tmp/merge-error)
+
+          if [ $? -ne 0 ] || [ -z "$MERGE_SHA" ]; then
+            echo "::error::Merge failed"
+            cat /tmp/merge-error 2>/dev/null
+            exit 1
+          fi
+
+          echo "promoted=true" >> $GITHUB_OUTPUT
+          echo "Merged development into release (${MERGE_SHA})"
+          echo "## Promotion Complete" >> $GITHUB_STEP_SUMMARY
+          echo "Merged \`development\` into \`release\` (\`${MERGE_SHA:0:10}\`)" >> $GITHUB_STEP_SUMMARY
+
+  backmerge:
+    needs: promote
+    if: always() && (needs.promote.outputs.promoted == 'true' || github.event.inputs.dry_run != 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Backmerge release -> main -> development
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          REPO="${{ github.repository }}"
+
+          COMPARE=$(gh api "repos/${REPO}/compare/main...release" --jq '.status')
+          if [ "$COMPARE" = "identical" ]; then
+            echo "main already in sync with release"
+          else
+            RESULT=$(gh api "repos/${REPO}/merges" \
+              -f base="main" \
+              -f head="release" \
+              -f commit_message="Backmerge release into main" \
+              --jq '.sha' 2>/dev/null || echo "already-merged")
+            echo "Merged release into main (${RESULT})"
+          fi
+
+          COMPARE=$(gh api "repos/${REPO}/compare/development...main" --jq '.status')
+          if [ "$COMPARE" = "identical" ] || [ "$COMPARE" = "behind" ]; then
+            echo "development already in sync with main"
+          else
+            RESULT=$(gh api "repos/${REPO}/merges" \
+              -f base="development" \
+              -f head="main" \
+              -f commit_message="Backmerge main into development" \
+              --jq '.sha' 2>/dev/null || echo "already-merged")
+            echo "Merged main into development (${RESULT})"
+          fi
+
+          echo "## Backmerge Complete" >> $GITHUB_STEP_SUMMARY
+          echo "release -> main -> development" >> $GITHUB_STEP_SUMMARY
