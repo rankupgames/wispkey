@@ -163,7 +163,7 @@ mod tests {
         assert_eq!(entries[0].event_type, "credential_accessed");
         assert_eq!(entries[0].credential_name.as_deref(), Some("my-key"));
         assert_eq!(entries[0].response_status, Some(200));
-        assert_eq!(entries[0].denied, false);
+        assert!(!entries[0].denied);
     }
 
     #[test]
@@ -184,7 +184,7 @@ mod tests {
         );
         let entries = query_log(&db, 10, None, None);
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].denied, true);
+        assert!(entries[0].denied);
         assert_eq!(entries[0].deny_reason.as_deref(), Some("host not allowed"));
     }
 

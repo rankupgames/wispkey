@@ -15,10 +15,9 @@ WispKey cloud sync is **coming soon**. Until it ships, credentials stay on the m
 
 | Tier | Price | Audience |
 |------|-------|----------|
-| Pro | $1.99/month | Single-user encrypted sync across your devices |
-| Team | $9.99/user/month | Multi-user workspaces with shared partitions and collaboration |
-
-Exact feature boundaries may adjust at launch; use official WispKey announcements for the final matrix.
+| Personal | Free | Local vault only, no cloud features |
+| Cloud | $1.99/month ($1.49/month annual) | Single-user encrypted sync across devices |
+| Enterprise | Contact us | Multi-user workspaces with shared partitions and org management |
 
 ## What Cloud Sync Will Offer
 
