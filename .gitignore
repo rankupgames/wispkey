@@ -1,0 +1,44 @@
+# Rust
+/target
+**/*.rs.bk
+
+# SQLite databases
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+
+# Local vault data
+.wispkey/
+
+# Spec docs (internal planning, not shipped)
+_docs/
+
+# Node (plugin dev tooling)
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# Environment files (never commit secrets)
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test / coverage
+coverage/
+*.profraw

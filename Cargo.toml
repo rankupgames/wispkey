@@ -1,0 +1,61 @@
+[package]
+name = "wispkey"
+version = "0.1.0"
+edition = "2024"
+authors = ["Miguel A. Lopez <miguel@rankupgames.com>"]
+description = "Local-first AI credential vault with wisp token proxy"
+license = "Apache-2.0"
+repository = "https://github.com/rankupgames/wispkey"
+readme = "README.md"
+keywords = ["credentials", "security", "ai-agents", "proxy", "mcp"]
+categories = ["authentication", "command-line-utilities"]
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP proxy
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full", "http1", "http2", "client-legacy", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Encryption
+ring = "0.17"
+argon2 = { version = "0.5", features = ["std"] }
+
+# Database
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Cloud sync (API client)
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.9"
+base64 = "0.22"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+dirs = "6"
+glob-match = "0.2"
+rpassword = "7"
+regex = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = "z"

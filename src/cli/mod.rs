@@ -1,0 +1,1008 @@
+/*
+ * Author: Miguel A. Lopez
+ * Company: RankUp Games LLC
+ * Project: WispKey
+ * Description: CLI command handlers -- wires user-facing subcommands to vault operations.
+ *              Handles interactive password prompts with WISPKEY_PASSWORD env var fallback.
+ * Created: 2026-04-07
+ * Last Modified: 2026-04-08
+ */
+
+use std::io::{self, Write};
+
+use crate::audit;
+use crate::cloud::{self, CloudClient, CloudError, CloudTier};
+use crate::core::{CredentialType, Vault, VaultError};
+use crate::mcp;
+use crate::migrate;
+use crate::partition;
+use crate::proxy;
+
+pub async fn handle_init() {
+    if Vault::exists() {
+        eprintln!(
+            "Error: vault already exists at {}",
+            Vault::vault_dir().display()
+        );
+        eprintln!("Delete {} to start fresh.", Vault::vault_dir().display());
+        std::process::exit(1);
+    }
+
+    let password =
+        match prompt_password_confirm("Enter master password: ", "Confirm master password: ") {
+            Some(p) => p,
+            None => {
+                eprintln!("Error: passwords did not match");
+                std::process::exit(1);
+            }
+        };
+
+    match Vault::init(&password) {
+        Ok(vault) => {
+            audit::log_event(
+                vault.db(),
+                "VaultCreated",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+            println!("Vault created at {}", Vault::vault_dir().display());
+            println!("Vault is unlocked for this session (30 min timeout).");
+            println!();
+            println!("Next steps:");
+            println!("  wispkey add \"my-api-key\" --type bearer_token --value \"sk-...\"");
+            println!("  wispkey import .env");
+            println!("  wispkey serve");
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_unlock(timeout: Option<i64>) {
+    let mut vault = match Vault::open() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let password = prompt_password("Enter master password: ");
+
+    match vault.unlock_with_timeout(&password, timeout) {
+        Ok(()) => {
+            audit::log_event(
+                vault.db(),
+                "VaultUnlocked",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+            let effective_timeout = timeout.unwrap_or_else(Vault::session_timeout_minutes);
+            if effective_timeout > 0 {
+                println!("Vault unlocked ({} min session).", effective_timeout);
+            } else {
+                println!("Vault unlocked (no expiry).");
+            }
+        }
+        Err(VaultError::InvalidPassword) => {
+            eprintln!("Error: invalid master password");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn handle_add(
+    name: &str,
+    type_str: &str,
+    value: Option<&str>,
+    hosts: Option<&str>,
+    tags: Option<&str>,
+    header_name: Option<&str>,
+    param_name: Option<&str>,
+    partition: Option<&str>,
+) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let credential_type =
+        match CredentialType::from_str_with_params(type_str, header_name, param_name) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+        };
+
+    let resolved_value = match value {
+        Some(v) => v.to_string(),
+        None => {
+            let entered = prompt_password_confirm("Enter secret value: ", "Confirm secret value: ");
+            match entered {
+                Some(v) => v,
+                None => {
+                    eprintln!("Error: values did not match");
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
+
+    match vault.add_credential(
+        name,
+        credential_type,
+        &resolved_value,
+        hosts,
+        tags,
+        partition,
+    ) {
+        Ok(cred) => {
+            audit::log_event(
+                vault.db(),
+                "CredentialAdded",
+                Some(name),
+                Some(&cred.wisp_token),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+            println!("Credential '{}' added.", name);
+            println!("Wisp token: {}", cred.wisp_token);
+            println!();
+            println!(
+                "Use this token in API calls. The proxy will swap it for the real credential."
+            );
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_list(partition: Option<&str>) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let list_result = if let Some(partition_name) = partition {
+        vault.list_credentials_in_partition(partition_name)
+    } else {
+        vault.list_credentials()
+    };
+
+    match list_result {
+        Ok(credentials) => {
+            if credentials.is_empty() {
+                println!("No credentials stored.");
+                println!(
+                    "Add one with: wispkey add \"name\" --type bearer_token --value \"secret\""
+                );
+                return;
+            }
+
+            println!("{:<24} {:<16} {:<20} TAGS", "NAME", "TYPE", "CREATED");
+            println!("{}", "-".repeat(72));
+            for cred in &credentials {
+                let tags = if cred.tags.is_empty() {
+                    String::new()
+                } else {
+                    cred.tags.join(", ")
+                };
+                println!(
+                    "{:<24} {:<16} {:<20} {}",
+                    cred.name,
+                    cred.credential_type.display_name(),
+                    cred.created_at.format("%Y-%m-%d %H:%M"),
+                    tags
+                );
+            }
+            println!();
+            println!("{} credential(s)", credentials.len());
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_get(name: &str, show_token: bool) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    match vault.get_credential(name) {
+        Ok(cred) => {
+            println!("Name:       {}", cred.name);
+            println!("Type:       {}", cred.credential_type.display_name());
+            if show_token {
+                println!("Wisp Token: {}", cred.wisp_token);
+            }
+            if !cred.hosts.is_empty() {
+                println!("Hosts:      {}", cred.hosts.join(", "));
+            }
+            if !cred.tags.is_empty() {
+                println!("Tags:       {}", cred.tags.join(", "));
+            }
+            println!(
+                "Created:    {}",
+                cred.created_at.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+            println!(
+                "Updated:    {}",
+                cred.updated_at.format("%Y-%m-%d %H:%M:%S UTC")
+            );
+            if let Some(last_used) = cred.last_used_at {
+                println!("Last Used:  {}", last_used.format("%Y-%m-%d %H:%M:%S UTC"));
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_remove(name: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    match vault.remove_credential(name) {
+        Ok(()) => {
+            audit::log_event(
+                vault.db(),
+                "CredentialRemoved",
+                Some(name),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+            println!("Credential '{}' removed.", name);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_rotate(name: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    match vault.rotate_wisp_token(name) {
+        Ok(new_token) => {
+            audit::log_event(
+                vault.db(),
+                "CredentialRotated",
+                Some(name),
+                Some(&new_token),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+            println!("Wisp token rotated for '{}'.", name);
+            println!("New token: {}", new_token);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_serve(port: u16, daemon: bool) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if daemon {
+        spawn_daemon(port);
+        return;
+    }
+
+    audit::log_event(
+        vault.db(),
+        "ProxyStarted",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        None,
+    );
+    println!("Starting WispKey proxy on localhost:{}...", port);
+    println!(
+        "Set HTTP_PROXY=http://localhost:{} in your agent's environment.",
+        port
+    );
+    println!();
+
+    if let Err(e) = proxy::start_proxy(port).await {
+        audit::log_event(
+            vault.db(),
+            "ProxyStopped",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some(&e.to_string()),
+        );
+        eprintln!("Proxy error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+fn spawn_daemon(port: u16) {
+    let executable = std::env::current_exe().unwrap_or_else(|e| {
+        eprintln!("Error: cannot find executable path: {}", e);
+        std::process::exit(1);
+    });
+
+    let log_path = Vault::vault_dir().join("proxy.log");
+
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .unwrap_or_else(|e| {
+            eprintln!("Error: cannot open log file {}: {}", log_path.display(), e);
+            std::process::exit(1);
+        });
+
+    let stderr_file = log_file.try_clone().unwrap_or_else(|e| {
+        eprintln!("Error: cannot clone log file handle: {}", e);
+        std::process::exit(1);
+    });
+
+    match std::process::Command::new(executable)
+        .args(["serve", "--port", &port.to_string()])
+        .stdout(log_file)
+        .stderr(stderr_file)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => {
+            println!("WispKey proxy daemonized (PID {}).", child.id());
+            println!("Logs: {}", log_path.display());
+            println!("Stop: kill {}", child.id());
+        }
+        Err(e) => {
+            eprintln!("Error: failed to spawn daemon: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_import(path: &str, prefix: Option<&str>, partition: Option<&str>) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    match migrate::import_env_file(&vault, path, prefix, partition) {
+        Ok(results) => {
+            println!("Import complete:");
+            println!("  Imported:  {}", results.imported);
+            println!("  Skipped:   {}", results.skipped);
+            if results.errors > 0 {
+                println!("  Errors:    {}", results.errors);
+            }
+            if !results.output_path.is_empty() {
+                println!();
+                println!("Wisp token .env written to: {}", results.output_path);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_status() {
+    if !Vault::exists() {
+        println!("Vault: not initialized");
+        println!("Run `wispkey init` to create a vault.");
+        return;
+    }
+
+    let vault = Vault::open();
+    match vault {
+        Ok(v) => {
+            let count = v.credential_count().unwrap_or(0);
+            let created = v
+                .vault_created_at()
+                .unwrap_or_else(|_| "unknown".to_string());
+            let session_active = Vault::open_with_session().is_ok();
+
+            println!("Vault:       {}", Vault::vault_dir().display());
+            println!("Created:     {}", created);
+            println!("Credentials: {}", count);
+            println!(
+                "Session:     {}",
+                if session_active { "active" } else { "locked" }
+            );
+
+            let pid_path = Vault::vault_dir().join("proxy.pid");
+            if pid_path.exists() {
+                if let Ok(pid_str) = std::fs::read_to_string(&pid_path) {
+                    println!("Proxy:       running (PID {})", pid_str.trim());
+                }
+            } else {
+                println!("Proxy:       stopped");
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+        }
+    }
+}
+
+pub async fn handle_log(last: usize, credential: Option<&str>, since: Option<&str>) {
+    let vault = match Vault::open() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let entries = audit::query_log(vault.db(), last, credential, since);
+
+    if entries.is_empty() {
+        println!("No audit log entries found.");
+        return;
+    }
+
+    println!(
+        "{:<20} {:<18} {:<20} {:<24} STATUS",
+        "TIMESTAMP", "EVENT", "CREDENTIAL", "TARGET"
+    );
+    println!("{}", "-".repeat(96));
+    for entry in &entries {
+        let target = match (&entry.target_host, &entry.target_path) {
+            (Some(host), Some(path)) => format!("{}{}", host, path),
+            (Some(host), None) => host.clone(),
+            _ => String::new(),
+        };
+        let status = if entry.denied {
+            format!(
+                "DENIED: {}",
+                entry.deny_reason.as_deref().unwrap_or("policy")
+            )
+        } else if let Some(code) = entry.response_status {
+            code.to_string()
+        } else {
+            String::new()
+        };
+
+        println!(
+            "{:<20} {:<18} {:<20} {:<24} {}",
+            &entry.timestamp[..19],
+            entry.event_type,
+            entry.credential_name.as_deref().unwrap_or("-"),
+            target,
+            status
+        );
+    }
+    println!();
+    println!("{} entries", entries.len());
+}
+
+pub async fn handle_mcp_serve() {
+    let _vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = mcp::run_mcp_server().await {
+        eprintln!("MCP server error: {}", e);
+        std::process::exit(1);
+    }
+}
+
+pub async fn handle_partition_create(name: &str, description: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    match vault.create_partition(name, description) {
+        Ok(p) => {
+            audit::log_event(
+                vault.db(),
+                "PartitionCreated",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+            println!("Partition '{}' created.", p.name);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_partition_list() {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    match vault.list_partitions() {
+        Ok(partitions) => {
+            println!(
+                "{:<20} {:<10} {:<30} CREATED",
+                "NAME", "CREDS", "DESCRIPTION"
+            );
+            println!("{}", "-".repeat(72));
+            for p in &partitions {
+                let count = vault.partition_credential_count(&p.id).unwrap_or(0);
+                println!(
+                    "{:<20} {:<10} {:<30} {}",
+                    p.name,
+                    count,
+                    p.description,
+                    p.created_at.format("%Y-%m-%d %H:%M")
+                );
+            }
+            println!();
+            println!("{} partition(s)", partitions.len());
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_partition_delete(name: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    match vault.delete_partition(name) {
+        Ok(()) => {
+            audit::log_event(
+                vault.db(),
+                "PartitionDeleted",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+            println!(
+                "Partition '{}' deleted. Credentials moved to 'personal'.",
+                name
+            );
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_partition_assign(credential: &str, partition_name: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    match vault.assign_credential_to_partition(credential, partition_name) {
+        Ok(()) => {
+            println!(
+                "Credential '{}' assigned to partition '{}'.",
+                credential, partition_name
+            );
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_partition_export(name: &str, output: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let passphrase = prompt_password_confirm("Enter bundle passphrase: ", "Confirm passphrase: ");
+    let passphrase = match passphrase {
+        Some(p) => p,
+        None => {
+            eprintln!("Error: passphrases did not match");
+            std::process::exit(1);
+        }
+    };
+    match partition::export_partition(&vault, name, &passphrase, output) {
+        Ok(count) => {
+            audit::log_event(
+                vault.db(),
+                "PartitionExported",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+            println!(
+                "Exported {} credential(s) from partition '{}' to {}",
+                count, name, output
+            );
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_partition_import(path: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let passphrase = prompt_password("Enter bundle passphrase: ");
+    match partition::import_partition(&vault, path, &passphrase) {
+        Ok(results) => {
+            audit::log_event(
+                vault.db(),
+                "PartitionImported",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+            );
+            println!("Import complete:");
+            println!("  Imported:  {}", results.imported);
+            println!("  Skipped:   {}", results.skipped);
+            if results.errors > 0 {
+                println!("  Errors:    {}", results.errors);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_cloud_status() {
+    let config = match cloud::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let status = match cloud::summarize_local_cloud_status(&config) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    if !status.authenticated {
+        println!("WispKey Cloud: not connected");
+        println!("Run `wispkey cloud login` to connect.");
+        println!("Pricing: Pro $1.99/mo | Team $9.99/user/mo");
+        println!("API: {}", config.api_url);
+        return;
+    }
+    println!("WispKey Cloud: connected (local session)");
+    println!("API:          {}", config.api_url);
+    println!("Tier:         {}", cloud_tier_label(&status.tier));
+    if let Some(user_id) = config.user_id.as_ref() {
+        println!("User ID:      {}", user_id);
+    }
+    if let Some(org_id) = config.org_id.as_ref() {
+        println!("Org ID:       {}", org_id);
+    }
+    if let Some(last) = config.last_sync.as_ref() {
+        println!("Last sync:    {}", last);
+    }
+    println!("Partitions (local manifest): {}", status.synced_partitions);
+    println!(
+        "Storage:      {} / {} bytes (local estimate until API is live)",
+        status.storage_used_bytes, status.storage_limit_bytes
+    );
+}
+
+pub async fn handle_cloud_login() {
+    print!("Email: ");
+    if io::stdout().flush().is_err() {
+        eprintln!("Error: could not write prompt");
+        std::process::exit(1);
+    }
+    let mut email_line = String::new();
+    if io::stdin().read_line(&mut email_line).is_err() {
+        eprintln!("Error: could not read email");
+        std::process::exit(1);
+    }
+    let email = email_line.trim();
+    if email.is_empty() {
+        eprintln!("Error: email required");
+        std::process::exit(1);
+    }
+    let password = if let Ok(password_from_env) = std::env::var("WISPKEY_PASSWORD") {
+        password_from_env
+    } else {
+        rpassword::prompt_password("Password: ").unwrap_or_else(|e| {
+            eprintln!("Error reading password: {}", e);
+            std::process::exit(1);
+        })
+    };
+    let config = match cloud::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let client = CloudClient::new(config);
+    match client.login(email, &password).await {
+        Ok(updated) => {
+            if let Err(e) = cloud::save_config(&updated) {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
+            println!("Logged in to WispKey Cloud.");
+        }
+        Err(e) => {
+            print_cloud_error(&e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_cloud_logout() {
+    let config = match cloud::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let mut client = CloudClient::new(config);
+    match client.logout() {
+        Ok(()) => println!("Logged out of WispKey Cloud."),
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_cloud_push(partition_name: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let config = match cloud::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let client = CloudClient::new(config);
+    match client.push_partition(&vault, partition_name).await {
+        Ok(manifest) => {
+            println!("Push complete for partition '{}'.", manifest.partition_name);
+            println!("Last synced at: {}", manifest.last_synced_at);
+        }
+        Err(e) => {
+            print_cloud_error(&e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_cloud_pull(partition_name: &str) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let config = match cloud::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let client = CloudClient::new(config);
+    match client.pull_partition(&vault, partition_name).await {
+        Ok(manifest) => {
+            println!("Pull complete for partition '{}'.", manifest.partition_name);
+            println!("Last synced at: {}", manifest.last_synced_at);
+        }
+        Err(e) => {
+            print_cloud_error(&e);
+            std::process::exit(1);
+        }
+    }
+}
+
+pub async fn handle_cloud_sync() {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let config = match cloud::load_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let client = CloudClient::new(config);
+    match client.sync_all(&vault).await {
+        Ok(manifests) => {
+            println!("Sync complete ({} partition(s)).", manifests.len());
+            for manifest in &manifests {
+                println!(
+                    "  - {} @ {}",
+                    manifest.partition_name, manifest.last_synced_at
+                );
+            }
+        }
+        Err(e) => {
+            print_cloud_error(&e);
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cloud_tier_label(tier: &CloudTier) -> &'static str {
+    match tier {
+        CloudTier::Free => "Free",
+        CloudTier::Pro => "Pro",
+        CloudTier::Team => "Team",
+    }
+}
+
+fn print_cloud_error(error: &CloudError) {
+    match error {
+        CloudError::Vault(vault_error) => eprintln!("Error: {}", vault_error),
+        other => eprintln!("Error: {}", other),
+    }
+}
+
+fn prompt_password(prompt: &str) -> String {
+    if let Ok(password) = std::env::var("WISPKEY_PASSWORD") {
+        return password;
+    }
+    rpassword::prompt_password(prompt).unwrap_or_else(|e| {
+        eprintln!("Error reading password: {}", e);
+        eprintln!("Hint: set WISPKEY_PASSWORD env var for non-interactive use.");
+        std::process::exit(1);
+    })
+}
+
+fn prompt_password_confirm(prompt1: &str, prompt2: &str) -> Option<String> {
+    if let Ok(password) = std::env::var("WISPKEY_PASSWORD") {
+        return Some(password);
+    }
+    let password1 = prompt_password(prompt1);
+    let password2 = rpassword::prompt_password(prompt2).unwrap_or_else(|e| {
+        eprintln!("Error reading password: {}", e);
+        std::process::exit(1);
+    });
+    if password1 == password2 {
+        Some(password1)
+    } else {
+        None
+    }
+}

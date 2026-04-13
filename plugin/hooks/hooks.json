@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "hooks": {
+    "beforeShellExecution": [
+      {
+        "command": "./plugin/scripts/secret-guard.sh",
+        "matcher": "\\b(curl|wget|http|fetch|axios)\\b"
+      },
+      {
+        "command": "./plugin/scripts/env-leak-guard.sh",
+        "matcher": "\\b(echo|printf|cat|export)\\b.*\\b(KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|API_KEY)\\b"
+      }
+    ]
+  }
+}

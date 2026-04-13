@@ -1,0 +1,43 @@
+---
+description: Route API requests through the WispKey proxy when wisp tokens are present
+globs: "*.sh,*.ts,*.js,*.py,*.rs,*.env*,Makefile,docker-compose*"
+---
+
+# WispKey Proxy Routing
+
+When constructing HTTP requests that use wisp tokens (`wk_*`), always route through the WispKey proxy.
+
+## Proxy Address
+`http://localhost:7700` (default). Set via `HTTP_PROXY` env var or pass directly.
+
+## curl
+```bash
+HTTP_PROXY=http://localhost:7700 curl -H "Authorization: Bearer wk_openai_api_abc123" https://api.openai.com/v1/models
+```
+
+## Node.js / fetch
+```typescript
+const response = await fetch("https://api.openai.com/v1/models", {
+  headers: { "Authorization": "Bearer wk_openai_api_abc123" },
+  agent: new HttpsProxyAgent("http://localhost:7700")
+});
+```
+
+## Python / requests
+```python
+import requests
+response = requests.get("https://api.openai.com/v1/models",
+    headers={"Authorization": "Bearer wk_openai_api_abc123"},
+    proxies={"http": "http://localhost:7700", "https": "http://localhost:7700"})
+```
+
+## Docker / docker-compose
+```yaml
+environment:
+  - HTTP_PROXY=http://host.docker.internal:7700
+```
+
+## Important
+- The proxy only listens on `localhost` -- requests from other machines will not work
+- Host restrictions are enforced per-credential (e.g. `openai-api` only works against `api.openai.com`)
+- Every proxied request is logged in the audit trail: `wispkey log`
