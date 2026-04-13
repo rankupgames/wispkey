@@ -55,7 +55,9 @@ pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error + Send + S
 fn handle_jsonrpc(request: &Value) -> Option<Value> {
     let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
-    if method.starts_with("notifications/") || (request.get("id").is_none() && method != "initialize") {
+    if method.starts_with("notifications/")
+        || (request.get("id").is_none() && method != "initialize")
+    {
         return None;
     }
 
@@ -298,7 +300,11 @@ fn handle_tool_proxy_status() -> Value {
 
     let status_text = format!(
         "Vault: {}\nSession: {}\nProxy: {}\nProxy address: {}\nHTTPS: supported (use X-Target-Url header)",
-        if vault_exists { "initialized" } else { "not initialized" },
+        if vault_exists {
+            "initialized"
+        } else {
+            "not initialized"
+        },
         if session_active { "active" } else { "locked" },
         if proxy_running { "running" } else { "stopped" },
         proxy_address,

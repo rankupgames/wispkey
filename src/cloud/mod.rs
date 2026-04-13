@@ -249,12 +249,16 @@ impl CloudClient {
 async fn browser_login_flow(api_url: &str) -> CloudResult<(String, Option<String>)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| CloudError::ApiError(format!("failed to bind localhost listener: {e}")))?;
-    let callback_port = listener.local_addr()
+    let callback_port = listener
+        .local_addr()
         .map_err(|e| CloudError::ApiError(format!("failed to get listener address: {e}")))?
         .port();
 
     let callback_url = format!("http://127.0.0.1:{callback_port}/callback");
-    let sign_in_url = format!("{api_url}/auth/cli-login?callback={}", urlencoding::encode(&callback_url));
+    let sign_in_url = format!(
+        "{api_url}/auth/cli-login?callback={}",
+        urlencoding::encode(&callback_url)
+    );
 
     eprintln!("Opening browser for WispKey Cloud sign-in...");
     eprintln!("If the browser doesn't open, visit: {sign_in_url}");
@@ -410,8 +414,14 @@ mod tests {
     #[test]
     fn storage_limits_match_tiers() {
         assert_eq!(storage_limit_bytes_for_tier(&CloudTier::Personal), 0);
-        assert_eq!(storage_limit_bytes_for_tier(&CloudTier::Cloud), 100 * 1024 * 1024);
-        assert_eq!(storage_limit_bytes_for_tier(&CloudTier::Enterprise), 1024 * 1024 * 1024 * 1024);
+        assert_eq!(
+            storage_limit_bytes_for_tier(&CloudTier::Cloud),
+            100 * 1024 * 1024
+        );
+        assert_eq!(
+            storage_limit_bytes_for_tier(&CloudTier::Enterprise),
+            1024 * 1024 * 1024 * 1024
+        );
     }
 
     #[test]

@@ -8,7 +8,6 @@
  * Last Modified: 2026-04-12
  */
 
-
 use crate::audit;
 use crate::cloud::{self, CloudClient, CloudError, CloudTier};
 use crate::core::{self, CredentialType, Vault, VaultError};
@@ -156,7 +155,9 @@ pub async fn handle_add(
         }
     };
 
-    let active_project = project.map(String::from).unwrap_or_else(core::resolve_active_project);
+    let active_project = project
+        .map(String::from)
+        .unwrap_or_else(core::resolve_active_project);
 
     match vault.add_credential(
         name,
@@ -209,7 +210,9 @@ pub async fn handle_list(partition: Option<&str>, project: Option<&str>, all_pro
     } else if all_projects {
         vault.list_credentials()
     } else {
-        let active = project.map(String::from).unwrap_or_else(core::resolve_active_project);
+        let active = project
+            .map(String::from)
+            .unwrap_or_else(core::resolve_active_project);
         vault.list_credentials_in_project(&active)
     };
 
@@ -218,7 +221,10 @@ pub async fn handle_list(partition: Option<&str>, project: Option<&str>, all_pro
             if credentials.is_empty() {
                 let active = core::resolve_active_project();
                 if !all_projects {
-                    println!("No credentials in project '{}'. Use --all-projects to see all.", active);
+                    println!(
+                        "No credentials in project '{}'. Use --all-projects to see all.",
+                        active
+                    );
                 } else {
                     println!("No credentials stored.");
                 }
@@ -403,12 +409,18 @@ pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
     if all_projects {
         println!("Project scope: ALL (no project filtering)");
     } else {
-        println!("Project scope: '{}' (use --all-projects to allow all)", active);
+        println!(
+            "Project scope: '{}' (use --all-projects to allow all)",
+            active
+        );
     }
 
     match proxy::start_proxy(port, all_projects).await {
         Ok(actual_port) => {
-            println!("Set HTTP_PROXY=http://localhost:{} in your agent's environment.", actual_port);
+            println!(
+                "Set HTTP_PROXY=http://localhost:{} in your agent's environment.",
+                actual_port
+            );
         }
         Err(e) => {
             audit::log_event(
@@ -472,7 +484,10 @@ fn spawn_daemon(port: u16, all_projects: bool) {
     {
         Ok(child) => {
             println!("WispKey proxy daemonized (PID {}).", child.id());
-            println!("Discovery: {}", Vault::vault_dir().join("proxy.json").display());
+            println!(
+                "Discovery: {}",
+                Vault::vault_dir().join("proxy.json").display()
+            );
             println!("Logs: {}", log_path.display());
             println!("Stop: kill {}", child.id());
         }
@@ -651,7 +666,10 @@ pub async fn handle_partition_create(name: &str, description: &str, project: Opt
                 Some(&active),
             );
             let project_name = project.unwrap_or(&active);
-            println!("Partition '{}' created in project '{}'.", p.name, project_name);
+            println!(
+                "Partition '{}' created in project '{}'.",
+                p.name, project_name
+            );
         }
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -942,10 +960,7 @@ pub async fn handle_project_delete(name: &str) {
                 None,
                 Some(name),
             );
-            println!(
-                "Project '{}' deleted. Partitions moved to 'default'.",
-                name
-            );
+            println!("Project '{}' deleted. Partitions moved to 'default'.", name);
         }
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -971,7 +986,10 @@ pub async fn handle_project_use(name: &str) {
             }
             println!("Active project set to '{}'.", name);
             println!("All commands will now default to this project.");
-            println!("Override per-terminal with: export WISPKEY_PROJECT={}", name);
+            println!(
+                "Override per-terminal with: export WISPKEY_PROJECT={}",
+                name
+            );
         }
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -1190,20 +1208,44 @@ pub async fn handle_policy_list() {
         println!("Run `wispkey policy init` to create a template policies.toml");
         return;
     }
-    println!("{} policies loaded from {}", config.policy.len(), crate::policy::policies_path().display());
+    println!(
+        "{} policies loaded from {}",
+        config.policy.len(),
+        crate::policy::policies_path().display()
+    );
     println!();
     for policy in &config.policy {
         println!("  [{}]", policy.name);
-        if let Some(ref cred) = policy.credential { println!("    credential: {}", cred); }
-        if let Some(ref agent) = policy.agent { println!("    agent: {}", agent); }
-        if !policy.allowed_methods.is_empty() { println!("    allowed_methods: {}", policy.allowed_methods.join(", ")); }
-        if !policy.allowed_hosts.is_empty() { println!("    allowed_hosts: {}", policy.allowed_hosts.join(", ")); }
-        if !policy.denied_hosts.is_empty() { println!("    denied_hosts: {}", policy.denied_hosts.join(", ")); }
-        if !policy.denied_paths.is_empty() { println!("    denied_paths: {}", policy.denied_paths.join(", ")); }
-        if !policy.allowed_paths.is_empty() { println!("    allowed_paths: {}", policy.allowed_paths.join(", ")); }
-        if let Some(ref rl) = policy.rate_limit { println!("    rate_limit: {}", rl); }
-        if let Some(ref tw) = policy.time_window { println!("    time_window: {}", tw); }
-        if policy.deny { println!("    deny: true"); }
+        if let Some(ref cred) = policy.credential {
+            println!("    credential: {}", cred);
+        }
+        if let Some(ref agent) = policy.agent {
+            println!("    agent: {}", agent);
+        }
+        if !policy.allowed_methods.is_empty() {
+            println!("    allowed_methods: {}", policy.allowed_methods.join(", "));
+        }
+        if !policy.allowed_hosts.is_empty() {
+            println!("    allowed_hosts: {}", policy.allowed_hosts.join(", "));
+        }
+        if !policy.denied_hosts.is_empty() {
+            println!("    denied_hosts: {}", policy.denied_hosts.join(", "));
+        }
+        if !policy.denied_paths.is_empty() {
+            println!("    denied_paths: {}", policy.denied_paths.join(", "));
+        }
+        if !policy.allowed_paths.is_empty() {
+            println!("    allowed_paths: {}", policy.allowed_paths.join(", "));
+        }
+        if let Some(ref rl) = policy.rate_limit {
+            println!("    rate_limit: {}", rl);
+        }
+        if let Some(ref tw) = policy.time_window {
+            println!("    time_window: {}", tw);
+        }
+        if policy.deny {
+            println!("    deny: true");
+        }
         println!();
     }
 }
@@ -1260,7 +1302,11 @@ pub async fn handle_policy_check() {
     });
     match toml::from_str::<crate::policy::PolicyConfig>(&content) {
         Ok(config) => {
-            println!("OK -- {} policies parsed from {}", config.policy.len(), path.display());
+            println!(
+                "OK -- {} policies parsed from {}",
+                config.policy.len(),
+                path.display()
+            );
             for policy in &config.policy {
                 println!("  [{}] ok", policy.name);
             }

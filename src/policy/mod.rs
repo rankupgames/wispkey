@@ -100,16 +100,33 @@ impl PolicyEngine {
     }
 
     /// Evaluate all policies against a request context. Returns the first denial, or None if allowed.
-    pub fn evaluate(&self, credential_name: &str, agent_name: Option<&str>, host: &str, path: &str, method: &str) -> Option<PolicyDenial> {
+    pub fn evaluate(
+        &self,
+        credential_name: &str,
+        agent_name: Option<&str>,
+        host: &str,
+        path: &str,
+        method: &str,
+    ) -> Option<PolicyDenial> {
         for policy in &self.policies {
-            if let Some(denial) = self.evaluate_single(policy, credential_name, agent_name, host, path, method) {
+            if let Some(denial) =
+                self.evaluate_single(policy, credential_name, agent_name, host, path, method)
+            {
                 return Some(denial);
             }
         }
         None
     }
 
-    fn evaluate_single(&self, policy: &Policy, credential_name: &str, agent_name: Option<&str>, host: &str, path: &str, method: &str) -> Option<PolicyDenial> {
+    fn evaluate_single(
+        &self,
+        policy: &Policy,
+        credential_name: &str,
+        agent_name: Option<&str>,
+        host: &str,
+        path: &str,
+        method: &str,
+    ) -> Option<PolicyDenial> {
         if !policy_matches_credential(policy, credential_name) {
             return None;
         }
@@ -118,28 +135,86 @@ impl PolicyEngine {
         }
 
         if policy.deny {
-            return Some(PolicyDenial { policy_name: policy.name.clone(), reason: format!("credential '{}' blocked by deny policy '{}'", credential_name, policy.name) });
+            return Some(PolicyDenial {
+                policy_name: policy.name.clone(),
+                reason: format!(
+                    "credential '{}' blocked by deny policy '{}'",
+                    credential_name, policy.name
+                ),
+            });
         }
 
-        if !policy.allowed_hosts.is_empty() && !policy.allowed_hosts.iter().any(|h| glob_match::glob_match(h, host)) {
-            return Some(PolicyDenial { policy_name: policy.name.clone(), reason: format!("host '{}' not in allowed_hosts for policy '{}'", host, policy.name) });
+        if !policy.allowed_hosts.is_empty()
+            && !policy
+                .allowed_hosts
+                .iter()
+                .any(|h| glob_match::glob_match(h, host))
+        {
+            return Some(PolicyDenial {
+                policy_name: policy.name.clone(),
+                reason: format!(
+                    "host '{}' not in allowed_hosts for policy '{}'",
+                    host, policy.name
+                ),
+            });
         }
-        if policy.denied_hosts.iter().any(|h| glob_match::glob_match(h, host)) {
-            return Some(PolicyDenial { policy_name: policy.name.clone(), reason: format!("host '{}' blocked by denied_hosts in policy '{}'", host, policy.name) });
+        if policy
+            .denied_hosts
+            .iter()
+            .any(|h| glob_match::glob_match(h, host))
+        {
+            return Some(PolicyDenial {
+                policy_name: policy.name.clone(),
+                reason: format!(
+                    "host '{}' blocked by denied_hosts in policy '{}'",
+                    host, policy.name
+                ),
+            });
         }
 
         if !policy.allowed_methods.is_empty() {
             let method_upper = method.to_uppercase();
-            if !policy.allowed_methods.iter().any(|m| m.to_uppercase() == method_upper) {
-                return Some(PolicyDenial { policy_name: policy.name.clone(), reason: format!("method '{}' not in allowed_methods for policy '{}'", method, policy.name) });
+            if !policy
+                .allowed_methods
+                .iter()
+                .any(|m| m.to_uppercase() == method_upper)
+            {
+                return Some(PolicyDenial {
+                    policy_name: policy.name.clone(),
+                    reason: format!(
+                        "method '{}' not in allowed_methods for policy '{}'",
+                        method, policy.name
+                    ),
+                });
             }
         }
 
-        if !policy.allowed_paths.is_empty() && !policy.allowed_paths.iter().any(|p| glob_match::glob_match(p, path)) {
-            return Some(PolicyDenial { policy_name: policy.name.clone(), reason: format!("path '{}' not in allowed_paths for policy '{}'", path, policy.name) });
+        if !policy.allowed_paths.is_empty()
+            && !policy
+                .allowed_paths
+                .iter()
+                .any(|p| glob_match::glob_match(p, path))
+        {
+            return Some(PolicyDenial {
+                policy_name: policy.name.clone(),
+                reason: format!(
+                    "path '{}' not in allowed_paths for policy '{}'",
+                    path, policy.name
+                ),
+            });
         }
-        if policy.denied_paths.iter().any(|p| glob_match::glob_match(p, path)) {
-            return Some(PolicyDenial { policy_name: policy.name.clone(), reason: format!("path '{}' blocked by denied_paths in policy '{}'", path, policy.name) });
+        if policy
+            .denied_paths
+            .iter()
+            .any(|p| glob_match::glob_match(p, path))
+        {
+            return Some(PolicyDenial {
+                policy_name: policy.name.clone(),
+                reason: format!(
+                    "path '{}' blocked by denied_paths in policy '{}'",
+                    path, policy.name
+                ),
+            });
         }
 
         if let Some(ref window_str) = policy.time_window
@@ -153,11 +228,21 @@ impl PolicyEngine {
         {
             let bucket_key = format!("{}:{}", policy.name, credential_name);
             if let Ok(mut buckets) = self.rate_buckets.lock() {
-                let bucket = buckets.entry(bucket_key).or_insert_with(|| RateBucket { timestamps: Vec::new() });
+                let bucket = buckets.entry(bucket_key).or_insert_with(|| RateBucket {
+                    timestamps: Vec::new(),
+                });
                 let now = Instant::now();
-                bucket.timestamps.retain(|t| now.duration_since(*t) < parsed.window);
+                bucket
+                    .timestamps
+                    .retain(|t| now.duration_since(*t) < parsed.window);
                 if bucket.timestamps.len() as u64 >= parsed.max_requests {
-                    return Some(PolicyDenial { policy_name: policy.name.clone(), reason: format!("rate limit exceeded ({}) for policy '{}'", limit_str, policy.name) });
+                    return Some(PolicyDenial {
+                        policy_name: policy.name.clone(),
+                        reason: format!(
+                            "rate limit exceeded ({}) for policy '{}'",
+                            limit_str, policy.name
+                        ),
+                    });
                 }
                 bucket.timestamps.push(now);
             }
@@ -195,7 +280,10 @@ fn parse_rate_limit(s: &str) -> Option<RateLimit> {
         "day" | "d" => Duration::from_secs(86400),
         _ => return None,
     };
-    Some(RateLimit { max_requests, window })
+    Some(RateLimit {
+        max_requests,
+        window,
+    })
 }
 
 fn check_time_window(policy_name: &str, window_str: &str) -> Option<PolicyDenial> {
@@ -217,7 +305,11 @@ fn check_time_window(policy_name: &str, window_str: &str) -> Option<PolicyDenial
     if !in_window {
         Some(PolicyDenial {
             policy_name: policy_name.to_string(),
-            reason: format!("current time {} outside allowed window {}", now.format("%H:%M"), window_str),
+            reason: format!(
+                "current time {} outside allowed window {}",
+                now.format("%H:%M"),
+                window_str
+            ),
         })
     } else {
         None
@@ -267,7 +359,11 @@ mod tests {
     #[test]
     fn no_policies_allows_all() {
         let engine = test_engine(vec![]);
-        assert!(engine.evaluate("any-cred", None, "any.host", "/any/path", "GET").is_none());
+        assert!(
+            engine
+                .evaluate("any-cred", None, "any.host", "/any/path", "GET")
+                .is_none()
+        );
     }
 
     #[test]
@@ -305,7 +401,11 @@ mod tests {
             time_window: None,
             deny: true,
         }]);
-        assert!(engine.evaluate("aws-dev", None, "aws.com", "/", "GET").is_none());
+        assert!(
+            engine
+                .evaluate("aws-dev", None, "aws.com", "/", "GET")
+                .is_none()
+        );
     }
 
     #[test]
@@ -342,8 +442,16 @@ mod tests {
             time_window: None,
             deny: false,
         }]);
-        assert!(engine.evaluate("cred", None, "host", "/admin/users", "GET").is_some());
-        assert!(engine.evaluate("cred", None, "host", "/api/data", "GET").is_none());
+        assert!(
+            engine
+                .evaluate("cred", None, "host", "/admin/users", "GET")
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate("cred", None, "host", "/api/data", "GET")
+                .is_none()
+        );
     }
 
     #[test]
@@ -361,8 +469,16 @@ mod tests {
             time_window: None,
             deny: false,
         }]);
-        assert!(engine.evaluate("cred", None, "api.evil.com", "/", "GET").is_some());
-        assert!(engine.evaluate("cred", None, "api.good.com", "/", "GET").is_none());
+        assert!(
+            engine
+                .evaluate("cred", None, "api.evil.com", "/", "GET")
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate("cred", None, "api.good.com", "/", "GET")
+                .is_none()
+        );
     }
 
     #[test]
@@ -380,8 +496,16 @@ mod tests {
             time_window: None,
             deny: false,
         }]);
-        assert!(engine.evaluate("cred", None, "api.example.com", "/", "GET").is_none());
-        assert!(engine.evaluate("cred", None, "other.com", "/", "GET").is_some());
+        assert!(
+            engine
+                .evaluate("cred", None, "api.example.com", "/", "GET")
+                .is_none()
+        );
+        assert!(
+            engine
+                .evaluate("cred", None, "other.com", "/", "GET")
+                .is_some()
+        );
     }
 
     #[test]
@@ -399,9 +523,21 @@ mod tests {
             time_window: None,
             deny: false,
         }]);
-        assert!(engine.evaluate("test-cred", None, "h", "/", "GET").is_none());
-        assert!(engine.evaluate("test-cred", None, "h", "/", "GET").is_none());
-        assert!(engine.evaluate("test-cred", None, "h", "/", "GET").is_none());
+        assert!(
+            engine
+                .evaluate("test-cred", None, "h", "/", "GET")
+                .is_none()
+        );
+        assert!(
+            engine
+                .evaluate("test-cred", None, "h", "/", "GET")
+                .is_none()
+        );
+        assert!(
+            engine
+                .evaluate("test-cred", None, "h", "/", "GET")
+                .is_none()
+        );
         let fourth = engine.evaluate("test-cred", None, "h", "/", "GET");
         assert!(fourth.is_some());
         assert!(fourth.unwrap().reason.contains("rate limit"));
@@ -431,9 +567,21 @@ mod tests {
             time_window: None,
             deny: false,
         }]);
-        assert!(engine.evaluate("cred", Some("claude-code"), "h", "/", "POST").is_some());
-        assert!(engine.evaluate("cred", Some("claude-code"), "h", "/", "GET").is_none());
-        assert!(engine.evaluate("cred", Some("cursor"), "h", "/", "POST").is_none());
+        assert!(
+            engine
+                .evaluate("cred", Some("claude-code"), "h", "/", "POST")
+                .is_some()
+        );
+        assert!(
+            engine
+                .evaluate("cred", Some("claude-code"), "h", "/", "GET")
+                .is_none()
+        );
+        assert!(
+            engine
+                .evaluate("cred", Some("cursor"), "h", "/", "POST")
+                .is_none()
+        );
         assert!(engine.evaluate("cred", None, "h", "/", "POST").is_none());
     }
 
@@ -452,8 +600,16 @@ mod tests {
             time_window: None,
             deny: false,
         }]);
-        assert!(engine.evaluate("aws-prod", None, "h", "/", "POST").is_some());
+        assert!(
+            engine
+                .evaluate("aws-prod", None, "h", "/", "POST")
+                .is_some()
+        );
         assert!(engine.evaluate("aws-dev", None, "h", "/", "POST").is_some());
-        assert!(engine.evaluate("openai-key", None, "h", "/", "POST").is_none());
+        assert!(
+            engine
+                .evaluate("openai-key", None, "h", "/", "POST")
+                .is_none()
+        );
     }
 }

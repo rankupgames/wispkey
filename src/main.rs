@@ -354,7 +354,11 @@ async fn main() {
             )
             .await;
         }
-        Commands::List { partition, project, all_projects } => {
+        Commands::List {
+            partition,
+            project,
+            all_projects,
+        } => {
             cli::handle_list(partition.as_deref(), project.as_deref(), all_projects).await;
         }
         Commands::Get { name, show_token } => {
@@ -366,7 +370,12 @@ async fn main() {
         Commands::Rotate { name } => {
             cli::handle_rotate(&name).await;
         }
-        Commands::Serve { port, random_port, daemon, all_projects } => {
+        Commands::Serve {
+            port,
+            random_port,
+            daemon,
+            all_projects,
+        } => {
             let effective_port = if random_port { 0 } else { port };
             cli::handle_serve(effective_port, daemon, all_projects).await;
         }
@@ -388,10 +397,14 @@ async fn main() {
             cli::handle_log(last, credential.as_deref(), since.as_deref()).await;
         }
         Commands::Partition { command } => match command {
-            PartitionCommands::Create { name, description, project } => {
-                cli::handle_partition_create(&name, &description, project.as_deref()).await
+            PartitionCommands::Create {
+                name,
+                description,
+                project,
+            } => cli::handle_partition_create(&name, &description, project.as_deref()).await,
+            PartitionCommands::List { all_projects } => {
+                cli::handle_partition_list(all_projects).await
             }
-            PartitionCommands::List { all_projects } => cli::handle_partition_list(all_projects).await,
             PartitionCommands::Delete { name } => cli::handle_partition_delete(&name).await,
             PartitionCommands::Assign { credential, to } => {
                 cli::handle_partition_assign(&credential, &to).await

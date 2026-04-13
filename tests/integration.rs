@@ -6,15 +6,24 @@ fn wispkey_bin() -> Command {
 
 #[test]
 fn version_flag_prints_version() {
-    let output = wispkey_bin().arg("--version").output().expect("failed to run wispkey");
+    let output = wispkey_bin()
+        .arg("--version")
+        .output()
+        .expect("failed to run wispkey");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("wispkey"), "expected version output, got: {stdout}");
+    assert!(
+        stdout.contains("wispkey"),
+        "expected version output, got: {stdout}"
+    );
 }
 
 #[test]
 fn help_flag_shows_commands() {
-    let output = wispkey_bin().arg("--help").output().expect("failed to run wispkey");
+    let output = wispkey_bin()
+        .arg("--help")
+        .output()
+        .expect("failed to run wispkey");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("init"));
@@ -32,8 +41,18 @@ fn status_without_vault_shows_error() {
         .env("HOME", "/tmp/wispkey-test-nonexistent")
         .output()
         .expect("failed to run wispkey");
-    let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-    assert!(combined.contains("vault") || combined.contains("Vault") || combined.contains("No vault") || combined.contains("not found"), "expected vault-related output, got: {combined}");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("vault")
+            || combined.contains("Vault")
+            || combined.contains("No vault")
+            || combined.contains("not found"),
+        "expected vault-related output, got: {combined}"
+    );
 }
 
 #[test]
@@ -43,8 +62,15 @@ fn cloud_status_shows_coming_soon_or_status() {
         .env("HOME", "/tmp/wispkey-test-nonexistent")
         .output()
         .expect("failed to run wispkey");
-    let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-    assert!(combined.contains("Cloud") || combined.contains("cloud") || combined.contains("vault"), "expected cloud-related output, got: {combined}");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Cloud") || combined.contains("cloud") || combined.contains("vault"),
+        "expected cloud-related output, got: {combined}"
+    );
 }
 
 #[test]
@@ -54,6 +80,13 @@ fn policy_list_without_vault_fails_gracefully() {
         .env("HOME", "/tmp/wispkey-test-nonexistent")
         .output()
         .expect("failed to run wispkey");
-    let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
-    assert!(combined.contains("polic") || combined.contains("No") || combined.contains("vault"), "expected policy or vault output, got: {combined}");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("polic") || combined.contains("No") || combined.contains("vault"),
+        "expected policy or vault output, got: {combined}"
+    );
 }

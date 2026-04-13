@@ -145,7 +145,19 @@ mod tests {
     #[test]
     fn log_event_inserts_row() {
         let db = test_db();
-        log_event(&db, "credential_accessed", Some("my-key"), Some("wk_my_key_abc"), Some("api.example.com"), Some("/v1/data"), Some("GET"), Some(200), false, None, None);
+        log_event(
+            &db,
+            "credential_accessed",
+            Some("my-key"),
+            Some("wk_my_key_abc"),
+            Some("api.example.com"),
+            Some("/v1/data"),
+            Some("GET"),
+            Some(200),
+            false,
+            None,
+            None,
+        );
         let entries = query_log(&db, 10, None, None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].event_type, "credential_accessed");
@@ -157,7 +169,19 @@ mod tests {
     #[test]
     fn log_event_denied() {
         let db = test_db();
-        log_event(&db, "proxy_denied", Some("secret"), Some("wk_secret_xyz"), Some("evil.com"), Some("/steal"), Some("POST"), None, true, Some("host not allowed"), None);
+        log_event(
+            &db,
+            "proxy_denied",
+            Some("secret"),
+            Some("wk_secret_xyz"),
+            Some("evil.com"),
+            Some("/steal"),
+            Some("POST"),
+            None,
+            true,
+            Some("host not allowed"),
+            None,
+        );
         let entries = query_log(&db, 10, None, None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].denied, true);
@@ -167,8 +191,32 @@ mod tests {
     #[test]
     fn query_log_filters_by_credential() {
         let db = test_db();
-        log_event(&db, "accessed", Some("key-a"), None, None, None, None, None, false, None, None);
-        log_event(&db, "accessed", Some("key-b"), None, None, None, None, None, false, None, None);
+        log_event(
+            &db,
+            "accessed",
+            Some("key-a"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+        log_event(
+            &db,
+            "accessed",
+            Some("key-b"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
         let entries = query_log(&db, 10, Some("key-a"), None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].credential_name.as_deref(), Some("key-a"));
@@ -178,7 +226,19 @@ mod tests {
     fn query_log_respects_limit() {
         let db = test_db();
         for index in 0..20 {
-            log_event(&db, &format!("event_{index}"), None, None, None, None, None, None, false, None, None);
+            log_event(
+                &db,
+                &format!("event_{index}"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            );
         }
         let entries = query_log(&db, 5, None, None);
         assert_eq!(entries.len(), 5);

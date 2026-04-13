@@ -76,7 +76,9 @@ pub fn export_partition(
         });
     }
 
-    let project_name = partition.project_id.as_ref()
+    let project_name = partition
+        .project_id
+        .as_ref()
         .and_then(|pid| vault.get_partition_project_name(pid).ok().flatten())
         .unwrap_or_else(core::resolve_active_project);
 
@@ -179,7 +181,11 @@ pub fn import_partition(
     match vault.get_partition(&payload.partition) {
         Ok(_) => {}
         Err(VaultError::PartitionNotFound(_)) => {
-            vault.create_partition(&payload.partition, &payload.description, Some(&project_name))?;
+            vault.create_partition(
+                &payload.partition,
+                &payload.description,
+                Some(&project_name),
+            )?;
         }
         Err(error) => return Err(error),
     }
