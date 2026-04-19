@@ -38,6 +38,9 @@ toml = "0.8"
 # Cloud sync (API client)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
+# TLS provider (explicit dep so we can install the process-wide CryptoProvider at startup)
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
