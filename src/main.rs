@@ -4,7 +4,7 @@
  * Project: WispKey
  * Description: Entry point -- CLI argument parsing and subcommand dispatch.
  * Created: 2026-04-07
- * Last Modified: 2026-04-13
+ * Last Modified: 2026-04-19
  */
 
 #![deny(clippy::correctness)]
@@ -299,6 +299,10 @@ enum McpCommands {
 
 #[tokio::main]
 async fn main() {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .expect("Failed to install rustls ring CryptoProvider");
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
