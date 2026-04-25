@@ -71,6 +71,7 @@ pub fn import_env_file(
             detected_type,
             &entry.value,
             None,
+            None,
             Some("imported"),
             partition,
         ) {

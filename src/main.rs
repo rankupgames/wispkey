@@ -52,6 +52,10 @@ enum Commands {
         #[arg(long, default_value = "bearer_token")]
         r#type: String,
 
+        /// Short human-readable description of what this credential is for
+        #[arg(long)]
+        description: Option<String>,
+
         /// The secret value to store (omit to enter securely via hidden prompt)
         #[arg(long, allow_hyphen_values = true)]
         value: Option<String>,
@@ -322,6 +326,7 @@ async fn main() {
         Commands::Add {
             name,
             r#type,
+            description,
             value,
             value_file,
             hosts,
@@ -348,6 +353,7 @@ async fn main() {
             cli::handle_add(
                 &name,
                 &r#type,
+                description.as_deref(),
                 resolved_value.as_deref(),
                 hosts.as_deref(),
                 tags.as_deref(),
