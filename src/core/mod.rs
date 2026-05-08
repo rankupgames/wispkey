@@ -134,6 +134,7 @@ impl CredentialType {
 pub struct Credential {
     pub id: String,
     pub name: String,
+    pub description: String,
     pub credential_type: CredentialType,
     pub wisp_token: String,
     pub hosts: Vec<String>,
@@ -385,6 +386,36 @@ impl Vault {
             )?;
         }
 
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "3".to_string());
+
+        if version.as_str() == "3" {
+            let has_description: bool = db
+                .prepare("PRAGMA table_info(credentials)")
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| row.get::<_, String>(1))
+                        .map(|rows| rows.filter_map(|r| r.ok()).any(|col| col == "description"))
+                })
+                .unwrap_or(false);
+
+            if !has_description {
+                db.execute(
+                    "ALTER TABLE credentials ADD COLUMN description TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+
+            db.execute(
+                "UPDATE vault_meta SET value = '4' WHERE key = 'version'",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -541,12 +572,13 @@ impl Vault {
         Ok(id)
     }
 
-    /// Inserts a new credential (encrypted secret, wisp token, optional hosts/tags/partition).
+    /// Inserts a new credential (encrypted secret, wisp token, optional description/hosts/tags/partition).
     pub fn add_credential(
         &self,
         name: &str,
         credential_type: CredentialType,
         value: &str,
+        description: Option<&str>,
         hosts: Option<&str>,
         tags: Option<&str>,
         partition: Option<&str>,
@@ -569,18 +601,20 @@ impl Vault {
         let wisp_token = self.generate_wisp_token(name)?;
         let type_json =
             serde_json::to_string(&credential_type).expect("CredentialType serializes to json");
+        let desc = description.unwrap_or("");
         let hosts_csv = hosts.unwrap_or("");
         let tags_csv = tags.unwrap_or("");
         let now = Utc::now().to_rfc3339();
 
         self.db.execute(
-			"INSERT INTO credentials (id, name, credential_type, encrypted_value, wisp_token, hosts, tags, created_at, updated_at, partition_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-			params![id, name, type_json, BASE64.encode(&encrypted_value), wisp_token, hosts_csv, tags_csv, now, now, partition_id],
+			"INSERT INTO credentials (id, name, description, credential_type, encrypted_value, wisp_token, hosts, tags, created_at, updated_at, partition_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+			params![id, name, desc, type_json, BASE64.encode(&encrypted_value), wisp_token, hosts_csv, tags_csv, now, now, partition_id],
 		)?;
 
         Ok(Credential {
             id,
             name: name.to_string(),
+            description: desc.to_string(),
             credential_type,
             wisp_token,
             hosts: parse_csv(hosts_csv),
@@ -718,7 +752,7 @@ impl Vault {
         let _ = self.ensure_unlocked()?;
         let partition_id = self.resolve_partition_id_for_insert(Some(partition_name))?;
         let mut stmt = self.db.prepare(
-			"SELECT id, name, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials WHERE partition_id = ?1 ORDER BY name",
+			"SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials WHERE partition_id = ?1 ORDER BY name",
 		)?;
         let credentials = stmt
             .query_map(params![partition_id], credential_from_row)?
@@ -739,7 +773,7 @@ impl Vault {
     /// Lists every credential in the vault, sorted by name.
     pub fn list_credentials(&self) -> Result<Vec<Credential>> {
         let _ = self.ensure_unlocked()?;
-        let mut stmt = self.db.prepare("SELECT id, name, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials ORDER BY name")?;
+        let mut stmt = self.db.prepare("SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials ORDER BY name")?;
         let credentials = stmt
             .query_map([], credential_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -749,7 +783,7 @@ impl Vault {
     /// Fetches credential metadata by unique name.
     pub fn get_credential(&self, name: &str) -> Result<Credential> {
         let _ = self.ensure_unlocked()?;
-        let mut stmt = self.db.prepare("SELECT id, name, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials WHERE name = ?1")?;
+        let mut stmt = self.db.prepare("SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials WHERE name = ?1")?;
         stmt.query_row(params![name], credential_from_row)
             .map_err(|_| VaultError::CredentialNotFound(name.to_string()))
     }
@@ -810,10 +844,10 @@ impl Vault {
     pub fn lookup_by_wisp_token(&self, token: &str) -> Result<(Credential, String)> {
         let key = self.ensure_unlocked()?;
 
-        let mut stmt = self.db.prepare("SELECT id, name, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id, encrypted_value FROM credentials WHERE wisp_token = ?1")?;
+        let mut stmt = self.db.prepare("SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id, encrypted_value FROM credentials WHERE wisp_token = ?1")?;
         let (cred, encoded) = stmt
             .query_row(params![token], |row| {
-                let encrypted_value: String = row.get(10)?;
+                let encrypted_value: String = row.get(11)?;
                 let cred = credential_from_row(row)?;
                 Ok((cred, encrypted_value))
             })
@@ -934,7 +968,7 @@ impl Vault {
         let _ = self.ensure_unlocked()?;
         let project_id = self.resolve_project_id(project_name)?;
         let mut stmt = self.db.prepare(
-			"SELECT c.id, c.name, c.credential_type, c.wisp_token, c.hosts, c.tags, c.created_at, c.updated_at, c.last_used_at, c.partition_id FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 ORDER BY c.name",
+			"SELECT c.id, c.name, c.description, c.credential_type, c.wisp_token, c.hosts, c.tags, c.created_at, c.updated_at, c.last_used_at, c.partition_id FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 ORDER BY c.name",
 		)?;
         let credentials = stmt
             .query_map(params![project_id], credential_from_row)?
@@ -994,6 +1028,7 @@ impl Vault {
 			CREATE TABLE IF NOT EXISTS credentials (
 				id TEXT PRIMARY KEY,
 				name TEXT UNIQUE NOT NULL,
+				description TEXT NOT NULL DEFAULT '',
 				credential_type TEXT NOT NULL,
 				encrypted_value TEXT NOT NULL,
 				wisp_token TEXT UNIQUE NOT NULL,
@@ -1167,19 +1202,21 @@ pub fn set_active_project(name: &str) -> Result<()> {
 }
 
 fn credential_from_row(row: &Row<'_>) -> rusqlite::Result<Credential> {
-    let type_json: String = row.get(2)?;
-    let hosts_csv: String = row.get(4)?;
-    let tags_csv: String = row.get(5)?;
-    let created_str: String = row.get(6)?;
-    let updated_str: String = row.get(7)?;
-    let last_used_str: Option<String> = row.get(8)?;
-    let partition_id: Option<String> = row.get(9)?;
+    let description: String = row.get(2)?;
+    let type_json: String = row.get(3)?;
+    let hosts_csv: String = row.get(5)?;
+    let tags_csv: String = row.get(6)?;
+    let created_str: String = row.get(7)?;
+    let updated_str: String = row.get(8)?;
+    let last_used_str: Option<String> = row.get(9)?;
+    let partition_id: Option<String> = row.get(10)?;
 
     Ok(Credential {
         id: row.get(0)?,
         name: row.get(1)?,
+        description,
         credential_type: serde_json::from_str(&type_json).unwrap_or(CredentialType::BearerToken),
-        wisp_token: row.get(3)?,
+        wisp_token: row.get(4)?,
         hosts: parse_csv(&hosts_csv),
         tags: parse_csv(&tags_csv),
         created_at: DateTime::parse_from_rfc3339(&created_str)
@@ -1270,12 +1307,14 @@ mod tests {
                 "my-key",
                 CredentialType::BearerToken,
                 "secret-value",
+                Some("test credential"),
                 Some("api.example.com"),
                 Some("prod,api"),
                 None,
             )
             .unwrap();
         assert!(cred.wisp_token.starts_with("wk_"));
+        assert_eq!(cred.description, "test credential");
         assert_eq!(cred.hosts, vec!["api.example.com"]);
         assert_eq!(cred.tags, vec!["prod", "api"]);
 
@@ -1288,9 +1327,9 @@ mod tests {
     fn duplicate_credential_rejected() {
         let vault = test_vault("pw");
         vault
-            .add_credential("dup", CredentialType::ApiKey, "val1", None, None, None)
+            .add_credential("dup", CredentialType::ApiKey, "val1", None, None, None, None)
             .unwrap();
-        let result = vault.add_credential("dup", CredentialType::ApiKey, "val2", None, None, None);
+        let result = vault.add_credential("dup", CredentialType::ApiKey, "val2", None, None, None, None);
         assert!(matches!(result, Err(VaultError::DuplicateCredential(_))));
     }
 
@@ -1298,7 +1337,7 @@ mod tests {
     fn remove_credential() {
         let vault = test_vault("pw");
         vault
-            .add_credential("rm-me", CredentialType::ApiKey, "val", None, None, None)
+            .add_credential("rm-me", CredentialType::ApiKey, "val", None, None, None, None)
             .unwrap();
         assert_eq!(vault.credential_count().unwrap(), 1);
         vault.remove_credential("rm-me").unwrap();
@@ -1320,6 +1359,7 @@ mod tests {
                 "rotate-me",
                 CredentialType::BearerToken,
                 "secret",
+                None,
                 None,
                 None,
                 None,
@@ -1355,6 +1395,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         let (found, value) = vault.lookup_by_wisp_token(&cred.wisp_token).unwrap();
@@ -1383,6 +1424,7 @@ mod tests {
                 "infra-cred",
                 CredentialType::ApiKey,
                 "val",
+                None,
                 None,
                 None,
                 Some("infra"),
@@ -1460,6 +1502,7 @@ mod tests {
                 "val",
                 None,
                 None,
+                None,
                 Some("eph-part"),
             )
             .unwrap();
@@ -1533,6 +1576,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap();
         vault
@@ -1540,6 +1584,7 @@ mod tests {
                 "x-cred",
                 CredentialType::ApiKey,
                 "v2",
+                None,
                 None,
                 None,
                 Some("x-part"),

@@ -202,6 +202,7 @@ fn handle_tool_list(arguments: &Value) -> Value {
                 .map(|c| {
                     json!({
                         "name": c.name,
+                        "description": c.description,
                         "type": c.credential_type.display_name(),
                         "tags": c.tags,
                         "hosts": c.hosts,

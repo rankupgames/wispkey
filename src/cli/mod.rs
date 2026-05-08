@@ -116,6 +116,7 @@ pub async fn handle_unlock(timeout: Option<i64>) {
 pub async fn handle_add(
     name: &str,
     type_str: &str,
+    description: Option<&str>,
     value: Option<&str>,
     hosts: Option<&str>,
     tags: Option<&str>,
@@ -163,6 +164,7 @@ pub async fn handle_add(
         name,
         credential_type,
         &resolved_value,
+        description,
         hosts,
         tags,
         partition,
@@ -234,18 +236,24 @@ pub async fn handle_list(partition: Option<&str>, project: Option<&str>, all_pro
                 return;
             }
 
-            println!("{:<24} {:<16} {:<20} TAGS", "NAME", "TYPE", "CREATED");
-            println!("{}", "-".repeat(72));
+            println!("{:<24} {:<16} {:<30} {:<20} TAGS", "NAME", "TYPE", "DESCRIPTION", "CREATED");
+            println!("{}", "-".repeat(102));
             for cred in &credentials {
                 let tags = if cred.tags.is_empty() {
                     String::new()
                 } else {
                     cred.tags.join(", ")
                 };
+                let desc = if cred.description.len() > 28 {
+                    format!("{}..", &cred.description[..28])
+                } else {
+                    cred.description.clone()
+                };
                 println!(
-                    "{:<24} {:<16} {:<20} {}",
+                    "{:<24} {:<16} {:<30} {:<20} {}",
                     cred.name,
                     cred.credential_type.display_name(),
+                    desc,
                     cred.created_at.format("%Y-%m-%d %H:%M"),
                     tags
                 );
@@ -273,6 +281,9 @@ pub async fn handle_get(name: &str, show_token: bool) {
     match vault.get_credential(name) {
         Ok(cred) => {
             println!("Name:       {}", cred.name);
+            if !cred.description.is_empty() {
+                println!("Desc:       {}", cred.description);
+            }
             println!("Type:       {}", cred.credential_type.display_name());
             if show_token {
                 println!("Wisp Token: {}", cred.wisp_token);

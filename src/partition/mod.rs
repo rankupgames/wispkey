@@ -28,6 +28,8 @@ const BUNDLE_HEADER_LEN: usize = 4 + 1 + 32 + 12;
 #[derive(Serialize, Deserialize)]
 struct BundleCredential {
     name: String,
+    #[serde(default)]
+    description: String,
     credential_type: CredentialType,
     value: String,
     hosts: String,
@@ -69,6 +71,7 @@ pub fn export_partition(
         let tags = credential.tags.join(",");
         bundle_credentials.push(BundleCredential {
             name: credential.name.clone(),
+            description: credential.description.clone(),
             credential_type: credential.credential_type.clone(),
             value,
             hosts,
@@ -195,6 +198,11 @@ pub fn import_partition(
     let mut errors = 0usize;
 
     for bundle_credential in payload.credentials {
+        let description = if bundle_credential.description.is_empty() {
+            None
+        } else {
+            Some(bundle_credential.description.as_str())
+        };
         let hosts = if bundle_credential.hosts.is_empty() {
             None
         } else {
@@ -209,6 +217,7 @@ pub fn import_partition(
             &bundle_credential.name,
             bundle_credential.credential_type,
             &bundle_credential.value,
+            description,
             hosts,
             tags,
             Some(&payload.partition),
