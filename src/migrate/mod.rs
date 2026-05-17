@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use regex::Regex;
 
 use crate::audit;
-use crate::core::{CredentialType, Vault, VaultError};
+use crate::core::{AddCredentialRequest, CredentialType, Vault, VaultError};
 
 /// Summary of a `.env` file import operation.
 pub struct ImportResults {
@@ -37,6 +37,7 @@ pub fn import_env_file(
     path: &str,
     prefix: Option<&str>,
     partition: Option<&str>,
+    project: Option<&str>,
 ) -> crate::core::Result<ImportResults> {
     let content = fs::read_to_string(path).map_err(VaultError::Io)?;
     let entries = parse_env(&content);
@@ -66,15 +67,16 @@ pub fn import_env_file(
         };
         let detected_type = detect_credential_type(&entry.value);
 
-        match vault.add_credential(
-            &cred_name,
-            detected_type,
-            &entry.value,
-            None,
-            None,
-            Some("imported"),
+        match vault.add_credential(AddCredentialRequest {
+            name: &cred_name,
+            credential_type: detected_type,
+            value: &entry.value,
+            description: None,
+            hosts: None,
+            tags: Some("imported"),
             partition,
-        ) {
+            project,
+        }) {
             Ok(cred) => {
                 audit::log_event(
                     vault.db(),
