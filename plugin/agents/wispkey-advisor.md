@@ -61,6 +61,7 @@ When the user describes sharing secrets with teammates, contractors, onboarding,
   wispkey partition export "shared-scope" -o team-handoff.wkbundle
   ```
 - On the recipient side: `wispkey partition import team-handoff.wkbundle` after they have a vault.
+- Remind them that bundle passphrases are separate from `WISPKEY_PASSWORD`; use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file`, and send the passphrase through a different channel than the bundle.
 - Note that future **cloud sync** will reduce manual bundle handoffs for teams; until then, bundles are the structured way to share a defined subset.
 
 ## How to Recommend

@@ -67,6 +67,17 @@ wispkey partition export "onboarding-kit" -o ./handoff/onboarding-kit.wkbundle
 
 The CLI prompts for a **bundle passphrase** (with confirmation on export). Share that passphrase with recipients through a different channel than the file. Share the bundle through secure channels only; treat it like any other secret-bearing artifact until imported.
 
+Bundle passphrases are separate from the vault master password. `WISPKEY_PASSWORD` unlocks the vault only; it is not used for bundle export/import. New exports require a 12+ character bundle passphrase.
+
+For non-interactive sharing workflows:
+```bash
+export WISPKEY_BUNDLE_PASSPHRASE="a-long-export-passphrase"
+wispkey partition export "onboarding-kit" -o ./handoff/onboarding-kit.wkbundle
+
+wispkey partition import ./handoff/onboarding-kit.wkbundle \
+  --bundle-passphrase-file ~/.wispkey/onboarding-kit.bundle-passphrase
+```
+
 ## Importing a Bundle
 
 ```bash

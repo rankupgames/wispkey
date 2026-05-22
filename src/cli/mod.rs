@@ -3,18 +3,83 @@
  * Company: RankUp Games LLC
  * Project: WispKey
  * Description: CLI command handlers -- wires user-facing subcommands to vault operations.
- *              Handles interactive password prompts with WISPKEY_PASSWORD env var fallback.
+ *              Handles interactive password prompts with scoped env var fallbacks.
  * Created: 2026-04-07
  * Last Modified: 2026-04-12
  */
 
 use crate::audit;
 use crate::cloud::{self, CloudClient, CloudError, CloudTier};
-use crate::core::{self, CredentialType, Vault, VaultError};
+use crate::core::{self, AddCredentialRequest, CredentialType, Vault, VaultError};
 use crate::mcp;
 use crate::migrate;
 use crate::partition;
 use crate::proxy;
+use crate::secure_files;
+use crate::sharing;
+use std::io::IsTerminal;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
+const BUNDLE_PASSPHRASE_ENV: &str = "WISPKEY_BUNDLE_PASSPHRASE";
+const MIN_BUNDLE_PASSPHRASE_LEN: usize = 12;
+const MAX_BUNDLE_PASSPHRASE_FILE_BYTES: u64 = 16 * 1024;
+
+pub fn set_json_output(enabled: bool) {
+    JSON_OUTPUT.store(enabled, Ordering::Relaxed);
+}
+
+fn json_output() -> bool {
+    JSON_OUTPUT.load(Ordering::Relaxed)
+}
+
+fn print_json(value: serde_json::Value) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&value).expect("json output must serialize")
+    );
+}
+
+fn credential_json(cred: &core::Credential) -> serde_json::Value {
+    serde_json::json!({
+        "id": cred.id,
+        "name": cred.name,
+        "description": cred.description,
+        "type": cred.credential_type.display_name(),
+        "wisp_token": cred.wisp_token,
+        "hosts": cred.hosts,
+        "tags": cred.tags,
+        "partition_id": cred.partition_id,
+        "created_at": cred.created_at.to_rfc3339(),
+        "updated_at": cred.updated_at.to_rfc3339(),
+        "last_used_at": cred.last_used_at.map(|d| d.to_rfc3339()),
+    })
+}
+
+fn partition_json(vault: &Vault, partition: &core::Partition) -> serde_json::Value {
+    serde_json::json!({
+        "id": partition.id,
+        "name": partition.name,
+        "description": partition.description,
+        "project_id": partition.project_id,
+        "credential_count": vault.partition_credential_count(&partition.id).unwrap_or(0),
+        "created_at": partition.created_at.to_rfc3339(),
+        "updated_at": partition.updated_at.to_rfc3339(),
+    })
+}
+
+fn project_json(vault: &Vault, project: &core::Project, active: &str) -> serde_json::Value {
+    serde_json::json!({
+        "id": project.id,
+        "name": project.name,
+        "description": project.description,
+        "partition_count": vault.project_partition_count(&project.id).unwrap_or(0),
+        "active": project.name == active,
+        "created_at": project.created_at.to_rfc3339(),
+        "updated_at": project.updated_at.to_rfc3339(),
+    })
+}
 
 /// Creates a new vault after prompting for and confirming the master password.
 pub async fn handle_init() {
@@ -160,15 +225,16 @@ pub async fn handle_add(
         .map(String::from)
         .unwrap_or_else(core::resolve_active_project);
 
-    match vault.add_credential(
+    match vault.add_credential(AddCredentialRequest {
         name,
         credential_type,
-        &resolved_value,
+        value: &resolved_value,
         description,
         hosts,
         tags,
         partition,
-    ) {
+        project,
+    }) {
         Ok(cred) => {
             audit::log_event(
                 vault.db(),
@@ -183,6 +249,14 @@ pub async fn handle_add(
                 None,
                 Some(&active_project),
             );
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "credential": credential_json(&cred),
+                    "project": active_project,
+                }));
+                return;
+            }
             println!("Credential '{}' added.", name);
             println!("Wisp token: {}", cred.wisp_token);
             println!();
@@ -208,7 +282,10 @@ pub async fn handle_list(partition: Option<&str>, project: Option<&str>, all_pro
     };
 
     let list_result = if let Some(partition_name) = partition {
-        vault.list_credentials_in_partition(partition_name)
+        let active = project
+            .map(String::from)
+            .unwrap_or_else(core::resolve_active_project);
+        vault.list_credentials_in_partition_for_project(&active, partition_name)
     } else if all_projects {
         vault.list_credentials()
     } else {
@@ -220,6 +297,20 @@ pub async fn handle_list(partition: Option<&str>, project: Option<&str>, all_pro
 
     match list_result {
         Ok(credentials) => {
+            if json_output() {
+                let active = project
+                    .map(String::from)
+                    .unwrap_or_else(core::resolve_active_project);
+                let list: Vec<serde_json::Value> =
+                    credentials.iter().map(credential_json).collect();
+                print_json(serde_json::json!({
+                    "credentials": list,
+                    "project": if all_projects { serde_json::Value::String("*".to_string()) } else { serde_json::Value::String(active) },
+                    "all_projects": all_projects,
+                    "partition": partition,
+                }));
+                return;
+            }
             if credentials.is_empty() {
                 let active = core::resolve_active_project();
                 if !all_projects {
@@ -236,7 +327,10 @@ pub async fn handle_list(partition: Option<&str>, project: Option<&str>, all_pro
                 return;
             }
 
-            println!("{:<24} {:<16} {:<30} {:<20} TAGS", "NAME", "TYPE", "DESCRIPTION", "CREATED");
+            println!(
+                "{:<24} {:<16} {:<30} {:<20} TAGS",
+                "NAME", "TYPE", "DESCRIPTION", "CREATED"
+            );
             println!("{}", "-".repeat(102));
             for cred in &credentials {
                 let tags = if cred.tags.is_empty() {
@@ -280,6 +374,14 @@ pub async fn handle_get(name: &str, show_token: bool) {
 
     match vault.get_credential(name) {
         Ok(cred) => {
+            if json_output() {
+                let mut value = credential_json(&cred);
+                if !show_token && let Some(object) = value.as_object_mut() {
+                    object.remove("wisp_token");
+                }
+                print_json(serde_json::json!({ "credential": value }));
+                return;
+            }
             println!("Name:       {}", cred.name);
             if !cred.description.is_empty() {
                 println!("Desc:       {}", cred.description);
@@ -338,6 +440,13 @@ pub async fn handle_remove(name: &str) {
                 None,
                 None,
             );
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "deleted": name,
+                }));
+                return;
+            }
             println!("Credential '{}' removed.", name);
         }
         Err(e) => {
@@ -372,6 +481,14 @@ pub async fn handle_rotate(name: &str) {
                 None,
                 None,
             );
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "credential": name,
+                    "wisp_token": new_token,
+                }));
+                return;
+            }
             println!("Wisp token rotated for '{}'.", name);
             println!("New token: {}", new_token);
         }
@@ -510,7 +627,12 @@ fn spawn_daemon(port: u16, all_projects: bool) {
 }
 
 /// Imports entries from a `.env` file into the vault with optional prefix and partition.
-pub async fn handle_import(path: &str, prefix: Option<&str>, partition: Option<&str>) {
+pub async fn handle_import(
+    path: &str,
+    prefix: Option<&str>,
+    partition: Option<&str>,
+    project: Option<&str>,
+) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
         Err(e) => {
@@ -519,8 +641,19 @@ pub async fn handle_import(path: &str, prefix: Option<&str>, partition: Option<&
         }
     };
 
-    match migrate::import_env_file(&vault, path, prefix, partition) {
+    match migrate::import_env_file(&vault, path, prefix, partition, project) {
         Ok(results) => {
+            if json_output() {
+                print_json(serde_json::json!({
+                    "imported": results.imported,
+                    "skipped": results.skipped,
+                    "errors": results.errors,
+                    "output_path": results.output_path,
+                    "project": project,
+                    "partition": partition,
+                }));
+                return;
+            }
             println!("Import complete:");
             println!("  Imported:  {}", results.imported);
             println!("  Skipped:   {}", results.skipped);
@@ -542,6 +675,17 @@ pub async fn handle_import(path: &str, prefix: Option<&str>, partition: Option<&
 /// Prints vault initialization, session, credential count, and proxy process status.
 pub async fn handle_status() {
     if !Vault::exists() {
+        if json_output() {
+            print_json(serde_json::json!({
+                "initialized": false,
+                "vault_path": Vault::vault_dir().to_string_lossy(),
+                "session_active": false,
+                "proxy_running": false,
+                "active_project": core::resolve_active_project(),
+                "credential_count": 0,
+            }));
+            return;
+        }
         println!("Vault: not initialized");
         println!("Run `wispkey init` to create a vault.");
         return;
@@ -555,6 +699,23 @@ pub async fn handle_status() {
                 .vault_created_at()
                 .unwrap_or_else(|_| "unknown".to_string());
             let session_active = Vault::open_with_session().is_ok();
+            let info_path = Vault::vault_dir().join("proxy.json");
+            let proxy_info = std::fs::read_to_string(&info_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
+
+            if json_output() {
+                print_json(serde_json::json!({
+                    "vault_path": Vault::vault_dir().to_string_lossy(),
+                    "created_at": created,
+                    "credential_count": count,
+                    "session_active": session_active,
+                    "active_project": core::resolve_active_project(),
+                    "proxy_running": proxy_info.is_some(),
+                    "proxy": proxy_info,
+                }));
+                return;
+            }
 
             println!("Vault:       {}", Vault::vault_dir().display());
             println!("Created:     {}", created);
@@ -564,7 +725,6 @@ pub async fn handle_status() {
                 if session_active { "active" } else { "locked" }
             );
 
-            let info_path = Vault::vault_dir().join("proxy.json");
             if info_path.exists() {
                 if let Ok(contents) = std::fs::read_to_string(&info_path)
                     && let Ok(info) = serde_json::from_str::<serde_json::Value>(&contents)
@@ -594,6 +754,30 @@ pub async fn handle_log(last: usize, credential: Option<&str>, since: Option<&st
     };
 
     let entries = audit::query_log(vault.db(), last, credential, since);
+
+    if json_output() {
+        let list: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "id": entry.id,
+                    "timestamp": entry.timestamp,
+                    "event_type": entry.event_type,
+                    "credential_name": entry.credential_name,
+                    "wisp_token": entry.wisp_token,
+                    "target_host": entry.target_host,
+                    "target_path": entry.target_path,
+                    "http_method": entry.http_method,
+                    "response_status": entry.response_status,
+                    "denied": entry.denied,
+                    "deny_reason": entry.deny_reason,
+                    "project_name": entry.project_name,
+                })
+            })
+            .collect();
+        print_json(serde_json::json!({ "entries": list }));
+        return;
+    }
 
     if entries.is_empty() {
         println!("No audit log entries found.");
@@ -694,6 +878,14 @@ pub async fn handle_partition_create(name: &str, description: &str, project: Opt
                 Some(&active),
             );
             let project_name = project.unwrap_or(&active);
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "project": project_name,
+                    "partition": partition_json(&vault, &p),
+                }));
+                return;
+            }
             println!(
                 "Partition '{}' created in project '{}'.",
                 p.name, project_name
@@ -725,6 +917,19 @@ pub async fn handle_partition_list(all_projects: bool) {
 
     match list_result {
         Ok(partitions) => {
+            if json_output() {
+                let active = core::resolve_active_project();
+                let list: Vec<serde_json::Value> = partitions
+                    .iter()
+                    .map(|p| partition_json(&vault, p))
+                    .collect();
+                print_json(serde_json::json!({
+                    "project": if all_projects { serde_json::Value::String("*".to_string()) } else { serde_json::Value::String(active) },
+                    "all_projects": all_projects,
+                    "partitions": list,
+                }));
+                return;
+            }
             println!(
                 "{:<20} {:<10} {:<30} CREATED",
                 "NAME", "CREDS", "DESCRIPTION"
@@ -774,6 +979,13 @@ pub async fn handle_partition_delete(name: &str) {
                 None,
                 None,
             );
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "deleted": name,
+                }));
+                return;
+            }
             println!(
                 "Partition '{}' deleted. Credentials moved to 'personal'.",
                 name
@@ -810,7 +1022,7 @@ pub async fn handle_partition_assign(credential: &str, partition_name: &str) {
 }
 
 /// Exports an encrypted bundle of a partition's credentials to a file path.
-pub async fn handle_partition_export(name: &str, output: &str) {
+pub async fn handle_partition_export(name: &str, output: &str, passphrase_file: Option<&str>) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
         Err(e) => {
@@ -818,14 +1030,7 @@ pub async fn handle_partition_export(name: &str, output: &str) {
             std::process::exit(1);
         }
     };
-    let passphrase = prompt_password_confirm("Enter bundle passphrase: ", "Confirm passphrase: ");
-    let passphrase = match passphrase {
-        Some(p) => p,
-        None => {
-            eprintln!("Error: passphrases did not match");
-            std::process::exit(1);
-        }
-    };
+    let passphrase = prompt_export_bundle_passphrase(passphrase_file);
     match partition::export_partition(&vault, name, &passphrase, output) {
         Ok(count) => {
             audit::log_event(
@@ -841,6 +1046,15 @@ pub async fn handle_partition_export(name: &str, output: &str) {
                 None,
                 None,
             );
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "partition": name,
+                    "output": output,
+                    "credential_count": count,
+                }));
+                return;
+            }
             println!(
                 "Exported {} credential(s) from partition '{}' to {}",
                 count, name, output
@@ -854,7 +1068,7 @@ pub async fn handle_partition_export(name: &str, output: &str) {
 }
 
 /// Imports credentials from an encrypted partition bundle file.
-pub async fn handle_partition_import(path: &str) {
+pub async fn handle_partition_import(path: &str, passphrase_file: Option<&str>) {
     let vault = match Vault::open_with_session() {
         Ok(v) => v,
         Err(e) => {
@@ -862,7 +1076,7 @@ pub async fn handle_partition_import(path: &str) {
             std::process::exit(1);
         }
     };
-    let passphrase = prompt_password("Enter bundle passphrase: ");
+    let passphrase = prompt_import_bundle_passphrase(passphrase_file);
     match partition::import_partition(&vault, path, &passphrase) {
         Ok(results) => {
             audit::log_event(
@@ -878,6 +1092,14 @@ pub async fn handle_partition_import(path: &str) {
                 None,
                 None,
             );
+            if json_output() {
+                print_json(serde_json::json!({
+                    "imported": results.imported,
+                    "skipped": results.skipped,
+                    "errors": results.errors,
+                }));
+                return;
+            }
             println!("Import complete:");
             println!("  Imported:  {}", results.imported);
             println!("  Skipped:   {}", results.skipped);
@@ -916,6 +1138,13 @@ pub async fn handle_project_create(name: &str, description: &str) {
                 None,
                 Some(&p.name),
             );
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "project": project_json(&vault, &p, &core::resolve_active_project()),
+                }));
+                return;
+            }
             println!("Project '{}' created.", p.name);
         }
         Err(e) => {
@@ -937,6 +1166,17 @@ pub async fn handle_project_list() {
     let active = core::resolve_active_project();
     match vault.list_projects() {
         Ok(projects) => {
+            if json_output() {
+                let list: Vec<serde_json::Value> = projects
+                    .iter()
+                    .map(|project| project_json(&vault, project, &active))
+                    .collect();
+                print_json(serde_json::json!({
+                    "active_project": active,
+                    "projects": list,
+                }));
+                return;
+            }
             println!(
                 "{:<3} {:<20} {:<10} {:<30} CREATED",
                 "", "NAME", "PARTS", "DESCRIPTION"
@@ -1012,6 +1252,13 @@ pub async fn handle_project_use(name: &str) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "active_project": name,
+                }));
+                return;
+            }
             println!("Active project set to '{}'.", name);
             println!("All commands will now default to this project.");
             println!(
@@ -1029,6 +1276,20 @@ pub async fn handle_project_use(name: &str) {
 /// Prints the active project and whether it came from env, file, or default.
 pub async fn handle_project_current() {
     let active = core::resolve_active_project();
+    if json_output() {
+        let source = if std::env::var("WISPKEY_PROJECT").is_ok() {
+            "env"
+        } else if Vault::vault_dir().join("active_project").exists() {
+            "file"
+        } else {
+            "default"
+        };
+        print_json(serde_json::json!({
+            "active_project": active,
+            "source": source,
+        }));
+        return;
+    }
     println!("Active project: {}", active);
     if std::env::var("WISPKEY_PROJECT").is_ok() {
         println!("  (set via WISPKEY_PROJECT env var)");
@@ -1036,6 +1297,197 @@ pub async fn handle_project_current() {
         println!("  (set via `wispkey project use`)");
     } else {
         println!("  (default)");
+    }
+}
+
+/// Exports a full project into an encrypted share bundle.
+pub async fn handle_project_export(name: &str, output: &str, passphrase_file: Option<&str>) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let passphrase = prompt_export_bundle_passphrase(passphrase_file);
+
+    match sharing::export_project(&vault, name, &passphrase, output) {
+        Ok(count) => {
+            audit::log_event(
+                vault.db(),
+                "ProjectExported",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                Some(name),
+            );
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "project": name,
+                    "output": output,
+                    "credential_count": count,
+                }));
+                return;
+            }
+            println!(
+                "Exported project '{}' with {} credential(s) to {}",
+                name, count, output
+            );
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Imports a full project from an encrypted share bundle.
+pub async fn handle_project_import(path: &str, passphrase_file: Option<&str>) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let passphrase = prompt_import_bundle_passphrase(passphrase_file);
+    match sharing::import_project(&vault, path, &passphrase) {
+        Ok(results) => {
+            audit::log_event(
+                vault.db(),
+                "ProjectImported",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            );
+            if json_output() {
+                print_json(serde_json::json!({
+                    "imported": results.imported,
+                    "skipped": results.skipped,
+                    "errors": results.errors,
+                }));
+                return;
+            }
+            println!("Import complete:");
+            println!("  Imported:  {}", results.imported);
+            println!("  Skipped:   {}", results.skipped);
+            if results.errors > 0 {
+                println!("  Errors:    {}", results.errors);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Exports one credential into an encrypted share bundle.
+pub async fn handle_credential_export(name: &str, output: &str, passphrase_file: Option<&str>) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let passphrase = prompt_export_bundle_passphrase(passphrase_file);
+
+    match sharing::export_credential(&vault, name, &passphrase, output) {
+        Ok(()) => {
+            audit::log_event(
+                vault.db(),
+                "CredentialExported",
+                Some(name),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                None,
+            );
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "credential": name,
+                    "output": output,
+                }));
+                return;
+            }
+            println!("Exported credential '{}' to {}", name, output);
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Imports one credential from an encrypted share bundle.
+pub async fn handle_credential_import(
+    path: &str,
+    project: Option<&str>,
+    partition: Option<&str>,
+    passphrase_file: Option<&str>,
+) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let passphrase = prompt_import_bundle_passphrase(passphrase_file);
+    match sharing::import_credential(&vault, path, &passphrase, project, partition) {
+        Ok(results) => {
+            audit::log_event(
+                vault.db(),
+                "CredentialImported",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                project,
+            );
+            if json_output() {
+                print_json(serde_json::json!({
+                    "imported": results.imported,
+                    "skipped": results.skipped,
+                    "errors": results.errors,
+                    "project": project,
+                    "partition": partition,
+                }));
+                return;
+            }
+            println!("Import complete:");
+            println!("  Imported:  {}", results.imported);
+            println!("  Skipped:   {}", results.skipped);
+            if results.errors > 0 {
+                println!("  Errors:    {}", results.errors);
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -1371,5 +1823,79 @@ fn prompt_password_confirm(prompt1: &str, prompt2: &str) -> Option<String> {
         Some(password1)
     } else {
         None
+    }
+}
+
+fn prompt_export_bundle_passphrase(passphrase_file: Option<&str>) -> String {
+    let passphrase = read_bundle_passphrase(passphrase_file, true);
+    validate_export_bundle_passphrase(&passphrase);
+    passphrase
+}
+
+fn prompt_import_bundle_passphrase(passphrase_file: Option<&str>) -> String {
+    read_bundle_passphrase(passphrase_file, false)
+}
+
+fn read_bundle_passphrase(passphrase_file: Option<&str>, confirm_interactive: bool) -> String {
+    if let Some(path) = passphrase_file {
+        return read_bundle_passphrase_file(path);
+    }
+    if let Ok(passphrase) = std::env::var(BUNDLE_PASSPHRASE_ENV) {
+        return passphrase;
+    }
+    if !std::io::stdin().is_terminal() {
+        eprintln!("Error: bundle passphrase is separate from WISPKEY_PASSWORD.");
+        eprintln!(
+            "Hint: set {BUNDLE_PASSPHRASE_ENV} or pass --bundle-passphrase-file for encrypted bundle operations."
+        );
+        std::process::exit(1);
+    }
+
+    if confirm_interactive {
+        let passphrase1 = prompt_hidden_bundle_passphrase("Enter bundle passphrase: ");
+        let passphrase2 = prompt_hidden_bundle_passphrase("Confirm bundle passphrase: ");
+        if passphrase1 != passphrase2 {
+            eprintln!("Error: bundle passphrases did not match");
+            std::process::exit(1);
+        }
+        return passphrase1;
+    }
+
+    prompt_hidden_bundle_passphrase("Enter bundle passphrase: ")
+}
+
+fn read_bundle_passphrase_file(path: &str) -> String {
+    let passphrase = match secure_files::read_private_string(
+        Path::new(path),
+        MAX_BUNDLE_PASSPHRASE_FILE_BYTES,
+    ) {
+        Ok(contents) => contents,
+        Err(error) => {
+            eprintln!("Error reading bundle passphrase file: {error}");
+            std::process::exit(1);
+        }
+    };
+    passphrase.trim_end_matches(['\n', '\r']).to_string()
+}
+
+fn prompt_hidden_bundle_passphrase(prompt: &str) -> String {
+    rpassword::prompt_password(prompt).unwrap_or_else(|error| {
+        eprintln!("Error reading bundle passphrase: {error}");
+        eprintln!(
+            "Hint: set {BUNDLE_PASSPHRASE_ENV} or pass --bundle-passphrase-file for non-interactive use."
+        );
+        std::process::exit(1);
+    })
+}
+
+fn validate_export_bundle_passphrase(passphrase: &str) {
+    if passphrase.chars().count() < MIN_BUNDLE_PASSPHRASE_LEN {
+        eprintln!(
+            "Error: bundle passphrase must be at least {MIN_BUNDLE_PASSPHRASE_LEN} characters."
+        );
+        eprintln!(
+            "Hint: use a dedicated export passphrase; do not reuse WISPKEY_PASSWORD or send it with the bundle."
+        );
+        std::process::exit(1);
     }
 }
