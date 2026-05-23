@@ -90,7 +90,7 @@ wispkey add "basic-auth-api" --type basic_auth --value "user:password" --hosts "
 
 ## MCP Integration
 
-Configure in Cursor, Claude Code, or any MCP-compatible tool. Vault-backed credentials use the current WispKey session; run `wispkey unlock` before starting the client, or set `WISPKEY_PASSWORD` only for trusted automation.
+Configure in Cursor, Claude Code, or any MCP-compatible tool. Keep the command as `wispkey` so the client uses the normal installed binary from `PATH`; do not hardcode a user-specific absolute path. Vault-backed credentials use the current WispKey session; run `wispkey unlock` before starting the client, or set `WISPKEY_PASSWORD` only for trusted automation.
 
 ```json
 {
@@ -103,7 +103,7 @@ Configure in Cursor, Claude Code, or any MCP-compatible tool. Vault-backed crede
 }
 ```
 
-For env-sideloaded MCP credentials, pass `WISPKEY_SIDELOAD_<SLUG>` to the WispKey MCP process instead of passing the vault master password. WispKey lists the env key and returns a `wk_env_<slug>` token; it never returns the env value.
+For env-sideloaded MCP credentials, pass `WISPKEY_SIDELOAD_<SLUG>` to the WispKey MCP process instead of passing the vault master password. WispKey lists the env key and returns a `wk_env_<slug>` token; it never returns the env value. In Codex, use `env_vars` so Codex forwards the variable from its own environment instead of storing the secret in config:
 
 ```toml
 [mcp_servers.wispkey]
@@ -113,6 +113,22 @@ env_vars = ["WISPKEY_SIDELOAD_OPENAI"]
 ```
 
 Start the WispKey proxy with the same `WISPKEY_SIDELOAD_<SLUG>` env var if you want the proxy to substitute the `wk_env_<slug>` token in outbound requests.
+
+For JSON-style MCP configs that do not support `env_vars`, set the sideload variable in the client process environment or in the MCP server's `env` block:
+
+```json
+{
+  "mcpServers": {
+    "wispkey": {
+      "command": "wispkey",
+      "args": ["mcp", "serve"],
+      "env": { "WISPKEY_SIDELOAD_OPENAI": "..." }
+    }
+  }
+}
+```
+
+Treat MCP `env` blocks as plaintext client config. Prefer process environment forwarding or an OS credential manager when available.
 
 Available MCP tools:
 - `wispkey_list` -- List credentials (filter by tag, project)
