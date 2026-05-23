@@ -122,18 +122,27 @@ New exports require a 12+ character bundle passphrase. Share the encrypted bundl
 
 ## MCP Tools (for IDE agents)
 
-Configure in Cursor/Claude Code:
+Configure in Cursor/Claude Code. Prefer an unlocked WispKey session for vault-backed credentials; use `WISPKEY_PASSWORD` only for trusted automation.
 ```json
 {
   "mcpServers": {
     "wispkey": {
       "command": "wispkey",
-      "args": ["mcp", "serve"],
-      "env": { "WISPKEY_PASSWORD": "your-master-password" }
+      "args": ["mcp", "serve"]
     }
   }
 }
 ```
+
+For locked-vault MCP use, pass env sideloads instead of the master password:
+```toml
+[mcp_servers.wispkey]
+command = "wispkey"
+args = ["mcp", "serve"]
+env_vars = ["WISPKEY_SIDELOAD_OPENAI"]
+```
+
+`WISPKEY_SIDELOAD_<SLUG>` values are exposed to agents only as deterministic `wk_env_<slug>` tokens. The raw env value must never be printed or logged.
 
 Available tools:
 - **`wispkey_list`** -- List credentials (filter by `tag`, `project`; defaults to active project, `"*"` for all)
@@ -177,6 +186,7 @@ When the proxy is running (`wispkey serve`):
 | `WISPKEY_VAULT_PATH` | Override vault directory |
 | `WISPKEY_PROJECT` | Override active project per-terminal |
 | `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import |
+| `WISPKEY_SIDELOAD_<SLUG>` | Env-sideload credential value for MCP/proxy use; never print the value |
 
 ## Conventions
 
