@@ -86,6 +86,8 @@ env_vars = ["WISPKEY_SIDELOAD_OPENAI"]
 
 For JSON-style configs, either launch the client with `WISPKEY_SIDELOAD_OPENAI` in its environment or add it to the MCP server `env` block. Treat `env` blocks as plaintext client config.
 
+Do not use old fallback env names. Rename `WISPKEY_FALLBACK_<SLUG>` variables to `WISPKEY_SIDELOAD_<SLUG>` before upgrading.
+
 The agent can then call:
 - `wispkey_list` -- see available credentials
 - `wispkey_get_token` -- get a wisp token by name

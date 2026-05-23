@@ -736,7 +736,6 @@ struct EnvCredentialResolution {
     name: String,
     env_key: String,
     value: String,
-    source: crate::env_sideload::EnvCredentialSource,
 }
 
 struct TokenRequestContext<'a> {
@@ -894,24 +893,10 @@ fn resolve_env_token_for_request(
         )));
     }
 
-    let is_legacy =
-        env_credential.source == crate::env_sideload::EnvCredentialSource::LegacyFallback;
-
     if let Some(vault) = vault {
-        let event_type = if is_legacy {
-            "FallbackUsed"
-        } else {
-            "SideloadUsed"
-        };
-        let note = if is_legacy {
-            "vault lookup failed, used legacy env fallback"
-        } else {
-            "used env sideload credential"
-        };
-
         audit::log_event(
             vault.db(),
-            event_type,
+            "SideloadUsed",
             Some(&env_credential.env_key),
             Some(token),
             Some(context.target_host),
@@ -919,12 +904,9 @@ fn resolve_env_token_for_request(
             Some(context.http_method),
             None,
             false,
-            Some(note),
+            Some("used env sideload credential"),
             context.project_scope.as_deref(),
         );
-        if is_legacy {
-            record_auto_fix_note(token, &env_credential.env_key);
-        }
     }
 
     Ok(ResolvedToken {
@@ -959,50 +941,13 @@ fn audit_denial(
 }
 
 /// Attempts to find a sideloaded credential value from environment variables.
-/// Supports deterministic MCP sideload tokens (`wk_env_<slug>`) and the old
-/// generated-token fallback slug path for compatibility.
+/// Supports deterministic MCP sideload tokens (`wk_env_<slug>`).
 fn try_env_sideload(token: &str) -> Option<EnvCredentialResolution> {
     crate::env_sideload::value_for_token(token).map(|(credential, value)| EnvCredentialResolution {
         name: credential.name,
         env_key: credential.env_key,
         value,
-        source: credential.source,
     })
-}
-
-/// Appends a fallback event to `.wispkey/auto-fix-notes.json` for later investigation.
-fn record_auto_fix_note(token: &str, env_key: &str) {
-    let vault_dir = crate::core::Vault::vault_dir();
-    let notes_path = vault_dir.join("auto-fix-notes.json");
-
-    let note = serde_json::json!({
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "event": "credential_fallback",
-        "wisp_token": token,
-        "fallback_env": env_key,
-        "action_needed": "Add this credential to the WispKey vault to stop relying on env fallback",
-    });
-
-    let mut notes: Vec<serde_json::Value> = if notes_path.exists() {
-        std::fs::read_to_string(&notes_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    notes.push(note);
-
-    if let Ok(data) = serde_json::to_string_pretty(&notes) {
-        let _ = std::fs::write(&notes_path, data);
-    }
-
-    tracing::warn!(
-        "(Proxy - handleRequest) Wisp token {} not found in vault, fell back to env var {}. See .wispkey/auto-fix-notes.json",
-        token,
-        env_key
-    );
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {

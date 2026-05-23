@@ -3,7 +3,7 @@
  * Company: RankUp Games LLC
  * Project: WispKey
  * Description: CLI command handlers -- wires user-facing subcommands to vault operations.
- *              Handles interactive password prompts with scoped env var fallbacks.
+ *              Handles interactive password prompts and env sideload support.
  * Created: 2026-04-07
  * Last Modified: 2026-04-12
  */

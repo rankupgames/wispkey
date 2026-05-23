@@ -239,6 +239,8 @@ wispkey add "key" --type api_key --value "secret"
 
 `wispkey mcp serve` does not require `WISPKEY_PASSWORD` when you only need env-sideloaded credentials. Set `WISPKEY_SIDELOAD_<SLUG>` in the MCP server environment and ask for credential name `<slug>` (case and separators are normalized).
 
+Older `WISPKEY_FALLBACK_<SLUG>` names are not supported. Rename those variables to `WISPKEY_SIDELOAD_<SLUG>` before upgrading.
+
 ## Project Structure
 
 ```

@@ -146,6 +146,8 @@ env_vars = ["WISPKEY_SIDELOAD_OPENAI"]
 
 For JSON MCP configs that do not support `env_vars`, set the sideload variable in the client process environment or in the server `env` block. Treat `env` blocks as plaintext client config and prefer process environment forwarding or an OS credential manager when available.
 
+Do not add legacy aliases for replaced config surfaces. If a name changes, document the migration to the current name and remove the old path. `WISPKEY_FALLBACK_<SLUG>` is not supported; use `WISPKEY_SIDELOAD_<SLUG>`.
+
 Available tools:
 - **`wispkey_list`** -- List credentials (filter by `tag`, `project`; defaults to active project, `"*"` for all)
 - **`wispkey_get_token`** -- Get wisp token for a credential by `name`
