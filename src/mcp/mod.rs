@@ -13,7 +13,8 @@ use std::io::{self, BufRead, Write};
 
 use serde_json::{Value, json};
 
-use crate::core::{self, Vault};
+use crate::core::{self, Vault, VaultError};
+use crate::env_sideload::EnvSideloadCredential;
 
 /// Runs the WispKey MCP server over stdio transport (JSON-RPC 2.0).
 pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -166,64 +167,77 @@ fn handle_jsonrpc(request: &Value) -> Option<Value> {
 }
 
 fn handle_tool_list(arguments: &Value) -> Value {
-    let vault = match Vault::open_with_session() {
-        Ok(v) => v,
-        Err(e) => return tool_error(&format!("vault error: {}", e)),
-    };
-
     let tag_filter = arguments.get("tag").and_then(|t| t.as_str());
     let project_filter = arguments.get("project").and_then(|p| p.as_str());
+    let active = core::resolve_active_project();
+    let mut list: Vec<Value> = Vec::new();
 
-    let creds_result = match project_filter {
-        Some("*") => vault.list_credentials(),
-        Some(name) => vault.list_credentials_in_project(name),
-        None => {
-            let active = core::resolve_active_project();
-            vault.list_credentials_in_project(&active)
+    let vault_state = match Vault::open_with_session() {
+        Ok(vault) => {
+            let creds_result = match project_filter {
+                Some("*") => vault.list_credentials(),
+                Some(name) => vault.list_credentials_in_project(name),
+                None => vault.list_credentials_in_project(&active),
+            };
+
+            match creds_result {
+                Ok(creds) => {
+                    list.extend(creds.iter().filter_map(|c| {
+                        if let Some(tag) = tag_filter
+                            && !c.tags.iter().any(|t| t == tag)
+                        {
+                            return None;
+                        }
+
+                        Some(json!({
+                            "name": c.name,
+                            "description": c.description,
+                            "type": c.credential_type.display_name(),
+                            "tags": c.tags,
+                            "hosts": c.hosts,
+                            "partition_id": c.partition_id,
+                            "source": "vault",
+                        }))
+                    }));
+                    "active"
+                }
+                Err(e) => return tool_error(&format!("failed to list: {}", e)),
+            }
         }
+        Err(VaultError::NotFound) => "not_initialized",
+        Err(_) => "locked",
     };
 
-    match creds_result {
-        Ok(creds) => {
-            let filtered: Vec<_> = creds
-                .iter()
-                .filter(|c| {
-                    if let Some(tag) = tag_filter {
-                        c.tags.iter().any(|t| t == tag)
-                    } else {
-                        true
-                    }
-                })
-                .collect();
-
-            let active = core::resolve_active_project();
-            let list: Vec<Value> = filtered
-                .iter()
-                .map(|c| {
-                    json!({
-                        "name": c.name,
-                        "description": c.description,
-                        "type": c.credential_type.display_name(),
-                        "tags": c.tags,
-                        "hosts": c.hosts,
-                        "partition_id": c.partition_id,
-                    })
-                })
-                .collect();
-
-            json!({
-                "content": [{
-                    "type": "text",
-                    "text": serde_json::to_string_pretty(&json!({
-                        "credentials": list,
-                        "count": list.len(),
-                        "project": project_filter.unwrap_or(&active),
-                    })).expect("json serialization of credential list")
-                }]
+    if tag_filter.is_none() {
+        let existing_names: std::collections::HashSet<String> = list
+            .iter()
+            .filter_map(|credential| {
+                credential
+                    .get("name")
+                    .and_then(|name| name.as_str())
+                    .map(String::from)
             })
-        }
-        Err(e) => tool_error(&format!("failed to list: {}", e)),
+            .collect();
+
+        list.extend(
+            crate::env_sideload::list_available()
+                .into_iter()
+                .filter(|credential| !existing_names.contains(&credential.name))
+                .map(|credential| sideload_credential_json(&credential)),
+        );
     }
+
+    json!({
+        "content": [{
+            "type": "text",
+            "text": serde_json::to_string_pretty(&json!({
+                "credentials": list,
+                "count": list.len(),
+                "project": project_filter.unwrap_or(&active),
+                "vault_state": vault_state,
+            })).expect("json serialization of credential list")
+        }]
+    })
 }
 
 fn handle_tool_project_list() -> Value {
@@ -266,27 +280,65 @@ fn handle_tool_get_token(arguments: &Value) -> Value {
         None => return tool_error("missing required argument: name"),
     };
 
-    let vault = match Vault::open_with_session() {
-        Ok(v) => v,
-        Err(e) => return tool_error(&format!("vault error: {}", e)),
-    };
-
     let proxy_address = read_proxy_address();
 
-    match vault.get_credential(name) {
-        Ok(cred) => {
-            json!({
-                "content": [{
-                    "type": "text",
-                    "text": format!(
-                        "Wisp token for '{}': {}\n\nUse this token in API requests through the WispKey proxy ({}).\nFor HTTP targets: set HTTP_PROXY={}\nFor HTTPS targets: add header X-Target-Url: <url> to your request.",
-                        name, cred.wisp_token, proxy_address, proxy_address
-                    )
-                }]
-            })
-        }
-        Err(e) => tool_error(&format!("credential '{}' not found: {}", name, e)),
+    match Vault::open_with_session() {
+        Ok(vault) => match vault.get_credential(name) {
+            Ok(cred) => {
+                json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!(
+                            "Wisp token for '{}': {}\n\nUse this token in API requests through the WispKey proxy ({}).\nFor HTTP targets: set HTTP_PROXY={}\nFor HTTPS targets: add header X-Target-Url: <url> to your request.",
+                            name, cred.wisp_token, proxy_address, proxy_address
+                        )
+                    }]
+                })
+            }
+            Err(e) => match crate::env_sideload::credential_for_name(name) {
+                Some(credential) => sideload_token_response(name, &credential, &proxy_address),
+                None => tool_error(&format!("credential '{}' not found: {}", name, e)),
+            },
+        },
+        Err(e) => match crate::env_sideload::credential_for_name(name) {
+            Some(credential) => sideload_token_response(name, &credential, &proxy_address),
+            None => {
+                let hint = crate::env_sideload::env_key_for_name(name)
+                    .map(|env_key| format!(" Set {} to sideload this credential.", env_key))
+                    .unwrap_or_default();
+                tool_error(&format!("vault error: {}.{}", e, hint))
+            }
+        },
     }
+}
+
+fn sideload_credential_json(credential: &EnvSideloadCredential) -> Value {
+    json!({
+        "name": credential.name,
+        "description": "Environment sideload credential",
+        "type": "bearer_token",
+        "tags": ["env-sideload"],
+        "hosts": [],
+        "partition_id": Value::Null,
+        "source": "env_sideload",
+        "env_key": credential.env_key,
+    })
+}
+
+fn sideload_token_response(
+    requested_name: &str,
+    credential: &EnvSideloadCredential,
+    proxy_address: &str,
+) -> Value {
+    json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "Wisp token for sideloaded env credential '{}': {}\n\nSource: {} (value not exposed). Use this token through the WispKey proxy ({}). Start the proxy with the same env var so it can substitute the token. No vault master password is required for this sideload path.",
+                requested_name, credential.token, credential.env_key, proxy_address
+            )
+        }]
+    })
 }
 
 fn handle_tool_proxy_status() -> Value {
@@ -298,9 +350,10 @@ fn handle_tool_proxy_status() -> Value {
 
     let vault_exists = Vault::exists();
     let session_active = Vault::open_with_session().is_ok();
+    let sideload_count = crate::env_sideload::list_available().len();
 
     let status_text = format!(
-        "Vault: {}\nSession: {}\nProxy: {}\nProxy address: {}\nHTTPS: supported (use X-Target-Url header)",
+        "Vault: {}\nSession: {}\nProxy: {}\nProxy address: {}\nEnv sideloads: {}\nHTTPS: supported (use X-Target-Url header)",
         if vault_exists {
             "initialized"
         } else {
@@ -309,6 +362,7 @@ fn handle_tool_proxy_status() -> Value {
         if session_active { "active" } else { "locked" },
         if proxy_running { "running" } else { "stopped" },
         proxy_address,
+        sideload_count,
     );
 
     json!({

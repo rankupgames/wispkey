@@ -15,6 +15,7 @@ mod bundle;
 mod cli;
 mod cloud;
 mod core;
+mod env_sideload;
 mod mcp;
 mod migrate;
 mod partition;
@@ -386,6 +387,7 @@ async fn main() {
         .expect("Failed to install rustls ring CryptoProvider");
 
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("wispkey=info".parse().expect("static directive must parse")),

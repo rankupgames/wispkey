@@ -3,7 +3,7 @@
  * Company: RankUp Games LLC
  * Project: WispKey
  * Description: CLI command handlers -- wires user-facing subcommands to vault operations.
- *              Handles interactive password prompts with scoped env var fallbacks.
+ *              Handles interactive password prompts and env sideload support.
  * Created: 2026-04-07
  * Last Modified: 2026-04-12
  */
@@ -20,6 +20,7 @@ use crate::sharing;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 static JSON_OUTPUT: AtomicBool = AtomicBool::new(false);
 const BUNDLE_PASSPHRASE_ENV: &str = "WISPKEY_BUNDLE_PASSPHRASE";
@@ -32,6 +33,104 @@ pub fn set_json_output(enabled: bool) {
 
 fn json_output() -> bool {
     JSON_OUTPUT.load(Ordering::Relaxed)
+}
+
+fn public_proxy_info(info: &serde_json::Value) -> serde_json::Value {
+    let mut public = info.clone();
+    if let Some(object) = public.as_object_mut() {
+        object.remove("management_token");
+    }
+    public
+}
+
+#[derive(Debug)]
+struct ProxyStatus {
+    info: Option<serde_json::Value>,
+    running: bool,
+    pid: Option<u64>,
+    port: Option<u64>,
+    check_error: Option<String>,
+}
+
+async fn read_proxy_status() -> ProxyStatus {
+    let info_path = Vault::vault_dir().join("proxy.json");
+    let info = std::fs::read_to_string(&info_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
+
+    let Some(info) = info else {
+        return ProxyStatus {
+            info: None,
+            running: false,
+            pid: None,
+            port: None,
+            check_error: None,
+        };
+    };
+
+    let pid = info.get("pid").and_then(|v| v.as_u64());
+    let port = info.get("port").and_then(|v| v.as_u64());
+    let public_info = public_proxy_info(&info);
+    let address = info
+        .get("address")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned)
+        .or_else(|| port.map(|p| format!("http://127.0.0.1:{}", p)));
+    let management_token = info
+        .get("management_token")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
+    let Some(address) = address else {
+        return ProxyStatus {
+            info: Some(public_info),
+            running: false,
+            pid,
+            port,
+            check_error: Some("missing proxy address".to_string()),
+        };
+    };
+
+    match probe_proxy_status(&address, management_token.as_deref()).await {
+        Ok(running) => ProxyStatus {
+            info: Some(public_info),
+            running,
+            pid,
+            port,
+            check_error: None,
+        },
+        Err(e) => ProxyStatus {
+            info: Some(public_info),
+            running: false,
+            pid,
+            port,
+            check_error: Some(e),
+        },
+    }
+}
+
+async fn probe_proxy_status(address: &str, management_token: Option<&str>) -> Result<bool, String> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_millis(750))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let url = format!("{}/api/status", address.trim_end_matches('/'));
+    let mut request = client.get(url);
+    if let Some(token) = management_token {
+        request = request.header("x-wispkey-management-token", token);
+    }
+    let response = request.send().await.map_err(|e| e.to_string())?;
+
+    if response.status().is_success() {
+        return Ok(true);
+    }
+
+    if response.status().as_u16() == 503 {
+        let body = response.text().await.unwrap_or_default();
+        return Ok(body.contains("vault locked"));
+    }
+
+    Ok(false)
 }
 
 fn print_json(value: serde_json::Value) {
@@ -502,10 +601,17 @@ pub async fn handle_rotate(name: &str) {
 /// Starts the HTTP proxy in the foreground or as a background daemon.
 pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
     let vault = match Vault::open_with_session() {
-        Ok(v) => v,
-        Err(e) => {
+        Ok(vault) => Some(vault),
+        Err(e) if crate::env_sideload::list_available().is_empty() => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!(
+                "Warning: {}. Starting proxy for env sideload credentials only.",
+                e
+            );
+            None
         }
     };
 
@@ -515,19 +621,21 @@ pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
     }
 
     let active = core::resolve_active_project();
-    audit::log_event(
-        vault.db(),
-        "ProxyStarted",
-        None,
-        None,
-        None,
-        None,
-        None,
-        None,
-        false,
-        None,
-        Some(&active),
-    );
+    if let Some(vault) = &vault {
+        audit::log_event(
+            vault.db(),
+            "ProxyStarted",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            Some(&active),
+        );
+    }
 
     if port == 0 {
         println!("Starting WispKey proxy on a random port...");
@@ -551,19 +659,21 @@ pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
             );
         }
         Err(e) => {
-            audit::log_event(
-                vault.db(),
-                "ProxyStopped",
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-                Some(&e.to_string()),
-                None,
-            );
+            if let Some(vault) = &vault {
+                audit::log_event(
+                    vault.db(),
+                    "ProxyStopped",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    Some(&e.to_string()),
+                    None,
+                );
+            }
             eprintln!("Proxy error: {}", e);
             std::process::exit(1);
         }
@@ -577,6 +687,12 @@ fn spawn_daemon(port: u16, all_projects: bool) {
     });
 
     let log_path = Vault::vault_dir().join("proxy.log");
+    if let Some(parent) = log_path.parent()
+        && let Err(e) = crate::secure_files::ensure_private_directory(parent)
+    {
+        eprintln!("Error: cannot prepare vault directory: {}", e);
+        std::process::exit(1);
+    }
 
     let log_file = std::fs::OpenOptions::new()
         .create(true)
@@ -699,10 +815,7 @@ pub async fn handle_status() {
                 .vault_created_at()
                 .unwrap_or_else(|_| "unknown".to_string());
             let session_active = Vault::open_with_session().is_ok();
-            let info_path = Vault::vault_dir().join("proxy.json");
-            let proxy_info = std::fs::read_to_string(&info_path)
-                .ok()
-                .and_then(|contents| serde_json::from_str::<serde_json::Value>(&contents).ok());
+            let proxy_status = read_proxy_status().await;
 
             if json_output() {
                 print_json(serde_json::json!({
@@ -711,8 +824,9 @@ pub async fn handle_status() {
                     "credential_count": count,
                     "session_active": session_active,
                     "active_project": core::resolve_active_project(),
-                    "proxy_running": proxy_info.is_some(),
-                    "proxy": proxy_info,
+                    "proxy_running": proxy_status.running,
+                    "proxy": proxy_status.info,
+                    "proxy_check_error": proxy_status.check_error,
                 }));
                 return;
             }
@@ -725,14 +839,19 @@ pub async fn handle_status() {
                 if session_active { "active" } else { "locked" }
             );
 
-            if info_path.exists() {
-                if let Ok(contents) = std::fs::read_to_string(&info_path)
-                    && let Ok(info) = serde_json::from_str::<serde_json::Value>(&contents)
-                {
-                    let pid = info.get("pid").and_then(|v| v.as_u64()).unwrap_or(0);
-                    let port = info.get("port").and_then(|v| v.as_u64()).unwrap_or(0);
-                    println!("Proxy:       running (PID {}, port {})", pid, port);
-                }
+            if proxy_status.info.is_some() && proxy_status.running {
+                println!(
+                    "Proxy:       running (PID {}, port {})",
+                    proxy_status.pid.unwrap_or(0),
+                    proxy_status.port.unwrap_or(0)
+                );
+            } else if proxy_status.info.is_some() {
+                let detail = proxy_status
+                    .check_error
+                    .as_deref()
+                    .map(|e| format!(": {}", e))
+                    .unwrap_or_default();
+                println!("Proxy:       stopped (stale proxy.json{})", detail);
             } else {
                 println!("Proxy:       stopped");
             }
@@ -819,32 +938,30 @@ pub async fn handle_log(last: usize, credential: Option<&str>, since: Option<&st
     println!("{} entries", entries.len());
 }
 
-/// Runs the Model Context Protocol server backed by an unlocked vault session.
-/// Falls back to `WISPKEY_PASSWORD` for non-interactive auto-unlock (e.g. Cursor MCP spawning).
+/// Runs the Model Context Protocol server.
+/// Uses an unlocked vault session when available, tries `WISPKEY_PASSWORD` for optional
+/// auto-unlock, and otherwise stays online for env-sideload credentials.
 pub async fn handle_mcp_serve() {
-    let _vault = match Vault::open_with_session() {
-        Ok(v) => v,
-        Err(_) => match std::env::var("WISPKEY_PASSWORD") {
-            Ok(password) => {
-                let mut vault = Vault::open().unwrap_or_else(|e| {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                });
-                vault.unlock(&password).unwrap_or_else(|e| {
-                    eprintln!("Error: auto-unlock via WISPKEY_PASSWORD failed: {}", e);
-                    std::process::exit(1);
-                });
-                vault
+    if Vault::open_with_session().is_err()
+        && let Ok(password) = std::env::var("WISPKEY_PASSWORD")
+    {
+        match Vault::open() {
+            Ok(mut vault) => {
+                if let Err(e) = vault.unlock(&password) {
+                    eprintln!(
+                        "Warning: auto-unlock via WISPKEY_PASSWORD failed: {}. Continuing with locked vault and env sideloads only.",
+                        e
+                    );
+                }
             }
-            Err(_) => {
-                eprintln!("Error: vault is locked and WISPKEY_PASSWORD is not set.");
+            Err(e) => {
                 eprintln!(
-                    "Hint: run `wispkey unlock` or set WISPKEY_PASSWORD for non-interactive use."
+                    "Warning: vault unavailable for auto-unlock: {}. Continuing with env sideloads only.",
+                    e
                 );
-                std::process::exit(1);
             }
-        },
-    };
+        }
+    }
 
     if let Err(e) = mcp::run_mcp_server().await {
         eprintln!("MCP server error: {}", e);

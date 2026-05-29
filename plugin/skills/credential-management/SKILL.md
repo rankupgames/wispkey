@@ -89,3 +89,11 @@ For non-interactive/CI usage:
 ```bash
 export WISPKEY_PASSWORD=<master-password>
 ```
+
+For MCP/proxy workflows where the vault should stay locked, use env sideload credentials instead of the master password:
+```bash
+export WISPKEY_SIDELOAD_OPENAI="$OPENAI_API_KEY"
+wispkey mcp serve
+```
+
+The MCP tool returns a deterministic `wk_env_openai` token and the env key name only. Start `wispkey serve` with the same `WISPKEY_SIDELOAD_OPENAI` variable when outbound requests need token substitution. Never print or log the raw sideload value.

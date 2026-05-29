@@ -48,7 +48,7 @@ Four commands from zero to protected. The AI process never touches your real sec
 - **Encrypted local vault** -- AES-256-GCM at rest, Argon2id master key derivation, SQLite backend, configurable session timeout (default 30 min)
 - **Wisp token proxy** -- HTTP forward proxy + blind HTTPS CONNECT tunneling + HTTPS reverse proxy mode (`X-Target-Url` header) on localhost:7700
 - **CLI** -- Full credential lifecycle: `init`, `unlock`, `add`, `list`, `get`, `remove`, `rotate`, `import`, `status`, `log`
-- **MCP server** -- Native integration with Cursor, Claude Code, Windsurf via stdio JSON-RPC
+- **MCP server** -- Native integration with Cursor, Claude Code, Windsurf via stdio JSON-RPC, including first-class env-sideloaded credentials for locked-vault use
 - **.env importer** -- One-command migration with auto-detection of OpenAI, GitHub, Slack, AWS, and bearer token patterns
 
 ### Organization
@@ -64,7 +64,7 @@ Four commands from zero to protected. The AI process never touches your real sec
 ### Cloud (groundwork -- auth and encrypted sync/share APIs)
 - **Browser-based Clerk login** -- `wispkey cloud login` opens browser, localhost callback captures session token
 - **Tier enforcement** -- Personal (free, local-only), Cloud ($1.99/mo), Enterprise (contact)
-- **Environment fallback** -- If a wisp token lookup fails, the proxy checks `WISPKEY_FALLBACK_{SLUG}` env vars and records an auto-fix note to `.wispkey/auto-fix-notes.json`
+- **Environment sideload** -- MCP/proxy processes can receive `WISPKEY_SIDELOAD_{SLUG}` env vars and expose them as deterministic `wk_env_{slug}` tokens. Agents still receive only opaque tokens, and no vault master password is required for this path.
 
 ## Credential Types
 
@@ -90,7 +90,31 @@ wispkey add "basic-auth-api" --type basic_auth --value "user:password" --hosts "
 
 ## MCP Integration
 
-Configure in Cursor, Claude Code, or any MCP-compatible tool:
+Configure in Cursor, Claude Code, or any MCP-compatible tool. Keep the command as `wispkey` so the client uses the normal installed binary from `PATH`; do not hardcode a user-specific absolute path. Vault-backed credentials use the current WispKey session; run `wispkey unlock` before starting the client, or set `WISPKEY_PASSWORD` only for trusted automation.
+
+```json
+{
+  "mcpServers": {
+    "wispkey": {
+      "command": "wispkey",
+      "args": ["mcp", "serve"]
+    }
+  }
+}
+```
+
+For env-sideloaded MCP credentials, pass `WISPKEY_SIDELOAD_<SLUG>` to the WispKey MCP process instead of passing the vault master password. WispKey lists the env key and returns a `wk_env_<slug>` token; it never returns the env value. In Codex, use `env_vars` so Codex forwards the variable from its own environment instead of storing the secret in config:
+
+```toml
+[mcp_servers.wispkey]
+command = "wispkey"
+args = ["mcp", "serve"]
+env_vars = ["WISPKEY_SIDELOAD_OPENAI"]
+```
+
+Start the WispKey proxy with the same `WISPKEY_SIDELOAD_<SLUG>` env var if you want the proxy to substitute the `wk_env_<slug>` token in outbound requests.
+
+For JSON-style MCP configs that do not support `env_vars`, set the sideload variable in the client process environment or in the MCP server's `env` block:
 
 ```json
 {
@@ -98,11 +122,13 @@ Configure in Cursor, Claude Code, or any MCP-compatible tool:
     "wispkey": {
       "command": "wispkey",
       "args": ["mcp", "serve"],
-      "env": { "WISPKEY_PASSWORD": "your-master-password" }
+      "env": { "WISPKEY_SIDELOAD_OPENAI": "..." }
     }
   }
 }
 ```
+
+Treat MCP `env` blocks as plaintext client config. Prefer process environment forwarding or an OS credential manager when available.
 
 Available MCP tools:
 - `wispkey_list` -- List credentials (filter by tag, project)
@@ -211,12 +237,16 @@ wispkey add "key" --type api_key --value "secret"
 
 `WISPKEY_PASSWORD` only unlocks or initializes the vault. It is intentionally not used for encrypted bundle export/import; use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file` for those commands.
 
+`wispkey mcp serve` does not require `WISPKEY_PASSWORD` when you only need env-sideloaded credentials. Set `WISPKEY_SIDELOAD_<SLUG>` in the MCP server environment and ask for credential name `<slug>` (case and separators are normalized).
+
+Older `WISPKEY_FALLBACK_<SLUG>` names are not supported. Rename those variables to `WISPKEY_SIDELOAD_<SLUG>` before upgrading.
+
 ## Project Structure
 
 ```
 src/
   core/       # Vault engine (encrypt/decrypt, CRUD, wisp tokens, projects, partitions)
-  proxy/      # HTTP/HTTPS proxy (tokio + hyper, credential injection, policy eval, env fallback)
+  proxy/      # HTTP/HTTPS proxy (tokio + hyper, credential injection, policy eval, env sideload)
   mcp/        # MCP server (stdio JSON-RPC transport)
   cli/        # CLI interface (clap, 37 subcommands)
   audit/      # Audit logging (SQLite, credential + time filtering)

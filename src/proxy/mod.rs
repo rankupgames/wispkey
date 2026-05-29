@@ -66,6 +66,7 @@ pub async fn start_proxy(
     tracing::info!("WispKey proxy listening on http://{}", actual_addr);
 
     let vault_dir = crate::core::Vault::vault_dir();
+    crate::secure_files::ensure_private_directory(&vault_dir)?;
     let pid_path = vault_dir.join("proxy.pid");
     let info_path = vault_dir.join("proxy.json");
     let management_token = Arc::new(crate::random::alphanumeric(48, false)?);
@@ -192,15 +193,7 @@ async fn handle_request(
 
     let target_host = extract_target_host(&uri, &headers);
 
-    let vault = match Vault::open_with_session() {
-        Ok(v) => v,
-        Err(_) => {
-            return Ok(error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Vault is locked. Run `wispkey unlock` first.",
-            ));
-        }
-    };
+    let vault = Vault::open_with_session().ok();
 
     let (parts, body) = req.into_parts();
     let body_bytes = match collect_limited_body(body).await {
@@ -225,7 +218,7 @@ async fn handle_request(
         {
             let injected = match inject_tokens_in_value(
                 value_str,
-                &vault,
+                vault.as_ref(),
                 &runtime.wisp_pattern,
                 &context,
                 &mut used_credentials,
@@ -256,7 +249,7 @@ async fn handle_request(
     {
         let replaced = match inject_tokens_in_value(
             body_str,
-            &vault,
+            vault.as_ref(),
             &runtime.wisp_pattern,
             &context,
             &mut used_credentials,
@@ -271,7 +264,7 @@ async fn handle_request(
     let mut target_uri = build_target_uri(&parts.uri, &headers);
     target_uri = match replace_tokens_in_uri(
         &target_uri,
-        &vault,
+        vault.as_ref(),
         &runtime.wisp_pattern,
         &context,
         &mut used_credentials,
@@ -317,19 +310,21 @@ async fn handle_request(
             };
 
             for (cred_name, token) in &used_credentials {
-                audit::log_event(
-                    vault.db(),
-                    "CredentialUsed",
-                    Some(cred_name),
-                    Some(token),
-                    Some(&target_host),
-                    Some(parts.uri.path()),
-                    Some(parts.method.as_str()),
-                    Some(response_status),
-                    false,
-                    None,
-                    None,
-                );
+                if let Some(vault) = &vault {
+                    audit::log_event(
+                        vault.db(),
+                        "CredentialUsed",
+                        Some(cred_name),
+                        Some(token),
+                        Some(&target_host),
+                        Some(parts.uri.path()),
+                        Some(parts.method.as_str()),
+                        Some(response_status),
+                        false,
+                        None,
+                        None,
+                    );
+                }
             }
 
             let mut response = Response::builder().status(resp_parts.status);
@@ -343,19 +338,21 @@ async fn handle_request(
         }
         Err(e) => {
             for (cred_name, token) in &used_credentials {
-                audit::log_event(
-                    vault.db(),
-                    "CredentialUsed",
-                    Some(cred_name),
-                    Some(token),
-                    Some(&target_host),
-                    Some(parts.uri.path()),
-                    Some(parts.method.as_str()),
-                    None,
-                    false,
-                    Some(&e.to_string()),
-                    None,
-                );
+                if let Some(vault) = &vault {
+                    audit::log_event(
+                        vault.db(),
+                        "CredentialUsed",
+                        Some(cred_name),
+                        Some(token),
+                        Some(&target_host),
+                        Some(parts.uri.path()),
+                        Some(parts.method.as_str()),
+                        None,
+                        false,
+                        Some(&e.to_string()),
+                        None,
+                    );
+                }
             }
 
             Ok(error_response(
@@ -383,15 +380,7 @@ async fn handle_reverse_proxy(
 
     let target_host = target_uri.host().unwrap_or("unknown").to_string();
 
-    let vault = match Vault::open_with_session() {
-        Ok(v) => v,
-        Err(_) => {
-            return error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "Vault is locked. Run `wispkey unlock` first.",
-            );
-        }
-    };
+    let vault = Vault::open_with_session().ok();
 
     let (parts, body) = req.into_parts();
     let body_bytes = match collect_limited_body(body).await {
@@ -420,7 +409,7 @@ async fn handle_reverse_proxy(
         {
             let injected = match inject_tokens_in_value(
                 value_str,
-                &vault,
+                vault.as_ref(),
                 &wisp_pattern,
                 &context,
                 &mut used_credentials,
@@ -451,7 +440,7 @@ async fn handle_reverse_proxy(
     {
         let replaced = match inject_tokens_in_value(
             body_str,
-            &vault,
+            vault.as_ref(),
             &wisp_pattern,
             &context,
             &mut used_credentials,
@@ -490,19 +479,21 @@ async fn handle_reverse_proxy(
             };
 
             for (cred_name, token) in &used_credentials {
-                audit::log_event(
-                    vault.db(),
-                    "CredentialUsed",
-                    Some(cred_name),
-                    Some(token),
-                    Some(&target_host),
-                    Some(target_uri.path()),
-                    Some(parts.method.as_str()),
-                    Some(response_status),
-                    false,
-                    None,
-                    None,
-                );
+                if let Some(vault) = &vault {
+                    audit::log_event(
+                        vault.db(),
+                        "CredentialUsed",
+                        Some(cred_name),
+                        Some(token),
+                        Some(&target_host),
+                        Some(target_uri.path()),
+                        Some(parts.method.as_str()),
+                        Some(response_status),
+                        false,
+                        None,
+                        None,
+                    );
+                }
             }
 
             let mut response = Response::builder().status(resp_parts.status);
@@ -515,19 +506,21 @@ async fn handle_reverse_proxy(
         }
         Err(e) => {
             for (cred_name, token) in &used_credentials {
-                audit::log_event(
-                    vault.db(),
-                    "CredentialUsed",
-                    Some(cred_name),
-                    Some(token),
-                    Some(&target_host),
-                    Some(target_uri.path()),
-                    Some(parts.method.as_str()),
-                    None,
-                    false,
-                    Some(&e.to_string()),
-                    None,
-                );
+                if let Some(vault) = &vault {
+                    audit::log_event(
+                        vault.db(),
+                        "CredentialUsed",
+                        Some(cred_name),
+                        Some(token),
+                        Some(&target_host),
+                        Some(target_uri.path()),
+                        Some(parts.method.as_str()),
+                        None,
+                        false,
+                        Some(&e.to_string()),
+                        None,
+                    );
+                }
             }
             error_response(
                 StatusCode::BAD_GATEWAY,
@@ -603,7 +596,7 @@ async fn handle_connect(req: Request<Incoming>) -> Result<Response<Full<Bytes>>,
 
 fn replace_tokens_in_uri(
     uri: &str,
-    vault: &Vault,
+    vault: Option<&Vault>,
     wisp_pattern: &Regex,
     context: &TokenRequestContext<'_>,
     used_credentials: &mut Vec<(String, String)>,
@@ -739,7 +732,8 @@ fn management_request_authorized(headers: &hyper::HeaderMap, expected_token: &st
         == Some(expected_token)
 }
 
-struct EnvFallback {
+struct EnvCredentialResolution {
+    name: String,
     env_key: String,
     value: String,
 }
@@ -761,7 +755,7 @@ struct ResolvedToken {
 
 fn inject_tokens_in_value(
     value: &str,
-    vault: &Vault,
+    vault: Option<&Vault>,
     wisp_pattern: &Regex,
     context: &TokenRequestContext<'_>,
     used_credentials: &mut Vec<(String, String)>,
@@ -791,10 +785,14 @@ fn inject_tokens_in_value(
 }
 
 fn resolve_token_for_request(
-    vault: &Vault,
+    vault: Option<&Vault>,
     token: &str,
     context: &TokenRequestContext<'_>,
 ) -> ProxyActionResult<ResolvedToken> {
+    let Some(vault) = vault else {
+        return resolve_env_token_for_request(None, token, context);
+    };
+
     match vault.lookup_by_wisp_token(token) {
         Ok((cred, real_value)) => {
             if let Some(reason) = check_project_scope(vault, &cred, context.project_scope) {
@@ -854,27 +852,8 @@ fn resolve_token_for_request(
             })
         }
         Err(_) => {
-            if let Some(fallback) = try_env_fallback(token) {
-                audit::log_event(
-                    vault.db(),
-                    "FallbackUsed",
-                    Some(&fallback.env_key),
-                    Some(token),
-                    Some(context.target_host),
-                    Some(context.target_path),
-                    Some(context.http_method),
-                    None,
-                    false,
-                    Some("vault lookup failed, used env fallback"),
-                    context.project_scope.as_deref(),
-                );
-                record_auto_fix_note(token, &fallback.env_key);
-                return Ok(ResolvedToken {
-                    credential_name: fallback.env_key,
-                    token: token.to_string(),
-                    credential_type: CredentialType::BearerToken,
-                    value: fallback.value,
-                });
+            if let Ok(resolved) = resolve_env_token_for_request(Some(vault), token, context) {
+                return Ok(resolved);
             }
 
             let reason = format!("wisp token '{}' was not found in the active vault", token);
@@ -882,6 +861,60 @@ fn resolve_token_for_request(
             Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)))
         }
     }
+}
+
+fn resolve_env_token_for_request(
+    vault: Option<&Vault>,
+    token: &str,
+    context: &TokenRequestContext<'_>,
+) -> ProxyActionResult<ResolvedToken> {
+    let Some(env_credential) = try_env_sideload(token) else {
+        let reason = if vault.is_some() {
+            format!("wisp token '{}' was not found in the active vault", token)
+        } else {
+            format!(
+                "wisp token '{}' requires an unlocked vault or matching WISPKEY_SIDELOAD_* env var",
+                token
+            )
+        };
+        return Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)));
+    };
+
+    if let Some(denial) = context.policy_engine.evaluate(
+        &env_credential.name,
+        None,
+        context.target_host,
+        context.target_path,
+        context.http_method,
+    ) {
+        return Err(Box::new(error_response(
+            StatusCode::FORBIDDEN,
+            &denial.reason,
+        )));
+    }
+
+    if let Some(vault) = vault {
+        audit::log_event(
+            vault.db(),
+            "SideloadUsed",
+            Some(&env_credential.env_key),
+            Some(token),
+            Some(context.target_host),
+            Some(context.target_path),
+            Some(context.http_method),
+            None,
+            false,
+            Some("used env sideload credential"),
+            context.project_scope.as_deref(),
+        );
+    }
+
+    Ok(ResolvedToken {
+        credential_name: env_credential.env_key,
+        token: token.to_string(),
+        credential_type: CredentialType::BearerToken,
+        value: env_credential.value,
+    })
 }
 
 fn audit_denial(
@@ -907,54 +940,14 @@ fn audit_denial(
     );
 }
 
-/// Attempts to find a credential value from environment variables when the vault
-/// lookup fails. Looks for `WISPKEY_FALLBACK_{TOKEN_SLUG}` where the slug is
-/// extracted from the wisp token (e.g. `wk_openai_abc123` -> `WISPKEY_FALLBACK_OPENAI`).
-fn try_env_fallback(token: &str) -> Option<EnvFallback> {
-    let parts: Vec<&str> = token.splitn(3, '_').collect();
-    if parts.len() < 2 {
-        return None;
-    }
-    let slug = parts[1].to_uppercase();
-    let env_key = format!("WISPKEY_FALLBACK_{slug}");
-    std::env::var(&env_key)
-        .ok()
-        .map(|value| EnvFallback { env_key, value })
-}
-
-/// Appends a fallback event to `.wispkey/auto-fix-notes.json` for later investigation.
-fn record_auto_fix_note(token: &str, env_key: &str) {
-    let vault_dir = crate::core::Vault::vault_dir();
-    let notes_path = vault_dir.join("auto-fix-notes.json");
-
-    let note = serde_json::json!({
-        "timestamp": chrono::Utc::now().to_rfc3339(),
-        "event": "credential_fallback",
-        "wisp_token": token,
-        "fallback_env": env_key,
-        "action_needed": "Add this credential to the WispKey vault to stop relying on env fallback",
-    });
-
-    let mut notes: Vec<serde_json::Value> = if notes_path.exists() {
-        std::fs::read_to_string(&notes_path)
-            .ok()
-            .and_then(|raw| serde_json::from_str(&raw).ok())
-            .unwrap_or_default()
-    } else {
-        Vec::new()
-    };
-
-    notes.push(note);
-
-    if let Ok(data) = serde_json::to_string_pretty(&notes) {
-        let _ = std::fs::write(&notes_path, data);
-    }
-
-    tracing::warn!(
-        "(Proxy - handleRequest) Wisp token {} not found in vault, fell back to env var {}. See .wispkey/auto-fix-notes.json",
-        token,
-        env_key
-    );
+/// Attempts to find a sideloaded credential value from environment variables.
+/// Supports deterministic MCP sideload tokens (`wk_env_<slug>`).
+fn try_env_sideload(token: &str) -> Option<EnvCredentialResolution> {
+    crate::env_sideload::value_for_token(token).map(|(credential, value)| EnvCredentialResolution {
+        name: credential.name,
+        env_key: credential.env_key,
+        value,
+    })
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
