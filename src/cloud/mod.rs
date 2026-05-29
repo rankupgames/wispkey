@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::core::{Vault, VaultError};
+use crate::secure_files;
 
 const COMING_SOON: &str = "WispKey Cloud is coming soon. Cloud $1.99/mo | Enterprise: contact us";
 
@@ -346,13 +347,13 @@ pub fn load_config() -> CloudResult<CloudConfig> {
 pub fn save_config(config: &CloudConfig) -> CloudResult<()> {
     let path = config_path();
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
+        secure_files::ensure_private_directory(parent)
             .map_err(|error| CloudError::ApiError(format!("config directory failed: {error}")))?;
     }
     let data = serde_json::to_string_pretty(config)
         .map_err(|error| CloudError::ApiError(format!("config serialize failed: {error}")))?;
     let temp_path = path.with_extension("json.tmp");
-    fs::write(&temp_path, &data)
+    secure_files::write_private(&temp_path, data.as_bytes())
         .map_err(|error| CloudError::ApiError(format!("config write failed: {error}")))?;
     fs::rename(&temp_path, &path)
         .map_err(|error| CloudError::ApiError(format!("config finalize failed: {error}")))?;

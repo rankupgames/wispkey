@@ -14,6 +14,8 @@ wispkey add "<name>" --type <type> --value "<secret>" [--hosts "<hosts>"] [--tag
 
 Types: `bearer_token` (default), `api_key`, `basic_auth`, `custom_header`, `query_param`
 
+`api_key` is the generic opaque-secret type. Use it for passwords, database URLs, SSH/private-key files, webhook secrets, OAuth tokens, service-account JSON, and other encrypted values that do not need a more specific proxy injection behavior.
+
 Optional **`--partition`** places the credential inside a named partition. Create the partition first with `wispkey partition create` if it does not exist (see the partition-management skill).
 
 Example:
@@ -24,6 +26,13 @@ wispkey add "openai-prod" --type bearer_token --value "sk-abc123..." --hosts "ap
 Example with partition:
 ```bash
 wispkey add "openai-prod" --type bearer_token --value "sk-abc123..." --hosts "api.openai.com" --partition "ml-services"
+```
+
+Examples for non-API-key secrets:
+```bash
+wispkey add "db-password" --type api_key --value "<password>" --tags "database"
+wispkey add "ssh-private-key" --type api_key --value-file ~/.ssh/id_ed25519 --partition "ssh-keys"
+wispkey add "service-account-json" --type api_key --value-file ./service-account.json --tags "gcp"
 ```
 
 ### Listing Credentials

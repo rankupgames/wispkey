@@ -8,8 +8,13 @@ on:
 
 jobs:
   check:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: Rust (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -23,6 +28,14 @@ jobs:
 
       - name: Format check
         run: cargo fmt --check
+
+      - name: Install cargo-audit
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: Dependency audit
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo audit
 
       - name: Clippy
         run: cargo clippy -- -D warnings -W clippy::suspicious -W clippy::style -W clippy::perf -W clippy::complexity

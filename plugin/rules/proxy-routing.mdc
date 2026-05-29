@@ -12,23 +12,29 @@ When constructing HTTP requests that use wisp tokens (`wk_*`), always route thro
 
 ## curl
 ```bash
-HTTP_PROXY=http://localhost:7700 curl -H "Authorization: Bearer wk_openai_api_abc123" https://api.openai.com/v1/models
+curl http://localhost:7700 \
+  -H "X-Target-Url: https://api.openai.com/v1/models" \
+  -H "Authorization: Bearer wk_openai_api_abc123"
 ```
 
 ## Node.js / fetch
 ```typescript
-const response = await fetch("https://api.openai.com/v1/models", {
-  headers: { "Authorization": "Bearer wk_openai_api_abc123" },
-  agent: new HttpsProxyAgent("http://localhost:7700")
+const response = await fetch("http://localhost:7700", {
+  headers: {
+    "X-Target-Url": "https://api.openai.com/v1/models",
+    "Authorization": "Bearer wk_openai_api_abc123"
+  }
 });
 ```
 
 ## Python / requests
 ```python
 import requests
-response = requests.get("https://api.openai.com/v1/models",
-    headers={"Authorization": "Bearer wk_openai_api_abc123"},
-    proxies={"http": "http://localhost:7700", "https": "http://localhost:7700"})
+response = requests.get("http://localhost:7700",
+    headers={
+        "X-Target-Url": "https://api.openai.com/v1/models",
+        "Authorization": "Bearer wk_openai_api_abc123",
+    })
 ```
 
 ## Docker / docker-compose
@@ -39,5 +45,7 @@ environment:
 
 ## Important
 - The proxy only listens on `localhost` -- requests from other machines will not work
+- `HTTPS_PROXY`/CONNECT tunneling is blind and cannot substitute `wk_*` tokens inside TLS
+- For HTTPS token substitution, use reverse proxy mode with `X-Target-Url`
 - Host restrictions are enforced per-credential (e.g. `openai-api` only works against `api.openai.com`)
 - Every proxied request is logged in the audit trail: `wispkey log`

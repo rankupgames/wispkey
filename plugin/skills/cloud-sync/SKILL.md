@@ -11,6 +11,8 @@ Cloud sync is not available yet. This skill describes the planned offering so yo
 
 WispKey cloud sync is **coming soon**. Until it ships, credentials stay on the machine where the vault was created unless you use partition bundles (`wispkey partition export` / `import`) or your own secure transfer process.
 
+Partition bundles are encrypted and passphrase-protected. The bundle passphrase is separate from the vault password; for automation use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file`.
+
 ## Planned Pricing
 
 | Tier | Price | Audience |

@@ -24,20 +24,27 @@ Default: `http://localhost:7700`. Custom port: `wispkey serve --port 8800`.
 ### Shell / CLI tools
 ```bash
 export HTTP_PROXY=http://localhost:7700
-export HTTPS_PROXY=http://localhost:7700
 ```
 
+`HTTPS_PROXY` uses CONNECT tunneling, which is blind and cannot replace `wk_*` tokens inside TLS. For HTTPS requests that need token substitution, use reverse proxy mode with `X-Target-Url`.
+
 ### Node.js
-Install `https-proxy-agent` and configure fetch/axios:
+For HTTPS token substitution, call the local reverse proxy target:
 ```typescript
-import { HttpsProxyAgent } from "https-proxy-agent";
-const agent = new HttpsProxyAgent("http://localhost:7700");
+const response = await fetch("http://localhost:7700", {
+  headers: {
+    "X-Target-Url": "https://api.example.com/test",
+    "Authorization": "Bearer wk_your_token_here"
+  }
+});
 ```
 
 ### Python
 ```python
-proxies = {"http": "http://localhost:7700", "https": "http://localhost:7700"}
-requests.get(url, headers=headers, proxies=proxies)
+requests.get("http://localhost:7700", headers={
+    "X-Target-Url": "https://api.example.com/test",
+    "Authorization": "Bearer wk_your_token_here",
+})
 ```
 
 ### Docker Compose
@@ -73,8 +80,10 @@ The agent can then call:
 # Check status
 wispkey status
 
-# Test a proxied request (should swap the wisp token)
-HTTP_PROXY=http://localhost:7700 curl -H "Authorization: Bearer wk_your_token_here" https://api.example.com/test
+# Test an HTTPS proxied request that swaps the wisp token
+curl http://localhost:7700 \
+  -H "X-Target-Url: https://api.example.com/test" \
+  -H "Authorization: Bearer wk_your_token_here"
 
 # Check the audit log
 wispkey log --last 5
@@ -82,4 +91,4 @@ wispkey log --last 5
 
 ## Desktop App (Optional)
 
-The WispKey Desktop app visualizes credentials and audit logs. It connects to the same proxy management API at `http://localhost:7700/api/`.
+The WispKey Desktop app visualizes credentials and audit logs. It runs the local `wispkey --format json ...` CLI through Tauri commands and reads proxy runtime state from WispKey discovery metadata.

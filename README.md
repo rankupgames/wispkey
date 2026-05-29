@@ -46,7 +46,7 @@ Four commands from zero to protected. The AI process never touches your real sec
 
 ### Core
 - **Encrypted local vault** -- AES-256-GCM at rest, Argon2id master key derivation, SQLite backend, configurable session timeout (default 30 min)
-- **Wisp token proxy** -- HTTP forward proxy + HTTPS CONNECT tunneling + reverse proxy mode (`X-Target-Url` header) on localhost:7700
+- **Wisp token proxy** -- HTTP forward proxy + blind HTTPS CONNECT tunneling + HTTPS reverse proxy mode (`X-Target-Url` header) on localhost:7700
 - **CLI** -- Full credential lifecycle: `init`, `unlock`, `add`, `list`, `get`, `remove`, `rotate`, `import`, `status`, `log`
 - **MCP server** -- Native integration with Cursor, Claude Code, Windsurf via stdio JSON-RPC
 - **.env importer** -- One-command migration with auto-detection of OpenAI, GitHub, Slack, AWS, and bearer token patterns
@@ -59,13 +59,16 @@ Four commands from zero to protected. The AI process never touches your real sec
 - **Policy engine** -- TOML-defined rules with per-credential, per-host, per-path, per-method restrictions, deny rules, time windows, and sliding-window rate limiting
 - **Audit log** -- Every credential use and denial logged with timestamp, target host/path, method, and status; queryable by credential and date range
 - **Host restrictions** -- Glob-pattern allowlists per credential (e.g. `api.openai.com/*`)
+- **Cross-OS local file protection** -- Vault directories and sensitive local files are owner-only on Linux/macOS and restricted with Windows ACLs on Windows
 
-### Cloud (groundwork -- sync stubs, auth complete)
+### Cloud (groundwork -- auth and encrypted sync/share APIs)
 - **Browser-based Clerk login** -- `wispkey cloud login` opens browser, localhost callback captures session token
 - **Tier enforcement** -- Personal (free, local-only), Cloud ($1.99/mo), Enterprise (contact)
 - **Environment fallback** -- If a wisp token lookup fails, the proxy checks `WISPKEY_FALLBACK_{SLUG}` env vars and records an auto-fix note to `.wispkey/auto-fix-notes.json`
 
 ## Credential Types
+
+WispKey stores arbitrary encrypted secret values, not only API keys from `.env` files. Use `api_key` as the generic opaque secret type for passwords, database URLs, SSH/private-key files, webhook secrets, OAuth tokens, service-account JSON, and anything else that should stay out of the agent process. The type mainly controls how the proxy injects or substitutes the value at request time.
 
 | Type | CLI Flag | Injection |
 |------|----------|-----------|
@@ -74,6 +77,16 @@ Four commands from zero to protected. The AI process never touches your real sec
 | Basic Auth | `--type basic_auth` | `Authorization: Basic <base64>` |
 | Custom Header | `--type custom_header --header-name X-Api-Key` | Named header |
 | Query Param | `--type query_param --param-name key` | URL query parameter |
+
+Examples:
+
+```bash
+wispkey add "db-password" --type api_key --value "correct-horse-battery-staple" --tags "database"
+wispkey add "db-url" --type api_key --value "postgres://user:pass@localhost/app" --tags "database"
+wispkey add "ssh-private-key" --type api_key --value-file ~/.ssh/id_ed25519 --partition "ssh-keys"
+wispkey add "service-account-json" --type api_key --value-file ./service-account.json --tags "gcp"
+wispkey add "basic-auth-api" --type basic_auth --value "user:password" --hosts "api.example.com"
+```
 
 ## MCP Integration
 
@@ -101,7 +114,7 @@ Available MCP tools:
 
 WispKey supports HTTPS in two ways:
 
-**CONNECT tunneling** (standard forward proxy) -- the agent sets `HTTP_PROXY=http://localhost:7700` and the proxy tunnels the TLS connection. Wisp token substitution happens in headers before the tunnel is established.
+**CONNECT tunneling** (standard forward proxy) -- the agent sets `HTTP_PROXY=http://localhost:7700` and the proxy tunnels the TLS connection. CONNECT is a blind tunnel: the proxy cannot inspect or rewrite headers, bodies, or query strings inside the TLS stream. Use CONNECT only when the request does not need wisp token substitution.
 
 **Reverse proxy mode** -- use `X-Target-Url` for explicit HTTPS targeting:
 
@@ -138,12 +151,15 @@ wispkey policy check    # Validate policy file
 ## Project Scoping
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
+Each project gets its own `personal` partition, so partition names are project-scoped.
 
 ```bash
 wispkey project create "client-alpha" --description "Client Alpha credentials"
 wispkey project use "client-alpha"
 wispkey project current
 wispkey project list
+wispkey project export "client-alpha" --output client-alpha.wkbundle
+wispkey project import client-alpha.wkbundle
 wispkey list --all-projects
 wispkey serve --all-projects
 ```
@@ -161,6 +177,27 @@ wispkey partition export "staging" --output staging.wkbundle
 wispkey partition import staging.wkbundle
 ```
 
+Exports are encrypted with a separate bundle passphrase, not the vault master password. The bundle file contains real secrets after decryption, so share the file and passphrase through different channels. New exports require a 12+ character bundle passphrase.
+
+For non-interactive bundle operations, use `WISPKEY_BUNDLE_PASSPHRASE` or a protected passphrase file:
+
+```bash
+export WISPKEY_BUNDLE_PASSPHRASE='a-long-export-passphrase'
+wispkey project export "client-alpha" --output client-alpha.wkbundle
+
+wispkey project import client-alpha.wkbundle \
+  --bundle-passphrase-file ~/.wispkey/client-alpha.bundle-passphrase
+```
+
+## Single Credential Bundles
+
+Export and import one encrypted credential for narrow sharing:
+
+```bash
+wispkey credential export "openai-key" --output openai-key.wkcred
+wispkey credential import openai-key.wkcred --project client-alpha --partition personal
+```
+
 ## Non-Interactive Mode (CI / Agents)
 
 Set `WISPKEY_PASSWORD` to skip interactive prompts:
@@ -171,6 +208,8 @@ wispkey init
 wispkey unlock
 wispkey add "key" --type api_key --value "secret"
 ```
+
+`WISPKEY_PASSWORD` only unlocks or initializes the vault. It is intentionally not used for encrypted bundle export/import; use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file` for those commands.
 
 ## Project Structure
 
@@ -183,6 +222,8 @@ src/
   audit/      # Audit logging (SQLite, credential + time filtering)
   migrate/    # .env file importer (auto-detection heuristics)
   partition/  # Encrypted bundle export/import (.wkbundle)
+  secure_files.rs # Cross-platform owner-only local file protection
+  sharing/    # Project and single-credential encrypted share bundles
   cloud/      # Cloud sync client (Clerk browser login, tier enforcement)
   policy/     # Policy engine (TOML rules, rate limiting, time windows)
 tests/
@@ -205,9 +246,10 @@ cd wispkey
 
 cargo build           # Debug build
 cargo build --release # Optimized release build
-cargo test            # Run all 75 tests (70 unit + 5 integration)
-cargo clippy -- -D warnings  # Lint
+cargo test            # Run all 86 tests (72 unit + 14 integration)
+cargo clippy --all-targets --all-features -- -D warnings -W clippy::suspicious -W clippy::style -W clippy::perf -W clippy::complexity
 cargo fmt --check     # Format check
+cargo audit           # Dependency advisory check (install with: cargo install cargo-audit --version 0.22.1 --locked)
 ```
 
 ### Cross-Compilation

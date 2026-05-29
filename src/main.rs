@@ -11,6 +11,7 @@
 #![warn(clippy::suspicious, clippy::style, clippy::perf, clippy::complexity)]
 
 mod audit;
+mod bundle;
 mod cli;
 mod cloud;
 mod core;
@@ -19,16 +20,29 @@ mod migrate;
 mod partition;
 mod policy;
 mod proxy;
+mod random;
+mod secure_files;
+mod sharing;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "wispkey")]
 #[command(about = "AI credential vault with wisp token proxy")]
 #[command(version)]
 struct Cli {
+    /// Output format for machine consumers such as WispKey Desktop
+    #[arg(long, global = true, value_enum, default_value_t = OutputFormat::Text)]
+    format: OutputFormat,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum OutputFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand)]
@@ -157,6 +171,10 @@ enum Commands {
         /// Partition to import into (default: personal)
         #[arg(long)]
         partition: Option<String>,
+
+        /// Project to import into (default: active project)
+        #[arg(long)]
+        project: Option<String>,
     },
 
     /// Show vault and proxy status
@@ -187,6 +205,12 @@ enum Commands {
     Project {
         #[command(subcommand)]
         command: ProjectCommands,
+    },
+
+    /// Share or import a single credential bundle
+    Credential {
+        #[command(subcommand)]
+        command: CredentialCommands,
     },
 
     /// Manage access policies
@@ -242,11 +266,17 @@ enum PartitionCommands {
         /// Output file path
         #[arg(long, short)]
         output: String,
+        /// Read the bundle passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
     },
     /// Import credentials from an encrypted .wkbundle file
     Import {
         /// Path to .wkbundle file
         path: String,
+        /// Read the bundle passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
     },
 }
 
@@ -267,6 +297,54 @@ enum ProjectCommands {
     Use { name: String },
     /// Show the currently active project
     Current,
+    /// Export a whole project as an encrypted .wkbundle file
+    Export {
+        /// Project name
+        name: String,
+        /// Output file path
+        #[arg(long, short)]
+        output: String,
+        /// Read the bundle passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Import a whole project from an encrypted .wkbundle file
+    Import {
+        /// Path to .wkbundle file
+        path: String,
+        /// Read the bundle passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum CredentialCommands {
+    /// Export one credential as an encrypted .wkcred file
+    Export {
+        /// Credential name
+        name: String,
+        /// Output file path
+        #[arg(long, short)]
+        output: String,
+        /// Read the bundle passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Import one credential from an encrypted .wkcred file
+    Import {
+        /// Path to .wkcred file
+        path: String,
+        /// Read the bundle passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+        /// Destination project override
+        #[arg(long)]
+        project: Option<String>,
+        /// Destination partition override
+        #[arg(long)]
+        partition: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -315,6 +393,7 @@ async fn main() {
         .init();
 
     let parsed = Cli::parse();
+    cli::set_json_output(matches!(parsed.format, OutputFormat::Json));
 
     match parsed.command {
         Commands::Init => {
@@ -393,8 +472,15 @@ async fn main() {
             path,
             prefix,
             partition,
+            project,
         } => {
-            cli::handle_import(&path, prefix.as_deref(), partition.as_deref()).await;
+            cli::handle_import(
+                &path,
+                prefix.as_deref(),
+                partition.as_deref(),
+                project.as_deref(),
+            )
+            .await;
         }
         Commands::Status => {
             cli::handle_status().await;
@@ -419,10 +505,18 @@ async fn main() {
             PartitionCommands::Assign { credential, to } => {
                 cli::handle_partition_assign(&credential, &to).await
             }
-            PartitionCommands::Export { name, output } => {
-                cli::handle_partition_export(&name, &output).await
+            PartitionCommands::Export {
+                name,
+                output,
+                bundle_passphrase_file,
+            } => {
+                cli::handle_partition_export(&name, &output, bundle_passphrase_file.as_deref())
+                    .await
             }
-            PartitionCommands::Import { path } => cli::handle_partition_import(&path).await,
+            PartitionCommands::Import {
+                path,
+                bundle_passphrase_file,
+            } => cli::handle_partition_import(&path, bundle_passphrase_file.as_deref()).await,
         },
         Commands::Project { command } => match command {
             ProjectCommands::Create { name, description } => {
@@ -432,6 +526,41 @@ async fn main() {
             ProjectCommands::Delete { name } => cli::handle_project_delete(&name).await,
             ProjectCommands::Use { name } => cli::handle_project_use(&name).await,
             ProjectCommands::Current => cli::handle_project_current().await,
+            ProjectCommands::Export {
+                name,
+                output,
+                bundle_passphrase_file,
+            } => {
+                cli::handle_project_export(&name, &output, bundle_passphrase_file.as_deref()).await
+            }
+            ProjectCommands::Import {
+                path,
+                bundle_passphrase_file,
+            } => cli::handle_project_import(&path, bundle_passphrase_file.as_deref()).await,
+        },
+        Commands::Credential { command } => match command {
+            CredentialCommands::Export {
+                name,
+                output,
+                bundle_passphrase_file,
+            } => {
+                cli::handle_credential_export(&name, &output, bundle_passphrase_file.as_deref())
+                    .await
+            }
+            CredentialCommands::Import {
+                path,
+                bundle_passphrase_file,
+                project,
+                partition,
+            } => {
+                cli::handle_credential_import(
+                    &path,
+                    project.as_deref(),
+                    partition.as_deref(),
+                    bundle_passphrase_file.as_deref(),
+                )
+                .await
+            }
         },
         Commands::Policy { command } => match command {
             PolicyCommands::List => cli::handle_policy_list().await,

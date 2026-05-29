@@ -78,11 +78,12 @@ wispkey serve --all-projects
 | `wispkey remove <name>` | Delete credential |
 | `wispkey rotate <name>` | Regenerate wisp token |
 | `wispkey serve [--port 7700] [--all-projects] [--daemon]` | Start proxy (HTTP + HTTPS reverse) |
-| `wispkey import <path> [--prefix P] [--partition P]` | Import .env file |
+| `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Import .env file |
 | `wispkey status` | Vault + session + proxy status |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Audit log |
 | `wispkey partition create/list/delete/assign/export/import` | Partition management |
-| `wispkey project create/list/delete/use/current` | Project management |
+| `wispkey project create/list/delete/use/current/export/import` | Project management and encrypted project bundles |
+| `wispkey credential export/import` | Encrypted single-credential sharing bundles |
 | `wispkey mcp serve` | Start MCP server (stdio) |
 
 ## Credential Types
@@ -95,7 +96,29 @@ wispkey serve --all-projects
 | Custom Header | `custom_header` | Requires `--header-name` |
 | Query Param | `query_param` | Requires `--param-name` |
 
+WispKey stores arbitrary encrypted secret values, not only API keys. Use `api_key` as the generic opaque type for passwords, database URLs, SSH/private-key files via `--value-file`, webhook secrets, OAuth tokens, service-account JSON, and other secret material. The credential type controls proxy injection behavior, not what can be stored.
+
 The proxy scans and replaces wisp tokens in three locations: **headers**, **request body** (text/json/form only), and **URL query parameters**.
+
+## Encrypted Export Bundles
+
+Partition, project, and single-credential exports are passphrase-protected encrypted bundles:
+```bash
+wispkey project export "client-alpha" --output client-alpha.wkbundle
+wispkey partition export "infrastructure" --output infrastructure.wkbundle
+wispkey credential export "openai-key" --output openai-key.wkcred
+```
+
+Bundle passphrases are separate from the vault master password. `WISPKEY_PASSWORD` unlocks the vault only; it is not used for bundle export/import. For non-interactive bundle operations, set `WISPKEY_BUNDLE_PASSPHRASE` or use `--bundle-passphrase-file`:
+```bash
+export WISPKEY_BUNDLE_PASSPHRASE='a-long-export-passphrase'
+wispkey project import client-alpha.wkbundle
+
+wispkey credential import openai-key.wkcred \
+  --bundle-passphrase-file ~/.wispkey/openai-key.bundle-passphrase
+```
+
+New exports require a 12+ character bundle passphrase. Share the encrypted bundle and passphrase through different channels.
 
 ## MCP Tools (for IDE agents)
 
@@ -120,7 +143,7 @@ Available tools:
 
 ## HTTPS Proxy (Reverse Proxy Mode)
 
-For HTTPS targets, add the `X-Target-Url` header:
+CONNECT tunneling is blind and cannot swap `wk_*` tokens inside TLS. For HTTPS token substitution, send the request to WispKey's reverse proxy mode with the `X-Target-Url` header:
 ```bash
 curl http://localhost:7700 \
   -H "X-Target-Url: https://api.openai.com/v1/chat/completions" \
@@ -147,11 +170,13 @@ When the proxy is running (`wispkey serve`):
 | Path | Purpose |
 |------|---------|
 | `~/.wispkey/vault.db` | Encrypted credential database |
-| `~/.wispkey/session` | Session key (30 min TTL, mode 0600) |
+| `~/.wispkey/session` | Session key (30 min TTL; owner-only permissions on Unix, restricted ACL on Windows) |
 | `~/.wispkey/proxy.pid` | Proxy PID (written on `serve`) |
+| `~/.wispkey/proxy.json` | Proxy discovery file with management token (owner-only permissions/ACL) |
 | `~/.wispkey/active_project` | Persistent active project (set by `project use`) |
 | `WISPKEY_VAULT_PATH` | Override vault directory |
 | `WISPKEY_PROJECT` | Override active project per-terminal |
+| `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import |
 
 ## Conventions
 

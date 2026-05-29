@@ -18,7 +18,7 @@ use std::sync::Arc;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
@@ -37,6 +37,19 @@ type HttpsClient = Client<
     hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     Full<Bytes>,
 >;
+type ProxyActionResult<T> = Result<T, Box<Response<Full<Bytes>>>>;
+
+const MAX_PROXY_BODY_BYTES: usize = 10 * 1024 * 1024;
+
+#[derive(Clone)]
+struct ProxyRuntime {
+    wisp_pattern: Arc<Regex>,
+    project_scope: Arc<Option<String>>,
+    http_client: Arc<HttpClient>,
+    https_client: Arc<HttpsClient>,
+    policy_engine: Arc<PolicyEngine>,
+    management_token: Arc<String>,
+}
 
 /// Starts the HTTP proxy on the given port. Pass `0` for an OS-assigned random port.
 /// Returns the actual port the proxy bound to (useful when `port == 0`).
@@ -55,6 +68,7 @@ pub async fn start_proxy(
     let vault_dir = crate::core::Vault::vault_dir();
     let pid_path = vault_dir.join("proxy.pid");
     let info_path = vault_dir.join("proxy.json");
+    let management_token = Arc::new(crate::random::alphanumeric(48, false)?);
 
     std::fs::write(&pid_path, std::process::id().to_string())?;
 
@@ -62,8 +76,12 @@ pub async fn start_proxy(
         "pid": std::process::id(),
         "port": actual_port,
         "address": format!("http://{}", actual_addr),
+        "management_token": management_token.as_ref(),
     });
-    std::fs::write(&info_path, serde_json::to_string_pretty(&proxy_info)?)?;
+    crate::secure_files::write_private(
+        &info_path,
+        serde_json::to_string_pretty(&proxy_info)?.as_bytes(),
+    )?;
 
     let pid_cleanup = pid_path.clone();
     let info_cleanup = info_path.clone();
@@ -102,33 +120,25 @@ pub async fn start_proxy(
         .build();
     let shared_https: Arc<HttpsClient> =
         Arc::new(Client::builder(TokioExecutor::new()).build(https_connector));
+    let runtime = ProxyRuntime {
+        wisp_pattern,
+        project_scope,
+        http_client: shared_http,
+        https_client: shared_https,
+        policy_engine,
+        management_token,
+    };
 
     loop {
         let (stream, remote_addr) = listener.accept().await?;
-        let pattern = wisp_pattern.clone();
-        let scope = project_scope.clone();
-        let http_client = shared_http.clone();
-        let https_client = shared_https.clone();
-        let policies = policy_engine.clone();
+        let runtime = runtime.clone();
 
         let io = hyper_util::rt::TokioIo::new(stream);
 
         tokio::task::spawn(async move {
             let service = service_fn(move |req| {
-                let pattern = pattern.clone();
-                let scope = scope.clone();
-                let http_client = http_client.clone();
-                let https_client = https_client.clone();
-                let policies = policies.clone();
-                handle_request(
-                    req,
-                    remote_addr,
-                    pattern,
-                    scope,
-                    http_client,
-                    https_client,
-                    policies,
-                )
+                let runtime = runtime.clone();
+                handle_request(req, remote_addr, runtime)
             });
 
             if let Err(e) = http1::Builder::new()
@@ -145,11 +155,7 @@ pub async fn start_proxy(
 async fn handle_request(
     req: Request<Incoming>,
     _remote_addr: SocketAddr,
-    wisp_pattern: Arc<Regex>,
-    project_scope: Arc<Option<String>>,
-    http_client: Arc<HttpClient>,
-    https_client: Arc<HttpsClient>,
-    policy_engine: Arc<PolicyEngine>,
+    runtime: ProxyRuntime,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let method = req.method().clone();
     let uri = req.uri().clone();
@@ -158,6 +164,12 @@ async fn handle_request(
     if uri.path().starts_with("/api/") {
         if method == Method::OPTIONS {
             return Ok(cors_preflight());
+        }
+        if !management_request_authorized(&headers, runtime.management_token.as_ref()) {
+            return Ok(json_response(
+                StatusCode::UNAUTHORIZED,
+                &serde_json::json!({"error": "missing or invalid management token"}),
+            ));
         }
         return Ok(handle_management_api(&method, &uri, &headers).await);
     }
@@ -170,9 +182,10 @@ async fn handle_request(
         return Ok(handle_reverse_proxy(
             req,
             target_url,
-            wisp_pattern,
-            project_scope,
-            https_client,
+            runtime.wisp_pattern,
+            runtime.project_scope,
+            runtime.policy_engine,
+            runtime.https_client,
         )
         .await);
     }
@@ -190,124 +203,38 @@ async fn handle_request(
     };
 
     let (parts, body) = req.into_parts();
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => {
-            return Ok(error_response(
-                StatusCode::BAD_REQUEST,
-                "Failed to read request body",
-            ));
-        }
+    let body_bytes = match collect_limited_body(body).await {
+        Ok(bytes) => bytes,
+        Err(response) => return Ok(*response),
     };
 
     let mut new_headers = parts.headers.clone();
     let mut new_body = body_bytes.to_vec();
     let mut used_credentials: Vec<(String, String)> = Vec::new();
+    let context = TokenRequestContext {
+        target_host: &target_host,
+        target_path: parts.uri.path(),
+        http_method: parts.method.as_str(),
+        project_scope: runtime.project_scope.as_ref(),
+        policy_engine: runtime.policy_engine.as_ref(),
+    };
 
     for (header_name, header_value) in parts.headers.iter() {
-        if let Ok(value_str) = header_value.to_str() {
-            for token_match in wisp_pattern.find_iter(value_str) {
-                let token = token_match.as_str();
-                match vault.lookup_by_wisp_token(token) {
-                    Ok((cred, real_value)) => {
-                        if let Some(reason) = check_project_scope(&vault, &cred, &project_scope) {
-                            let active = project_scope.as_deref().unwrap_or("unknown");
-                            audit::log_event(
-                                vault.db(),
-                                "CredentialDenied",
-                                Some(&cred.name),
-                                Some(token),
-                                Some(&target_host),
-                                Some(parts.uri.path()),
-                                Some(parts.method.as_str()),
-                                None,
-                                true,
-                                Some(&reason),
-                                Some(active),
-                            );
-                            return Ok(error_response(StatusCode::FORBIDDEN, &reason));
-                        }
-                        if !check_host_restriction(&cred.hosts, &target_host) {
-                            let reason = format!(
-                                "host '{}' not allowed for credential '{}'",
-                                target_host, cred.name
-                            );
-                            audit::log_event(
-                                vault.db(),
-                                "CredentialDenied",
-                                Some(&cred.name),
-                                Some(token),
-                                Some(&target_host),
-                                Some(parts.uri.path()),
-                                Some(parts.method.as_str()),
-                                None,
-                                true,
-                                Some(&reason),
-                                None,
-                            );
-                            return Ok(error_response(StatusCode::FORBIDDEN, &reason));
-                        }
-                        if let Some(denial) = policy_engine.evaluate(
-                            &cred.name,
-                            None,
-                            &target_host,
-                            parts.uri.path(),
-                            parts.method.as_str(),
-                        ) {
-                            audit::log_event(
-                                vault.db(),
-                                "PolicyDenied",
-                                Some(&cred.name),
-                                Some(token),
-                                Some(&target_host),
-                                Some(parts.uri.path()),
-                                Some(parts.method.as_str()),
-                                None,
-                                true,
-                                Some(&denial.reason),
-                                None,
-                            );
-                            return Ok(error_response(StatusCode::FORBIDDEN, &denial.reason));
-                        }
-
-                        let injected =
-                            inject_credential(&cred.credential_type, &real_value, value_str, token);
-                        if let Ok(new_value) = hyper::header::HeaderValue::from_str(&injected) {
-                            new_headers.insert(header_name.clone(), new_value);
-                        }
-                        used_credentials.push((cred.name.clone(), token.to_string()));
-                    }
-                    Err(_) => {
-                        if let Some(fallback) = try_env_fallback(token) {
-                            let injected = inject_credential(
-                                &core::CredentialType::BearerToken,
-                                &fallback.value,
-                                value_str,
-                                token,
-                            );
-                            if let Ok(new_value) = hyper::header::HeaderValue::from_str(&injected) {
-                                new_headers.insert(header_name.clone(), new_value);
-                            }
-                            used_credentials.push((fallback.env_key.clone(), token.to_string()));
-                            audit::log_event(
-                                vault.db(),
-                                "FallbackUsed",
-                                Some(&fallback.env_key),
-                                Some(token),
-                                Some(&target_host),
-                                Some(parts.uri.path()),
-                                Some(parts.method.as_str()),
-                                None,
-                                false,
-                                Some("vault lookup failed, used env fallback"),
-                                None,
-                            );
-                            record_auto_fix_note(token, &fallback.env_key);
-                        } else {
-                            tracing::debug!("Token '{}' not found in vault or env fallback", token);
-                        }
-                    }
-                }
+        if let Ok(value_str) = header_value.to_str()
+            && runtime.wisp_pattern.is_match(value_str)
+        {
+            let injected = match inject_tokens_in_value(
+                value_str,
+                &vault,
+                &runtime.wisp_pattern,
+                &context,
+                &mut used_credentials,
+            ) {
+                Ok(value) => value,
+                Err(response) => return Ok(*response),
+            };
+            if let Ok(new_value) = hyper::header::HeaderValue::from_str(&injected) {
+                new_headers.insert(header_name.clone(), new_value);
             }
         }
     }
@@ -325,94 +252,33 @@ async fn handle_request(
 
     if is_text_body
         && let Ok(body_str) = std::str::from_utf8(&new_body)
-        && wisp_pattern.is_match(body_str)
+        && runtime.wisp_pattern.is_match(body_str)
     {
-        let mut replaced = body_str.to_string();
-        for token_match in wisp_pattern.find_iter(body_str) {
-            let token = token_match.as_str();
-            match vault.lookup_by_wisp_token(token) {
-                Ok((cred, real_value)) => {
-                    if let Some(reason) = check_project_scope(&vault, &cred, &project_scope) {
-                        let active = project_scope.as_deref().unwrap_or("unknown");
-                        audit::log_event(
-                            vault.db(),
-                            "CredentialDenied",
-                            Some(&cred.name),
-                            Some(token),
-                            Some(&target_host),
-                            Some(parts.uri.path()),
-                            Some(parts.method.as_str()),
-                            None,
-                            true,
-                            Some(&reason),
-                            Some(active),
-                        );
-                        return Ok(error_response(StatusCode::FORBIDDEN, &reason));
-                    }
-                    if !check_host_restriction(&cred.hosts, &target_host) {
-                        let reason = format!(
-                            "host '{}' not allowed for credential '{}'",
-                            target_host, cred.name
-                        );
-                        audit::log_event(
-                            vault.db(),
-                            "CredentialDenied",
-                            Some(&cred.name),
-                            Some(token),
-                            Some(&target_host),
-                            Some(parts.uri.path()),
-                            Some(parts.method.as_str()),
-                            None,
-                            true,
-                            Some(&reason),
-                            None,
-                        );
-                        return Ok(error_response(StatusCode::FORBIDDEN, &reason));
-                    }
-                    let injected =
-                        inject_credential(&cred.credential_type, &real_value, &replaced, token);
-                    replaced = injected;
-                    used_credentials.push((cred.name.clone(), token.to_string()));
-                }
-                Err(_) => {
-                    if let Some(fallback) = try_env_fallback(token) {
-                        replaced = replaced.replace(token, &fallback.value);
-                        used_credentials.push((fallback.env_key.clone(), token.to_string()));
-                        audit::log_event(
-                            vault.db(),
-                            "FallbackUsed",
-                            Some(&fallback.env_key),
-                            Some(token),
-                            Some(&target_host),
-                            Some(parts.uri.path()),
-                            Some(parts.method.as_str()),
-                            None,
-                            false,
-                            Some("vault lookup failed, used env fallback (body)"),
-                            None,
-                        );
-                        record_auto_fix_note(token, &fallback.env_key);
-                    } else {
-                        tracing::debug!(
-                            "Body token '{}' not found in vault or env fallback",
-                            token
-                        );
-                    }
-                }
-            }
-        }
+        let replaced = match inject_tokens_in_value(
+            body_str,
+            &vault,
+            &runtime.wisp_pattern,
+            &context,
+            &mut used_credentials,
+        ) {
+            Ok(value) => value,
+            Err(response) => return Ok(*response),
+        };
         new_body = replaced.into_bytes();
     }
+    set_content_length(&mut new_headers, new_body.len());
 
     let mut target_uri = build_target_uri(&parts.uri, &headers);
-    target_uri = replace_tokens_in_uri(
+    target_uri = match replace_tokens_in_uri(
         &target_uri,
         &vault,
-        &wisp_pattern,
-        &project_scope,
-        &target_host,
+        &runtime.wisp_pattern,
+        &context,
         &mut used_credentials,
-    );
+    ) {
+        Ok(uri) => uri,
+        Err(response) => return Ok(*response),
+    };
     let mut forward_req = Request::builder()
         .method(parts.method.clone())
         .uri(&target_uri);
@@ -435,9 +301,9 @@ async fn handle_request(
     };
 
     let response = if target_uri.starts_with("https://") {
-        https_client.request(forward_req).await
+        runtime.https_client.request(forward_req).await
     } else {
-        http_client.request(forward_req).await
+        runtime.http_client.request(forward_req).await
     };
 
     match response {
@@ -507,6 +373,7 @@ async fn handle_reverse_proxy(
     target_url: &str,
     wisp_pattern: Arc<Regex>,
     project_scope: Arc<Option<String>>,
+    policy_engine: Arc<PolicyEngine>,
     https_client: Arc<HttpsClient>,
 ) -> Response<Full<Bytes>> {
     let target_uri: Uri = match target_url.parse() {
@@ -527,36 +394,42 @@ async fn handle_reverse_proxy(
     };
 
     let (parts, body) = req.into_parts();
-    let body_bytes = match body.collect().await {
-        Ok(collected) => collected.to_bytes(),
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "Failed to read request body"),
+    let body_bytes = match collect_limited_body(body).await {
+        Ok(bytes) => bytes,
+        Err(response) => return *response,
     };
 
     let mut new_headers = parts.headers.clone();
     new_headers.remove("x-target-url");
     let mut new_body = body_bytes.to_vec();
     let mut used_credentials: Vec<(String, String)> = Vec::new();
+    let context = TokenRequestContext {
+        target_host: &target_host,
+        target_path: target_uri.path(),
+        http_method: parts.method.as_str(),
+        project_scope: project_scope.as_ref(),
+        policy_engine: policy_engine.as_ref(),
+    };
 
     for (header_name, header_value) in parts.headers.iter() {
         if header_name == "x-target-url" || header_name == "host" {
             continue;
         }
-        if let Ok(value_str) = header_value.to_str() {
-            for token_match in wisp_pattern.find_iter(value_str) {
-                let token = token_match.as_str();
-                if let Ok((cred, real_value)) = vault.lookup_by_wisp_token(token) {
-                    if check_project_scope(&vault, &cred, &project_scope).is_some()
-                        || !check_host_restriction(&cred.hosts, &target_host)
-                    {
-                        continue;
-                    }
-                    let injected =
-                        inject_credential(&cred.credential_type, &real_value, value_str, token);
-                    if let Ok(new_value) = hyper::header::HeaderValue::from_str(&injected) {
-                        new_headers.insert(header_name.clone(), new_value);
-                    }
-                    used_credentials.push((cred.name.clone(), token.to_string()));
-                }
+        if let Ok(value_str) = header_value.to_str()
+            && wisp_pattern.is_match(value_str)
+        {
+            let injected = match inject_tokens_in_value(
+                value_str,
+                &vault,
+                &wisp_pattern,
+                &context,
+                &mut used_credentials,
+            ) {
+                Ok(value) => value,
+                Err(response) => return *response,
+            };
+            if let Ok(new_value) = hyper::header::HeaderValue::from_str(&injected) {
+                new_headers.insert(header_name.clone(), new_value);
             }
         }
     }
@@ -576,23 +449,19 @@ async fn handle_reverse_proxy(
         && let Ok(body_str) = std::str::from_utf8(&new_body)
         && wisp_pattern.is_match(body_str)
     {
-        let mut replaced = body_str.to_string();
-        for token_match in wisp_pattern.find_iter(body_str) {
-            let token = token_match.as_str();
-            if let Ok((cred, real_value)) = vault.lookup_by_wisp_token(token) {
-                if check_project_scope(&vault, &cred, &project_scope).is_some()
-                    || !check_host_restriction(&cred.hosts, &target_host)
-                {
-                    continue;
-                }
-                let injected =
-                    inject_credential(&cred.credential_type, &real_value, &replaced, token);
-                replaced = injected;
-                used_credentials.push((cred.name.clone(), token.to_string()));
-            }
-        }
+        let replaced = match inject_tokens_in_value(
+            body_str,
+            &vault,
+            &wisp_pattern,
+            &context,
+            &mut used_credentials,
+        ) {
+            Ok(value) => value,
+            Err(response) => return *response,
+        };
         new_body = replaced.into_bytes();
     }
+    set_content_length(&mut new_headers, new_body.len());
 
     let mut forward_req = Request::builder()
         .method(parts.method.clone())
@@ -736,27 +605,13 @@ fn replace_tokens_in_uri(
     uri: &str,
     vault: &Vault,
     wisp_pattern: &Regex,
-    project_scope: &Option<String>,
-    target_host: &str,
+    context: &TokenRequestContext<'_>,
     used_credentials: &mut Vec<(String, String)>,
-) -> String {
+) -> ProxyActionResult<String> {
     if !wisp_pattern.is_match(uri) {
-        return uri.to_string();
+        return Ok(uri.to_string());
     }
-    let mut result = uri.to_string();
-    for token_match in wisp_pattern.find_iter(uri) {
-        let token = token_match.as_str();
-        if let Ok((cred, real_value)) = vault.lookup_by_wisp_token(token) {
-            if check_project_scope(vault, &cred, project_scope).is_some()
-                || !check_host_restriction(&cred.hosts, target_host)
-            {
-                continue;
-            }
-            result = result.replace(token, &real_value);
-            used_credentials.push((cred.name.clone(), token.to_string()));
-        }
-    }
-    result
+    inject_tokens_in_value(uri, vault, wisp_pattern, context, used_credentials)
 }
 
 /// Checks if a credential's project matches the active project scope.
@@ -831,10 +686,31 @@ fn build_target_uri(uri: &Uri, headers: &hyper::HeaderMap) -> String {
     format!("http://{}{}", host, uri)
 }
 
+fn query_param(uri: &Uri, key: &str) -> Option<String> {
+    uri.query()?.split('&').find_map(|pair| {
+        let mut split = pair.splitn(2, '=');
+        let param_key = split.next()?;
+        let param_value = split.next().unwrap_or("");
+        if param_key == key {
+            Some(
+                urlencoding::decode(param_value)
+                    .map(|value| value.into_owned())
+                    .unwrap_or_else(|_| param_value.to_string()),
+            )
+        } else {
+            None
+        }
+    })
+}
+
+fn requested_project(uri: &Uri) -> String {
+    query_param(uri, "project").unwrap_or_else(core::resolve_active_project)
+}
+
 fn cors_preflight() -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .header("access-control-allow-origin", "*")
+        .header("access-control-allow-origin", "http://localhost")
         .header(
             "access-control-allow-methods",
             "GET, POST, PUT, DELETE, OPTIONS",
@@ -848,9 +724,187 @@ fn cors_preflight() -> Response<Full<Bytes>> {
         .expect("empty cors response must build")
 }
 
+fn management_request_authorized(headers: &hyper::HeaderMap, expected_token: &str) -> bool {
+    let header_token = headers
+        .get("x-wispkey-management-token")
+        .and_then(|value| value.to_str().ok());
+    if header_token == Some(expected_token) {
+        return true;
+    }
+
+    headers
+        .get(hyper::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        == Some(expected_token)
+}
+
 struct EnvFallback {
     env_key: String,
     value: String,
+}
+
+struct TokenRequestContext<'a> {
+    target_host: &'a str,
+    target_path: &'a str,
+    http_method: &'a str,
+    project_scope: &'a Option<String>,
+    policy_engine: &'a PolicyEngine,
+}
+
+struct ResolvedToken {
+    credential_name: String,
+    token: String,
+    credential_type: CredentialType,
+    value: String,
+}
+
+fn inject_tokens_in_value(
+    value: &str,
+    vault: &Vault,
+    wisp_pattern: &Regex,
+    context: &TokenRequestContext<'_>,
+    used_credentials: &mut Vec<(String, String)>,
+) -> ProxyActionResult<String> {
+    if !wisp_pattern.is_match(value) {
+        return Ok(value.to_string());
+    }
+
+    let tokens: Vec<String> = wisp_pattern
+        .find_iter(value)
+        .map(|token_match| token_match.as_str().to_string())
+        .collect();
+    let mut replaced = value.to_string();
+
+    for token in tokens {
+        let resolved = resolve_token_for_request(vault, &token, context)?;
+        replaced = inject_credential(
+            &resolved.credential_type,
+            &resolved.value,
+            &replaced,
+            &resolved.token,
+        );
+        used_credentials.push((resolved.credential_name, resolved.token));
+    }
+
+    Ok(replaced)
+}
+
+fn resolve_token_for_request(
+    vault: &Vault,
+    token: &str,
+    context: &TokenRequestContext<'_>,
+) -> ProxyActionResult<ResolvedToken> {
+    match vault.lookup_by_wisp_token(token) {
+        Ok((cred, real_value)) => {
+            if let Some(reason) = check_project_scope(vault, &cred, context.project_scope) {
+                audit_denial(
+                    vault,
+                    "CredentialDenied",
+                    Some(&cred.name),
+                    token,
+                    context,
+                    &reason,
+                );
+                return Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)));
+            }
+
+            if !check_host_restriction(&cred.hosts, context.target_host) {
+                let reason = format!(
+                    "host '{}' not allowed for credential '{}'",
+                    context.target_host, cred.name
+                );
+                audit_denial(
+                    vault,
+                    "CredentialDenied",
+                    Some(&cred.name),
+                    token,
+                    context,
+                    &reason,
+                );
+                return Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)));
+            }
+
+            if let Some(denial) = context.policy_engine.evaluate(
+                &cred.name,
+                None,
+                context.target_host,
+                context.target_path,
+                context.http_method,
+            ) {
+                audit_denial(
+                    vault,
+                    "PolicyDenied",
+                    Some(&cred.name),
+                    token,
+                    context,
+                    &denial.reason,
+                );
+                return Err(Box::new(error_response(
+                    StatusCode::FORBIDDEN,
+                    &denial.reason,
+                )));
+            }
+
+            Ok(ResolvedToken {
+                credential_name: cred.name,
+                token: token.to_string(),
+                credential_type: cred.credential_type,
+                value: real_value,
+            })
+        }
+        Err(_) => {
+            if let Some(fallback) = try_env_fallback(token) {
+                audit::log_event(
+                    vault.db(),
+                    "FallbackUsed",
+                    Some(&fallback.env_key),
+                    Some(token),
+                    Some(context.target_host),
+                    Some(context.target_path),
+                    Some(context.http_method),
+                    None,
+                    false,
+                    Some("vault lookup failed, used env fallback"),
+                    context.project_scope.as_deref(),
+                );
+                record_auto_fix_note(token, &fallback.env_key);
+                return Ok(ResolvedToken {
+                    credential_name: fallback.env_key,
+                    token: token.to_string(),
+                    credential_type: CredentialType::BearerToken,
+                    value: fallback.value,
+                });
+            }
+
+            let reason = format!("wisp token '{}' was not found in the active vault", token);
+            audit_denial(vault, "CredentialDenied", None, token, context, &reason);
+            Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)))
+        }
+    }
+}
+
+fn audit_denial(
+    vault: &Vault,
+    event_type: &str,
+    credential_name: Option<&str>,
+    token: &str,
+    context: &TokenRequestContext<'_>,
+    reason: &str,
+) {
+    audit::log_event(
+        vault.db(),
+        event_type,
+        credential_name,
+        Some(token),
+        Some(context.target_host),
+        Some(context.target_path),
+        Some(context.http_method),
+        None,
+        true,
+        Some(reason),
+        context.project_scope.as_deref(),
+    );
 }
 
 /// Attempts to find a credential value from environment variables when the vault
@@ -912,6 +966,26 @@ fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
         .expect("error response must build")
 }
 
+async fn collect_limited_body(body: Incoming) -> ProxyActionResult<Bytes> {
+    match Limited::new(body, MAX_PROXY_BODY_BYTES).collect().await {
+        Ok(collected) => Ok(collected.to_bytes()),
+        Err(_) => Err(Box::new(error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Request body exceeds WispKey proxy size limit",
+        ))),
+    }
+}
+
+fn set_content_length(headers: &mut hyper::HeaderMap, body_len: usize) {
+    headers.remove(hyper::header::CONTENT_LENGTH);
+    if body_len == 0 {
+        return;
+    }
+    let value = hyper::header::HeaderValue::from_str(&body_len.to_string())
+        .expect("usize content length must be a valid header value");
+    headers.insert(hyper::header::CONTENT_LENGTH, value);
+}
+
 async fn handle_management_api(
     method: &hyper::Method,
     uri: &Uri,
@@ -931,7 +1005,16 @@ async fn handle_management_api(
 
     match (method.as_str(), path) {
         ("GET", "/api/status") => {
-            let count = vault.credential_count().unwrap_or(0);
+            let active_project = core::resolve_active_project();
+            let requested = requested_project(uri);
+            let count = if requested == "*" {
+                vault.credential_count().unwrap_or(0)
+            } else {
+                vault
+                    .list_credentials_in_project(&requested)
+                    .map(|credentials| credentials.len())
+                    .unwrap_or(0)
+            };
             let created = vault
                 .vault_created_at()
                 .unwrap_or_else(|_| "unknown".to_string());
@@ -949,15 +1032,27 @@ async fn handle_management_api(
                     "created_at": created,
                     "credential_count": count,
                     "session_active": true,
+                    "active_project": active_project,
+                    "project": requested,
                     "proxy_running": true,
                     "proxy_port": proxy_port,
                 }),
             )
         }
-        ("GET", "/api/credentials") => match vault.list_credentials() {
+        ("GET", "/api/credentials") => match if requested_project(uri) == "*" {
+            vault.list_credentials()
+        } else {
+            vault.list_credentials_in_project(&requested_project(uri))
+        } {
             Ok(creds) => {
                 let list: Vec<serde_json::Value> = creds.iter().map(credential_to_json).collect();
-                json_response(StatusCode::OK, &serde_json::json!({"credentials": list}))
+                json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "project": requested_project(uri),
+                        "credentials": list
+                    }),
+                )
             }
             Err(e) => json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -974,7 +1069,11 @@ async fn handle_management_api(
                 ),
             }
         }
-        ("GET", "/api/partitions") => match vault.list_partitions() {
+        ("GET", "/api/partitions") => match if requested_project(uri) == "*" {
+            vault.list_partitions()
+        } else {
+            vault.list_partitions_in_project(&requested_project(uri))
+        } {
             Ok(partitions) => {
                 let list: Vec<serde_json::Value> = partitions
                     .iter()
@@ -991,7 +1090,13 @@ async fn handle_management_api(
                         })
                     })
                     .collect();
-                json_response(StatusCode::OK, &serde_json::json!({"partitions": list}))
+                json_response(
+                    StatusCode::OK,
+                    &serde_json::json!({
+                        "project": requested_project(uri),
+                        "partitions": list
+                    }),
+                )
             }
             Err(e) => json_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1000,11 +1105,19 @@ async fn handle_management_api(
         },
         ("GET", path) if path.starts_with("/api/partitions/") && path.ends_with("/credentials") => {
             let segment = &path["/api/partitions/".len()..path.len() - "/credentials".len()];
-            match vault.list_credentials_in_partition(segment) {
+            let project = requested_project(uri);
+            match vault.list_credentials_in_partition_for_project(&project, segment) {
                 Ok(creds) => {
                     let list: Vec<serde_json::Value> =
                         creds.iter().map(credential_to_json).collect();
-                    json_response(StatusCode::OK, &serde_json::json!({"credentials": list}))
+                    json_response(
+                        StatusCode::OK,
+                        &serde_json::json!({
+                            "project": project,
+                            "partition": segment,
+                            "credentials": list
+                        }),
+                    )
                 }
                 Err(e) => json_response(
                     StatusCode::NOT_FOUND,
@@ -1014,7 +1127,8 @@ async fn handle_management_api(
         }
         ("GET", path) if path.starts_with("/api/partitions/") => {
             let name = &path["/api/partitions/".len()..];
-            match vault.get_partition(name) {
+            let project = requested_project(uri);
+            match vault.get_partition_in_project(&project, name) {
                 Ok(p) => {
                     let count = vault.partition_credential_count(&p.id).unwrap_or(0);
                     json_response(
@@ -1023,6 +1137,7 @@ async fn handle_management_api(
                             "id": p.id,
                             "name": p.name,
                             "description": p.description,
+                            "project_id": p.project_id,
                             "credential_count": count,
                             "created_at": p.created_at.to_rfc3339(),
                             "updated_at": p.updated_at.to_rfc3339(),
@@ -1037,7 +1152,8 @@ async fn handle_management_api(
         }
         ("DELETE", path) if path.starts_with("/api/partitions/") => {
             let name = &path["/api/partitions/".len()..];
-            match vault.delete_partition(name) {
+            let project = requested_project(uri);
+            match vault.delete_partition_in_project(&project, name) {
                 Ok(()) => {
                     audit::log_event(
                         vault.db(),
@@ -1202,7 +1318,7 @@ fn json_response(status: StatusCode, body: &serde_json::Value) -> Response<Full<
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
-        .header("access-control-allow-origin", "*")
+        .header("access-control-allow-origin", "http://localhost")
         .header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
         .header(
             "access-control-allow-headers",
