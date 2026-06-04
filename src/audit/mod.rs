@@ -99,7 +99,17 @@ pub fn query_log(
             target_host: row.get(5)?,
             target_path: row.get(6)?,
             http_method: row.get(7)?,
-            response_status: row.get::<_, Option<i32>>(8)?.map(|v| v as u16),
+            response_status: row
+                .get::<_, Option<i64>>(8)?
+                .map(u16::try_from)
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
             denied: row.get::<_, i32>(9)? != 0,
             deny_reason: row.get(10)?,
             project_name: row.get(11)?,
@@ -112,7 +122,17 @@ pub fn query_log(
         }
     };
 
-    rows.filter_map(|r| r.ok()).collect()
+    let mut entries = Vec::new();
+    for row in rows {
+        match row {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                tracing::error!("Failed to read audit log row: {}", e);
+                return Vec::new();
+            }
+        }
+    }
+    entries
 }
 
 #[cfg(test)]
@@ -242,5 +262,17 @@ mod tests {
         }
         let entries = query_log(&db, 5, None, None);
         assert_eq!(entries.len(), 5);
+    }
+
+    #[test]
+    fn query_log_rejects_invalid_response_status() {
+        let db = test_db();
+        db.execute(
+            "INSERT INTO audit_log (timestamp, event_type, response_status, denied) VALUES (?1, 'bad_status', 70000, 0)",
+            params![Utc::now().to_rfc3339()],
+        )
+        .unwrap();
+
+        assert!(query_log(&db, 10, None, None).is_empty());
     }
 }

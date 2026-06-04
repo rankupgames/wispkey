@@ -92,13 +92,13 @@ fn credential_for_env_key(env_key: &str) -> Option<EnvSideloadCredential> {
 fn env_key_for_token(token: &str) -> Option<String> {
     let body = token.strip_prefix("wk_")?;
 
-    if let Some(slug) = body.strip_prefix("env_") {
-        if valid_slug(slug) {
-            return Some(format!(
-                "{SIDELOAD_ENV_PREFIX}{}",
-                slug.to_ascii_uppercase()
-            ));
-        }
+    if let Some(slug) = body.strip_prefix("env_")
+        && valid_slug(slug)
+    {
+        return Some(format!(
+            "{SIDELOAD_ENV_PREFIX}{}",
+            slug.to_ascii_uppercase()
+        ));
     }
 
     None
