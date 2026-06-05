@@ -122,18 +122,31 @@ New exports require a 12+ character bundle passphrase. Share the encrypted bundl
 
 ## MCP Tools (for IDE agents)
 
-Configure in Cursor/Claude Code:
+Configure in Cursor/Claude Code. Keep `command` as `wispkey` so clients use the normal installed binary from `PATH`; do not hardcode a user-specific absolute path. Prefer an unlocked WispKey session for vault-backed credentials; use `WISPKEY_PASSWORD` only for trusted automation.
 ```json
 {
   "mcpServers": {
     "wispkey": {
       "command": "wispkey",
-      "args": ["mcp", "serve"],
-      "env": { "WISPKEY_PASSWORD": "your-master-password" }
+      "args": ["mcp", "serve"]
     }
   }
 }
 ```
+
+For locked-vault MCP use, pass env sideloads instead of the master password. In Codex, use `env_vars` to forward a variable from the Codex process environment:
+```toml
+[mcp_servers.wispkey]
+command = "wispkey"
+args = ["mcp", "serve"]
+env_vars = ["WISPKEY_SIDELOAD_OPENAI"]
+```
+
+`WISPKEY_SIDELOAD_<SLUG>` values are exposed to agents only as deterministic `wk_env_<slug>` tokens. The raw env value must never be printed or logged.
+
+For JSON MCP configs that do not support `env_vars`, set the sideload variable in the client process environment or in the server `env` block. Treat `env` blocks as plaintext client config and prefer process environment forwarding or an OS credential manager when available.
+
+Do not add legacy aliases for replaced config surfaces. If a name changes, document the migration to the current name and remove the old path. `WISPKEY_FALLBACK_<SLUG>` is not supported; use `WISPKEY_SIDELOAD_<SLUG>`.
 
 Available tools:
 - **`wispkey_list`** -- List credentials (filter by `tag`, `project`; defaults to active project, `"*"` for all)
@@ -177,6 +190,7 @@ When the proxy is running (`wispkey serve`):
 | `WISPKEY_VAULT_PATH` | Override vault directory |
 | `WISPKEY_PROJECT` | Override active project per-terminal |
 | `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import |
+| `WISPKEY_SIDELOAD_<SLUG>` | Env-sideload credential value for MCP/proxy use; never print the value |
 
 ## Conventions
 

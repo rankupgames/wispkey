@@ -7,9 +7,9 @@ description: Set up the WispKey proxy for a project. Use when the user wants to 
 
 ## Prerequisites
 
-1. WispKey installed (`cargo install --path .` or binary in PATH)
-2. Vault initialized: `wispkey init`
-3. At least one credential stored: `wispkey add ...`
+1. WispKey installed normally (`cargo install --path . --locked`, package manager, or binary in PATH)
+2. Vault initialized with `wispkey init` for vault-backed credentials, or `WISPKEY_SIDELOAD_<SLUG>` set for sideload-only use
+3. At least one vault credential stored with `wispkey add ...`, or one sideload env var available to both MCP and proxy
 
 ## Start the Proxy
 
@@ -18,6 +18,13 @@ wispkey serve
 ```
 
 Default: `http://localhost:7700`. Custom port: `wispkey serve --port 8800`.
+
+For sideload-only proxy use, launch with the same sideload env var that the MCP server uses:
+```bash
+WISPKEY_SIDELOAD_OPENAI="$OPENAI_API_KEY" wispkey serve
+```
+
+The agent still receives only `wk_env_openai`; the raw sideload value stays in the WispKey process environment.
 
 ## Configure Your Project
 
@@ -57,7 +64,7 @@ services:
 
 ## MCP Integration (Cursor / Claude Code)
 
-Add to your MCP config:
+Add to your MCP config. Keep `command` as `wispkey` so the client uses the normal installed binary from `PATH`, not a machine-specific absolute path:
 ```json
 {
   "mcpServers": {
@@ -68,6 +75,18 @@ Add to your MCP config:
   }
 }
 ```
+
+For Codex-style env forwarding:
+```toml
+[mcp_servers.wispkey]
+command = "wispkey"
+args = ["mcp", "serve"]
+env_vars = ["WISPKEY_SIDELOAD_OPENAI"]
+```
+
+For JSON-style configs, either launch the client with `WISPKEY_SIDELOAD_OPENAI` in its environment or add it to the MCP server `env` block. Treat `env` blocks as plaintext client config.
+
+Do not use old fallback env names. Rename `WISPKEY_FALLBACK_<SLUG>` variables to `WISPKEY_SIDELOAD_<SLUG>` before upgrading.
 
 The agent can then call:
 - `wispkey_list` -- see available credentials

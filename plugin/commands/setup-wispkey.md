@@ -35,7 +35,7 @@ Quick setup for a new project.
    wispkey list
    ```
 
-6. **Configure MCP** (add to Cursor settings):
+6. **Configure MCP** (add to Cursor settings). Keep `command` as `wispkey` so the client uses the normal installed binary from `PATH`:
    ```json
    {
      "mcpServers": {
@@ -46,5 +46,15 @@ Quick setup for a new project.
      }
    }
    ```
+
+   For locked-vault MCP use, sideload credentials instead of passing the vault master password:
+   ```toml
+   [mcp_servers.wispkey]
+   command = "wispkey"
+   args = ["mcp", "serve"]
+   env_vars = ["WISPKEY_SIDELOAD_OPENAI"]
+   ```
+
+   The MCP server returns `wk_env_openai` and the env key name, never the raw env value. Start `wispkey serve` with the same `WISPKEY_SIDELOAD_OPENAI` variable when the proxy needs to substitute that token.
 
 After setup, all API requests routed through `HTTP_PROXY=http://localhost:7700` will automatically have wisp tokens swapped for real credentials.
