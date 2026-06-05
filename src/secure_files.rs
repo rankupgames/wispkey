@@ -172,7 +172,7 @@ mod windows_acl {
     }
 
     fn current_user_sid_string() -> Result<String> {
-        let mut token: HANDLE = 0;
+        let mut token: HANDLE = null_mut();
         let opened =
             unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token as *mut _) };
         if opened == 0 {

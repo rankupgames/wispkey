@@ -181,6 +181,12 @@ enum Commands {
     /// Show vault and proxy status
     Status,
 
+    /// Manage the local WispKey proxy control plane
+    Proxy {
+        #[command(subcommand)]
+        command: ProxyCommands,
+    },
+
     /// Query the audit log
     Log {
         /// Number of recent entries to show
@@ -375,6 +381,16 @@ enum CloudCommands {
 }
 
 #[derive(Subcommand)]
+enum ProxyCommands {
+    /// Show local proxy lifecycle status
+    Status,
+    /// Stop the owned local proxy
+    Stop,
+    /// Remove stale proxy discovery files
+    Cleanup,
+}
+
+#[derive(Subcommand)]
 enum McpCommands {
     /// Start MCP server (stdio transport)
     Serve,
@@ -431,18 +447,18 @@ async fn main() {
                 },
                 (v, None) => v.clone(),
             };
-            cli::handle_add(
-                &name,
-                &r#type,
-                description.as_deref(),
-                resolved_value.as_deref(),
-                hosts.as_deref(),
-                tags.as_deref(),
-                header_name.as_deref(),
-                param_name.as_deref(),
-                partition.as_deref(),
-                project.as_deref(),
-            )
+            cli::handle_add(cli::AddCredentialArgs {
+                name: &name,
+                type_str: &r#type,
+                description: description.as_deref(),
+                value: resolved_value.as_deref(),
+                hosts: hosts.as_deref(),
+                tags: tags.as_deref(),
+                header_name: header_name.as_deref(),
+                param_name: param_name.as_deref(),
+                partition: partition.as_deref(),
+                project: project.as_deref(),
+            })
             .await;
         }
         Commands::List {
@@ -487,6 +503,11 @@ async fn main() {
         Commands::Status => {
             cli::handle_status().await;
         }
+        Commands::Proxy { command } => match command {
+            ProxyCommands::Status => cli::handle_proxy_status().await,
+            ProxyCommands::Stop => cli::handle_proxy_stop().await,
+            ProxyCommands::Cleanup => cli::handle_proxy_cleanup().await,
+        },
         Commands::Log {
             last,
             credential,

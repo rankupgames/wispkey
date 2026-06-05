@@ -15,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::core::{self, Vault, VaultError};
 use crate::env_sideload::EnvSideloadCredential;
+use crate::proxy::lifecycle;
 
 /// Runs the WispKey MCP server over stdio transport (JSON-RPC 2.0).
 pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -43,7 +44,7 @@ pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error + Send + S
             }
         };
 
-        if let Some(response) = handle_jsonrpc(&request) {
+        if let Some(response) = handle_jsonrpc(&request).await {
             let response_str = serde_json::to_string(&response)?;
             writeln!(stdout, "{}", response_str)?;
             stdout.flush()?;
@@ -53,7 +54,7 @@ pub async fn run_mcp_server() -> Result<(), Box<dyn std::error::Error + Send + S
     Ok(())
 }
 
-fn handle_jsonrpc(request: &Value) -> Option<Value> {
+async fn handle_jsonrpc(request: &Value) -> Option<Value> {
     let method = request.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
     if method.starts_with("notifications/")
@@ -140,7 +141,7 @@ fn handle_jsonrpc(request: &Value) -> Option<Value> {
             let result = match tool_name {
                 "wispkey_list" => handle_tool_list(&arguments),
                 "wispkey_get_token" => handle_tool_get_token(&arguments),
-                "wispkey_proxy_status" => handle_tool_proxy_status(),
+                "wispkey_proxy_status" => handle_tool_proxy_status().await,
                 "wispkey_project_list" => handle_tool_project_list(),
                 _ => tool_error(&format!("unknown tool: {}", tool_name)),
             };
@@ -297,7 +298,7 @@ fn handle_tool_get_token(arguments: &Value) -> Value {
             }
             Err(e) => match crate::env_sideload::credential_for_name(name) {
                 Some(credential) => sideload_token_response(name, &credential, &proxy_address),
-                None => tool_error(&format!("credential '{}' not found: {}", name, e)),
+                None => tool_error(&credential_not_found_message(&vault, name, &e.to_string())),
             },
         },
         Err(e) => match crate::env_sideload::credential_for_name(name) {
@@ -341,45 +342,128 @@ fn sideload_token_response(
     })
 }
 
-fn handle_tool_proxy_status() -> Value {
-    let vault_dir = Vault::vault_dir();
-    let pid_path = vault_dir.join("proxy.pid");
-    let proxy_running = pid_path.exists();
-
-    let proxy_address = read_proxy_address();
-
+async fn handle_tool_proxy_status() -> Value {
+    let proxy_status = lifecycle::read_status().await;
     let vault_exists = Vault::exists();
     let session_active = Vault::open_with_session().is_ok();
     let sideload_count = crate::env_sideload::list_available().len();
 
-    let status_text = format!(
-        "Vault: {}\nSession: {}\nProxy: {}\nProxy address: {}\nEnv sideloads: {}\nHTTPS: supported (use X-Target-Url header)",
-        if vault_exists {
-            "initialized"
-        } else {
-            "not initialized"
-        },
-        if session_active { "active" } else { "locked" },
-        if proxy_running { "running" } else { "stopped" },
-        proxy_address,
-        sideload_count,
-    );
+    let status_json = json!({
+        "vault": if vault_exists { "initialized" } else { "not_initialized" },
+        "session": if session_active { "active" } else { "locked" },
+        "proxy": proxy_status.public_json(),
+        "proxy_address": proxy_status.address_or_default(),
+        "env_sideloads": sideload_count,
+        "https": "supported via X-Target-Url header",
+    });
 
     json!({
         "content": [{
             "type": "text",
-            "text": status_text
+            "text": serde_json::to_string_pretty(&status_json).expect("proxy status json")
         }]
     })
 }
 
 fn read_proxy_address() -> String {
-    let info_path = Vault::vault_dir().join("proxy.json");
-    std::fs::read_to_string(&info_path)
-        .ok()
-        .and_then(|c| serde_json::from_str::<Value>(&c).ok())
-        .and_then(|v| v.get("address").and_then(|a| a.as_str().map(String::from)))
-        .unwrap_or_else(|| "http://localhost:7700".to_string())
+    lifecycle::proxy_address_or_default()
+}
+
+fn credential_not_found_message(vault: &Vault, requested: &str, error: &str) -> String {
+    let suggestions = suggest_credential_names(vault, requested);
+    if suggestions.is_empty() {
+        return format!("credential '{requested}' not found: {error}");
+    }
+
+    format!(
+        "credential '{requested}' not found: {error}. Did you mean: {}?",
+        suggestions.join(", ")
+    )
+}
+
+fn suggest_credential_names(vault: &Vault, requested: &str) -> Vec<String> {
+    let active = core::resolve_active_project();
+    let mut candidates = vault
+        .list_credentials_in_project(&active)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|credential| credential.name)
+        .collect::<Vec<_>>();
+
+    let active_count = candidates.len();
+    for name in vault
+        .list_credentials()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|credential| credential.name)
+    {
+        if !candidates.iter().any(|existing| existing == &name) {
+            candidates.push(name);
+        }
+    }
+
+    let requested_key = normalize_lookup_name(requested);
+    let mut scored = candidates
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, name)| {
+            let key = normalize_lookup_name(&name);
+            let project_rank = usize::from(index >= active_count);
+            if key == requested_key {
+                return Some((0usize, project_rank, name));
+            }
+            let distance = edit_distance(&key, &requested_key);
+            (distance <= 3).then_some((distance, project_rank, name))
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+            .then_with(|| left.2.cmp(&right.2))
+    });
+    scored
+        .into_iter()
+        .take(3)
+        .map(|(_, _, name)| name)
+        .collect()
+}
+
+fn normalize_lookup_name(name: &str) -> String {
+    let mut normalized = String::new();
+    let mut last_was_separator = false;
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            normalized.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !normalized.is_empty() && !last_was_separator {
+            normalized.push('-');
+            last_was_separator = true;
+        }
+    }
+    while normalized.ends_with('-') {
+        normalized.pop();
+    }
+    normalized
+}
+
+fn edit_distance(left: &str, right: &str) -> usize {
+    let right_chars = right.chars().collect::<Vec<_>>();
+    let mut previous = (0..=right_chars.len()).collect::<Vec<_>>();
+
+    for (left_index, left_char) in left.chars().enumerate() {
+        let mut current = vec![left_index + 1];
+        for (right_index, right_char) in right_chars.iter().enumerate() {
+            let insert = current[right_index] + 1;
+            let delete = previous[right_index + 1] + 1;
+            let replace = previous[right_index] + usize::from(left_char != *right_char);
+            current.push(insert.min(delete).min(replace));
+        }
+        previous = current;
+    }
+
+    previous[right_chars.len()]
 }
 
 fn tool_error(message: &str) -> Value {
