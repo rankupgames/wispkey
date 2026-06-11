@@ -12,6 +12,11 @@ use chrono::Utc;
 use rusqlite::{Connection, params};
 use serde::Serialize;
 
+use crate::core::Vault;
+use crate::secure_files;
+
+pub const SIDELOAD_FALLBACK_AUDIT_FILE: &str = "sideload-audit.jsonl";
+
 /// Single row from the audit log.
 #[derive(Debug, Clone, Serialize)]
 pub struct AuditEntry {
@@ -50,6 +55,66 @@ pub fn log_event(
 	);
     if let Err(e) = result {
         tracing::error!("Failed to write audit log: {}", e);
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct FallbackAuditEntry<'a> {
+    timestamp: String,
+    event_type: &'a str,
+    credential_name: Option<&'a str>,
+    wisp_token: Option<&'a str>,
+    target_host: Option<&'a str>,
+    target_path: Option<&'a str>,
+    http_method: Option<&'a str>,
+    response_status: Option<u16>,
+    denied: bool,
+    deny_reason: Option<&'a str>,
+    project_name: Option<&'a str>,
+    sink: &'static str,
+}
+
+/// Writes an audit event when no unlocked vault database is available.
+#[allow(clippy::too_many_arguments)]
+pub fn log_fallback_event(
+    event_type: &str,
+    credential_name: Option<&str>,
+    wisp_token: Option<&str>,
+    target_host: Option<&str>,
+    target_path: Option<&str>,
+    http_method: Option<&str>,
+    response_status: Option<u16>,
+    denied: bool,
+    deny_reason: Option<&str>,
+    project_name: Option<&str>,
+) {
+    let entry = FallbackAuditEntry {
+        timestamp: Utc::now().to_rfc3339(),
+        event_type,
+        credential_name,
+        wisp_token,
+        target_host,
+        target_path,
+        http_method,
+        response_status,
+        denied,
+        deny_reason,
+        project_name,
+        sink: "sideload-fallback-jsonl",
+    };
+
+    let mut line = match serde_json::to_vec(&entry) {
+        Ok(line) => line,
+        Err(e) => {
+            tracing::error!("Failed to encode fallback audit log: {}", e);
+            return;
+        }
+    };
+    line.push(b'\n');
+
+    let path = Vault::vault_dir().join(SIDELOAD_FALLBACK_AUDIT_FILE);
+    if let Err(e) = secure_files::append_private(&path, &line) {
+        tracing::error!("Failed to write fallback audit log: {}", e);
     }
 }
 

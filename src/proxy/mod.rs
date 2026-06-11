@@ -745,6 +745,7 @@ async fn collect_limited_body(body: Incoming) -> ProxyActionResult<Bytes> {
 
 fn set_content_length(headers: &mut hyper::HeaderMap, body_len: usize) {
     headers.remove(hyper::header::CONTENT_LENGTH);
+    headers.remove(hyper::header::TRANSFER_ENCODING);
     if body_len == 0 {
         return;
     }
