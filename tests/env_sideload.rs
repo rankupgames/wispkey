@@ -4,9 +4,29 @@ use common::*;
 use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::Path;
 use std::process::Stdio;
 use std::thread;
-use std::time::{Duration, Instant};
+
+fn start_sideload_proxy(vault_dir: &Path, unlock_vault: bool) -> (ChildGuard, u16) {
+    let mut command = wispkey_bin();
+    command
+        .args(["serve", "--random-port"])
+        .env("WISPKEY_VAULT_PATH", vault_dir)
+        .env("WISPKEY_SIDELOAD_OPENAI", "sideload-secret")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if unlock_vault {
+        command.env("WISPKEY_PASSWORD", "test-password");
+    } else {
+        command.env_remove("WISPKEY_PASSWORD");
+    }
+
+    let child = command.spawn().expect("spawn proxy");
+    let proxy_info = wait_for_proxy_info(vault_dir);
+    let proxy_port = proxy_info["port"].as_u64().expect("proxy port") as u16;
+    (ChildGuard(child), proxy_port)
+}
 
 #[test]
 fn mcp_serve_returns_env_sideload_token_without_master_password() {
@@ -90,32 +110,7 @@ fn proxy_uses_env_sideload_token_without_master_password() {
             .expect("write upstream response");
     });
 
-    let child = wispkey_bin()
-        .args(["serve", "--random-port"])
-        .env("WISPKEY_VAULT_PATH", vault_dir.path())
-        .env("WISPKEY_SIDELOAD_OPENAI", "sideload-secret")
-        .env_remove("WISPKEY_PASSWORD")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn proxy");
-    let _guard = ChildGuard(child);
-
-    let proxy_info_path = vault_dir.path().join("proxy.json");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let proxy_port = loop {
-        if let Ok(raw) = std::fs::read_to_string(&proxy_info_path) {
-            let value: Value = serde_json::from_str(&raw).expect("proxy info json");
-            if let Some(port) = value["port"].as_u64() {
-                break port as u16;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "proxy did not write proxy.json in time"
-        );
-        thread::sleep(Duration::from_millis(50));
-    };
+    let (_guard, proxy_port) = start_sideload_proxy(vault_dir.path(), false);
 
     let request = format!(
         "GET http://127.0.0.1:{upstream_port}/test HTTP/1.1\r\n\
@@ -137,4 +132,66 @@ fn proxy_uses_env_sideload_token_without_master_password() {
     );
 
     upstream_handle.join().expect("upstream assertion");
+
+    let fallback_audit = std::fs::read_to_string(vault_dir.path().join("sideload-audit.jsonl"))
+        .expect("fallback sideload audit log");
+    assert!(
+        fallback_audit.contains("\"event_type\":\"SideloadUsed\""),
+        "expected sideload audit event:\n{fallback_audit}"
+    );
+    assert!(
+        fallback_audit.contains("WISPKEY_SIDELOAD_OPENAI"),
+        "expected sideload env key in audit event:\n{fallback_audit}"
+    );
+    assert!(
+        fallback_audit.contains("wk_env_openai"),
+        "expected sideload token in audit event:\n{fallback_audit}"
+    );
+    assert!(
+        !fallback_audit.contains("sideload-secret"),
+        "fallback audit must not expose env secret:\n{fallback_audit}"
+    );
+}
+
+#[test]
+fn proxy_returns_policy_denial_for_env_sideload_with_unlocked_vault() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    std::fs::write(
+        vault_dir.path().join("policies.toml"),
+        r#"
+[[policy]]
+name = "block-openai-sideload"
+credential = "openai"
+deny = true
+"#,
+    )
+    .expect("write policy");
+
+    let (_guard, proxy_port) = start_sideload_proxy(vault_dir.path(), true);
+    let request = "GET http://127.0.0.1:9/test HTTP/1.1\r\n\
+                   Host: 127.0.0.1:9\r\n\
+                   Authorization: Bearer wk_env_openai\r\n\
+                   Connection: close\r\n\r\n";
+    let mut proxy_stream = TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect to proxy");
+    proxy_stream
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = String::new();
+    proxy_stream
+        .read_to_string(&mut response)
+        .expect("read proxy response");
+
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden"),
+        "expected policy denial, got:\n{response}"
+    );
+    assert!(
+        response.contains("blocked by deny policy"),
+        "expected policy reason to survive env sideload resolution:\n{response}"
+    );
+    assert!(
+        !response.contains("not found"),
+        "policy-denied sideload token must not be reported as missing:\n{response}"
+    );
 }

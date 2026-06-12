@@ -60,6 +60,7 @@ struct RateLimit {
 
 struct RateBucket {
     timestamps: Vec<Instant>,
+    window: Duration,
 }
 
 /// Evaluates requests against loaded policies and enforces rate limits.
@@ -228,10 +229,19 @@ impl PolicyEngine {
         {
             let bucket_key = format!("{}:{}", policy.name, credential_name);
             if let Ok(mut buckets) = self.rate_buckets.lock() {
+                let now = Instant::now();
+                for bucket in buckets.values_mut() {
+                    bucket
+                        .timestamps
+                        .retain(|t| now.duration_since(*t) < bucket.window);
+                }
+                buckets.retain(|_, bucket| !bucket.timestamps.is_empty());
+
                 let bucket = buckets.entry(bucket_key).or_insert_with(|| RateBucket {
                     timestamps: Vec::new(),
+                    window: parsed.window,
                 });
-                let now = Instant::now();
+                bucket.window = parsed.window;
                 bucket
                     .timestamps
                     .retain(|t| now.duration_since(*t) < parsed.window);

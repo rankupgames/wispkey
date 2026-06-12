@@ -1,12 +1,24 @@
 mod common;
 
 use common::*;
-use serde_json::Value;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::process::Stdio;
 use std::thread;
-use std::time::{Duration, Instant};
+
+fn start_proxy(vault_dir: &std::path::Path) -> (ChildGuard, u16) {
+    let child = wispkey_bin()
+        .args(["serve", "--random-port"])
+        .env("WISPKEY_VAULT_PATH", vault_dir)
+        .env("WISPKEY_PASSWORD", "test-password")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn proxy");
+    let proxy_info = wait_for_proxy_info(vault_dir);
+    let proxy_port = proxy_info["port"].as_u64().expect("proxy port") as u16;
+    (ChildGuard(child), proxy_port)
+}
 
 #[test]
 fn bundle_passphrase_file_roundtrips_multiline_secret_through_proxy() {
@@ -98,31 +110,7 @@ fn bundle_passphrase_file_roundtrips_multiline_secret_through_proxy() {
             .expect("write upstream response");
     });
 
-    let child = wispkey_bin()
-        .args(["serve", "--random-port"])
-        .env("WISPKEY_VAULT_PATH", destination_dir.path())
-        .env("WISPKEY_PASSWORD", "test-password")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn proxy");
-    let _guard = ChildGuard(child);
-
-    let proxy_info_path = destination_dir.path().join("proxy.json");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let proxy_port = loop {
-        if let Ok(raw) = std::fs::read_to_string(&proxy_info_path) {
-            let value: Value = serde_json::from_str(&raw).expect("proxy info json");
-            if let Some(port) = value["port"].as_u64() {
-                break port as u16;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "proxy did not write proxy.json in time"
-        );
-        thread::sleep(Duration::from_millis(50));
-    };
+    let (_guard, proxy_port) = start_proxy(destination_dir.path());
 
     let body = token;
     let request = format!(
@@ -196,31 +184,7 @@ fn proxy_swaps_wisp_token_before_local_upstream_receives_request() {
         .expect("wisp token")
         .to_string();
 
-    let child = wispkey_bin()
-        .args(["serve", "--random-port"])
-        .env("WISPKEY_VAULT_PATH", vault_dir.path())
-        .env("WISPKEY_PASSWORD", "test-password")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn proxy");
-    let _guard = ChildGuard(child);
-
-    let proxy_info_path = vault_dir.path().join("proxy.json");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    let proxy_port = loop {
-        if let Ok(raw) = std::fs::read_to_string(&proxy_info_path) {
-            let value: Value = serde_json::from_str(&raw).expect("proxy info json");
-            if let Some(port) = value["port"].as_u64() {
-                break port as u16;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "proxy did not write proxy.json in time"
-        );
-        thread::sleep(Duration::from_millis(50));
-    };
+    let (_guard, proxy_port) = start_proxy(vault_dir.path());
 
     let mut proxy_stream = TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect to proxy");
     let request = format!(
@@ -229,6 +193,163 @@ fn proxy_swaps_wisp_token_before_local_upstream_receives_request() {
          Authorization: Bearer {token}\r\n\
          Connection: close\r\n\r\n"
     );
+    proxy_stream
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = String::new();
+    proxy_stream
+        .read_to_string(&mut response)
+        .expect("read proxy response");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "expected successful proxy response, got:\n{response}"
+    );
+
+    upstream_handle.join().expect("upstream assertion");
+}
+
+#[test]
+fn proxy_resolves_token_adjacent_to_lowercase_suffix() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+
+    let added = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "add",
+            "adjacent-key",
+            "--type",
+            "api_key",
+            "--value",
+            "real-secret",
+            "--hosts",
+            "127.0.0.1",
+        ],
+    );
+    let token = added["credential"]["wisp_token"]
+        .as_str()
+        .expect("wisp token")
+        .to_string();
+
+    let upstream = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let upstream_port = upstream.local_addr().expect("upstream address").port();
+    let upstream_handle = thread::spawn(move || {
+        let (mut stream, _) = upstream.accept().expect("accept upstream request");
+        let mut buffer = [0u8; 8192];
+        let bytes_read = stream.read(&mut buffer).expect("read upstream request");
+        let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+        assert!(
+            request.contains("payload=real-secretsuffix_more"),
+            "upstream should receive token prefix replaced and adjacent suffix preserved:\n{request}"
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .expect("write upstream response");
+    });
+
+    let (_guard, proxy_port) = start_proxy(vault_dir.path());
+    let body = format!("payload={token}suffix_more");
+    let request = format!(
+        "POST http://127.0.0.1:{upstream_port}/test HTTP/1.1\r\n\
+         Host: 127.0.0.1:{upstream_port}\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let mut proxy_stream = TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect to proxy");
+    proxy_stream
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = String::new();
+    proxy_stream
+        .read_to_string(&mut response)
+        .expect("read proxy response");
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "expected successful proxy response, got:\n{response}"
+    );
+
+    upstream_handle.join().expect("upstream assertion");
+}
+
+#[test]
+fn proxy_does_not_rewrite_tokens_embedded_in_injected_secret() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+
+    let secondary = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "add",
+            "secondary-key",
+            "--type",
+            "api_key",
+            "--value",
+            "real-secondary",
+            "--hosts",
+            "127.0.0.1",
+        ],
+    );
+    let secondary_token = secondary["credential"]["wisp_token"]
+        .as_str()
+        .expect("secondary wisp token")
+        .to_string();
+    let primary_value = format!("literal-{secondary_token}-inside");
+    let primary = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "add",
+            "primary-key",
+            "--type",
+            "api_key",
+            "--value",
+            &primary_value,
+            "--hosts",
+            "127.0.0.1",
+        ],
+    );
+    let primary_token = primary["credential"]["wisp_token"]
+        .as_str()
+        .expect("primary wisp token")
+        .to_string();
+
+    let upstream = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let upstream_port = upstream.local_addr().expect("upstream address").port();
+    let expected_body = format!("first=literal-{secondary_token}-inside&second=real-secondary");
+    let upstream_handle = thread::spawn(move || {
+        let (mut stream, _) = upstream.accept().expect("accept upstream request");
+        let mut buffer = [0u8; 8192];
+        let bytes_read = stream.read(&mut buffer).expect("read upstream request");
+        let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+        assert!(
+            request.contains(&expected_body),
+            "injected secret should not be rescanned for later tokens:\n{request}"
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .expect("write upstream response");
+    });
+
+    let (_guard, proxy_port) = start_proxy(vault_dir.path());
+    let body = format!("first={primary_token}&second={secondary_token}");
+    let request = format!(
+        "POST http://127.0.0.1:{upstream_port}/test HTTP/1.1\r\n\
+         Host: 127.0.0.1:{upstream_port}\r\n\
+         Content-Type: application/x-www-form-urlencoded\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    let mut proxy_stream = TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect to proxy");
     proxy_stream
         .write_all(request.as_bytes())
         .expect("write proxy request");

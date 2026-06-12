@@ -1,4 +1,6 @@
-use super::tokens::{check_host_restriction, inject_credential};
+use super::tokens::{
+    candidate_prefix_lengths_with_sideload_tokens, check_host_restriction, inject_credential,
+};
 use super::*;
 use crate::core::CredentialType;
 use base64::Engine;
@@ -45,6 +47,46 @@ fn inject_custom_header_replaces() {
     };
     let result = inject_credential(&cred_type, "secret", "wk_custom_abc", "wk_custom_abc");
     assert_eq!(result, "secret");
+}
+
+#[test]
+fn token_prefix_candidates_prefer_longest_vault_token_shape() {
+    assert_eq!(
+        candidate_prefix_lengths_with_sideload_tokens(
+            "wk_outer_12345678wk_inner_abcdefghsuffix",
+            std::iter::empty::<&str>(),
+        ),
+        vec![
+            "wk_outer_12345678wk_inner_abcdefgh".len(),
+            "wk_outer_12345678".len(),
+        ],
+    );
+}
+
+#[test]
+fn token_prefix_candidates_include_available_sideload_token() {
+    assert_eq!(
+        candidate_prefix_lengths_with_sideload_tokens("wk_env_openai_suffix", ["wk_env_openai"]),
+        vec!["wk_env_openai".len()],
+    );
+}
+
+#[test]
+fn set_content_length_strips_conflicting_transfer_encoding() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert(
+        hyper::header::TRANSFER_ENCODING,
+        hyper::header::HeaderValue::from_static("chunked"),
+    );
+    headers.insert(
+        hyper::header::CONTENT_LENGTH,
+        hyper::header::HeaderValue::from_static("999"),
+    );
+
+    set_content_length(&mut headers, 12);
+
+    assert!(!headers.contains_key(hyper::header::TRANSFER_ENCODING));
+    assert_eq!(headers[hyper::header::CONTENT_LENGTH], "12");
 }
 
 #[test]

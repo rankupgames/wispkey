@@ -33,6 +33,18 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     harden_file(path)
 }
 
+/// Appends sensitive bytes to disk and then applies owner-only protection.
+pub(crate) fn append_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ensure_private_directory(parent)?;
+    }
+    append_private_file(path, bytes)?;
+    harden_file(path)
+}
+
 /// Reads a small sensitive text file after rejecting obviously unsafe inputs
 /// such as directories, oversized files, and broad Unix permissions.
 pub(crate) fn read_private_string(path: &Path, max_bytes: u64) -> Result<String> {
@@ -69,9 +81,34 @@ fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn append_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(path, bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn append_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let mut file = OpenOptions::new().append(true).create(true).open(path)?;
+    file.write_all(bytes)?;
     Ok(())
 }
 
