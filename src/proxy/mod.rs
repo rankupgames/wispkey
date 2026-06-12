@@ -2,12 +2,7 @@
  * Author: Miguel A. Lopez
  * Company: RankUp Games LLC
  * Project: WispKey
- * Description: HTTP/HTTPS forward proxy -- intercepts requests containing wk_* wisp tokens,
- *              swaps them for real credentials, enforces host restrictions, logs audit events.
- *              Also serves the management API at /api/ endpoints for the desktop app.
- *              Supports three modes for HTTPS: forward proxy (auto-detects https:// in target),
- *              reverse proxy (X-Target-Url header), and CONNECT tunneling (blind tunnel).
- *
+ * Description: HTTP/HTTPS forward proxy -- listener, request routing, and forwarding.
  * Created: 2026-04-07
  * Last Modified: 2026-04-13
  */
@@ -15,8 +10,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
@@ -27,10 +20,23 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use regex::Regex;
 use tokio::net::TcpListener;
+use tokio::sync::broadcast;
 
 use crate::audit;
-use crate::core::{self, CredentialType, Vault};
+use crate::core::{self, Vault};
 use crate::policy::PolicyEngine;
+
+pub mod lifecycle;
+mod management;
+mod target;
+#[cfg(test)]
+mod tests;
+mod tokens;
+
+use lifecycle::{ProxyMetadata, ProxyState, StartDecision};
+use management::{handle_management_api, json_response};
+use target::{authority_points_to_proxy, target_points_to_proxy};
+use tokens::{TokenRequestContext, inject_tokens_in_value, replace_tokens_in_uri};
 
 type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>;
 type HttpsClient = Client<
@@ -41,6 +47,12 @@ type ProxyActionResult<T> = Result<T, Box<Response<Full<Bytes>>>>;
 
 const MAX_PROXY_BODY_BYTES: usize = 10 * 1024 * 1024;
 
+#[derive(Debug, Clone)]
+pub enum StartProxyOutcome {
+    AlreadyRunning(ProxyMetadata),
+    Stopped { port: u16 },
+}
+
 #[derive(Clone)]
 struct ProxyRuntime {
     wisp_pattern: Arc<Regex>,
@@ -49,6 +61,9 @@ struct ProxyRuntime {
     https_client: Arc<HttpsClient>,
     policy_engine: Arc<PolicyEngine>,
     management_token: Arc<String>,
+    shutdown_tx: broadcast::Sender<String>,
+    proxy_port: u16,
+    metadata: Arc<ProxyMetadata>,
 }
 
 /// Starts the HTTP proxy on the given port. Pass `0` for an OS-assigned random port.
@@ -57,41 +72,25 @@ struct ProxyRuntime {
 pub async fn start_proxy(
     port: u16,
     all_projects: bool,
-) -> Result<u16, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<StartProxyOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    match lifecycle::prepare_for_start(port).await {
+        Ok(StartDecision::Start) => {}
+        Ok(StartDecision::AlreadyRunning(metadata)) => {
+            return Ok(StartProxyOutcome::AlreadyRunning(metadata));
+        }
+        Err(e) => return Err(e.into()),
+    }
+
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = TcpListener::bind(addr).await?;
+    let listener = TcpListener::bind(addr).await.map_err(|e| {
+        format!(
+            "failed to bind {addr}: {e}. If another process owns this port, WispKey will not terminate it without owned proxy metadata."
+        )
+    })?;
     let actual_addr = listener.local_addr()?;
     let actual_port = actual_addr.port();
 
     tracing::info!("WispKey proxy listening on http://{}", actual_addr);
-
-    let vault_dir = crate::core::Vault::vault_dir();
-    crate::secure_files::ensure_private_directory(&vault_dir)?;
-    let pid_path = vault_dir.join("proxy.pid");
-    let info_path = vault_dir.join("proxy.json");
-    let management_token = Arc::new(crate::random::alphanumeric(48, false)?);
-
-    std::fs::write(&pid_path, std::process::id().to_string())?;
-
-    let proxy_info = serde_json::json!({
-        "pid": std::process::id(),
-        "port": actual_port,
-        "address": format!("http://{}", actual_addr),
-        "management_token": management_token.as_ref(),
-    });
-    crate::secure_files::write_private(
-        &info_path,
-        serde_json::to_string_pretty(&proxy_info)?.as_bytes(),
-    )?;
-
-    let pid_cleanup = pid_path.clone();
-    let info_cleanup = info_path.clone();
-    tokio::spawn(async move {
-        tokio::signal::ctrl_c().await.ok();
-        let _ = std::fs::remove_file(&pid_cleanup);
-        let _ = std::fs::remove_file(&info_cleanup);
-        std::process::exit(0);
-    });
 
     let wisp_pattern = Arc::new(Regex::new(r"wk_[a-z0-9_]+").expect("static regex must compile"));
     let project_scope: Arc<Option<String>> = if all_projects {
@@ -99,6 +98,14 @@ pub async fn start_proxy(
     } else {
         Arc::new(Some(core::resolve_active_project()))
     };
+    let management_token = Arc::new(crate::random::alphanumeric(48, false)?);
+    let metadata = Arc::new(ProxyMetadata::new(
+        actual_port,
+        format!("http://{}", actual_addr),
+        project_scope.as_ref().clone(),
+        management_token.as_ref().clone(),
+    ));
+    lifecycle::write_metadata(&metadata)?;
 
     let policy_engine = Arc::new(PolicyEngine::load());
     let policy_count = policy_engine.policies().len();
@@ -121,6 +128,7 @@ pub async fn start_proxy(
         .build();
     let shared_https: Arc<HttpsClient> =
         Arc::new(Client::builder(TokioExecutor::new()).build(https_connector));
+    let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<String>(4);
     let runtime = ProxyRuntime {
         wisp_pattern,
         project_scope,
@@ -128,10 +136,26 @@ pub async fn start_proxy(
         https_client: shared_https,
         policy_engine,
         management_token,
+        shutdown_tx,
+        proxy_port: actual_port,
+        metadata: metadata.clone(),
     };
 
     loop {
-        let (stream, remote_addr) = listener.accept().await?;
+        let accepted = tokio::select! {
+            accepted = listener.accept() => accepted?,
+            _ = tokio::signal::ctrl_c() => {
+                lifecycle::cleanup_metadata(&metadata.instance_id, "ctrl-c signal")?;
+                return Ok(StartProxyOutcome::Stopped { port: actual_port });
+            }
+            reason = shutdown_rx.recv() => {
+                let reason = reason.unwrap_or_else(|_| "shutdown requested".to_string());
+                lifecycle::cleanup_metadata(&metadata.instance_id, &reason)?;
+                return Ok(StartProxyOutcome::Stopped { port: actual_port });
+            }
+        };
+
+        let (stream, remote_addr) = accepted;
         let runtime = runtime.clone();
 
         let io = hyper_util::rt::TokioIo::new(stream);
@@ -172,14 +196,36 @@ async fn handle_request(
                 &serde_json::json!({"error": "missing or invalid management token"}),
             ));
         }
+        if method == Method::POST && uri.path() == "/api/shutdown" {
+            lifecycle::record_event(
+                "shutdown_requested",
+                "management API requested shutdown",
+                Some(&runtime.metadata),
+                ProxyState::Running,
+            );
+            let _ = runtime
+                .shutdown_tx
+                .send("management API shutdown".to_string());
+            return Ok(json_response(
+                StatusCode::OK,
+                &serde_json::json!({"stopping": true}),
+            ));
+        }
         return Ok(handle_management_api(&method, &uri, &headers).await);
     }
 
     if method == Method::CONNECT {
-        return handle_connect(req).await;
+        return handle_connect(req, runtime.proxy_port, &runtime).await;
     }
 
     if let Some(target_url) = headers.get("x-target-url").and_then(|v| v.to_str().ok()) {
+        if target_points_to_proxy(target_url, runtime.proxy_port) {
+            return Ok(reject_self_target(
+                "reverse proxy target",
+                target_url,
+                &runtime,
+            ));
+        }
         return Ok(handle_reverse_proxy(
             req,
             target_url,
@@ -262,6 +308,13 @@ async fn handle_request(
     set_content_length(&mut new_headers, new_body.len());
 
     let mut target_uri = build_target_uri(&parts.uri, &headers);
+    if target_points_to_proxy(&target_uri, runtime.proxy_port) {
+        return Ok(reject_self_target(
+            "forward proxy target",
+            &target_uri,
+            &runtime,
+        ));
+    }
     target_uri = match replace_tokens_in_uri(
         &target_uri,
         vault.as_ref(),
@@ -535,7 +588,11 @@ async fn handle_reverse_proxy(
 /// This is a blind tunnel -- wisp token replacement is not possible inside the encrypted
 /// stream. For wisp token support over HTTPS, use the reverse proxy mode (X-Target-Url)
 /// or configure the agent to send requests as plain HTTP to the proxy which forwards via HTTPS.
-async fn handle_connect(req: Request<Incoming>) -> Result<Response<Full<Bytes>>, hyper::Error> {
+async fn handle_connect(
+    req: Request<Incoming>,
+    proxy_port: u16,
+    runtime: &ProxyRuntime,
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let authority = req
         .uri()
         .authority()
@@ -555,6 +612,10 @@ async fn handle_connect(req: Request<Incoming>) -> Result<Response<Full<Bytes>>,
             StatusCode::BAD_REQUEST,
             "CONNECT: missing target authority",
         ));
+    }
+
+    if authority_points_to_proxy(&authority, Some(443), proxy_port) {
+        return Ok(reject_self_target("CONNECT target", &authority, runtime));
     }
 
     let host_port = if authority.contains(':') {
@@ -594,68 +655,6 @@ async fn handle_connect(req: Request<Incoming>) -> Result<Response<Full<Bytes>>,
         .expect("static response"))
 }
 
-fn replace_tokens_in_uri(
-    uri: &str,
-    vault: Option<&Vault>,
-    wisp_pattern: &Regex,
-    context: &TokenRequestContext<'_>,
-    used_credentials: &mut Vec<(String, String)>,
-) -> ProxyActionResult<String> {
-    if !wisp_pattern.is_match(uri) {
-        return Ok(uri.to_string());
-    }
-    inject_tokens_in_value(uri, vault, wisp_pattern, context, used_credentials)
-}
-
-/// Checks if a credential's project matches the active project scope.
-/// Returns `Some(reason)` with the denial reason if the credential is out of scope,
-/// or `None` if access is allowed.
-fn check_project_scope(
-    vault: &Vault,
-    cred: &crate::core::Credential,
-    project_scope: &Option<String>,
-) -> Option<String> {
-    let active_project = project_scope.as_ref()?;
-    let partition_id = cred.partition_id.as_ref()?;
-    let cred_project = vault
-        .get_partition_project_name(partition_id)
-        .ok()
-        .flatten()?;
-    if cred_project != *active_project {
-        Some(format!(
-            "credential '{}' belongs to project '{}', not active project '{}'",
-            cred.name, cred_project, active_project
-        ))
-    } else {
-        None
-    }
-}
-
-fn inject_credential(
-    credential_type: &CredentialType,
-    real_value: &str,
-    original_header_value: &str,
-    token: &str,
-) -> String {
-    match credential_type {
-        CredentialType::BearerToken
-        | CredentialType::ApiKey
-        | CredentialType::CustomHeader { .. }
-        | CredentialType::QueryParam { .. } => original_header_value.replace(token, real_value),
-        CredentialType::BasicAuth => {
-            let encoded = BASE64.encode(real_value.as_bytes());
-            original_header_value.replace(token, &format!("Basic {}", encoded))
-        }
-    }
-}
-
-fn check_host_restriction(allowed_hosts: &[String], target_host: &str) -> bool {
-    allowed_hosts.is_empty()
-        || allowed_hosts
-            .iter()
-            .any(|pattern| glob_match::glob_match(pattern, target_host))
-}
-
 fn extract_target_host(uri: &Uri, headers: &hyper::HeaderMap) -> String {
     if let Some(host) = uri.host() {
         return host.to_string();
@@ -679,27 +678,6 @@ fn build_target_uri(uri: &Uri, headers: &hyper::HeaderMap) -> String {
     format!("http://{}{}", host, uri)
 }
 
-fn query_param(uri: &Uri, key: &str) -> Option<String> {
-    uri.query()?.split('&').find_map(|pair| {
-        let mut split = pair.splitn(2, '=');
-        let param_key = split.next()?;
-        let param_value = split.next().unwrap_or("");
-        if param_key == key {
-            Some(
-                urlencoding::decode(param_value)
-                    .map(|value| value.into_owned())
-                    .unwrap_or_else(|_| param_value.to_string()),
-            )
-        } else {
-            None
-        }
-    })
-}
-
-fn requested_project(uri: &Uri) -> String {
-    query_param(uri, "project").unwrap_or_else(core::resolve_active_project)
-}
-
 fn cors_preflight() -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
@@ -710,7 +688,7 @@ fn cors_preflight() -> Response<Full<Bytes>> {
         )
         .header(
             "access-control-allow-headers",
-            "content-type, authorization",
+            "content-type, authorization, x-wispkey-management-token",
         )
         .header("access-control-max-age", "86400")
         .body(Full::new(Bytes::new()))
@@ -719,7 +697,7 @@ fn cors_preflight() -> Response<Full<Bytes>> {
 
 fn management_request_authorized(headers: &hyper::HeaderMap, expected_token: &str) -> bool {
     let header_token = headers
-        .get("x-wispkey-management-token")
+        .get(lifecycle::MANAGEMENT_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok());
     if header_token == Some(expected_token) {
         return true;
@@ -732,222 +710,18 @@ fn management_request_authorized(headers: &hyper::HeaderMap, expected_token: &st
         == Some(expected_token)
 }
 
-struct EnvCredentialResolution {
-    name: String,
-    env_key: String,
-    value: String,
-}
-
-struct TokenRequestContext<'a> {
-    target_host: &'a str,
-    target_path: &'a str,
-    http_method: &'a str,
-    project_scope: &'a Option<String>,
-    policy_engine: &'a PolicyEngine,
-}
-
-struct ResolvedToken {
-    credential_name: String,
-    token: String,
-    credential_type: CredentialType,
-    value: String,
-}
-
-fn inject_tokens_in_value(
-    value: &str,
-    vault: Option<&Vault>,
-    wisp_pattern: &Regex,
-    context: &TokenRequestContext<'_>,
-    used_credentials: &mut Vec<(String, String)>,
-) -> ProxyActionResult<String> {
-    if !wisp_pattern.is_match(value) {
-        return Ok(value.to_string());
-    }
-
-    let tokens: Vec<String> = wisp_pattern
-        .find_iter(value)
-        .map(|token_match| token_match.as_str().to_string())
-        .collect();
-    let mut replaced = value.to_string();
-
-    for token in tokens {
-        let resolved = resolve_token_for_request(vault, &token, context)?;
-        replaced = inject_credential(
-            &resolved.credential_type,
-            &resolved.value,
-            &replaced,
-            &resolved.token,
-        );
-        used_credentials.push((resolved.credential_name, resolved.token));
-    }
-
-    Ok(replaced)
-}
-
-fn resolve_token_for_request(
-    vault: Option<&Vault>,
-    token: &str,
-    context: &TokenRequestContext<'_>,
-) -> ProxyActionResult<ResolvedToken> {
-    let Some(vault) = vault else {
-        return resolve_env_token_for_request(None, token, context);
-    };
-
-    match vault.lookup_by_wisp_token(token) {
-        Ok((cred, real_value)) => {
-            if let Some(reason) = check_project_scope(vault, &cred, context.project_scope) {
-                audit_denial(
-                    vault,
-                    "CredentialDenied",
-                    Some(&cred.name),
-                    token,
-                    context,
-                    &reason,
-                );
-                return Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)));
-            }
-
-            if !check_host_restriction(&cred.hosts, context.target_host) {
-                let reason = format!(
-                    "host '{}' not allowed for credential '{}'",
-                    context.target_host, cred.name
-                );
-                audit_denial(
-                    vault,
-                    "CredentialDenied",
-                    Some(&cred.name),
-                    token,
-                    context,
-                    &reason,
-                );
-                return Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)));
-            }
-
-            if let Some(denial) = context.policy_engine.evaluate(
-                &cred.name,
-                None,
-                context.target_host,
-                context.target_path,
-                context.http_method,
-            ) {
-                audit_denial(
-                    vault,
-                    "PolicyDenied",
-                    Some(&cred.name),
-                    token,
-                    context,
-                    &denial.reason,
-                );
-                return Err(Box::new(error_response(
-                    StatusCode::FORBIDDEN,
-                    &denial.reason,
-                )));
-            }
-
-            Ok(ResolvedToken {
-                credential_name: cred.name,
-                token: token.to_string(),
-                credential_type: cred.credential_type,
-                value: real_value,
-            })
-        }
-        Err(_) => {
-            if let Ok(resolved) = resolve_env_token_for_request(Some(vault), token, context) {
-                return Ok(resolved);
-            }
-
-            let reason = format!("wisp token '{}' was not found in the active vault", token);
-            audit_denial(vault, "CredentialDenied", None, token, context, &reason);
-            Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)))
-        }
-    }
-}
-
-fn resolve_env_token_for_request(
-    vault: Option<&Vault>,
-    token: &str,
-    context: &TokenRequestContext<'_>,
-) -> ProxyActionResult<ResolvedToken> {
-    let Some(env_credential) = try_env_sideload(token) else {
-        let reason = if vault.is_some() {
-            format!("wisp token '{}' was not found in the active vault", token)
-        } else {
-            format!(
-                "wisp token '{}' requires an unlocked vault or matching WISPKEY_SIDELOAD_* env var",
-                token
-            )
-        };
-        return Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)));
-    };
-
-    if let Some(denial) = context.policy_engine.evaluate(
-        &env_credential.name,
-        None,
-        context.target_host,
-        context.target_path,
-        context.http_method,
-    ) {
-        return Err(Box::new(error_response(
-            StatusCode::FORBIDDEN,
-            &denial.reason,
-        )));
-    }
-
-    if let Some(vault) = vault {
-        audit::log_event(
-            vault.db(),
-            "SideloadUsed",
-            Some(&env_credential.env_key),
-            Some(token),
-            Some(context.target_host),
-            Some(context.target_path),
-            Some(context.http_method),
-            None,
-            false,
-            Some("used env sideload credential"),
-            context.project_scope.as_deref(),
-        );
-    }
-
-    Ok(ResolvedToken {
-        credential_name: env_credential.env_key,
-        token: token.to_string(),
-        credential_type: CredentialType::BearerToken,
-        value: env_credential.value,
-    })
-}
-
-fn audit_denial(
-    vault: &Vault,
-    event_type: &str,
-    credential_name: Option<&str>,
-    token: &str,
-    context: &TokenRequestContext<'_>,
-    reason: &str,
-) {
-    audit::log_event(
-        vault.db(),
-        event_type,
-        credential_name,
-        Some(token),
-        Some(context.target_host),
-        Some(context.target_path),
-        Some(context.http_method),
-        None,
-        true,
-        Some(reason),
-        context.project_scope.as_deref(),
+fn reject_self_target(kind: &str, target: &str, runtime: &ProxyRuntime) -> Response<Full<Bytes>> {
+    let reason = format!("blocked self-targeted proxy request ({kind}: {target})");
+    lifecycle::record_event(
+        "self_target_blocked",
+        &reason,
+        Some(&runtime.metadata),
+        ProxyState::Running,
     );
-}
-
-/// Attempts to find a sideloaded credential value from environment variables.
-/// Supports deterministic MCP sideload tokens (`wk_env_<slug>`).
-fn try_env_sideload(token: &str) -> Option<EnvCredentialResolution> {
-    crate::env_sideload::value_for_token(token).map(|(credential, value)| EnvCredentialResolution {
-        name: credential.name,
-        env_key: credential.env_key,
-        value,
-    })
+    error_response(
+        StatusCode::from_u16(508).expect("508 is a valid status"),
+        &reason,
+    )
 }
 
 fn error_response(status: StatusCode, message: &str) -> Response<Full<Bytes>> {
@@ -977,451 +751,4 @@ fn set_content_length(headers: &mut hyper::HeaderMap, body_len: usize) {
     let value = hyper::header::HeaderValue::from_str(&body_len.to_string())
         .expect("usize content length must be a valid header value");
     headers.insert(hyper::header::CONTENT_LENGTH, value);
-}
-
-async fn handle_management_api(
-    method: &hyper::Method,
-    uri: &Uri,
-    _headers: &hyper::HeaderMap,
-) -> Response<Full<Bytes>> {
-    let path = uri.path();
-
-    let vault = match Vault::open_with_session() {
-        Ok(v) => v,
-        Err(_) => {
-            return json_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                &serde_json::json!({"error": "vault locked"}),
-            );
-        }
-    };
-
-    match (method.as_str(), path) {
-        ("GET", "/api/status") => {
-            let active_project = core::resolve_active_project();
-            let requested = requested_project(uri);
-            let count = if requested == "*" {
-                vault.credential_count().unwrap_or(0)
-            } else {
-                vault
-                    .list_credentials_in_project(&requested)
-                    .map(|credentials| credentials.len())
-                    .unwrap_or(0)
-            };
-            let created = vault
-                .vault_created_at()
-                .unwrap_or_else(|_| "unknown".to_string());
-
-            let proxy_info = Vault::vault_dir().join("proxy.json");
-            let proxy_port: Option<u64> = std::fs::read_to_string(&proxy_info)
-                .ok()
-                .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
-                .and_then(|v| v.get("port").and_then(|p| p.as_u64()));
-
-            json_response(
-                StatusCode::OK,
-                &serde_json::json!({
-                    "vault_path": Vault::vault_dir().to_string_lossy(),
-                    "created_at": created,
-                    "credential_count": count,
-                    "session_active": true,
-                    "active_project": active_project,
-                    "project": requested,
-                    "proxy_running": true,
-                    "proxy_port": proxy_port,
-                }),
-            )
-        }
-        ("GET", "/api/credentials") => match if requested_project(uri) == "*" {
-            vault.list_credentials()
-        } else {
-            vault.list_credentials_in_project(&requested_project(uri))
-        } {
-            Ok(creds) => {
-                let list: Vec<serde_json::Value> = creds.iter().map(credential_to_json).collect();
-                json_response(
-                    StatusCode::OK,
-                    &serde_json::json!({
-                        "project": requested_project(uri),
-                        "credentials": list
-                    }),
-                )
-            }
-            Err(e) => json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &serde_json::json!({"error": e.to_string()}),
-            ),
-        },
-        ("GET", path) if path.starts_with("/api/credentials/") => {
-            let name = &path["/api/credentials/".len()..];
-            match vault.get_credential(name) {
-                Ok(cred) => json_response(StatusCode::OK, &credential_to_json(&cred)),
-                Err(_) => json_response(
-                    StatusCode::NOT_FOUND,
-                    &serde_json::json!({"error": "credential not found"}),
-                ),
-            }
-        }
-        ("GET", "/api/partitions") => match if requested_project(uri) == "*" {
-            vault.list_partitions()
-        } else {
-            vault.list_partitions_in_project(&requested_project(uri))
-        } {
-            Ok(partitions) => {
-                let list: Vec<serde_json::Value> = partitions
-                    .iter()
-                    .map(|p| {
-                        let count = vault.partition_credential_count(&p.id).unwrap_or(0);
-                        serde_json::json!({
-                            "id": p.id,
-                            "name": p.name,
-                            "description": p.description,
-                            "project_id": p.project_id,
-                            "credential_count": count,
-                            "created_at": p.created_at.to_rfc3339(),
-                            "updated_at": p.updated_at.to_rfc3339(),
-                        })
-                    })
-                    .collect();
-                json_response(
-                    StatusCode::OK,
-                    &serde_json::json!({
-                        "project": requested_project(uri),
-                        "partitions": list
-                    }),
-                )
-            }
-            Err(e) => json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &serde_json::json!({"error": e.to_string()}),
-            ),
-        },
-        ("GET", path) if path.starts_with("/api/partitions/") && path.ends_with("/credentials") => {
-            let segment = &path["/api/partitions/".len()..path.len() - "/credentials".len()];
-            let project = requested_project(uri);
-            match vault.list_credentials_in_partition_for_project(&project, segment) {
-                Ok(creds) => {
-                    let list: Vec<serde_json::Value> =
-                        creds.iter().map(credential_to_json).collect();
-                    json_response(
-                        StatusCode::OK,
-                        &serde_json::json!({
-                            "project": project,
-                            "partition": segment,
-                            "credentials": list
-                        }),
-                    )
-                }
-                Err(e) => json_response(
-                    StatusCode::NOT_FOUND,
-                    &serde_json::json!({"error": e.to_string()}),
-                ),
-            }
-        }
-        ("GET", path) if path.starts_with("/api/partitions/") => {
-            let name = &path["/api/partitions/".len()..];
-            let project = requested_project(uri);
-            match vault.get_partition_in_project(&project, name) {
-                Ok(p) => {
-                    let count = vault.partition_credential_count(&p.id).unwrap_or(0);
-                    json_response(
-                        StatusCode::OK,
-                        &serde_json::json!({
-                            "id": p.id,
-                            "name": p.name,
-                            "description": p.description,
-                            "project_id": p.project_id,
-                            "credential_count": count,
-                            "created_at": p.created_at.to_rfc3339(),
-                            "updated_at": p.updated_at.to_rfc3339(),
-                        }),
-                    )
-                }
-                Err(_) => json_response(
-                    StatusCode::NOT_FOUND,
-                    &serde_json::json!({"error": "partition not found"}),
-                ),
-            }
-        }
-        ("DELETE", path) if path.starts_with("/api/partitions/") => {
-            let name = &path["/api/partitions/".len()..];
-            let project = requested_project(uri);
-            match vault.delete_partition_in_project(&project, name) {
-                Ok(()) => {
-                    audit::log_event(
-                        vault.db(),
-                        "PartitionDeleted",
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        false,
-                        None,
-                        None,
-                    );
-                    json_response(StatusCode::OK, &serde_json::json!({"deleted": name}))
-                }
-                Err(e) => json_response(
-                    StatusCode::BAD_REQUEST,
-                    &serde_json::json!({"error": e.to_string()}),
-                ),
-            }
-        }
-        ("DELETE", path) if path.starts_with("/api/credentials/") => {
-            let name = &path["/api/credentials/".len()..];
-            match vault.remove_credential(name) {
-                Ok(()) => {
-                    audit::log_event(
-                        vault.db(),
-                        "CredentialRemoved",
-                        Some(name),
-                        None,
-                        None,
-                        None,
-                        None,
-                        None,
-                        false,
-                        None,
-                        None,
-                    );
-                    json_response(StatusCode::OK, &serde_json::json!({"deleted": name}))
-                }
-                Err(e) => json_response(
-                    StatusCode::NOT_FOUND,
-                    &serde_json::json!({"error": e.to_string()}),
-                ),
-            }
-        }
-        ("GET", "/api/projects") => match vault.list_projects() {
-            Ok(projects) => {
-                let active = core::resolve_active_project();
-                let list: Vec<serde_json::Value> = projects
-                    .iter()
-                    .map(|p| {
-                        let count = vault.project_partition_count(&p.id).unwrap_or(0);
-                        serde_json::json!({
-                            "id": p.id,
-                            "name": p.name,
-                            "description": p.description,
-                            "partition_count": count,
-                            "active": p.name == active,
-                            "created_at": p.created_at.to_rfc3339(),
-                            "updated_at": p.updated_at.to_rfc3339(),
-                        })
-                    })
-                    .collect();
-                json_response(StatusCode::OK, &serde_json::json!({"projects": list}))
-            }
-            Err(e) => json_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &serde_json::json!({"error": e.to_string()}),
-            ),
-        },
-        ("GET", path) if path.starts_with("/api/projects/") => {
-            let name = &path["/api/projects/".len()..];
-            match vault.get_project(name) {
-                Ok(p) => {
-                    let count = vault.project_partition_count(&p.id).unwrap_or(0);
-                    let active = core::resolve_active_project();
-                    json_response(
-                        StatusCode::OK,
-                        &serde_json::json!({
-                            "id": p.id,
-                            "name": p.name,
-                            "description": p.description,
-                            "partition_count": count,
-                            "active": p.name == active,
-                            "created_at": p.created_at.to_rfc3339(),
-                            "updated_at": p.updated_at.to_rfc3339(),
-                        }),
-                    )
-                }
-                Err(_) => json_response(
-                    StatusCode::NOT_FOUND,
-                    &serde_json::json!({"error": "project not found"}),
-                ),
-            }
-        }
-        ("GET", "/api/logs") => {
-            let query = uri.query().unwrap_or("");
-            let params: Vec<(&str, &str)> = query
-                .split('&')
-                .filter_map(|p| {
-                    let mut split = p.splitn(2, '=');
-                    Some((split.next()?, split.next().unwrap_or("")))
-                })
-                .collect();
-
-            let last: usize = params
-                .iter()
-                .find(|(k, _)| *k == "last")
-                .and_then(|(_, v)| v.parse().ok())
-                .unwrap_or(50);
-            let credential = params
-                .iter()
-                .find(|(k, _)| *k == "credential")
-                .map(|(_, v)| *v);
-            let since = params.iter().find(|(k, _)| *k == "since").map(|(_, v)| *v);
-
-            let entries = audit::query_log(vault.db(), last, credential, since);
-            let list: Vec<serde_json::Value> = entries
-                .iter()
-                .map(|e| {
-                    serde_json::json!({
-                        "id": e.id,
-                        "timestamp": e.timestamp,
-                        "event_type": e.event_type,
-                        "credential_name": e.credential_name,
-                        "wisp_token": e.wisp_token,
-                        "target_host": e.target_host,
-                        "target_path": e.target_path,
-                        "http_method": e.http_method,
-                        "response_status": e.response_status,
-                        "denied": e.denied,
-                        "deny_reason": e.deny_reason,
-                    })
-                })
-                .collect();
-            json_response(StatusCode::OK, &serde_json::json!({"entries": list}))
-        }
-        _ => json_response(
-            StatusCode::NOT_FOUND,
-            &serde_json::json!({"error": "not found"}),
-        ),
-    }
-}
-
-fn credential_to_json(c: &crate::core::Credential) -> serde_json::Value {
-    serde_json::json!({
-        "name": c.name,
-        "type": c.credential_type.display_name(),
-        "wisp_token": c.wisp_token,
-        "hosts": c.hosts,
-        "tags": c.tags,
-        "partition_id": c.partition_id,
-        "created_at": c.created_at.to_rfc3339(),
-        "updated_at": c.updated_at.to_rfc3339(),
-        "last_used_at": c.last_used_at.map(|d| d.to_rfc3339()),
-    })
-}
-
-fn json_response(status: StatusCode, body: &serde_json::Value) -> Response<Full<Bytes>> {
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .header("access-control-allow-origin", "http://localhost")
-        .header("access-control-allow-methods", "GET, POST, DELETE, OPTIONS")
-        .header(
-            "access-control-allow-headers",
-            "content-type, authorization",
-        )
-        .body(Full::new(Bytes::from(body.to_string())))
-        .expect("json response must build")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn inject_bearer_replaces_token() {
-        let result = inject_credential(
-            &CredentialType::BearerToken,
-            "real-secret",
-            "Bearer wk_test_abc123",
-            "wk_test_abc123",
-        );
-        assert_eq!(result, "Bearer real-secret");
-    }
-
-    #[test]
-    fn inject_api_key_replaces_token() {
-        let result = inject_credential(
-            &CredentialType::ApiKey,
-            "real-key",
-            "wk_api_xyz",
-            "wk_api_xyz",
-        );
-        assert_eq!(result, "real-key");
-    }
-
-    #[test]
-    fn inject_basic_auth_base64_encodes() {
-        let result = inject_credential(
-            &CredentialType::BasicAuth,
-            "user:pass",
-            "wk_basic_abc",
-            "wk_basic_abc",
-        );
-        let expected = format!("Basic {}", BASE64.encode("user:pass".as_bytes()));
-        assert_eq!(result, expected);
-    }
-
-    #[test]
-    fn inject_custom_header_replaces() {
-        let cred_type = CredentialType::CustomHeader {
-            header_name: "X-Custom".to_string(),
-        };
-        let result = inject_credential(&cred_type, "secret", "wk_custom_abc", "wk_custom_abc");
-        assert_eq!(result, "secret");
-    }
-
-    #[test]
-    fn host_restriction_empty_allows_all() {
-        assert!(check_host_restriction(&[], "anything.com"));
-    }
-
-    #[test]
-    fn host_restriction_exact_match() {
-        let hosts = vec!["api.example.com".to_string()];
-        assert!(check_host_restriction(&hosts, "api.example.com"));
-        assert!(!check_host_restriction(&hosts, "evil.com"));
-    }
-
-    #[test]
-    fn host_restriction_glob_match() {
-        let hosts = vec!["*.example.com".to_string()];
-        assert!(check_host_restriction(&hosts, "api.example.com"));
-        assert!(!check_host_restriction(&hosts, "example.com"));
-    }
-
-    #[test]
-    fn build_target_uri_with_scheme() {
-        let headers = hyper::HeaderMap::new();
-        let uri: Uri = "http://example.com/path".parse().unwrap();
-        assert_eq!(build_target_uri(&uri, &headers), "http://example.com/path");
-    }
-
-    #[test]
-    fn build_target_uri_without_scheme() {
-        let mut headers = hyper::HeaderMap::new();
-        headers.insert(
-            "host",
-            hyper::header::HeaderValue::from_static("example.com"),
-        );
-        let uri: Uri = "/path".parse().unwrap();
-        assert_eq!(build_target_uri(&uri, &headers), "http://example.com/path");
-    }
-
-    #[test]
-    fn build_target_uri_without_scheme_no_host() {
-        let headers = hyper::HeaderMap::new();
-        let uri: Uri = "/path".parse().unwrap();
-        assert_eq!(build_target_uri(&uri, &headers), "http://localhost/path");
-    }
-
-    #[test]
-    fn error_response_has_json_body() {
-        let resp = error_response(StatusCode::FORBIDDEN, "denied");
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
-        let content_type = resp
-            .headers()
-            .get("content-type")
-            .unwrap()
-            .to_str()
-            .unwrap();
-        assert_eq!(content_type, "application/json");
-    }
 }

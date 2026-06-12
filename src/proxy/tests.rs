@@ -1,0 +1,155 @@
+use super::tokens::{check_host_restriction, inject_credential};
+use super::*;
+use crate::core::CredentialType;
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+
+#[test]
+fn inject_bearer_replaces_token() {
+    let result = inject_credential(
+        &CredentialType::BearerToken,
+        "real-secret",
+        "Bearer wk_test_abc123",
+        "wk_test_abc123",
+    );
+    assert_eq!(result, "Bearer real-secret");
+}
+
+#[test]
+fn inject_api_key_replaces_token() {
+    let result = inject_credential(
+        &CredentialType::ApiKey,
+        "real-key",
+        "wk_api_xyz",
+        "wk_api_xyz",
+    );
+    assert_eq!(result, "real-key");
+}
+
+#[test]
+fn inject_basic_auth_base64_encodes() {
+    let result = inject_credential(
+        &CredentialType::BasicAuth,
+        "user:pass",
+        "wk_basic_abc",
+        "wk_basic_abc",
+    );
+    let expected = format!("Basic {}", BASE64.encode("user:pass".as_bytes()));
+    assert_eq!(result, expected);
+}
+
+#[test]
+fn inject_custom_header_replaces() {
+    let cred_type = CredentialType::CustomHeader {
+        header_name: "X-Custom".to_string(),
+    };
+    let result = inject_credential(&cred_type, "secret", "wk_custom_abc", "wk_custom_abc");
+    assert_eq!(result, "secret");
+}
+
+#[test]
+fn host_restriction_empty_allows_all() {
+    assert!(check_host_restriction(&[], "anything.com"));
+}
+
+#[test]
+fn host_restriction_exact_match() {
+    let hosts = vec!["api.example.com".to_string()];
+    assert!(check_host_restriction(&hosts, "api.example.com"));
+    assert!(!check_host_restriction(&hosts, "evil.com"));
+}
+
+#[test]
+fn host_restriction_glob_match() {
+    let hosts = vec!["*.example.com".to_string()];
+    assert!(check_host_restriction(&hosts, "api.example.com"));
+    assert!(!check_host_restriction(&hosts, "example.com"));
+}
+
+#[test]
+fn build_target_uri_with_scheme() {
+    let headers = hyper::HeaderMap::new();
+    let uri: Uri = "http://example.com/path".parse().unwrap();
+    assert_eq!(build_target_uri(&uri, &headers), "http://example.com/path");
+}
+
+#[test]
+fn build_target_uri_without_scheme() {
+    let mut headers = hyper::HeaderMap::new();
+    headers.insert(
+        "host",
+        hyper::header::HeaderValue::from_static("example.com"),
+    );
+    let uri: Uri = "/path".parse().unwrap();
+    assert_eq!(build_target_uri(&uri, &headers), "http://example.com/path");
+}
+
+#[test]
+fn build_target_uri_without_scheme_no_host() {
+    let headers = hyper::HeaderMap::new();
+    let uri: Uri = "/path".parse().unwrap();
+    assert_eq!(build_target_uri(&uri, &headers), "http://localhost/path");
+}
+
+#[test]
+fn error_response_has_json_body() {
+    let resp = error_response(StatusCode::FORBIDDEN, "denied");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .unwrap()
+        .to_str()
+        .unwrap();
+    assert_eq!(content_type, "application/json");
+}
+
+#[test]
+fn self_target_detects_loopback_forward_urls() {
+    assert!(target::target_points_to_proxy(
+        "http://localhost:7700/v1",
+        7700
+    ));
+    assert!(target::target_points_to_proxy(
+        "http://127.0.0.1:7700/v1",
+        7700
+    ));
+    assert!(target::target_points_to_proxy("http://[::1]:7700/v1", 7700));
+    assert!(!target::target_points_to_proxy(
+        "http://localhost:7701/v1",
+        7700
+    ));
+    assert!(!target::target_points_to_proxy(
+        "https://api.example.com/v1",
+        7700
+    ));
+}
+
+#[test]
+fn self_target_detects_connect_authorities() {
+    assert!(target::authority_points_to_proxy(
+        "localhost:7700",
+        Some(443),
+        7700
+    ));
+    assert!(target::authority_points_to_proxy(
+        "127.0.0.1:7700",
+        Some(443),
+        7700
+    ));
+    assert!(target::authority_points_to_proxy(
+        "[::1]:7700",
+        Some(443),
+        7700
+    ));
+    assert!(!target::authority_points_to_proxy(
+        "localhost:443",
+        Some(443),
+        7700
+    ));
+    assert!(!target::authority_points_to_proxy(
+        "api.example.com:443",
+        Some(443),
+        7700
+    ));
+}
