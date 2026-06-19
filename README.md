@@ -2,7 +2,7 @@
 
 **Your AI agents work. Your secrets stay home.**
 
-Local-first, open-source credential vault that lets AI agents authenticate and use API keys without ever seeing the plaintext secret. Uses the "wisp token" pattern: agents receive opaque placeholders, a local proxy swaps them for real credentials at the network boundary.
+Local-first, open-source credential firewall for AI agents that lets agents authenticate and use API keys without ever seeing the plaintext secret. Uses the "wisp token" pattern: agents receive opaque placeholders, a local proxy swaps them for real credentials at the network boundary.
 
 ## Quick Start
 
@@ -57,9 +57,10 @@ Four commands from zero to protected. The AI process never touches your real sec
 
 ### Security
 - **Policy engine** -- TOML-defined rules with per-credential, per-host, per-path, per-method restrictions, deny rules, time windows, and sliding-window rate limiting
-- **Audit log** -- Every credential use and denial logged with timestamp, target host/path, method, and status; queryable by credential and date range
+- **Audit log** -- Every credential use and denial logged with timestamp, target host/path, method, and status; vault-backed events are queryable by credential and date range, while vault-less env sideload use writes a local fallback JSONL audit file
 - **Host restrictions** -- Glob-pattern allowlists per credential (e.g. `api.openai.com/*`)
 - **Cross-OS local file protection** -- Vault directories and sensitive local files are owner-only on Linux/macOS and restricted with Windows ACLs on Windows
+- **Threat model** -- The current boundary and intentional limits are documented in [`_docs/threat-model.md`](_docs/threat-model.md)
 
 ### Cloud (groundwork -- auth and encrypted sync/share APIs)
 - **Browser-based Clerk login** -- `wispkey cloud login` opens browser, localhost callback captures session token
@@ -150,6 +151,16 @@ curl -x http://localhost:7700 \
   -H "Authorization: Bearer wk_openai_prod_a7x9m2k4" \
   -d '{"model": "gpt-4", "messages": [...]}'
 ```
+
+## How WispKey Compares
+
+WispKey is not a traditional secrets manager. Traditional vaults are built to deliver plaintext secrets to trusted applications; WispKey is built for agents that should never hold plaintext secrets at all.
+
+- **Versus agent credential proxies** -- WispKey is a local Rust binary with a policy engine, audit trail, five injection modes, first-class MCP tooling, and env sideload support for locked-vault agent workflows.
+- **Versus enterprise access platforms** -- WispKey does not require a cloud account, sales motion, or hosted control plane for local use. Secrets can stay on the user's machine.
+- **Versus `.env` files** -- `.env` gives prompt-injectable processes direct access to plaintext. WispKey imports secrets once and gives agents scoped wisp tokens instead.
+
+Security claims are intentionally scoped: CONNECT is a blind tunnel, localhost clients are trusted by design, text-body substitution is limited to text-like content types, and the current unlocked session boundary is the OS user account. See [`_docs/threat-model.md`](_docs/threat-model.md) for the full internal threat model.
 
 ## Policy Engine
 

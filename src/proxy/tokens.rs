@@ -1,6 +1,8 @@
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use hyper::StatusCode;
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::{Response, StatusCode};
 use regex::Regex;
 
 use crate::audit;
@@ -8,6 +10,9 @@ use crate::core::{CredentialType, Vault};
 use crate::policy::PolicyEngine;
 
 use super::{ProxyActionResult, error_response};
+
+const WISP_TOKEN_PREFIX: &str = "wk_";
+const VAULT_TOKEN_RANDOM_LEN: usize = 8;
 
 pub(super) fn replace_tokens_in_uri(
     uri: &str,
@@ -46,20 +51,26 @@ fn check_project_scope(
     }
 }
 
+#[cfg(test)]
 pub(super) fn inject_credential(
     credential_type: &CredentialType,
     real_value: &str,
     original_header_value: &str,
     token: &str,
 ) -> String {
+    let replacement = credential_replacement_value(credential_type, real_value);
+    original_header_value.replacen(token, &replacement, 1)
+}
+
+fn credential_replacement_value(credential_type: &CredentialType, real_value: &str) -> String {
     match credential_type {
         CredentialType::BearerToken
         | CredentialType::ApiKey
         | CredentialType::CustomHeader { .. }
-        | CredentialType::QueryParam { .. } => original_header_value.replace(token, real_value),
+        | CredentialType::QueryParam { .. } => real_value.to_string(),
         CredentialType::BasicAuth => {
             let encoded = BASE64.encode(real_value.as_bytes());
-            original_header_value.replace(token, &format!("Basic {}", encoded))
+            format!("Basic {}", encoded)
         }
     }
 }
@@ -92,6 +103,12 @@ struct ResolvedToken {
     value: String,
 }
 
+enum TokenResolution {
+    Resolved(ResolvedToken),
+    NotFound,
+    Denied(Box<Response<Full<Bytes>>>),
+}
+
 pub(super) fn inject_tokens_in_value(
     value: &str,
     vault: Option<&Vault>,
@@ -103,33 +120,126 @@ pub(super) fn inject_tokens_in_value(
         return Ok(value.to_string());
     }
 
-    let tokens: Vec<String> = wisp_pattern
-        .find_iter(value)
-        .map(|token_match| token_match.as_str().to_string())
+    let sideload_tokens: Vec<String> = crate::env_sideload::list_available()
+        .into_iter()
+        .map(|credential| credential.token)
         .collect();
-    let mut replaced = value.to_string();
+    let mut replaced = String::with_capacity(value.len());
+    let mut cursor = 0;
 
-    for token in tokens {
-        let resolved = resolve_token_for_request(vault, &token, context)?;
-        replaced = inject_credential(
-            &resolved.credential_type,
-            &resolved.value,
-            &replaced,
-            &resolved.token,
-        );
-        used_credentials.push((resolved.credential_name, resolved.token));
+    for candidate_match in wisp_pattern.find_iter(value) {
+        replaced.push_str(&value[cursor..candidate_match.start()]);
+        replace_tokens_in_candidate(
+            candidate_match.as_str(),
+            vault,
+            context,
+            used_credentials,
+            &sideload_tokens,
+            &mut replaced,
+        )?;
+        cursor = candidate_match.end();
     }
 
+    replaced.push_str(&value[cursor..]);
     Ok(replaced)
 }
 
-fn resolve_token_for_request(
+fn replace_tokens_in_candidate(
+    candidate: &str,
+    vault: Option<&Vault>,
+    context: &TokenRequestContext<'_>,
+    used_credentials: &mut Vec<(String, String)>,
+    sideload_tokens: &[String],
+    output: &mut String,
+) -> ProxyActionResult<()> {
+    let mut cursor = 0;
+
+    while cursor < candidate.len() {
+        let Some(relative_start) = candidate[cursor..].find(WISP_TOKEN_PREFIX) else {
+            output.push_str(&candidate[cursor..]);
+            break;
+        };
+        let start = cursor + relative_start;
+        output.push_str(&candidate[cursor..start]);
+
+        let token_candidate = &candidate[start..];
+        let (resolved, consumed) =
+            resolve_token_prefix_for_request(vault, token_candidate, context, sideload_tokens)?;
+        output.push_str(&credential_replacement_value(
+            &resolved.credential_type,
+            &resolved.value,
+        ));
+        used_credentials.push((resolved.credential_name, resolved.token));
+        cursor = start + consumed;
+    }
+
+    Ok(())
+}
+
+fn resolve_token_prefix_for_request(
+    vault: Option<&Vault>,
+    candidate: &str,
+    context: &TokenRequestContext<'_>,
+    sideload_tokens: &[String],
+) -> ProxyActionResult<(ResolvedToken, usize)> {
+    for prefix_len in candidate_prefix_lengths(candidate, sideload_tokens) {
+        let token = &candidate[..prefix_len];
+        match try_resolve_exact_token_for_request(vault, token, context) {
+            TokenResolution::Resolved(resolved) => return Ok((resolved, prefix_len)),
+            TokenResolution::NotFound => {}
+            TokenResolution::Denied(response) => return Err(response),
+        }
+    }
+
+    Err(missing_token_response(vault, candidate, context))
+}
+
+fn candidate_prefix_lengths(candidate: &str, sideload_tokens: &[String]) -> Vec<usize> {
+    candidate_prefix_lengths_with_sideload_tokens(
+        candidate,
+        sideload_tokens.iter().map(String::as_str),
+    )
+}
+
+pub(super) fn candidate_prefix_lengths_with_sideload_tokens<'a>(
+    candidate: &str,
+    sideload_tokens: impl IntoIterator<Item = &'a str>,
+) -> Vec<usize> {
+    let mut lengths = Vec::new();
+
+    for token in sideload_tokens {
+        if candidate.starts_with(token) {
+            lengths.push(token.len());
+        }
+    }
+
+    let bytes = candidate.as_bytes();
+    for separator in 3..bytes.len() {
+        if bytes[separator] != b'_' {
+            continue;
+        }
+        let end = separator + 1 + VAULT_TOKEN_RANDOM_LEN;
+        if end <= bytes.len()
+            && bytes[separator + 1..end]
+                .iter()
+                .all(u8::is_ascii_alphanumeric)
+        {
+            lengths.push(end);
+        }
+    }
+
+    lengths.sort_unstable_by(|left, right| right.cmp(left));
+    lengths.dedup();
+    lengths
+}
+
+fn try_resolve_exact_token_for_request(
     vault: Option<&Vault>,
     token: &str,
     context: &TokenRequestContext<'_>,
-) -> ProxyActionResult<ResolvedToken> {
+) -> TokenResolution {
     let Some(vault) = vault else {
-        return resolve_env_token_for_request(None, token, context);
+        return try_resolve_env_token_for_request(None, token, context);
     };
 
     match vault.lookup_by_wisp_token(token) {
@@ -143,7 +253,10 @@ fn resolve_token_for_request(
                     context,
                     &reason,
                 );
-                return Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)));
+                return TokenResolution::Denied(Box::new(error_response(
+                    StatusCode::FORBIDDEN,
+                    &reason,
+                )));
             }
 
             if !check_host_restriction(&cred.hosts, context.target_host) {
@@ -159,7 +272,10 @@ fn resolve_token_for_request(
                     context,
                     &reason,
                 );
-                return Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)));
+                return TokenResolution::Denied(Box::new(error_response(
+                    StatusCode::FORBIDDEN,
+                    &reason,
+                )));
             }
 
             if let Some(denial) = context.policy_engine.evaluate(
@@ -177,29 +293,57 @@ fn resolve_token_for_request(
                     context,
                     &denial.reason,
                 );
-                return Err(Box::new(error_response(
+                return TokenResolution::Denied(Box::new(error_response(
                     StatusCode::FORBIDDEN,
                     &denial.reason,
                 )));
             }
 
-            Ok(ResolvedToken {
+            TokenResolution::Resolved(ResolvedToken {
                 credential_name: cred.name,
                 token: token.to_string(),
                 credential_type: cred.credential_type,
                 value: real_value,
             })
         }
-        Err(_) => {
-            if let Ok(resolved) = resolve_env_token_for_request(Some(vault), token, context) {
-                return Ok(resolved);
-            }
+        Err(_) => try_resolve_env_token_for_request(Some(vault), token, context),
+    }
+}
 
-            let reason = format!("wisp token '{}' was not found in the active vault", token);
-            audit_denial(vault, "CredentialDenied", None, token, context, &reason);
-            Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)))
+fn try_resolve_env_token_for_request(
+    vault: Option<&Vault>,
+    token: &str,
+    context: &TokenRequestContext<'_>,
+) -> TokenResolution {
+    match resolve_env_token_for_request(vault, token, context) {
+        Ok(resolved) => TokenResolution::Resolved(resolved),
+        Err(response) => {
+            if try_env_sideload(token).is_some() {
+                TokenResolution::Denied(response)
+            } else {
+                TokenResolution::NotFound
+            }
         }
     }
+}
+
+fn missing_token_response(
+    vault: Option<&Vault>,
+    token: &str,
+    context: &TokenRequestContext<'_>,
+) -> Box<Response<Full<Bytes>>> {
+    let reason = if vault.is_some() {
+        format!("wisp token '{}' was not found in the active vault", token)
+    } else {
+        format!(
+            "wisp token '{}' requires an unlocked vault or matching WISPKEY_SIDELOAD_* env var",
+            token
+        )
+    };
+    if let Some(vault) = vault {
+        audit_denial(vault, "CredentialDenied", None, token, context, &reason);
+    }
+    Box::new(error_response(StatusCode::FORBIDDEN, &reason))
 }
 
 fn resolve_env_token_for_request(
@@ -226,6 +370,29 @@ fn resolve_env_token_for_request(
         context.target_path,
         context.http_method,
     ) {
+        if let Some(vault) = vault {
+            audit_denial(
+                vault,
+                "PolicyDenied",
+                Some(&env_credential.env_key),
+                token,
+                context,
+                &denial.reason,
+            );
+        } else {
+            audit::log_fallback_event(
+                "PolicyDenied",
+                Some(&env_credential.env_key),
+                Some(token),
+                Some(context.target_host),
+                Some(context.target_path),
+                Some(context.http_method),
+                None,
+                true,
+                Some(&denial.reason),
+                context.project_scope.as_deref(),
+            );
+        }
         return Err(Box::new(error_response(
             StatusCode::FORBIDDEN,
             &denial.reason,
@@ -244,6 +411,19 @@ fn resolve_env_token_for_request(
             None,
             false,
             Some("used env sideload credential"),
+            context.project_scope.as_deref(),
+        );
+    } else {
+        audit::log_fallback_event(
+            "SideloadUsed",
+            Some(&env_credential.env_key),
+            Some(token),
+            Some(context.target_host),
+            Some(context.target_path),
+            Some(context.http_method),
+            None,
+            false,
+            Some("used env sideload credential without unlocked vault"),
             context.project_scope.as_deref(),
         );
     }
