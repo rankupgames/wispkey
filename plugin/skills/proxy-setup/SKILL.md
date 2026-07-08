@@ -19,6 +19,15 @@ wispkey serve
 
 Default: `http://localhost:7700`. Custom port: `wispkey serve --port 8800`.
 
+For multi-instance deployments, use one or more explicit listeners:
+```bash
+wispkey serve \
+  --listen tcp://127.0.0.1:7700 \
+  --listen unix:/run/wispkey/proxy.sock
+```
+
+Unix domain socket and feature-gated Linux vsock listeners require per-request instance identity by default. TCP listeners keep the trusted-local default unless `--require-identity` is set.
+
 For sideload-only proxy use, launch with the same sideload env var that the MCP server uses:
 ```bash
 WISPKEY_SIDELOAD_OPENAI="$OPENAI_API_KEY" wispkey serve

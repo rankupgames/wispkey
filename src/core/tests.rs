@@ -554,3 +554,328 @@ fn parse_csv_works() {
     assert_eq!(parse_csv("solo"), vec!["solo"]);
     assert_eq!(parse_csv(" a , b "), vec!["a", "b"]);
 }
+
+#[test]
+fn schema_v6_to_v7_migration_adds_instance_tables_without_touching_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vault.db");
+    let db = Connection::open(&db_path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE vault_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE partitions (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(project_id, name)
+        );
+        CREATE TABLE credentials (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            credential_type TEXT NOT NULL,
+            encrypted_value TEXT NOT NULL,
+            wisp_token TEXT UNIQUE NOT NULL,
+            hosts TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_used_at TEXT,
+            partition_id TEXT REFERENCES partitions(id)
+        );
+        CREATE TABLE audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            credential_name TEXT,
+            wisp_token TEXT,
+            target_host TEXT,
+            target_path TEXT,
+            http_method TEXT,
+            response_status INTEGER,
+            denied INTEGER NOT NULL DEFAULT 0,
+            deny_reason TEXT,
+            project_name TEXT
+        );",
+    )
+    .unwrap();
+
+    let now = Utc::now().to_rfc3339();
+    db.execute(
+        "INSERT INTO vault_meta (key, value) VALUES ('version', '6')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO projects (id, name, description, created_at, updated_at) VALUES ('default', 'default', 'Default project', ?1, ?2)",
+        params![now, now],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO partitions (id, name, description, project_id, created_at, updated_at) VALUES ('personal', 'personal', '', 'default', ?1, ?2)",
+        params![now, now],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO credentials (id, name, description, credential_type, encrypted_value, wisp_token, hosts, tags, created_at, updated_at, partition_id) VALUES ('cred-1', 'kept', '', 'api_key', 'encrypted', 'wk_kept_12345678', '', '', ?1, ?2, 'personal')",
+        params![now, now],
+    )
+    .unwrap();
+
+    Vault::migrate_schema(&db).unwrap();
+
+    let version: String = db
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key = 'version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "7");
+
+    for table in ["instances", "instance_scopes", "access_requests"] {
+        let count: usize = db
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    let credential_count: usize = db
+        .query_row(
+            "SELECT COUNT(*) FROM credentials WHERE name = 'kept'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(credential_count, 1);
+}
+
+#[test]
+fn enroll_instance_creates_instance_and_scopes() {
+    let vault = test_vault("pw");
+    let enrolled = vault
+        .enroll_instance(
+            "vm-one",
+            "ephemeral worker",
+            &[
+                InstanceScopeInput::new("partition", "personal"),
+                InstanceScopeInput::new("project", "default"),
+                InstanceScopeInput::new("credential", "openai-key"),
+                InstanceScopeInput::new("tag", "company:acme"),
+            ],
+        )
+        .unwrap();
+
+    assert_eq!(enrolled.instance.name, "vm-one");
+    assert_eq!(enrolled.instance.description, "ephemeral worker");
+    assert_eq!(enrolled.secret.len(), 48);
+    assert_eq!(enrolled.instance.scopes.len(), 4);
+
+    let fetched = vault.get_instance("vm-one").unwrap();
+    assert_eq!(fetched.id, enrolled.instance.id);
+    assert!(
+        fetched
+            .scopes
+            .iter()
+            .any(|scope| { scope.scope_type == "partition" && scope.scope_value == "personal" })
+    );
+}
+
+#[test]
+fn instance_secret_verifies_and_wrong_secret_fails() {
+    let vault = test_vault("pw");
+    let enrolled = vault.enroll_instance("vm-auth", "", &[]).unwrap();
+
+    assert!(
+        vault
+            .verify_instance_secret(&enrolled.instance.id, &enrolled.secret)
+            .unwrap()
+    );
+    assert!(
+        !vault
+            .verify_instance_secret(&enrolled.instance.id, "wrong-secret")
+            .unwrap()
+    );
+
+    let fetched = vault.get_instance(&enrolled.instance.id).unwrap();
+    assert!(fetched.last_seen_at.is_some());
+}
+
+#[test]
+fn credential_in_scope_matches_each_selector_type() {
+    let vault = test_vault("pw");
+    vault.create_project("client", "").unwrap();
+    vault
+        .create_partition("infra", "", Some("default"))
+        .unwrap();
+
+    vault
+        .add_credential(
+            AddCredentialRequest::new("partition-cred", CredentialType::ApiKey, "secret")
+                .partition(Some("infra"))
+                .project(Some("default")),
+        )
+        .unwrap();
+    vault
+        .add_credential(
+            AddCredentialRequest::new("project-cred", CredentialType::ApiKey, "secret")
+                .project(Some("client")),
+        )
+        .unwrap();
+    vault
+        .add_credential(
+            AddCredentialRequest::new("credential-cred", CredentialType::ApiKey, "secret")
+                .project(Some("default")),
+        )
+        .unwrap();
+    vault
+        .add_credential(
+            AddCredentialRequest::new("tagged-cred", CredentialType::ApiKey, "secret")
+                .tags(Some("company:acme,prod"))
+                .project(Some("default")),
+        )
+        .unwrap();
+    vault
+        .add_credential(
+            AddCredentialRequest::new("outside-cred", CredentialType::ApiKey, "secret")
+                .project(Some("default")),
+        )
+        .unwrap();
+
+    let enrolled = vault
+        .enroll_instance(
+            "vm-scoped",
+            "",
+            &[
+                InstanceScopeInput::new("partition", "infra"),
+                InstanceScopeInput::new("project", "client"),
+                InstanceScopeInput::new("credential", "credential-cred"),
+                InstanceScopeInput::new("tag", "company:acme"),
+            ],
+        )
+        .unwrap();
+
+    assert!(
+        vault
+            .credential_in_scope(&enrolled.instance.id, "partition-cred")
+            .unwrap()
+    );
+    assert!(
+        vault
+            .credential_in_scope(&enrolled.instance.id, "project-cred")
+            .unwrap()
+    );
+    assert!(
+        vault
+            .credential_in_scope(&enrolled.instance.id, "credential-cred")
+            .unwrap()
+    );
+    assert!(
+        vault
+            .credential_in_scope(&enrolled.instance.id, "tagged-cred")
+            .unwrap()
+    );
+    assert!(
+        !vault
+            .credential_in_scope(&enrolled.instance.id, "outside-cred")
+            .unwrap()
+    );
+    assert!(
+        !vault
+            .credential_in_scope(&enrolled.instance.id, "missing-cred")
+            .unwrap()
+    );
+}
+
+#[test]
+fn approved_access_request_grants_scope_and_duplicate_pending_reuses() {
+    let vault = test_vault("pw");
+    vault
+        .add_credential(
+            AddCredentialRequest::new("needs-approval", CredentialType::ApiKey, "secret")
+                .project(Some("default")),
+        )
+        .unwrap();
+    let enrolled = vault.enroll_instance("vm-requester", "", &[]).unwrap();
+
+    assert!(
+        !vault
+            .credential_in_scope(&enrolled.instance.id, "needs-approval")
+            .unwrap()
+    );
+
+    let first = vault
+        .create_or_reuse_access_request(&enrolled.instance.id, "needs-approval", "deploy needs it")
+        .unwrap();
+    let second = vault
+        .create_or_reuse_access_request(&enrolled.instance.id, "needs-approval", "same request")
+        .unwrap();
+    assert_eq!(first.id, second.id);
+
+    let pending = vault
+        .list_access_requests(Some("vm-requester"), true)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+
+    let approved = vault.decide_access_request(&first.id, true).unwrap();
+    assert_eq!(approved.status, "approved");
+    assert!(approved.decided_at.is_some());
+    assert!(
+        vault
+            .credential_in_scope(&enrolled.instance.id, "needs-approval")
+            .unwrap()
+    );
+}
+
+#[test]
+fn denied_access_request_does_not_grant_scope() {
+    let vault = test_vault("pw");
+    vault
+        .add_credential(
+            AddCredentialRequest::new("denied-cred", CredentialType::ApiKey, "secret")
+                .project(Some("default")),
+        )
+        .unwrap();
+    let enrolled = vault.enroll_instance("vm-denied", "", &[]).unwrap();
+    let request = vault
+        .create_or_reuse_access_request(&enrolled.instance.id, "denied-cred", "")
+        .unwrap();
+
+    let denied = vault.decide_access_request(&request.id, false).unwrap();
+    assert_eq!(denied.status, "denied");
+    assert!(
+        !vault
+            .credential_in_scope(&enrolled.instance.id, "denied-cred")
+            .unwrap()
+    );
+}
+
+#[test]
+fn revoke_instance_flips_status_and_fails_auth() {
+    let vault = test_vault("pw");
+    let enrolled = vault.enroll_instance("vm-revoke", "", &[]).unwrap();
+
+    let revoked = vault.revoke_instance("vm-revoke").unwrap();
+    assert_eq!(revoked.status, "revoked");
+    assert!(
+        !vault
+            .verify_instance_secret(&enrolled.instance.id, &enrolled.secret)
+            .unwrap()
+    );
+}

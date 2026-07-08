@@ -41,7 +41,7 @@ printf '%s' "$SECRET_VALUE" | wispkey add "key" --type api_key --value-file -  #
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v6 automatically.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v7 automatically.
 
 ```bash
 # Create a project
@@ -69,6 +69,17 @@ wispkey serve
 wispkey serve --all-projects
 ```
 
+## Multi-Instance Access
+
+The default `wispkey serve` listener remains loopback TCP with no instance identity requirement for the original trusted-local workflow. For untrusted ephemeral VMs or worker instances, enroll an instance and use identity-required listeners such as Unix domain sockets or feature-gated Linux vsock:
+
+```bash
+wispkey instance enroll "worker-acme-001" --credential openai-key --tag company:acme
+wispkey serve --listen unix:/run/wispkey/proxy.sock
+```
+
+Instances authenticate every proxied request with `x-wispkey-instance-id` and `x-wispkey-instance-secret`. Scope checks fail closed; out-of-scope token use returns `403 out_of_scope`, queues or reuses an access request, and requires host approval with `wispkey instance approve <request-id>` before retry.
+
 ## CLI Reference
 
 | Command | Purpose |
@@ -80,13 +91,14 @@ wispkey serve --all-projects
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
 | `wispkey remove <name>` | Delete credential |
 | `wispkey rotate <name>` | Regenerate wisp token |
-| `wispkey serve [--port 7700] [--all-projects] [--daemon]` | Start proxy (HTTP + HTTPS reverse) |
+| `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start proxy; `SPEC` supports `tcp://host:port`, `unix:/path.sock`, and feature-gated `vsock://cid:port` |
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Import .env file |
 | `wispkey status` | Vault + session + proxy status |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Audit log |
 | `wispkey partition create/list/delete/assign/export/import` | Partition management |
 | `wispkey project create/list/delete/use/current/export/import` | Project management and encrypted project bundles |
 | `wispkey credential export/import` | Encrypted single-credential sharing bundles |
+| `wispkey instance enroll/list/show/scope/revoke/requests/approve/deny` | Manage instance identities, scopes, and access requests |
 | `wispkey mcp serve` | Start MCP server (stdio) |
 
 ## Credential Types

@@ -1,11 +1,19 @@
 use crate::audit;
 use crate::core::{self, Vault};
 use crate::proxy::lifecycle;
+use crate::proxy::transport::{IdentityRequirement, ListenConfig, ListenSpec};
 use crate::proxy::{self, StartProxyOutcome};
 
 use super::shared::{json_output, print_json};
 
-pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
+pub async fn handle_serve(
+    port: u16,
+    daemon: bool,
+    all_projects: bool,
+    listen_specs: Vec<String>,
+    require_identity: bool,
+    no_require_identity: bool,
+) {
     let vault = match Vault::open_with_session() {
         Ok(vault) => Some(vault),
         Err(e) if crate::env_sideload::list_available().is_empty() => {
@@ -22,7 +30,13 @@ pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
     };
 
     if daemon {
-        spawn_daemon(port, all_projects);
+        spawn_daemon(
+            port,
+            all_projects,
+            &listen_specs,
+            require_identity,
+            no_require_identity,
+        );
         return;
     }
 
@@ -43,10 +57,38 @@ pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
         );
     }
 
-    if port == 0 {
+    let identity = match (require_identity, no_require_identity) {
+        (true, false) => IdentityRequirement::Require,
+        (false, true) => IdentityRequirement::DoNotRequire,
+        (false, false) => IdentityRequirement::Default,
+        (true, true) => {
+            eprintln!(
+                "Error: --require-identity and --no-require-identity cannot be used together"
+            );
+            std::process::exit(1);
+        }
+    };
+    let listener_configs = match build_listener_configs(port, &listen_specs, identity) {
+        Ok(configs) => configs,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if listen_specs.is_empty() && port == 0 {
         println!("Starting WispKey proxy on a random port...");
-    } else {
+    } else if listen_specs.is_empty() {
         println!("Starting WispKey proxy on localhost:{}...", port);
+    } else {
+        println!("Starting WispKey proxy on configured listeners...");
+        for config in &listener_configs {
+            println!(
+                "  {} (require identity: {})",
+                listen_config_display(config),
+                config.require_identity
+            );
+        }
     }
     if all_projects {
         println!("Project scope: ALL (no project filtering)");
@@ -57,7 +99,11 @@ pub async fn handle_serve(port: u16, daemon: bool, all_projects: bool) {
         );
     }
 
-    match proxy::start_proxy(port, all_projects).await {
+    match if listen_specs.is_empty() && identity == IdentityRequirement::Default {
+        proxy::start_proxy(port, all_projects).await
+    } else {
+        proxy::start_proxy_with_listeners(listener_configs, all_projects).await
+    } {
         Ok(StartProxyOutcome::AlreadyRunning(metadata)) => {
             println!(
                 "WispKey proxy is already running (PID {}, port {}).",
@@ -180,7 +226,13 @@ fn print_proxy_status(status: &lifecycle::ProxyStatus) {
     }
 }
 
-fn spawn_daemon(port: u16, all_projects: bool) {
+fn spawn_daemon(
+    port: u16,
+    all_projects: bool,
+    listen_specs: &[String],
+    require_identity: bool,
+    no_require_identity: bool,
+) {
     let executable = std::env::current_exe().unwrap_or_else(|e| {
         eprintln!("Error: cannot find executable path: {}", e);
         std::process::exit(1);
@@ -218,6 +270,16 @@ fn spawn_daemon(port: u16, all_projects: bool) {
     if all_projects {
         args.push("--all-projects".into());
     }
+    for spec in listen_specs {
+        args.push("--listen".into());
+        args.push(spec.clone());
+    }
+    if require_identity {
+        args.push("--require-identity".into());
+    }
+    if no_require_identity {
+        args.push("--no-require-identity".into());
+    }
 
     match std::process::Command::new(executable)
         .args(&args)
@@ -239,5 +301,35 @@ fn spawn_daemon(port: u16, all_projects: bool) {
             eprintln!("Error: failed to spawn daemon: {}", e);
             std::process::exit(1);
         }
+    }
+}
+
+fn build_listener_configs(
+    port: u16,
+    listen_specs: &[String],
+    identity: IdentityRequirement,
+) -> Result<Vec<ListenConfig>, String> {
+    if listen_specs.is_empty() {
+        return Ok(vec![ListenConfig::new(
+            ListenSpec::default_tcp(port),
+            identity,
+        )]);
+    }
+
+    listen_specs
+        .iter()
+        .map(|spec| {
+            ListenSpec::parse(spec)
+                .map(|spec| ListenConfig::new(spec, identity))
+                .map_err(|e| e.to_string())
+        })
+        .collect()
+}
+
+fn listen_config_display(config: &ListenConfig) -> String {
+    match &config.spec {
+        ListenSpec::Tcp(addr) => format!("tcp://{addr}"),
+        ListenSpec::Unix(path) => format!("unix:{}", path.display()),
+        ListenSpec::Vsock { cid, port } => format!("vsock://{cid}:{port}"),
     }
 }

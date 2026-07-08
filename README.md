@@ -49,6 +49,7 @@ Four commands from zero to protected. The AI process never touches your real sec
 - **Wisp token proxy** -- HTTP forward proxy + blind HTTPS CONNECT tunneling + HTTPS reverse proxy mode (`X-Target-Url` header) on localhost:7700
 - **CLI** -- Full credential lifecycle: `init`, `unlock`, `add`, `list`, `get`, `remove`, `rotate`, `import`, `status`, `log`
 - **MCP server** -- Native integration with Cursor, Claude Code, Windsurf via stdio JSON-RPC, including first-class env-sideloaded credentials for locked-vault use
+- **Multi-instance access** -- Enroll ephemeral VMs or worker instances with per-request identity, least-privilege credential scope, UDS/vsock-ready proxy listeners, and host-approved access escalation
 - **.env importer** -- One-command migration with auto-detection of OpenAI, GitHub, Slack, AWS, and bearer token patterns
 
 ### Organization
@@ -157,6 +158,24 @@ curl -x http://localhost:7700 \
 
 Reverse proxy mode substitutes wisp tokens in headers, supported text bodies, and the `X-Target-Url` query string before forwarding upstream.
 
+## Multi-Instance Access
+
+WispKey can serve untrusted ephemeral VMs and worker instances without giving them plaintext secrets. The host enrolls each instance, gives it a one-time id and secret plus `wk_*` tokens, and runs the proxy on one or more listeners:
+
+```bash
+wispkey instance enroll worker-acme-001 --tag company:acme --credential openai-key
+wispkey serve --listen tcp://127.0.0.1:7700 --listen unix:/run/wispkey/proxy.sock
+```
+
+Unix domain socket and vsock listeners require instance identity by default. Loopback TCP keeps the original trusted-local behavior unless `--require-identity` is set. Out-of-scope token use returns `403 out_of_scope`, queues an access request, and can be approved by the host:
+
+```bash
+wispkey instance requests --pending
+wispkey instance approve req_...
+```
+
+See [`docs/multi-instance-deployment.md`](docs/multi-instance-deployment.md) for the deployment model, listener options, and a Firecracker microVM example.
+
 ## How WispKey Compares
 
 WispKey is not a traditional secrets manager. Traditional vaults are built to deliver plaintext secrets to trusted applications; WispKey is built for agents that should never hold plaintext secrets at all.
@@ -165,7 +184,7 @@ WispKey is not a traditional secrets manager. Traditional vaults are built to de
 - **Versus enterprise access platforms** -- WispKey does not require a cloud account, sales motion, or hosted control plane for local use. Secrets can stay on the user's machine.
 - **Versus `.env` files** -- `.env` gives prompt-injectable processes direct access to plaintext. WispKey imports secrets once and gives agents scoped wisp tokens instead.
 
-Security claims are intentionally scoped: CONNECT is a blind tunnel, localhost clients are trusted by design, text-body substitution is limited to text-like content types, and the machine-bound session store does not defend against a same-user process that can read all local WispKey files or inspect memory. See [`docs/security-model.md`](docs/security-model.md) for the public security model.
+Security claims are intentionally scoped: CONNECT is a blind tunnel, loopback TCP keeps the trusted-local default, authenticated instance listeners are scoped and fail closed, text-body substitution is limited to text-like content types, and the machine-bound session store does not defend against a same-user process that can read all local WispKey files or inspect memory. See [`docs/security-model.md`](docs/security-model.md) for the public security model.
 
 ## Policy Engine
 
@@ -196,7 +215,7 @@ Agent-scoped policies fail closed when the requester agent identity is unavailab
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 Each project gets its own `personal` partition, so partition names are project-scoped.
-Credential names are unique within a project, not across the whole vault. The same credential name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve against the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v6 automatically.
+Credential names are unique within a project, not across the whole vault. The same credential name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve against the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v7 automatically.
 
 ```bash
 wispkey project create "client-alpha" --description "Client Alpha credentials"
@@ -212,6 +231,27 @@ wispkey serve --all-projects
 Override per-terminal with `export WISPKEY_PROJECT=client-alpha`.
 
 The proxy management API also honors project scope for `GET /api/credentials`, `GET /api/credentials/{name}`, `DELETE /api/credentials/{name}`, `GET /api/partitions`, and `DELETE /api/partitions/{name}` by passing `?project=<name>`.
+
+## Command Reference
+
+| Command | Purpose |
+|---------|---------|
+| `wispkey init` | Create vault and master password |
+| `wispkey unlock` | Unlock vault for the current session |
+| `wispkey add <name> [--type TYPE] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store a credential |
+| `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials |
+| `wispkey get <name> [--show-token]` | Show credential metadata and wisp token |
+| `wispkey remove <name>` | Delete a credential |
+| `wispkey rotate <name>` | Regenerate a wisp token |
+| `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start the proxy; `SPEC` supports `tcp://host:port`, `unix:/path.sock`, and feature-gated `vsock://cid:port` |
+| `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Import credentials from a `.env` file |
+| `wispkey status` | Show vault, session, and proxy status |
+| `wispkey log [--last N] [--credential C] [--since DATE]` | Query audit events |
+| `wispkey partition create/list/delete/assign/export/import` | Manage partitions |
+| `wispkey project create/list/delete/use/current/export/import` | Manage projects and encrypted project bundles |
+| `wispkey credential export/import` | Export or import one encrypted credential bundle |
+| `wispkey instance enroll/list/show/scope/revoke/requests/approve/deny` | Manage instance identities, scopes, and access requests |
+| `wispkey mcp serve` | Start the MCP server over stdio |
 
 ## Partition Bundles
 
@@ -271,7 +311,7 @@ src/
   core/       # Vault engine (encrypt/decrypt, CRUD, wisp tokens, projects, partitions)
   proxy/      # HTTP/HTTPS proxy (tokio + hyper, credential injection, policy eval, env sideload)
   mcp/        # MCP server (stdio JSON-RPC transport)
-  cli/        # CLI interface (clap, 37 subcommands)
+  cli/        # CLI interface (clap subcommands)
   audit/      # Audit logging (SQLite, credential + time filtering)
   migrate/    # .env file importer (auto-detection heuristics)
   partition/  # Encrypted bundle export/import (.wkbundle)
@@ -299,7 +339,7 @@ cd wispkey
 
 cargo build           # Debug build
 cargo build --release # Optimized release build
-cargo test            # Run all 86 tests (72 unit + 14 integration)
+cargo test            # Run the test suite
 cargo clippy --all-targets --all-features -- -D warnings -W clippy::suspicious -W clippy::style -W clippy::perf -W clippy::complexity
 cargo fmt --check     # Format check
 cargo audit           # Dependency advisory check (install with: cargo install cargo-audit --version 0.22.1 --locked)
