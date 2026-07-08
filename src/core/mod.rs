@@ -24,6 +24,7 @@ mod crypto;
 mod rows;
 mod schema;
 mod session;
+mod session_store;
 #[cfg(test)]
 mod tests;
 
@@ -35,7 +36,7 @@ use rows::{parse_credential_type_column, parse_datetime_column};
 pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
-const CURRENT_SCHEMA_VERSION: &str = "5";
+const CURRENT_SCHEMA_VERSION: &str = "6";
 
 /// Errors returned by vault operations (I/O, crypto, schema, and business rules).
 #[derive(Error, Debug)]
@@ -269,10 +270,13 @@ impl Vault {
     /// Inserts a new credential (encrypted secret, wisp token, optional description/hosts/tags/partition).
     pub fn add_credential(&self, request: AddCredentialRequest<'_>) -> Result<Credential> {
         let key = self.ensure_unlocked()?;
+        let active = resolve_active_project();
+        let project_name = request.project.unwrap_or(&active);
+        let project_id = self.resolve_project_id(project_name)?;
 
         let existing: bool = self.db.query_row(
-            "SELECT COUNT(*) > 0 FROM credentials WHERE name = ?1",
-            params![request.name],
+            "SELECT COUNT(*) > 0 FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
+            params![project_id, request.name],
             |row| row.get(0),
         )?;
         if existing {
@@ -455,8 +459,8 @@ impl Vault {
         let partition_id =
             self.resolve_partition_id_for_insert(Some(partition_name), Some(&project_name))?;
         self.db.execute(
-            "UPDATE credentials SET partition_id = ?1, updated_at = ?2 WHERE name = ?3",
-            params![partition_id, Utc::now().to_rfc3339(), credential_name],
+            "UPDATE credentials SET partition_id = ?1, updated_at = ?2 WHERE id = ?3",
+            params![partition_id, Utc::now().to_rfc3339(), credential.id],
         )?;
         Ok(())
     }
@@ -507,23 +511,41 @@ impl Vault {
         Ok(credentials)
     }
 
-    /// Fetches credential metadata by unique name.
+    /// Fetches credential metadata by name in the active project.
     pub fn get_credential(&self, name: &str) -> Result<Credential> {
+        let active = resolve_active_project();
+        self.get_credential_in_project(&active, name)
+    }
+
+    pub fn get_credential_in_project(&self, project_name: &str, name: &str) -> Result<Credential> {
         let _ = self.ensure_unlocked()?;
-        let mut stmt = self.db.prepare("SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials WHERE name = ?1")?;
-        stmt.query_row(params![name], credential_from_row)
+        let project_id = self.resolve_project_id(project_name)?;
+        let mut stmt = self.db.prepare(
+			"SELECT c.id, c.name, c.description, c.credential_type, c.wisp_token, c.hosts, c.tags, c.created_at, c.updated_at, c.last_used_at, c.partition_id FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
+		)?;
+        stmt.query_row(params![project_id, name], credential_from_row)
             .map_err(|_| VaultError::CredentialNotFound(name.to_string()))
     }
 
     /// Decrypts and returns the stored secret for a credential by name.
     #[allow(dead_code)]
     pub fn decrypt_credential_value(&self, name: &str) -> Result<String> {
+        let active = resolve_active_project();
+        self.decrypt_credential_value_in_project(&active, name)
+    }
+
+    pub fn decrypt_credential_value_in_project(
+        &self,
+        project_name: &str,
+        name: &str,
+    ) -> Result<String> {
         let key = self.ensure_unlocked()?;
+        let project_id = self.resolve_project_id(project_name)?;
         let encoded: String = self
             .db
             .query_row(
-                "SELECT encrypted_value FROM credentials WHERE name = ?1",
-                params![name],
+                "SELECT c.encrypted_value FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
+                params![project_id, name],
                 |row| row.get(0),
             )
             .map_err(|_| VaultError::CredentialNotFound(name.to_string()))?;
@@ -536,10 +558,17 @@ impl Vault {
 
     /// Deletes a credential row by name.
     pub fn remove_credential(&self, name: &str) -> Result<()> {
+        let active = resolve_active_project();
+        self.remove_credential_in_project(&active, name)
+    }
+
+    pub fn remove_credential_in_project(&self, project_name: &str, name: &str) -> Result<()> {
         let _ = self.ensure_unlocked()?;
-        let affected = self
-            .db
-            .execute("DELETE FROM credentials WHERE name = ?1", params![name])?;
+        let project_id = self.resolve_project_id(project_name)?;
+        let affected = self.db.execute(
+            "DELETE FROM credentials WHERE name = ?1 AND partition_id IN (SELECT id FROM partitions WHERE project_id = ?2)",
+            params![name, project_id],
+        )?;
         if affected == 0 {
             return Err(VaultError::CredentialNotFound(name.to_string()));
         }
@@ -548,11 +577,17 @@ impl Vault {
 
     /// Issues a new unique wisp token for an existing credential.
     pub fn rotate_wisp_token(&self, name: &str) -> Result<String> {
+        let active = resolve_active_project();
+        self.rotate_wisp_token_in_project(&active, name)
+    }
+
+    pub fn rotate_wisp_token_in_project(&self, project_name: &str, name: &str) -> Result<String> {
         let _ = self.ensure_unlocked()?;
+        let project_id = self.resolve_project_id(project_name)?;
 
         let exists: bool = self.db.query_row(
-            "SELECT COUNT(*) > 0 FROM credentials WHERE name = ?1",
-            params![name],
+            "SELECT COUNT(*) > 0 FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
+            params![project_id, name],
             |row| row.get(0),
         )?;
         if !exists {
@@ -561,8 +596,8 @@ impl Vault {
 
         let new_token = self.generate_wisp_token(name)?;
         self.db.execute(
-            "UPDATE credentials SET wisp_token = ?1, updated_at = ?2 WHERE name = ?3",
-            params![new_token, Utc::now().to_rfc3339(), name],
+            "UPDATE credentials SET wisp_token = ?1, updated_at = ?2 WHERE name = ?3 AND partition_id IN (SELECT id FROM partitions WHERE project_id = ?4)",
+            params![new_token, Utc::now().to_rfc3339(), name, project_id],
         )?;
         Ok(new_token)
     }

@@ -29,6 +29,8 @@ Quick setup for a new project.
    echo '.env' >> .gitignore
    ```
 
+   `wispkey import` writes `.env.wispkey` with owner-only permissions. It contains wisp tokens rather than raw secrets, but review it before committing.
+
 5. **Verify**:
    ```bash
    wispkey status
@@ -57,4 +59,4 @@ Quick setup for a new project.
 
    The MCP server returns `wk_env_openai` and the env key name, never the raw env value. Start `wispkey serve` with the same `WISPKEY_SIDELOAD_OPENAI` variable when the proxy needs to substitute that token.
 
-After setup, all API requests routed through `HTTP_PROXY=http://localhost:7700` will automatically have wisp tokens swapped for real credentials.
+After setup, HTTP requests routed through `HTTP_PROXY=http://localhost:7700` will have wisp tokens swapped for real credentials. For HTTPS token substitution, use reverse proxy mode with `X-Target-Url`.

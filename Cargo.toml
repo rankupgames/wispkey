@@ -1,9 +1,9 @@
 [package]
 name = "wispkey"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Miguel A. Lopez <miguel@rankupgames.com>"]
-description = "Local-first AI credential vault with wisp token proxy"
+description = "Local-first credential firewall for AI agents with wisp token proxy"
 license = "Apache-2.0"
 repository = "https://github.com/rankupgames/wispkey"
 readme = "README.md"

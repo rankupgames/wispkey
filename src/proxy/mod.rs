@@ -505,9 +505,20 @@ async fn handle_reverse_proxy(
     }
     set_content_length(&mut new_headers, new_body.len());
 
+    let target_url = match replace_tokens_in_uri(
+        target_url,
+        vault.as_ref(),
+        &wisp_pattern,
+        &context,
+        &mut used_credentials,
+    ) {
+        Ok(uri) => uri,
+        Err(response) => return *response,
+    };
+
     let mut forward_req = Request::builder()
         .method(parts.method.clone())
-        .uri(target_url);
+        .uri(&target_url);
     for (name, value) in new_headers.iter() {
         if name != "host" && name != "x-target-url" {
             forward_req = forward_req.header(name, value);
@@ -699,15 +710,25 @@ fn management_request_authorized(headers: &hyper::HeaderMap, expected_token: &st
     let header_token = headers
         .get(lifecycle::MANAGEMENT_TOKEN_HEADER)
         .and_then(|value| value.to_str().ok());
-    if header_token == Some(expected_token) {
+    if token_matches(header_token, expected_token) {
         return true;
     }
 
-    headers
+    let bearer_token = headers
         .get(hyper::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        == Some(expected_token)
+        .and_then(|value| value.strip_prefix("Bearer "));
+    token_matches(bearer_token, expected_token)
+}
+
+#[allow(deprecated)]
+fn token_matches(actual: Option<&str>, expected: &str) -> bool {
+    actual
+        .map(|token| {
+            ring::constant_time::verify_slices_are_equal(token.as_bytes(), expected.as_bytes())
+                .is_ok()
+        })
+        .unwrap_or(false)
 }
 
 fn reject_self_target(kind: &str, target: &str, runtime: &ProxyRuntime) -> Response<Full<Bytes>> {

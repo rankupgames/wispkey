@@ -27,5 +27,10 @@
     "secrets-management",
     "credential-vault",
     "ai-safety"
-  ]
+  ],
+  "rules": "rules/",
+  "skills": "skills/",
+  "agents": "agents/",
+  "commands": "commands/",
+  "hooks": "hooks/hooks.json"
 }

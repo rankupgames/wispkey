@@ -18,6 +18,8 @@ This will:
 3. Encrypt and store each credential in the vault
 4. Generate `.env.wispkey` with wisp tokens replacing real values
 
+The generated `.env.wispkey` file is written with owner-only permissions. It contains only wisp tokens, but still treat it as project configuration and review it before committing.
+
 ## Output
 
 Original `.env`:
@@ -55,6 +57,6 @@ Already-imported credentials are skipped with a notice. Safe to re-run.
 
 1. Verify all credentials imported: `wispkey list`
 2. Add `.env` to `.gitignore` (if not already)
-3. Commit `.env.wispkey` (safe -- contains only wisp tokens)
+3. Commit `.env.wispkey` if appropriate for the project (it contains only wisp tokens and is written owner-only locally)
 4. Update project README with proxy setup instructions
 5. Delete the original `.env` once confirmed

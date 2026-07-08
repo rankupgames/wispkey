@@ -1,6 +1,6 @@
 # WispKey -- Agent Reference
 
-> Local-first credential vault with wisp token proxy.
+> Local-first credential firewall for AI agents with wisp token proxy.
 > Agents get opaque `wk_*` tokens; the proxy swaps them for real secrets at the network boundary.
 
 ## Quick Start (New User)
@@ -14,8 +14,8 @@ export PATH="$PWD/target/release:$PATH"
 wispkey init
 
 # 3. Add credentials
-wispkey add "openai-key" --type bearer_token --value "sk-..." --hosts "api.openai.com"
-wispkey add "db-creds" --type basic_auth --value "user:pass" --tags "database"
+printf '%s' "$OPENAI_API_KEY" | wispkey add "openai-key" --type bearer_token --value-file - --hosts "api.openai.com"
+printf '%s' "$BASIC_AUTH_VALUE" | wispkey add "db-creds" --type basic_auth --value-file - --tags "database"
 wispkey add "ssh-key" --type api_key --value-file ~/.ssh/my_key --partition "ssh-keys"
 
 # 4. Start proxy
@@ -32,13 +32,16 @@ Set `WISPKEY_PASSWORD` to skip interactive prompts:
 export WISPKEY_PASSWORD='your-master-password'
 wispkey init        # no prompt
 wispkey unlock      # no prompt
-wispkey add "key" --type api_key --value "secret"  # no prompt
+printf '%s' "$SECRET_VALUE" | wispkey add "key" --type api_key --value-file -  # no prompt
 ```
+
+`wispkey add --value` still works, but warns on stderr because command-line arguments can be exposed through shell history and process listings. Prefer `--value-file <path>` or `--value-file -` for non-interactive secret input.
 
 ## Project Scoping
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v6 automatically.
 
 ```bash
 # Create a project
@@ -72,7 +75,7 @@ wispkey serve --all-projects
 |---------|---------|
 | `wispkey init` | Create vault + master password |
 | `wispkey unlock` | Unlock vault (30 min session) |
-| `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH] [--hosts H] [--tags T] [--partition P]` | Store credential |
+| `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store credential |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials (names only) |
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
 | `wispkey remove <name>` | Delete credential |
@@ -98,7 +101,9 @@ wispkey serve --all-projects
 
 WispKey stores arbitrary encrypted secret values, not only API keys. Use `api_key` as the generic opaque type for passwords, database URLs, SSH/private-key files via `--value-file`, webhook secrets, OAuth tokens, service-account JSON, and other secret material. The credential type controls proxy injection behavior, not what can be stored.
 
-The proxy scans and replaces wisp tokens in three locations: **headers**, **request body** (text/json/form only), and **URL query parameters**.
+The proxy scans and replaces wisp tokens in three locations: **headers**, **request body** (text/json/form only), and **URL query parameters**. In reverse-proxy mode, this includes wisp tokens in the `X-Target-Url` query string.
+
+Agent-scoped policies fail closed when the requester's agent identity is unavailable. The proxy currently has no trusted agent identity source, so a policy with an `agent = "..."` scope applies to proxy requests even when no agent name is known.
 
 ## Encrypted Export Bundles
 
@@ -166,6 +171,8 @@ curl http://localhost:7700 \
 
 The proxy terminates TLS upstream, swaps wisp tokens, and forwards. The agent never sees the real credential.
 
+Management API tokens are compared in constant time.
+
 ## Proxy Management API
 
 When the proxy is running (`wispkey serve`):
@@ -173,8 +180,11 @@ When the proxy is running (`wispkey serve`):
 | Endpoint | Returns |
 |----------|---------|
 | `GET /api/status` | Vault info, credential count, session state |
-| `GET /api/credentials` | All credentials with tokens (no plaintext values) |
+| `GET /api/credentials` | All credentials with tokens (no plaintext values); honors `?project=` |
+| `GET /api/credentials/{name}` | Single credential by name; honors `?project=` |
+| `DELETE /api/credentials/{name}` | Delete credential by name; honors `?project=` |
 | `GET /api/partitions` | All partitions with credential counts |
+| `DELETE /api/partitions/{name}` | Delete partition by name; honors `?project=` |
 | `GET /api/projects` | All projects with partition counts and active flag |
 | `GET /api/projects/{name}` | Single project details |
 
@@ -182,11 +192,12 @@ When the proxy is running (`wispkey serve`):
 
 | Path | Purpose |
 |------|---------|
-| `~/.wispkey/vault.db` | Encrypted credential database |
+| `~/.wispkey/vault.db` | Encrypted credential database (owner-only permissions on Unix) |
 | `~/.wispkey/session` | Session key (30 min TTL; owner-only permissions on Unix, restricted ACL on Windows) |
 | `~/.wispkey/proxy.pid` | Proxy PID (written on `serve`) |
 | `~/.wispkey/proxy.json` | Proxy discovery file with management token (owner-only permissions/ACL) |
 | `~/.wispkey/active_project` | Persistent active project (set by `project use`) |
+| `.env.wispkey` | Generated import output with wisp tokens (owner-only permissions on Unix) |
 | `WISPKEY_VAULT_PATH` | Override vault directory |
 | `WISPKEY_PROJECT` | Override active project per-terminal |
 | `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import |
@@ -199,4 +210,4 @@ When the proxy is running (`wispkey serve`):
 - Hosts: comma-separated globs on `--hosts` (e.g. `--hosts "api.cloudflare.com,*.workers.dev"`)
 - Partitions: logical grouping (e.g. `infrastructure`, `cloud-services`, `ci-cd`)
 - Projects: team/project isolation (e.g. `client-alpha`, `internal-tools`)
-- Values starting with `-`: use `--value='-1abc...'` (equals syntax)
+- Values starting with `-`: use `--value='-1abc...'` (equals syntax), though `--value-file` is preferred for secret material

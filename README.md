@@ -45,7 +45,7 @@ Four commands from zero to protected. The AI process never touches your real sec
 ## Features
 
 ### Core
-- **Encrypted local vault** -- AES-256-GCM at rest, Argon2id master key derivation, SQLite backend, configurable session timeout (default 30 min)
+- **Encrypted local vault** -- AES-256-GCM at rest, Argon2id master key derivation, SQLite backend, configurable session timeout (default 30 min), machine-bound encrypted session file by default
 - **Wisp token proxy** -- HTTP forward proxy + blind HTTPS CONNECT tunneling + HTTPS reverse proxy mode (`X-Target-Url` header) on localhost:7700
 - **CLI** -- Full credential lifecycle: `init`, `unlock`, `add`, `list`, `get`, `remove`, `rotate`, `import`, `status`, `log`
 - **MCP server** -- Native integration with Cursor, Claude Code, Windsurf via stdio JSON-RPC, including first-class env-sideloaded credentials for locked-vault use
@@ -59,8 +59,9 @@ Four commands from zero to protected. The AI process never touches your real sec
 - **Policy engine** -- TOML-defined rules with per-credential, per-host, per-path, per-method restrictions, deny rules, time windows, and sliding-window rate limiting
 - **Audit log** -- Every credential use and denial logged with timestamp, target host/path, method, and status; vault-backed events are queryable by credential and date range, while vault-less env sideload use writes a local fallback JSONL audit file
 - **Host restrictions** -- Glob-pattern allowlists per credential (e.g. `api.openai.com/*`)
-- **Cross-OS local file protection** -- Vault directories and sensitive local files are owner-only on Linux/macOS and restricted with Windows ACLs on Windows
-- **Threat model** -- The current boundary and intentional limits are documented in [`_docs/threat-model.md`](_docs/threat-model.md)
+- **Cross-OS local file protection** -- Vault directories and sensitive local files are owner-only on Linux/macOS and restricted with Windows ACLs on Windows; generated `.env.wispkey` files and `vault.db` are written owner-only on Unix
+- **Management API token checks** -- The proxy compares management tokens in constant time
+- **Security model** -- The current boundary and intentional limits are documented in [`docs/security-model.md`](docs/security-model.md)
 
 ### Cloud (groundwork -- auth and encrypted sync/share APIs)
 - **Browser-based Clerk login** -- `wispkey cloud login` opens browser, localhost callback captures session token
@@ -70,6 +71,8 @@ Four commands from zero to protected. The AI process never touches your real sec
 ## Credential Types
 
 WispKey stores arbitrary encrypted secret values, not only API keys from `.env` files. Use `api_key` as the generic opaque secret type for passwords, database URLs, SSH/private-key files, webhook secrets, OAuth tokens, service-account JSON, and anything else that should stay out of the agent process. The type mainly controls how the proxy injects or substitutes the value at request time.
+
+For non-interactive adds, prefer `--value-file <path>` or `--value-file -` for stdin. `--value` still works, but WispKey warns on stderr because command-line arguments can be exposed through shell history and process listings.
 
 | Type | CLI Flag | Injection |
 |------|----------|-----------|
@@ -82,11 +85,11 @@ WispKey stores arbitrary encrypted secret values, not only API keys from `.env` 
 Examples:
 
 ```bash
-wispkey add "db-password" --type api_key --value "correct-horse-battery-staple" --tags "database"
-wispkey add "db-url" --type api_key --value "postgres://user:pass@localhost/app" --tags "database"
+printf '%s' "$DB_PASSWORD" | wispkey add "db-password" --type api_key --value-file - --tags "database"
+printf '%s' "$DATABASE_URL" | wispkey add "db-url" --type api_key --value-file - --tags "database"
 wispkey add "ssh-private-key" --type api_key --value-file ~/.ssh/id_ed25519 --partition "ssh-keys"
 wispkey add "service-account-json" --type api_key --value-file ./service-account.json --tags "gcp"
-wispkey add "basic-auth-api" --type basic_auth --value "user:password" --hosts "api.example.com"
+printf '%s' "$BASIC_AUTH_VALUE" | wispkey add "basic-auth-api" --type basic_auth --value-file - --hosts "api.example.com"
 ```
 
 ## MCP Integration
@@ -152,6 +155,8 @@ curl -x http://localhost:7700 \
   -d '{"model": "gpt-4", "messages": [...]}'
 ```
 
+Reverse proxy mode substitutes wisp tokens in headers, supported text bodies, and the `X-Target-Url` query string before forwarding upstream.
+
 ## How WispKey Compares
 
 WispKey is not a traditional secrets manager. Traditional vaults are built to deliver plaintext secrets to trusted applications; WispKey is built for agents that should never hold plaintext secrets at all.
@@ -160,7 +165,7 @@ WispKey is not a traditional secrets manager. Traditional vaults are built to de
 - **Versus enterprise access platforms** -- WispKey does not require a cloud account, sales motion, or hosted control plane for local use. Secrets can stay on the user's machine.
 - **Versus `.env` files** -- `.env` gives prompt-injectable processes direct access to plaintext. WispKey imports secrets once and gives agents scoped wisp tokens instead.
 
-Security claims are intentionally scoped: CONNECT is a blind tunnel, localhost clients are trusted by design, text-body substitution is limited to text-like content types, and the current unlocked session boundary is the OS user account. See [`_docs/threat-model.md`](_docs/threat-model.md) for the full internal threat model.
+Security claims are intentionally scoped: CONNECT is a blind tunnel, localhost clients are trusted by design, text-body substitution is limited to text-like content types, and the machine-bound session store does not defend against a same-user process that can read all local WispKey files or inspect memory. See [`docs/security-model.md`](docs/security-model.md) for the public security model.
 
 ## Policy Engine
 
@@ -185,10 +190,13 @@ wispkey policy list     # Show loaded policies
 wispkey policy check    # Validate policy file
 ```
 
+Agent-scoped policies fail closed when the requester agent identity is unavailable. The proxy does not currently have a trusted agent identity source, so a policy with an `agent = "..."` scope still applies to proxy requests.
+
 ## Project Scoping
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 Each project gets its own `personal` partition, so partition names are project-scoped.
+Credential names are unique within a project, not across the whole vault. The same credential name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve against the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v6 automatically.
 
 ```bash
 wispkey project create "client-alpha" --description "Client Alpha credentials"
@@ -202,6 +210,8 @@ wispkey serve --all-projects
 ```
 
 Override per-terminal with `export WISPKEY_PROJECT=client-alpha`.
+
+The proxy management API also honors project scope for `GET /api/credentials`, `GET /api/credentials/{name}`, `DELETE /api/credentials/{name}`, `GET /api/partitions`, and `DELETE /api/partitions/{name}` by passing `?project=<name>`.
 
 ## Partition Bundles
 
@@ -243,8 +253,10 @@ Set `WISPKEY_PASSWORD` to skip interactive prompts:
 export WISPKEY_PASSWORD='your-master-password'
 wispkey init
 wispkey unlock
-wispkey add "key" --type api_key --value "secret"
+printf '%s' "$SECRET_VALUE" | wispkey add "key" --type api_key --value-file -
 ```
+
+For non-interactive secret input, prefer `wispkey add "key" --type api_key --value-file ./secret.txt` or pipe the value to `--value-file -`. Passing secrets with `--value` emits a warning because the value can be captured by shell history or process listings.
 
 `WISPKEY_PASSWORD` only unlocks or initializes the vault. It is intentionally not used for encrypted bundle export/import; use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file` for those commands.
 

@@ -330,6 +330,64 @@ fn add_credential_respects_project_default_partition() {
 }
 
 #[test]
+fn duplicate_credential_names_are_scoped_to_project() {
+    let vault = test_vault("pw");
+    vault.create_project("client-alpha", "").unwrap();
+    vault.create_project("client-beta", "").unwrap();
+
+    let alpha = vault
+        .add_credential(
+            AddCredentialRequest::new("openai-key", CredentialType::ApiKey, "alpha-secret")
+                .project(Some("client-alpha")),
+        )
+        .unwrap();
+    let beta = vault
+        .add_credential(
+            AddCredentialRequest::new("openai-key", CredentialType::ApiKey, "beta-secret")
+                .project(Some("client-beta")),
+        )
+        .unwrap();
+
+    assert_ne!(alpha.id, beta.id);
+    assert_ne!(alpha.wisp_token, beta.wisp_token);
+    assert_eq!(
+        vault
+            .get_credential_in_project("client-alpha", "openai-key")
+            .unwrap()
+            .id,
+        alpha.id
+    );
+    assert_eq!(
+        vault
+            .get_credential_in_project("client-beta", "openai-key")
+            .unwrap()
+            .id,
+        beta.id
+    );
+
+    let duplicate = vault.add_credential(
+        AddCredentialRequest::new("openai-key", CredentialType::ApiKey, "alpha-dupe")
+            .project(Some("client-alpha")),
+    );
+    assert!(matches!(duplicate, Err(VaultError::DuplicateCredential(_))));
+
+    vault
+        .remove_credential_in_project("client-beta", "openai-key")
+        .unwrap();
+    assert!(matches!(
+        vault.get_credential_in_project("client-beta", "openai-key"),
+        Err(VaultError::CredentialNotFound(_))
+    ));
+    assert_eq!(
+        vault
+            .get_credential_in_project("client-alpha", "openai-key")
+            .unwrap()
+            .id,
+        alpha.id
+    );
+}
+
+#[test]
 fn list_partitions_in_project_scoping() {
     let vault = test_vault("pw");
     vault.create_project("alpha", "").unwrap();

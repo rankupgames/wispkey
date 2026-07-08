@@ -78,6 +78,11 @@ fn cli_project_and_single_credential_bundle_roundtrips_are_real() {
         serde_json::json!(["client", "prod"])
     );
 
+    run_wispkey_json(
+        source_dir.path(),
+        &["--format", "json", "project", "use", "client-alpha"],
+    );
+
     let credential_bundle_path = credential_bundle.to_string_lossy().to_string();
     run_wispkey_bundle_json(
         source_dir.path(),

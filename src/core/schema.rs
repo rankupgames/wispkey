@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
@@ -47,6 +47,7 @@ impl Vault {
         secure_files::ensure_private_directory(&vault_dir)?;
 
         let db = Connection::open(&db_path)?;
+        harden_db_file(&db_path)?;
         Self::create_schema(&db)?;
 
         let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
@@ -103,6 +104,7 @@ impl Vault {
             return Err(VaultError::NotFound);
         }
         let db = Connection::open(&db_path)?;
+        harden_db_file(&db_path)?;
         Self::migrate_schema(&db)?;
         Ok(Self {
             db,
@@ -287,6 +289,45 @@ impl Vault {
 
             db.execute(
                 "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                params!["5"],
+            )?;
+        }
+
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "5".to_string());
+
+        if version.as_str() == "5" {
+            db.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                CREATE TABLE IF NOT EXISTS credentials_v6 (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    credential_type TEXT NOT NULL,
+                    encrypted_value TEXT NOT NULL,
+                    wisp_token TEXT UNIQUE NOT NULL,
+                    hosts TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_used_at TEXT,
+                    partition_id TEXT REFERENCES partitions(id)
+                );
+                INSERT INTO credentials_v6 (id, name, description, credential_type, encrypted_value, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id)
+                    SELECT id, name, description, credential_type, encrypted_value, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id
+                    FROM credentials;
+                DROP TABLE credentials;
+                ALTER TABLE credentials_v6 RENAME TO credentials;
+                PRAGMA foreign_keys = ON;",
+            )?;
+
+            db.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
                 params![CURRENT_SCHEMA_VERSION],
             )?;
         }
@@ -315,13 +356,13 @@ impl Vault {
 				created_at TEXT NOT NULL,
 				updated_at TEXT NOT NULL,
 				UNIQUE(project_id, name)
-			);
-			CREATE TABLE IF NOT EXISTS credentials (
-				id TEXT PRIMARY KEY,
-				name TEXT UNIQUE NOT NULL,
-				description TEXT NOT NULL DEFAULT '',
-				credential_type TEXT NOT NULL,
-				encrypted_value TEXT NOT NULL,
+				);
+				CREATE TABLE IF NOT EXISTS credentials (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					description TEXT NOT NULL DEFAULT '',
+					credential_type TEXT NOT NULL,
+					encrypted_value TEXT NOT NULL,
 				wisp_token TEXT UNIQUE NOT NULL,
 				hosts TEXT NOT NULL DEFAULT '',
 				tags TEXT NOT NULL DEFAULT '',
@@ -347,4 +388,18 @@ impl Vault {
         )?;
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn harden_db_file(path: &Path) -> Result<()> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_db_file(_path: &Path) -> Result<()> {
+    Ok(())
 }

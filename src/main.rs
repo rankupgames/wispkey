@@ -25,11 +25,13 @@ mod random;
 mod secure_files;
 mod sharing;
 
+use std::io::Read;
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
 #[command(name = "wispkey")]
-#[command(about = "AI credential vault with wisp token proxy")]
+#[command(about = "Credential firewall for AI agents with wisp token proxy")]
 #[command(version)]
 struct Cli {
     /// Output format for machine consumers such as WispKey Desktop
@@ -71,11 +73,11 @@ enum Commands {
         #[arg(long)]
         description: Option<String>,
 
-        /// The secret value to store (omit to enter securely via hidden prompt)
+        /// The secret value to store; exposed in shell history and process listings
         #[arg(long, allow_hyphen_values = true)]
         value: Option<String>,
 
-        /// Read the secret value from a file (useful for SSH keys and multiline secrets)
+        /// Read the secret value from a file, or '-' for stdin
         #[arg(long)]
         value_file: Option<String>,
 
@@ -438,14 +440,31 @@ async fn main() {
                     eprintln!("Error: cannot use both --value and --value-file");
                     std::process::exit(1);
                 }
-                (_, Some(path)) => match std::fs::read_to_string(path) {
-                    Ok(content) => Some(content),
-                    Err(e) => {
-                        eprintln!("Error reading {}: {}", path, e);
-                        std::process::exit(1);
+                (_, Some(path)) => {
+                    let content = if path == "-" {
+                        let mut content = String::new();
+                        match std::io::stdin().read_to_string(&mut content) {
+                            Ok(_) => Ok(content),
+                            Err(e) => Err(e),
+                        }
+                    } else {
+                        std::fs::read_to_string(path)
+                    };
+                    match content {
+                        Ok(content) => Some(content),
+                        Err(e) => {
+                            eprintln!("Error reading {}: {}", path, e);
+                            std::process::exit(1);
+                        }
                     }
-                },
-                (v, None) => v.clone(),
+                }
+                (Some(v), None) => {
+                    eprintln!(
+                        "Warning: --value can expose secrets in shell history and process listings; use the hidden prompt or --value-file instead."
+                    );
+                    Some(v.clone())
+                }
+                (None, None) => None,
             };
             cli::handle_add(cli::AddCredentialArgs {
                 name: &name,

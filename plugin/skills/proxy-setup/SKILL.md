@@ -40,7 +40,7 @@ For HTTPS token substitution, call the local reverse proxy target:
 ```typescript
 const response = await fetch("http://localhost:7700", {
   headers: {
-    "X-Target-Url": "https://api.example.com/test",
+    "X-Target-Url": "https://api.example.com/test?api_key=wk_your_token_here",
     "Authorization": "Bearer wk_your_token_here"
   }
 });
@@ -49,10 +49,14 @@ const response = await fetch("http://localhost:7700", {
 ### Python
 ```python
 requests.get("http://localhost:7700", headers={
-    "X-Target-Url": "https://api.example.com/test",
+    "X-Target-Url": "https://api.example.com/test?api_key=wk_your_token_here",
     "Authorization": "Bearer wk_your_token_here",
 })
 ```
+
+Reverse proxy mode replaces wisp tokens in request headers, supported text bodies, and the query string inside `X-Target-Url`.
+
+Agent-scoped policies fail closed when no trusted agent identity is available. Today the proxy does not have a trusted agent identity source, so `agent = "..."` policies still apply to proxy requests without an agent name.
 
 ### Docker Compose
 ```yaml
@@ -101,7 +105,7 @@ wispkey status
 
 # Test an HTTPS proxied request that swaps the wisp token
 curl http://localhost:7700 \
-  -H "X-Target-Url: https://api.example.com/test" \
+  -H "X-Target-Url: https://api.example.com/test?api_key=wk_your_token_here" \
   -H "Authorization: Bearer wk_your_token_here"
 
 # Check the audit log
