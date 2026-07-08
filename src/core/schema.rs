@@ -120,7 +120,7 @@ impl Vault {
         Ok(vault)
     }
 
-    fn migrate_schema(db: &Connection) -> Result<()> {
+    pub(super) fn migrate_schema(db: &Connection) -> Result<()> {
         let version: String = db
             .query_row(
                 "SELECT value FROM vault_meta WHERE key = 'version'",
@@ -328,6 +328,22 @@ impl Vault {
 
             db.execute(
                 "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                params!["6"],
+            )?;
+        }
+
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "6".to_string());
+
+        if version.as_str() == "6" {
+            create_instance_tables(db)?;
+            db.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
                 params![CURRENT_SCHEMA_VERSION],
             )?;
         }
@@ -386,8 +402,42 @@ impl Vault {
 				project_name TEXT
 			);",
         )?;
+        create_instance_tables(db)?;
         Ok(())
     }
+}
+
+fn create_instance_tables(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS instances (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            secret_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS instance_scopes (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+            scope_type TEXT NOT NULL,
+            scope_value TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(instance_id, scope_type, scope_value)
+        );
+        CREATE TABLE IF NOT EXISTS access_requests (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+            credential_name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            decided_at TEXT
+        );",
+    )?;
+    Ok(())
 }
 
 #[cfg(unix)]

@@ -7,7 +7,6 @@
  * Last Modified: 2026-04-13
  */
 
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -15,11 +14,10 @@ use http_body_util::{BodyExt, Full, Limited};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode, Uri, upgrade};
+use hyper::{HeaderMap, Method, Request, Response, StatusCode, Uri, upgrade};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use regex::Regex;
-use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 
 use crate::audit;
@@ -32,11 +30,13 @@ mod target;
 #[cfg(test)]
 mod tests;
 mod tokens;
+pub mod transport;
 
 use lifecycle::{ProxyMetadata, ProxyState, StartDecision};
 use management::{handle_management_api, json_response};
 use target::{authority_points_to_proxy, target_points_to_proxy};
 use tokens::{TokenRequestContext, inject_tokens_in_value, replace_tokens_in_uri};
+use transport::{BoundTransport, IdentityRequirement, ListenConfig, ListenSpec, ListenerMetadata};
 
 type HttpClient = Client<hyper_util::client::legacy::connect::HttpConnector, Full<Bytes>>;
 type HttpsClient = Client<
@@ -46,6 +46,8 @@ type HttpsClient = Client<
 type ProxyActionResult<T> = Result<T, Box<Response<Full<Bytes>>>>;
 
 const MAX_PROXY_BODY_BYTES: usize = 10 * 1024 * 1024;
+const INSTANCE_ID_HEADER: &str = "x-wispkey-instance-id";
+const INSTANCE_SECRET_HEADER: &str = "x-wispkey-instance-secret";
 
 #[derive(Debug, Clone)]
 pub enum StartProxyOutcome {
@@ -66,6 +68,19 @@ struct ProxyRuntime {
     metadata: Arc<ProxyMetadata>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct InstanceIdentity {
+    pub(super) id: String,
+    pub(super) name: String,
+}
+
+#[derive(Debug, Clone)]
+struct ListenerRuntime {
+    label: Arc<String>,
+    address: Arc<String>,
+    require_identity: bool,
+}
+
 /// Starts the HTTP proxy on the given port. Pass `0` for an OS-assigned random port.
 /// Returns the actual port the proxy bound to (useful when `port == 0`).
 /// Writes `proxy.json` to the vault directory for agent/tool discovery.
@@ -73,7 +88,19 @@ pub async fn start_proxy(
     port: u16,
     all_projects: bool,
 ) -> Result<StartProxyOutcome, Box<dyn std::error::Error + Send + Sync>> {
-    match lifecycle::prepare_for_start(port).await {
+    let listeners = vec![ListenConfig::new(
+        ListenSpec::default_tcp(port),
+        IdentityRequirement::Default,
+    )];
+    start_proxy_with_listeners(listeners, all_projects).await
+}
+
+pub async fn start_proxy_with_listeners(
+    listener_configs: Vec<ListenConfig>,
+    all_projects: bool,
+) -> Result<StartProxyOutcome, Box<dyn std::error::Error + Send + Sync>> {
+    let requested_port = requested_primary_port(&listener_configs);
+    match lifecycle::prepare_for_start(requested_port).await {
         Ok(StartDecision::Start) => {}
         Ok(StartDecision::AlreadyRunning(metadata)) => {
             return Ok(StartProxyOutcome::AlreadyRunning(metadata));
@@ -81,16 +108,30 @@ pub async fn start_proxy(
         Err(e) => return Err(e.into()),
     }
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = TcpListener::bind(addr).await.map_err(|e| {
-        format!(
-            "failed to bind {addr}: {e}. If another process owns this port, WispKey will not terminate it without owned proxy metadata."
-        )
-    })?;
-    let actual_addr = listener.local_addr()?;
-    let actual_port = actual_addr.port();
+    if listener_configs.is_empty() {
+        return Err("at least one proxy listener is required".into());
+    }
 
-    tracing::info!("WispKey proxy listening on http://{}", actual_addr);
+    let mut bound_listeners = Vec::with_capacity(listener_configs.len());
+    for config in listener_configs {
+        bound_listeners.push(BoundTransport::bind(config).await?);
+    }
+    let listener_metadata = bound_listeners
+        .iter()
+        .map(|listener| listener.metadata().clone())
+        .collect::<Vec<_>>();
+    let primary_port = primary_tcp_port(&listener_metadata).unwrap_or(0);
+    let primary_address = primary_http_address(&listener_metadata)
+        .unwrap_or_else(|| format!("http://127.0.0.1:{primary_port}"));
+
+    for listener in &listener_metadata {
+        tracing::info!(
+            "WispKey proxy listening on {} (transport={}, require_identity={})",
+            listener.address,
+            listener.transport,
+            listener.require_identity
+        );
+    }
 
     let wisp_pattern = Arc::new(Regex::new(r"wk_[a-z0-9_]+").expect("static regex must compile"));
     let project_scope: Arc<Option<String>> = if all_projects {
@@ -100,10 +141,11 @@ pub async fn start_proxy(
     };
     let management_token = Arc::new(crate::random::alphanumeric(48, false)?);
     let metadata = Arc::new(ProxyMetadata::new(
-        actual_port,
-        format!("http://{}", actual_addr),
+        primary_port,
+        primary_address,
         project_scope.as_ref().clone(),
         management_token.as_ref().clone(),
+        listener_metadata.clone(),
     ));
     lifecycle::write_metadata(&metadata)?;
 
@@ -137,33 +179,67 @@ pub async fn start_proxy(
         policy_engine,
         management_token,
         shutdown_tx,
-        proxy_port: actual_port,
+        proxy_port: primary_port,
         metadata: metadata.clone(),
     };
 
-    loop {
-        let accepted = tokio::select! {
-            accepted = listener.accept() => accepted?,
-            _ = tokio::signal::ctrl_c() => {
-                lifecycle::cleanup_metadata(&metadata.instance_id, "ctrl-c signal")?;
-                return Ok(StartProxyOutcome::Stopped { port: actual_port });
+    let cleanup_paths = bound_listeners
+        .iter()
+        .filter_map(BoundTransport::cleanup_path)
+        .collect::<Vec<_>>();
+    for listener in bound_listeners {
+        let runtime = runtime.clone();
+        tokio::task::spawn(serve_listener(listener, runtime));
+    }
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {
+            for path in &cleanup_paths {
+                transport::cleanup_socket(path);
             }
-            reason = shutdown_rx.recv() => {
-                let reason = reason.unwrap_or_else(|_| "shutdown requested".to_string());
-                lifecycle::cleanup_metadata(&metadata.instance_id, &reason)?;
-                return Ok(StartProxyOutcome::Stopped { port: actual_port });
+            lifecycle::cleanup_metadata(&metadata.instance_id, "ctrl-c signal")?;
+            Ok(StartProxyOutcome::Stopped { port: primary_port })
+        }
+        reason = shutdown_rx.recv() => {
+            let reason = reason.unwrap_or_else(|_| "shutdown requested".to_string());
+            for path in &cleanup_paths {
+                transport::cleanup_socket(path);
+            }
+            lifecycle::cleanup_metadata(&metadata.instance_id, &reason)?;
+            Ok(StartProxyOutcome::Stopped { port: primary_port })
+        }
+    }
+}
+
+async fn serve_listener(listener: BoundTransport, runtime: ProxyRuntime) {
+    let metadata = listener.metadata().clone();
+    let listener_runtime = ListenerRuntime {
+        label: Arc::new(metadata.transport.clone()),
+        address: Arc::new(metadata.address.clone()),
+        require_identity: metadata.require_identity,
+    };
+
+    loop {
+        let accepted = match listener.accept().await {
+            Ok(accepted) => accepted,
+            Err(e) => {
+                tracing::error!("Listener error on {}: {}", metadata.address, e);
+                break;
             }
         };
 
-        let (stream, remote_addr) = accepted;
         let runtime = runtime.clone();
-
-        let io = hyper_util::rt::TokioIo::new(stream);
+        let listener_runtime = listener_runtime.clone();
+        let remote_label = accepted.peer_label;
+        let io = hyper_util::rt::TokioIo::new(accepted.stream);
 
         tokio::task::spawn(async move {
+            let connection_label = remote_label.clone();
             let service = service_fn(move |req| {
                 let runtime = runtime.clone();
-                handle_request(req, remote_addr, runtime)
+                let listener_runtime = listener_runtime.clone();
+                let remote_label = remote_label.clone();
+                handle_request(req, remote_label, listener_runtime, runtime)
             });
 
             if let Err(e) = http1::Builder::new()
@@ -171,15 +247,43 @@ pub async fn start_proxy(
                 .with_upgrades()
                 .await
             {
-                tracing::error!("Connection error from {}: {}", remote_addr, e);
+                tracing::error!("Connection error from {}: {}", connection_label, e);
             }
         });
     }
 }
 
+fn requested_primary_port(configs: &[ListenConfig]) -> u16 {
+    configs
+        .iter()
+        .find_map(|config| match config.spec {
+            ListenSpec::Tcp(addr) => Some(addr.port()),
+            _ => None,
+        })
+        .unwrap_or(0)
+}
+
+fn primary_tcp_port(listeners: &[ListenerMetadata]) -> Option<u16> {
+    listeners
+        .iter()
+        .find(|listener| listener.transport == "tcp")
+        .and_then(|listener| listener.address.strip_prefix("tcp://"))
+        .and_then(|address| address.parse::<std::net::SocketAddr>().ok())
+        .map(|address| address.port())
+}
+
+fn primary_http_address(listeners: &[ListenerMetadata]) -> Option<String> {
+    listeners
+        .iter()
+        .find(|listener| listener.transport == "tcp")
+        .and_then(|listener| listener.address.strip_prefix("tcp://"))
+        .map(|address| format!("http://{address}"))
+}
+
 async fn handle_request(
     req: Request<Incoming>,
-    _remote_addr: SocketAddr,
+    _remote_addr: String,
+    listener: ListenerRuntime,
     runtime: ProxyRuntime,
 ) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let method = req.method().clone();
@@ -214,6 +318,11 @@ async fn handle_request(
         return Ok(handle_management_api(&method, &uri, &headers).await);
     }
 
+    let instance = match authenticate_instance(&headers, &listener) {
+        Ok(instance) => instance,
+        Err(response) => return Ok(*response),
+    };
+
     if method == Method::CONNECT {
         return handle_connect(req, runtime.proxy_port, &runtime).await;
     }
@@ -233,6 +342,7 @@ async fn handle_request(
             runtime.project_scope,
             runtime.policy_engine,
             runtime.https_client,
+            instance,
         )
         .await);
     }
@@ -256,9 +366,13 @@ async fn handle_request(
         http_method: parts.method.as_str(),
         project_scope: runtime.project_scope.as_ref(),
         policy_engine: runtime.policy_engine.as_ref(),
+        instance: instance.as_ref(),
     };
 
     for (header_name, header_value) in parts.headers.iter() {
+        if is_instance_auth_header(header_name) {
+            continue;
+        }
         if let Ok(value_str) = header_value.to_str()
             && runtime.wisp_pattern.is_match(value_str)
         {
@@ -330,7 +444,7 @@ async fn handle_request(
         .uri(&target_uri);
 
     for (name, value) in new_headers.iter() {
-        if name != "host" {
+        if name != "host" && !is_instance_auth_header(name) {
             forward_req = forward_req.header(name, value);
         }
     }
@@ -374,7 +488,10 @@ async fn handle_request(
                         Some(parts.method.as_str()),
                         Some(response_status),
                         false,
-                        None,
+                        instance
+                            .as_ref()
+                            .map(|instance| format!("instance={}", instance.name))
+                            .as_deref(),
                         None,
                     );
                 }
@@ -402,7 +519,14 @@ async fn handle_request(
                         Some(parts.method.as_str()),
                         None,
                         false,
-                        Some(&e.to_string()),
+                        Some(
+                            &instance
+                                .as_ref()
+                                .map(|instance| {
+                                    format!("instance={} upstream error: {}", instance.name, e)
+                                })
+                                .unwrap_or_else(|| e.to_string()),
+                        ),
                         None,
                     );
                 }
@@ -425,6 +549,7 @@ async fn handle_reverse_proxy(
     project_scope: Arc<Option<String>>,
     policy_engine: Arc<PolicyEngine>,
     https_client: Arc<HttpsClient>,
+    instance: Option<InstanceIdentity>,
 ) -> Response<Full<Bytes>> {
     let target_uri: Uri = match target_url.parse() {
         Ok(u) => u,
@@ -451,10 +576,14 @@ async fn handle_reverse_proxy(
         http_method: parts.method.as_str(),
         project_scope: project_scope.as_ref(),
         policy_engine: policy_engine.as_ref(),
+        instance: instance.as_ref(),
     };
 
     for (header_name, header_value) in parts.headers.iter() {
-        if header_name == "x-target-url" || header_name == "host" {
+        if header_name == "x-target-url"
+            || header_name == "host"
+            || is_instance_auth_header(header_name)
+        {
             continue;
         }
         if let Ok(value_str) = header_value.to_str()
@@ -520,7 +649,7 @@ async fn handle_reverse_proxy(
         .method(parts.method.clone())
         .uri(&target_url);
     for (name, value) in new_headers.iter() {
-        if name != "host" && name != "x-target-url" {
+        if name != "host" && name != "x-target-url" && !is_instance_auth_header(name) {
             forward_req = forward_req.header(name, value);
         }
     }
@@ -554,7 +683,10 @@ async fn handle_reverse_proxy(
                         Some(parts.method.as_str()),
                         Some(response_status),
                         false,
-                        None,
+                        instance
+                            .as_ref()
+                            .map(|instance| format!("instance={}", instance.name))
+                            .as_deref(),
                         None,
                     );
                 }
@@ -581,7 +713,14 @@ async fn handle_reverse_proxy(
                         Some(parts.method.as_str()),
                         None,
                         false,
-                        Some(&e.to_string()),
+                        Some(
+                            &instance
+                                .as_ref()
+                                .map(|instance| {
+                                    format!("instance={} upstream error: {}", instance.name, e)
+                                })
+                                .unwrap_or_else(|| e.to_string()),
+                        ),
                         None,
                     );
                 }
@@ -678,6 +817,68 @@ fn extract_target_host(uri: &Uri, headers: &hyper::HeaderMap) -> String {
     "unknown".to_string()
 }
 
+fn authenticate_instance(
+    headers: &HeaderMap,
+    listener: &ListenerRuntime,
+) -> Result<Option<InstanceIdentity>, Box<Response<Full<Bytes>>>> {
+    let instance_id = headers
+        .get(INSTANCE_ID_HEADER)
+        .and_then(|value| value.to_str().ok());
+    let instance_secret = headers
+        .get(INSTANCE_SECRET_HEADER)
+        .and_then(|value| value.to_str().ok());
+
+    if !listener.require_identity && instance_id.is_none() && instance_secret.is_none() {
+        return Ok(None);
+    }
+
+    let Some(instance_id) = instance_id else {
+        tracing::warn!(
+            "instance authentication failed on {} listener {}: missing instance id",
+            listener.label,
+            listener.address
+        );
+        return Err(instance_auth_failed_response());
+    };
+    let Some(instance_secret) = instance_secret else {
+        tracing::warn!(
+            "instance authentication failed on {} listener {}: missing instance secret",
+            listener.label,
+            listener.address
+        );
+        return Err(instance_auth_failed_response());
+    };
+
+    let Ok(vault) = Vault::open_with_session() else {
+        return Err(instance_auth_failed_response());
+    };
+    let Ok(instance) = vault.get_instance(instance_id) else {
+        return Err(instance_auth_failed_response());
+    };
+    let verified = vault
+        .verify_instance_secret(&instance.id, instance_secret)
+        .unwrap_or(false);
+    if !verified {
+        return Err(instance_auth_failed_response());
+    }
+
+    Ok(Some(InstanceIdentity {
+        id: instance.id,
+        name: instance.name,
+    }))
+}
+
+fn instance_auth_failed_response() -> Box<Response<Full<Bytes>>> {
+    Box::new(json_response(
+        StatusCode::UNAUTHORIZED,
+        &serde_json::json!({"error": "instance authentication failed"}),
+    ))
+}
+
+fn is_instance_auth_header(name: &hyper::header::HeaderName) -> bool {
+    name == INSTANCE_ID_HEADER || name == INSTANCE_SECRET_HEADER
+}
+
 fn build_target_uri(uri: &Uri, headers: &hyper::HeaderMap) -> String {
     if uri.scheme().is_some() {
         return uri.to_string();
@@ -699,7 +900,7 @@ fn cors_preflight() -> Response<Full<Bytes>> {
         )
         .header(
             "access-control-allow-headers",
-            "content-type, authorization, x-wispkey-management-token",
+            "content-type, authorization, x-wispkey-management-token, x-wispkey-instance-id, x-wispkey-instance-secret",
         )
         .header("access-control-max-age", "86400")
         .body(Full::new(Bytes::new()))

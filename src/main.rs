@@ -160,6 +160,18 @@ enum Commands {
         /// Allow credentials from all projects (default: active project only)
         #[arg(long)]
         all_projects: bool,
+
+        /// Add a listener: tcp://127.0.0.1:7700, unix:/absolute/path.sock, or vsock://<cid>:<port>
+        #[arg(long = "listen")]
+        listen: Vec<String>,
+
+        /// Require per-request instance identity on all listeners
+        #[arg(long, conflicts_with = "no_require_identity")]
+        require_identity: bool,
+
+        /// Do not require per-request instance identity on any listener
+        #[arg(long, conflicts_with = "require_identity")]
+        no_require_identity: bool,
     },
 
     /// Import credentials from a .env file
@@ -226,6 +238,12 @@ enum Commands {
     Policy {
         #[command(subcommand)]
         command: PolicyCommands,
+    },
+
+    /// Manage enrolled instance identities and access requests
+    Instance {
+        #[command(subcommand)]
+        command: InstanceCommands,
     },
 
     /// Cloud sync (WispKey Cloud)
@@ -367,6 +385,74 @@ enum PolicyCommands {
 }
 
 #[derive(Subcommand)]
+enum InstanceCommands {
+    /// Enroll a new instance and print its one-time secret
+    Enroll {
+        name: String,
+        #[arg(long, default_value = "")]
+        description: String,
+        #[arg(long)]
+        partition: Vec<String>,
+        #[arg(long)]
+        project: Vec<String>,
+        #[arg(long)]
+        credential: Vec<String>,
+        #[arg(long)]
+        tag: Vec<String>,
+    },
+    /// List enrolled instances
+    List,
+    /// Show full instance details
+    Show { name: String },
+    /// Add or remove instance scopes
+    Scope {
+        #[command(subcommand)]
+        command: InstanceScopeCommands,
+    },
+    /// Revoke an instance without deleting audit history
+    Revoke { name: String },
+    /// List access requests
+    Requests {
+        #[arg(long)]
+        instance: Option<String>,
+        #[arg(long)]
+        pending: bool,
+    },
+    /// Approve an access request
+    Approve { request_id: String },
+    /// Deny an access request
+    Deny { request_id: String },
+}
+
+#[derive(Subcommand)]
+enum InstanceScopeCommands {
+    /// Add one or more scope selectors
+    Add {
+        name: String,
+        #[arg(long, num_args = 1..)]
+        partition: Vec<String>,
+        #[arg(long, num_args = 1..)]
+        project: Vec<String>,
+        #[arg(long, num_args = 1..)]
+        credential: Vec<String>,
+        #[arg(long, num_args = 1..)]
+        tag: Vec<String>,
+    },
+    /// Remove one or more scope selectors
+    Remove {
+        name: String,
+        #[arg(long, num_args = 1..)]
+        partition: Vec<String>,
+        #[arg(long, num_args = 1..)]
+        project: Vec<String>,
+        #[arg(long, num_args = 1..)]
+        credential: Vec<String>,
+        #[arg(long, num_args = 1..)]
+        tag: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum CloudCommands {
     /// Show cloud sync status
     Status,
@@ -501,9 +587,20 @@ async fn main() {
             random_port,
             daemon,
             all_projects,
+            listen,
+            require_identity,
+            no_require_identity,
         } => {
             let effective_port = if random_port { 0 } else { port };
-            cli::handle_serve(effective_port, daemon, all_projects).await;
+            cli::handle_serve(
+                effective_port,
+                daemon,
+                all_projects,
+                listen,
+                require_identity,
+                no_require_identity,
+            )
+            .await;
         }
         Commands::Import {
             path,
@@ -608,6 +705,64 @@ async fn main() {
             PolicyCommands::List => cli::handle_policy_list().await,
             PolicyCommands::Init => cli::handle_policy_init().await,
             PolicyCommands::Check => cli::handle_policy_check().await,
+        },
+        Commands::Instance { command } => match command {
+            InstanceCommands::Enroll {
+                name,
+                description,
+                partition,
+                project,
+                credential,
+                tag,
+            } => {
+                cli::handle_instance_enroll(
+                    &name,
+                    &description,
+                    &partition,
+                    &project,
+                    &credential,
+                    &tag,
+                )
+                .await
+            }
+            InstanceCommands::List => cli::handle_instance_list().await,
+            InstanceCommands::Show { name } => cli::handle_instance_show(&name).await,
+            InstanceCommands::Scope { command } => match command {
+                InstanceScopeCommands::Add {
+                    name,
+                    partition,
+                    project,
+                    credential,
+                    tag,
+                } => {
+                    cli::handle_instance_scope_add(&name, &partition, &project, &credential, &tag)
+                        .await
+                }
+                InstanceScopeCommands::Remove {
+                    name,
+                    partition,
+                    project,
+                    credential,
+                    tag,
+                } => {
+                    cli::handle_instance_scope_remove(
+                        &name,
+                        &partition,
+                        &project,
+                        &credential,
+                        &tag,
+                    )
+                    .await
+                }
+            },
+            InstanceCommands::Revoke { name } => cli::handle_instance_revoke(&name).await,
+            InstanceCommands::Requests { instance, pending } => {
+                cli::handle_instance_requests(instance.as_deref(), pending).await
+            }
+            InstanceCommands::Approve { request_id } => {
+                cli::handle_instance_approve(&request_id).await
+            }
+            InstanceCommands::Deny { request_id } => cli::handle_instance_deny(&request_id).await,
         },
         Commands::Cloud { command } => match command {
             CloudCommands::Status => cli::handle_cloud_status().await,

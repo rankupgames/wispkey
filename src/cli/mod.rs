@@ -10,6 +10,7 @@
 mod cloud;
 mod credential_sharing;
 mod credentials;
+mod instances;
 mod log;
 mod mcp;
 mod partitions;
@@ -28,6 +29,11 @@ pub use credential_sharing::{handle_credential_export, handle_credential_import}
 pub use credentials::{
     AddCredentialArgs, handle_add, handle_get, handle_import, handle_list, handle_remove,
     handle_rotate,
+};
+pub use instances::{
+    handle_instance_approve, handle_instance_deny, handle_instance_enroll, handle_instance_list,
+    handle_instance_requests, handle_instance_revoke, handle_instance_scope_add,
+    handle_instance_scope_remove, handle_instance_show,
 };
 pub use log::handle_log;
 pub use mcp::handle_mcp_serve;

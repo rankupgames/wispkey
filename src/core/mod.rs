@@ -21,6 +21,7 @@ use uuid::Uuid;
 use crate::secure_files;
 
 mod crypto;
+mod instances;
 mod rows;
 mod schema;
 mod session;
@@ -28,6 +29,7 @@ mod session_store;
 #[cfg(test)]
 mod tests;
 
+pub use instances::{AccessRequest, EnrollInstanceResult, Instance, InstanceScopeInput};
 use rows::{credential_from_row, parse_csv, partition_from_row, project_from_row};
 #[cfg(test)]
 use rows::{parse_credential_type_column, parse_datetime_column};
@@ -36,7 +38,7 @@ use rows::{parse_credential_type_column, parse_datetime_column};
 pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
-const CURRENT_SCHEMA_VERSION: &str = "6";
+const CURRENT_SCHEMA_VERSION: &str = "7";
 
 /// Errors returned by vault operations (I/O, crypto, schema, and business rules).
 #[derive(Error, Debug)]
@@ -78,6 +80,18 @@ pub enum VaultError {
     CannotDeleteDefaultProject,
     #[error("invalid bundle: {0}")]
     InvalidBundle(String),
+    #[error("instance '{0}' already exists")]
+    DuplicateInstance(String),
+    #[error("instance '{0}' not found")]
+    InstanceNotFound(String),
+    #[error("invalid instance scope type: {0}")]
+    InvalidInstanceScope(String),
+    #[error("instance scope '{0}' not found")]
+    InstanceScopeNotFound(String),
+    #[error("access request '{0}' not found")]
+    AccessRequestNotFound(String),
+    #[error("access request '{0}' is already decided")]
+    AccessRequestAlreadyDecided(String),
 }
 
 /// Convenient `Result` alias using [`VaultError`] as the error type.

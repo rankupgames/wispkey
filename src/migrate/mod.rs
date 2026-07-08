@@ -4,7 +4,7 @@
  * Project: WispKey
  * Description: .env file importer -- parses env files, auto-detects credential types
  *              via regex heuristics, encrypts and stores them, outputs a .env.wispkey
- *              file with phantom tokens.
+ *              file with wisp tokens.
  * Created: 2026-04-07
  * Last Modified: 2026-04-08
  */

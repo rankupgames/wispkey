@@ -7,6 +7,8 @@ WispKey is a credential firewall for AI agents. Its main boundary is between a p
 - Prompt-injected or compromised agents reading plaintext credentials through normal WispKey CLI or MCP surfaces. `wispkey_get_token` returns wisp tokens, not raw values.
 - Agents accidentally or intentionally sending vault-backed credentials before the proxy boundary. The proxy replaces valid wisp tokens in headers, supported text bodies, and URL query parameters.
 - Credential use outside configured boundaries when host restrictions or TOML policies are configured. Policies can restrict hosts, paths, methods, time windows, and rate limits.
+- Untrusted VM or worker instances using credentials outside their enrolled scope when served over identity-required transports. Instance requests must authenticate with an enrollment secret, scope checks fail closed, and out-of-scope use is denied before forwarding.
+- Silent privilege escalation by enrolled instances. Out-of-scope use creates a pending access request that must be approved by the host before the instance can retry successfully.
 - Silent vault-backed credential use. WispKey writes use and denial events to the SQLite audit log. Env-sideload-only proxy use without an unlocked vault writes fallback JSONL audit events.
 - Accidental env-sideload disclosure. `WISPKEY_SIDELOAD_<SLUG>` values are exposed to agents as deterministic `wk_env_<slug>` tokens; the raw env value is not printed or logged.
 - Timing disclosure of proxy management tokens through direct string comparison. Management API tokens are compared in constant time.
@@ -14,7 +16,10 @@ WispKey is a credential firewall for AI agents. Its main boundary is between a p
 ## Explicit Limits
 
 - HTTPS CONNECT is a blind TCP tunnel. WispKey cannot substitute tokens inside CONNECT traffic. Use reverse proxy mode with `X-Target-Url` when HTTPS requests need token substitution.
-- Localhost clients are trusted by design. Keep the proxy bound to loopback and run it only on trusted machines.
+- Default loopback TCP clients are trusted by design for backward compatibility. Keep the default proxy bound to loopback and run it only on trusted machines unless you explicitly require instance identity.
+- Instance identities are bearer credentials. Protect `x-wispkey-instance-id` and `x-wispkey-instance-secret` in the VM environment or metadata channel. Rotate by revoking the instance and enrolling a replacement.
+- A compromised instance can use credentials that are already in its scope. Scope limits reduce blast radius; they do not make an in-scope credential safe after the instance is compromised.
+- Transport security for untrusted instances depends on the channel. Bind UDS listeners to host-only socket paths, keep socket permissions tight, and use vsock only for the intended host/guest boundary. Do not expose identity-required listeners on networks where the instance secret can be intercepted.
 - WispKey does not defend against a same-OS-user local process that can read all local WispKey files, read the device seed, reconstruct machine inputs, call local OS APIs available to that user, attach a debugger, or inspect process memory.
 - Root, Administrator, kernel-level compromise, malware with equivalent local privileges, or a malicious WispKey binary are out of scope.
 - Body substitution is limited to text-like content types such as JSON, text, form-urlencoded, and XML. Binary or opaque body rewriting is intentionally not supported.
@@ -32,3 +37,11 @@ This prevents a simple read of `~/.wispkey/session` from recovering the vault ke
 ## Agent-Scoped Policies
 
 Agent-scoped policies fail closed when the requester agent identity is unavailable. The proxy currently has no trusted agent identity source, so a policy with an `agent = "..."` scope applies to proxy requests even when no agent name is known.
+
+## Instance Boundary
+
+Multi-instance access adds an authenticated untrusted-client boundary for ephemeral VMs and worker instances. Each instance enrolls on the host with a unique id and one-time secret. The secret is Argon2id-hashed at rest and must be presented on every proxied request with `x-wispkey-instance-id` and `x-wispkey-instance-secret`.
+
+Unix domain socket and vsock listeners require instance identity by default. Loopback TCP keeps the original no-identity default unless `--require-identity` is set. Missing, invalid, or revoked instance identity returns HTTP 401.
+
+After authentication, WispKey checks instance scope before injecting a vault credential. Scope selectors can match by partition, project, credential name, or exact tag. If a token is out of scope, WispKey returns HTTP 403 with `error: "out_of_scope"`, queues or reuses a pending access request, audits the denial, and does not forward the upstream request. Host approval makes that credential available to the instance on retry.

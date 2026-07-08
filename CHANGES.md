@@ -1,5 +1,17 @@
 # Changes
 
+## 0.3.0 (2026-07-08)
+
+### Multi-instance access
+
+- Added host-managed instance enrollment for ephemeral VMs and workers with `wispkey instance enroll <name>`, one-time 48-character secrets, Argon2id-hashed instance secrets at rest, and scope selectors for partitions, projects, credentials, and tags.
+- Added instance lifecycle and escalation commands: `instance list`, `show`, `scope add`, `scope remove`, `revoke`, `requests`, `approve`, and `deny`.
+- Added schema v7 tables for `instances`, `instance_scopes`, and `access_requests`.
+- Added repeatable proxy listeners with `wispkey serve --listen <spec>` for TCP, Unix domain sockets, and feature-gated Linux vsock. The default `wispkey serve` loopback TCP behavior remains unchanged.
+- Added per-request instance authentication with `x-wispkey-instance-id` and `x-wispkey-instance-secret`. UDS and vsock listeners require identity by default; TCP listeners do not unless `--require-identity` is set.
+- Added instance scope enforcement at token injection. Out-of-scope use returns HTTP 403 `out_of_scope`, queues an idempotent pending access request, and requires host approval before retry.
+- Added public multi-instance deployment documentation in `docs/multi-instance-deployment.md` and updated the security model for authenticated, scoped, untrusted instance clients.
+
 ## 0.2.0 (2026-07-07)
 
 ### Project scoping and proxy hardening
