@@ -1,5 +1,37 @@
 # Changes
 
+## 0.4.0 (2026-07-08)
+
+### Secret injection for subprocesses
+
+- Added `wispkey exec --credential <name> [--project <p>] [--stdin] [--env <VAR>] [--askpass] -- <command> [args...]` for audited subprocess secret injection outside the HTTP proxy.
+- Added `wispkey run [--manifest <path>] [--project <p>] -- <command> [args...]` for manifest-based multi-secret child environment injection. Manifests use `[env]` entries where `cred:<name>` resolves a credential and plain strings pass through literally.
+- Added `wispkey inject -i <infile|-> [-o <outfile>] [--project <p>] [--stdout]` for rendering `{{ cred:<name> }}` template references to owner-only output files, with explicit `--stdout` for caller-visible plaintext.
+- Added the hidden internal `wispkey askpass` helper for `SUDO_ASKPASS`, `SSH_ASKPASS`, and `GIT_ASKPASS` flows. `exec --askpass` now creates a per-exec owner-only handoff capability file exposed to the child with `WISPKEY_ASKPASS_HANDOFF`; the helper refuses to run without a valid handoff and is not a standalone plaintext oracle.
+- `exec`, `run`, and `inject` resolve credentials within the active or explicit project, fail closed when the vault is locked or a referenced credential is missing, and never interpolate secrets into child argv, parent environment, WispKey stdout/stderr except explicit `inject --stdout`, tracing logs, or audit value fields.
+- Added `CredentialExec`, `CredentialRun`, and `CredentialInject` audit events containing credential names, command or output metadata, project, and exit status where applicable, with no plaintext secret values.
+- Documented `exec`, `run`, and `inject` usage, security boundaries, and the stdin/stdout limitations for intentional plaintext egress.
+- Added integration tests for exec env, stdin, askpass, missing credential, missing channel, run manifest injection, inject rendering, owner-only output files, fail-closed behavior, and audit behavior.
+
+### Instance bootstrap tokens
+
+- Added schema v8 `bootstrap_tokens` storage with Argon2id-hashed bootstrap token material, scope JSON, optional TTL, optional max-use count, use count, and revocation status. The v7-to-v8 migration is additive and preserves existing credential, instance, scope, and access-request rows.
+- Added `wispkey instance bootstrap create/list/revoke` for host-minted scoped bootstrap tokens and `wispkey instance join [<bootstrap-token>] [--token-file <path|->] --name <instance-name>` for local self-enrollment tests and host-side automation. Positional bootstrap tokens still work but warn about argv exposure; examples prefer `--token-file -`.
+- Added unauthenticated first-contact `POST /api/instances/join` on the proxy management API. The endpoint is authenticated only by the bootstrap token, remains reachable on identity-required listeners, returns a new per-instance id and one-time secret on success, and emits `InstanceJoined` audit events without logging bootstrap tokens or instance secrets.
+- Bootstrap redemption is atomic/race-safe, fails closed for invalid, expired, exhausted, and revoked tokens, strictly enforces max-use counts under concurrent joins, and copies the bootstrap token's partition/project/credential/tag selectors onto the new instance.
+- Added unit and integration tests for single-use redemption, copied tag scope, expired/revoked failures, additive v7-to-v8 migration, and the Unix-socket join endpoint path that requires sockets.
+
+### Audit export and streaming
+
+- Added `wispkey audit export [--since <ts>] [--until <ts>] [--credential <name>] [--encoding jsonl|json] [-o <file>]` for bulk SIEM egress from the combined vault-backed and sideload-fallback audit sinks.
+- Added `wispkey audit tail [--follow] [--credential <name>]` to print newest audit events as JSONL and optionally poll for new events with a forward `(timestamp,id)` cursor that does not skip same-timestamp rows, for piping into tools such as `logger`, Vector, or Fluent Bit.
+- Extended audit queries with unbounded range export while preserving the existing `wispkey log --last` behavior.
+- Added integration tests for JSONL export, JSON file export, date-range filtering, tail output, and absence of plaintext secret values in audit export output.
+
+### Fixes
+
+- Stored-timestamp parsing now accepts both RFC 3339 and the SQLite space-separated `YYYY-MM-DD HH:MM:SS[.f]` form (assumed UTC). A single row written through raw SQL or `CURRENT_TIMESTAMP` previously made `list`, `mcp` listing, and other reads fail with `Conversion error from type Text at index: 8, premature end of input`; one legacy row can no longer break a whole listing.
+
 ## 0.3.0 (2026-07-08)
 
 ### Multi-instance access
@@ -33,7 +65,7 @@
 ### Audit log surfaces
 
 - `src/audit/mod.rs` and `src/cli/log.rs`: merge vault-backed SQLite audit rows with vault-less `sideload-audit.jsonl` fallback rows, including `--credential`/`--since` filtering, exact-midnight UTC filtering, and JSON `source` markers.
-- `tests/env_sideload.rs`: verifies `wispkey log --format json --credential openai` can read a vault-less `SideloadUsed` fallback event without exposing the sideloaded env secret.
+- `tests/env_sideload.rs`: verifies `wispkey --format json log --credential openai` can read a vault-less `SideloadUsed` fallback event without exposing the sideloaded env secret.
 
 ### Correctness fixes
 

@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use http_body_util::Full;
 use hyper::{Response, StatusCode, Uri};
+use serde::Deserialize;
 
 use crate::audit;
 use crate::core::{self, Vault, VaultError};
@@ -308,6 +309,90 @@ pub(super) async fn handle_management_api(
         _ => json_response(
             StatusCode::NOT_FOUND,
             &serde_json::json!({"error": "not found"}),
+        ),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct JoinRequest {
+    bootstrap_token: String,
+    name: String,
+}
+
+pub(super) async fn handle_instance_join_api(body: &[u8]) -> Response<Full<Bytes>> {
+    let request = match serde_json::from_slice::<JoinRequest>(body) {
+        Ok(request) => request,
+        Err(_) => {
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                &serde_json::json!({"error": "invalid request body"}),
+            );
+        }
+    };
+    if request.bootstrap_token.trim().is_empty() || request.name.trim().is_empty() {
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            &serde_json::json!({"error": "bootstrap_token and name are required"}),
+        );
+    }
+
+    let vault = match Vault::open_with_session() {
+        Ok(vault) => vault,
+        Err(_) => {
+            return json_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &serde_json::json!({"error": "vault locked"}),
+            );
+        }
+    };
+
+    match vault.redeem_bootstrap_token(&request.bootstrap_token, &request.name) {
+        Ok(result) => {
+            let scopes = result
+                .instance
+                .scopes
+                .iter()
+                .map(|scope| {
+                    serde_json::json!({
+                        "scope_type": scope.scope_type,
+                        "scope_value": scope.scope_value,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let scope_json = serde_json::to_string(&scopes).unwrap_or_else(|_| "[]".to_string());
+            audit::log_event(
+                vault.db(),
+                "InstanceJoined",
+                Some(&result.instance.name),
+                None,
+                Some(&result.bootstrap_token_id),
+                None,
+                None,
+                None,
+                false,
+                Some(&scope_json),
+                None,
+            );
+            json_response(
+                StatusCode::CREATED,
+                &serde_json::json!({
+                    "id": result.instance.id,
+                    "secret": result.secret,
+                    "scopes": scopes,
+                }),
+            )
+        }
+        Err(VaultError::InvalidBootstrapToken) => json_response(
+            StatusCode::UNAUTHORIZED,
+            &serde_json::json!({"error": "invalid bootstrap token"}),
+        ),
+        Err(VaultError::DuplicateInstance(_)) => json_response(
+            StatusCode::CONFLICT,
+            &serde_json::json!({"error": "instance name already exists"}),
+        ),
+        Err(error) => json_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &serde_json::json!({"error": error.to_string()}),
         ),
     }
 }

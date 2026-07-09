@@ -37,7 +37,7 @@ wispkey instance enroll worker-acme-001 \
 
 The output includes the instance id and secret. Save the secret into the VM launch environment or metadata channel immediately; WispKey cannot show it again.
 
-For automation, add `--format json` and read the returned `id` and `secret` fields.
+For automation, use `wispkey --format json instance enroll ...` and read the returned `id` and `secret` fields.
 
 Manage instances and scope:
 
@@ -50,6 +50,36 @@ wispkey instance revoke worker-acme-001
 ```
 
 Revocation keeps audit history and makes the original id/secret fail authentication.
+
+## Fleet Self-Enrollment
+
+For VM fleets, the host can mint a scoped bootstrap token instead of pre-enrolling every instance by hand. The token is a first-contact bearer credential: it is scoped, optional-TTL-limited, optional-use-limited, revocable, and stored only as an Argon2id hash.
+
+Create a bootstrap token on the host:
+
+```bash
+wispkey instance bootstrap create \
+  --description "Acme worker launch token" \
+  --tag company:acme \
+  --ttl 1h \
+  --uses 50
+```
+
+The output includes the bootstrap token once. Pass it to the VM launcher through a protected launch channel. The VM can redeem it locally when the vault is available; prefer `--token-file` so the token is not exposed through shell history or process listings:
+
+```bash
+printf '%s' "$BOOTSTRAP_TOKEN" | wispkey instance join --token-file - --name worker-acme-001
+```
+
+For remote first contact through the proxy, call the join endpoint. It does not require a management token or existing instance identity because the VM has neither yet; the bootstrap token is the sole authenticator:
+
+```bash
+curl --unix-socket /run/wispkey/proxy.sock http://wispkey.local/api/instances/join \
+  -H "Content-Type: application/json" \
+  -d '{"bootstrap_token":"<bootstrap-token>","name":"worker-acme-001"}'
+```
+
+On success, WispKey returns the new instance `id`, one-time `secret`, and copied scopes. Bootstrap redemption is atomic/race-safe, so max-use limits are strictly enforced under concurrent joins. The VM then proceeds with the normal request flow using `x-wispkey-instance-id` and `x-wispkey-instance-secret`. Invalid, expired, exhausted, or revoked bootstrap tokens fail closed.
 
 ## Proxy Listeners
 

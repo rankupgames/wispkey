@@ -153,6 +153,20 @@ pub fn query_combined_log(
     sort_and_limit(entries, last)
 }
 
+/// Queries both audit sinks without a row limit, ordered oldest to newest.
+pub fn query_combined_log_range(
+    db: Option<&Connection>,
+    credential: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Vec<AuditEntry> {
+    let mut entries = db
+        .map(|db| query_log_range(db, credential, since, until))
+        .unwrap_or_default();
+    entries.extend(query_fallback_log_range(credential, since, until));
+    sort_oldest_first(entries)
+}
+
 /// Queries the audit log with optional filters for credential name, date range, and row limit.
 pub fn query_log(
     db: &Connection,
@@ -242,6 +256,55 @@ pub fn query_log(
     entries
 }
 
+/// Queries the audit log with optional credential and timestamp range filters, without a row limit.
+pub fn query_log_range(
+    db: &Connection,
+    credential: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Vec<AuditEntry> {
+    let mut query = String::from(
+        "SELECT id, timestamp, event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied, deny_reason, project_name FROM audit_log WHERE 1=1",
+    );
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(4);
+
+    if let Some(cred) = credential {
+        if let Some(env_key) = sideload_env_key_filter(cred) {
+            query.push_str(" AND (credential_name = ? OR credential_name = ?)");
+            param_values.push(Box::new(cred.to_string()));
+            param_values.push(Box::new(env_key));
+        } else {
+            query.push_str(" AND credential_name = ?");
+            param_values.push(Box::new(cred.to_string()));
+        }
+    }
+
+    if let Some(since_date) = since {
+        query.push_str(" AND timestamp >= ?");
+        param_values.push(Box::new(lower_bound(since_date)));
+    }
+
+    if let Some(until_date) = until {
+        query.push_str(" AND timestamp <= ?");
+        param_values.push(Box::new(upper_bound(until_date)));
+    }
+
+    query.push_str(" ORDER BY timestamp ASC, id ASC");
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
+
+    let mut stmt = match db.prepare(&query) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to query audit log: {}", e);
+            return Vec::new();
+        }
+    };
+
+    read_audit_rows(&mut stmt, params_ref.as_slice())
+}
+
 /// Queries vault-less env-sideload audit rows from the fallback JSONL sink.
 pub fn query_fallback_log(
     last: usize,
@@ -254,6 +317,34 @@ pub fn query_fallback_log(
         credential,
         since,
     )
+}
+
+/// Queries all vault-less env-sideload audit rows in a range.
+pub fn query_fallback_log_range(
+    credential: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Vec<AuditEntry> {
+    query_fallback_log_range_from_path(
+        &Vault::vault_dir().join(SIDELOAD_FALLBACK_AUDIT_FILE),
+        credential,
+        since,
+        until,
+    )
+}
+
+fn query_fallback_log_range_from_path(
+    path: &Path,
+    credential: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Vec<AuditEntry> {
+    let mut entries = query_fallback_log_from_path(path, usize::MAX, credential, since)
+        .into_iter()
+        .filter(|entry| matches_until(&entry.timestamp, until))
+        .collect::<Vec<_>>();
+    entries = sort_oldest_first(entries);
+    entries
 }
 
 fn query_fallback_log_from_path(
@@ -330,6 +421,66 @@ fn sort_and_limit(mut entries: Vec<AuditEntry>, last: usize) -> Vec<AuditEntry> 
     entries
 }
 
+fn sort_oldest_first(mut entries: Vec<AuditEntry>) -> Vec<AuditEntry> {
+    entries.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    entries
+}
+
+fn read_audit_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+    params_ref: &[&dyn rusqlite::types::ToSql],
+) -> Vec<AuditEntry> {
+    let rows = match stmt.query_map(params_ref, |row| {
+        Ok(AuditEntry {
+            id: row.get(0)?,
+            timestamp: row.get(1)?,
+            event_type: row.get(2)?,
+            credential_name: row.get(3)?,
+            wisp_token: row.get(4)?,
+            target_host: row.get(5)?,
+            target_path: row.get(6)?,
+            http_method: row.get(7)?,
+            response_status: row
+                .get::<_, Option<i64>>(8)?
+                .map(u16::try_from)
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+            denied: row.get::<_, i32>(9)? != 0,
+            deny_reason: row.get(10)?,
+            project_name: row.get(11)?,
+            source: "vault".to_string(),
+        })
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to query audit log: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut entries = Vec::new();
+    for row in rows {
+        match row {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                tracing::error!("Failed to read audit log row: {}", e);
+                return Vec::new();
+            }
+        }
+    }
+    entries
+}
+
 fn matches_credential(entry_credential: Option<&str>, filter: Option<&str>) -> bool {
     let Some(filter) = filter else {
         return true;
@@ -349,14 +500,28 @@ fn sideload_env_key_filter(credential: &str) -> Option<String> {
 }
 
 fn since_lower_bound(since: &str) -> String {
-    format!("{since}T00:00:00+00:00")
+    lower_bound(since)
+}
+
+fn lower_bound(value: &str) -> String {
+    if value.contains('T') {
+        return value.to_string();
+    }
+    format!("{value}T00:00:00+00:00")
+}
+
+fn upper_bound(value: &str) -> String {
+    if value.contains('T') {
+        return value.to_string();
+    }
+    format!("{value}T23:59:59.999999999+00:00")
 }
 
 fn matches_since(timestamp: &str, since: Option<&str>) -> bool {
     let Some(since) = since else {
         return true;
     };
-    let threshold = match DateTime::parse_from_rfc3339(&since_lower_bound(since)) {
+    let threshold = match DateTime::parse_from_rfc3339(&lower_bound(since)) {
         Ok(threshold) => threshold.with_timezone(&Utc),
         Err(_) => return false,
     };
@@ -365,6 +530,21 @@ fn matches_since(timestamp: &str, since: Option<&str>) -> bool {
         Err(_) => return false,
     };
     timestamp >= threshold
+}
+
+fn matches_until(timestamp: &str, until: Option<&str>) -> bool {
+    let Some(until) = until else {
+        return true;
+    };
+    let threshold = match DateTime::parse_from_rfc3339(&upper_bound(until)) {
+        Ok(threshold) => threshold.with_timezone(&Utc),
+        Err(_) => return false,
+    };
+    let timestamp = match DateTime::parse_from_rfc3339(timestamp) {
+        Ok(timestamp) => timestamp.with_timezone(&Utc),
+        Err(_) => return false,
+    };
+    timestamp <= threshold
 }
 
 #[cfg(test)]

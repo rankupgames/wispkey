@@ -47,9 +47,9 @@ Four commands from zero to protected. The AI process never touches your real sec
 ### Core
 - **Encrypted local vault** -- AES-256-GCM at rest, Argon2id master key derivation, SQLite backend, configurable session timeout (default 30 min), machine-bound encrypted session file by default
 - **Wisp token proxy** -- HTTP forward proxy + blind HTTPS CONNECT tunneling + HTTPS reverse proxy mode (`X-Target-Url` header) on localhost:7700
-- **CLI** -- Full credential lifecycle: `init`, `unlock`, `add`, `list`, `get`, `remove`, `rotate`, `import`, `status`, `log`
+- **CLI** -- Credential lifecycle, project and partition management, encrypted bundle import/export, proxy serving, subprocess/template injection, instance administration, and audit export/tail
 - **MCP server** -- Native integration with Cursor, Claude Code, Windsurf via stdio JSON-RPC, including first-class env-sideloaded credentials for locked-vault use
-- **Multi-instance access** -- Enroll ephemeral VMs or worker instances with per-request identity, least-privilege credential scope, UDS/vsock-ready proxy listeners, and host-approved access escalation
+- **Multi-instance access** -- Enroll ephemeral VMs or worker instances with per-request identity, least-privilege credential scope, scoped bootstrap-token self-enrollment, UDS/vsock-ready proxy listeners, and host-approved access escalation
 - **.env importer** -- One-command migration with auto-detection of OpenAI, GitHub, Slack, AWS, and bearer token patterns
 
 ### Organization
@@ -58,10 +58,11 @@ Four commands from zero to protected. The AI process never touches your real sec
 
 ### Security
 - **Policy engine** -- TOML-defined rules with per-credential, per-host, per-path, per-method restrictions, deny rules, time windows, and sliding-window rate limiting
-- **Audit log** -- Every credential use and denial logged with timestamp, target host/path, method, and status; vault-backed events are queryable by credential and date range, while vault-less env sideload use writes a local fallback JSONL audit file
+- **Audit log** -- Every credential use and denial logged with timestamp, target host/path, method, and status; vault-backed events are queryable by credential and date range, bulk export supports JSONL/JSON for SIEM egress, `audit tail --follow` streams without skipping same-timestamp events, and vault-less env sideload use writes a local fallback JSONL audit file
 - **Host restrictions** -- Glob-pattern allowlists per credential (e.g. `api.openai.com/*`)
 - **Cross-OS local file protection** -- Vault directories and sensitive local files are owner-only on Linux/macOS and restricted with Windows ACLs on Windows; generated `.env.wispkey` files and `vault.db` are written owner-only on Unix
 - **Management API token checks** -- The proxy compares management tokens in constant time
+- **Secret injection for subprocesses and templates** -- `wispkey exec`, `wispkey run`, and `wispkey inject` are audited, owner-only plaintext-egress tools that resolve credentials in-process without placing plaintext in argv, parent env, WispKey stdout except explicit `inject --stdout`, or audit logs
 - **Security model** -- The current boundary and intentional limits are documented in [`docs/security-model.md`](docs/security-model.md)
 
 ### Cloud (groundwork -- auth and encrypted sync/share APIs)
@@ -92,6 +93,54 @@ wispkey add "ssh-private-key" --type api_key --value-file ~/.ssh/id_ed25519 --pa
 wispkey add "service-account-json" --type api_key --value-file ./service-account.json --tags "gcp"
 printf '%s' "$BASIC_AUTH_VALUE" | wispkey add "basic-auth-api" --type basic_auth --value-file - --hosts "api.example.com"
 ```
+
+## Secret Injection (`wispkey exec`, `wispkey run`, `wispkey inject`)
+
+For non-HTTP consumers such as `sudo`, `ssh`, `git`, database CLIs, and local tools, `wispkey exec` resolves a vault credential in-process and injects it only into the child process:
+
+```bash
+# Stdin channel, useful for commands such as sudo -S.
+wispkey exec --credential laptop-password --stdin -- sudo -S -p "" whoami
+
+# Child-only environment variable.
+wispkey exec --credential db-password --env DB_PASSWORD -- psql "$DATABASE_URL"
+
+# Askpass helpers for sudo/ssh/git. Use sudo -A so sudo calls SUDO_ASKPASS.
+wispkey exec --credential laptop-password --askpass -- sudo -A whoami
+wispkey exec --credential git-token --askpass -- git fetch
+```
+
+At least one channel is required: `--stdin`, `--env <VAR>`, or `--askpass`. Channels can be combined. The credential is resolved within the active project, or within `--project <name>` when provided.
+
+`--stdin` writes the secret followed by one newline and closes the child's stdin. Commands that also need interactive stdin should use `--env` or `--askpass` instead.
+
+`exec` is a deliberate, owner-only plaintext-egress path for tools that cannot use the WispKey proxy. It is audited with `CredentialExec` events, but the audit row contains only the credential name, child program name, channel summary, project, and exit status. WispKey does not put the plaintext value in argv, the parent environment, WispKey stdout/stderr, tracing logs, or audit fields. The hidden askpass helper is not a standalone secret oracle: `exec --askpass` creates a per-exec owner-only handoff file and passes its path through `WISPKEY_ASKPASS_HANDOFF`; the helper refuses to run without a valid handoff from that child launch.
+
+For tools that need multiple child-only environment variables, `wispkey run` reads a TOML manifest and resolves every `cred:<name>` reference before spawning the child:
+
+```toml
+# wispkey.toml
+[env]
+OPENAI_API_KEY = "cred:openai-key"
+DATABASE_URL = "cred:db-url"
+APP_ENV = "development"
+```
+
+```bash
+wispkey run -- npm test
+wispkey run --manifest ./secrets/wispkey.toml --project client-alpha -- sh -c 'psql "$DATABASE_URL"'
+```
+
+Manifest values without the `cred:` prefix are passed through as literal child environment values. `run` fails closed when the manifest is missing, invalid, has no `[env]` entries, or any referenced credential cannot be resolved. It writes a `CredentialRun` audit event with the credential names, child program name, project, and exit status.
+
+For config files or templates, `wispkey inject` replaces `{{ cred:<name> }}` references and writes the rendered plaintext to an owner-only output file:
+
+```bash
+wispkey inject -i .env.template -o .env.local
+wispkey inject -i config.template --stdout
+```
+
+`--stdout` is an explicit plaintext disclosure to the caller. The safer default is `-o <outfile>`, which uses WispKey's owner-only file writer. `inject` writes a `CredentialInject` audit event with the credential names, output destination, and project.
 
 ## MCP Integration
 
@@ -166,6 +215,15 @@ WispKey can serve untrusted ephemeral VMs and worker instances without giving th
 wispkey instance enroll worker-acme-001 --tag company:acme --credential openai-key
 wispkey serve --listen tcp://127.0.0.1:7700 --listen unix:/run/wispkey/proxy.sock
 ```
+
+For fleets, the host can mint a scoped bootstrap token and let each VM self-enroll for its own instance id and secret. Successful redemptions are atomic, so TTL and max-use limits are enforced under concurrent joins:
+
+```bash
+wispkey instance bootstrap create --tag company:acme --ttl 1h --uses 50
+printf '%s' "$BOOTSTRAP_TOKEN" | wispkey instance join --token-file - --name worker-acme-001
+```
+
+Remote first-contact self-enrollment can use `POST /api/instances/join`; that endpoint is authenticated by the bootstrap token and does not require a management token or existing instance identity.
 
 Unix domain socket and vsock listeners require instance identity by default. Loopback TCP keeps the original trusted-local behavior unless `--require-identity` is set. Out-of-scope token use returns `403 out_of_scope`, queues an access request, and can be approved by the host:
 
@@ -243,14 +301,22 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey get <name> [--show-token]` | Show credential metadata and wisp token |
 | `wispkey remove <name>` | Delete a credential |
 | `wispkey rotate <name>` | Regenerate a wisp token |
+| `wispkey exec --credential <name> [--project P] [--stdin] [--env VAR]... [--askpass] -- <command> [args...]` | Inject a credential into a child process through audited stdin, child-only env, or askpass channels |
+| `wispkey run [--manifest PATH] [--project P] -- <command> [args...]` | Run a child process with manifest-defined child-only environment variables |
+| `wispkey inject -i <infile|-> [-o <outfile>] [--project P] [--stdout]` | Render `{{ cred:<name> }}` template references to an owner-only file or explicit stdout |
 | `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start the proxy; `SPEC` supports `tcp://host:port`, `unix:/path.sock`, and feature-gated `vsock://cid:port` |
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Import credentials from a `.env` file |
 | `wispkey status` | Show vault, session, and proxy status |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Query audit events |
+| `wispkey audit export [--since TS] [--until TS] [--credential C] [--encoding jsonl|json] [-o FILE]` | Export matching audit events for SIEM ingestion |
+| `wispkey audit tail [--follow] [--credential C]` | Stream newest audit events as JSONL; `--follow` uses a forward `(timestamp,id)` cursor |
 | `wispkey partition create/list/delete/assign/export/import` | Manage partitions |
 | `wispkey project create/list/delete/use/current/export/import` | Manage projects and encrypted project bundles |
 | `wispkey credential export/import` | Export or import one encrypted credential bundle |
-| `wispkey instance enroll/list/show/scope/revoke/requests/approve/deny` | Manage instance identities, scopes, and access requests |
+| `wispkey instance enroll <name> [--description D] [--partition P]... [--project P]... [--credential C]... [--tag T]...` | Enroll a host-managed instance identity |
+| `wispkey instance list/show/scope/revoke/requests/approve/deny` | List, inspect, scope, revoke, and approve or deny instance access requests |
+| `wispkey instance bootstrap create/list/revoke` | Manage scoped, atomic bootstrap tokens for fleet self-enrollment |
+| `wispkey instance join [<bootstrap-token>] [--token-file <path|->] --name <instance-name>` | Redeem a bootstrap token; prefer `--token-file -` to avoid argv exposure |
 | `wispkey mcp serve` | Start the MCP server over stdio |
 
 ## Partition Bundles

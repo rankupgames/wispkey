@@ -556,7 +556,7 @@ fn parse_csv_works() {
 }
 
 #[test]
-fn schema_v6_to_v7_migration_adds_instance_tables_without_touching_data() {
+fn schema_v6_to_current_migration_adds_instance_and_bootstrap_tables_without_touching_data() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("vault.db");
     let db = Connection::open(&db_path).unwrap();
@@ -643,9 +643,14 @@ fn schema_v6_to_v7_migration_adds_instance_tables_without_touching_data() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(version, "7");
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
-    for table in ["instances", "instance_scopes", "access_requests"] {
+    for table in [
+        "instances",
+        "instance_scopes",
+        "access_requests",
+        "bootstrap_tokens",
+    ] {
         let count: usize = db
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -664,6 +669,160 @@ fn schema_v6_to_v7_migration_adds_instance_tables_without_touching_data() {
         )
         .unwrap();
     assert_eq!(credential_count, 1);
+}
+
+#[test]
+fn schema_v7_to_v8_migration_adds_bootstrap_tokens_without_touching_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vault.db");
+    let db = Connection::open(&db_path).unwrap();
+    db.execute_batch(
+        "CREATE TABLE vault_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE partitions (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(project_id, name)
+        );
+        CREATE TABLE credentials (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            credential_type TEXT NOT NULL,
+            encrypted_value TEXT NOT NULL,
+            wisp_token TEXT UNIQUE NOT NULL,
+            hosts TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_used_at TEXT,
+            partition_id TEXT REFERENCES partitions(id)
+        );
+        CREATE TABLE audit_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            credential_name TEXT,
+            wisp_token TEXT,
+            target_host TEXT,
+            target_path TEXT,
+            http_method TEXT,
+            response_status INTEGER,
+            denied INTEGER NOT NULL DEFAULT 0,
+            deny_reason TEXT,
+            project_name TEXT
+        );
+        CREATE TABLE instances (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            secret_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT
+        );
+        CREATE TABLE instance_scopes (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+            scope_type TEXT NOT NULL,
+            scope_value TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(instance_id, scope_type, scope_value)
+        );
+        CREATE TABLE access_requests (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+            credential_name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            decided_at TEXT
+        );",
+    )
+    .unwrap();
+
+    let now = Utc::now().to_rfc3339();
+    db.execute(
+        "INSERT INTO vault_meta (key, value) VALUES ('version', '7')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO projects (id, name, description, created_at, updated_at) VALUES ('default', 'default', 'Default project', ?1, ?2)",
+        params![now, now],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO partitions (id, name, description, project_id, created_at, updated_at) VALUES ('personal', 'personal', '', 'default', ?1, ?2)",
+        params![now, now],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO credentials (id, name, description, credential_type, encrypted_value, wisp_token, hosts, tags, created_at, updated_at, partition_id) VALUES ('cred-1', 'kept', '', 'api_key', 'encrypted', 'wk_kept_12345678', '', '', ?1, ?2, 'personal')",
+        params![now, now],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO instances (id, name, secret_hash, status, description, created_at, updated_at) VALUES ('inst-1', 'worker', 'hash', 'active', '', ?1, ?2)",
+        params![now, now],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO instance_scopes (id, instance_id, scope_type, scope_value, created_at) VALUES ('scope-1', 'inst-1', 'tag', 'company:acme', ?1)",
+        params![now],
+    )
+    .unwrap();
+
+    Vault::migrate_schema(&db).unwrap();
+
+    let version: String = db
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key = 'version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+    let bootstrap_table_count: usize = db
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'bootstrap_tokens'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(bootstrap_table_count, 1);
+
+    let credential_count: usize = db
+        .query_row(
+            "SELECT COUNT(*) FROM credentials WHERE name = 'kept'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(credential_count, 1);
+    let instance_scope_count: usize = db
+        .query_row(
+            "SELECT COUNT(*) FROM instance_scopes WHERE instance_id = 'inst-1' AND scope_type = 'tag'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(instance_scope_count, 1);
 }
 
 #[test]
@@ -695,6 +854,82 @@ fn enroll_instance_creates_instance_and_scopes() {
             .iter()
             .any(|scope| { scope.scope_type == "partition" && scope.scope_value == "personal" })
     );
+}
+
+#[test]
+fn bootstrap_token_redeems_once_and_copies_scope() {
+    let vault = test_vault("pw");
+    let created = vault
+        .create_bootstrap_token(
+            "worker fleet",
+            &[InstanceScopeInput::new("tag", "company:acme")],
+            Some(1),
+            Some(chrono::Duration::hours(1)),
+        )
+        .unwrap();
+
+    assert_eq!(created.plaintext_token.len(), 48);
+    let joined = vault
+        .redeem_bootstrap_token(&created.plaintext_token, "fleet-worker-1")
+        .unwrap();
+    assert_eq!(joined.bootstrap_token_id, created.token.id);
+    assert_eq!(joined.secret.len(), 48);
+    assert!(
+        joined
+            .instance
+            .scopes
+            .iter()
+            .any(|scope| scope.scope_type == "tag" && scope.scope_value == "company:acme")
+    );
+
+    let second = vault.redeem_bootstrap_token(&created.plaintext_token, "fleet-worker-2");
+    assert!(matches!(second, Err(VaultError::InvalidBootstrapToken)));
+
+    let tokens = vault.list_bootstrap_tokens().unwrap();
+    assert_eq!(tokens[0].used_count, 1);
+}
+
+#[test]
+fn bootstrap_token_expired_and_revoked_fail_closed() {
+    let vault = test_vault("pw");
+    let expired = vault
+        .create_bootstrap_token(
+            "expired",
+            &[InstanceScopeInput::new("tag", "company:acme")],
+            None,
+            None,
+        )
+        .unwrap();
+    vault
+        .db
+        .execute(
+            "UPDATE bootstrap_tokens SET expires_at = ?1 WHERE id = ?2",
+            params![
+                (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+                expired.token.id
+            ],
+        )
+        .unwrap();
+    let expired_join = vault.redeem_bootstrap_token(&expired.plaintext_token, "expired-worker");
+    assert!(matches!(
+        expired_join,
+        Err(VaultError::InvalidBootstrapToken)
+    ));
+
+    let revoked = vault
+        .create_bootstrap_token(
+            "revoked",
+            &[InstanceScopeInput::new("tag", "company:acme")],
+            None,
+            Some(chrono::Duration::hours(1)),
+        )
+        .unwrap();
+    vault.revoke_bootstrap_token(&revoked.token.id).unwrap();
+    let revoked_join = vault.redeem_bootstrap_token(&revoked.plaintext_token, "revoked-worker");
+    assert!(matches!(
+        revoked_join,
+        Err(VaultError::InvalidBootstrapToken)
+    ));
 }
 
 #[test]

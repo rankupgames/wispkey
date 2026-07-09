@@ -1,4 +1,10 @@
-use crate::core::{AccessRequest, EnrollInstanceResult, Instance, InstanceScopeInput, Vault};
+use chrono::Duration;
+
+use crate::audit;
+use crate::core::{
+    AccessRequest, BootstrapJoinResult, BootstrapToken, CreateBootstrapTokenResult,
+    EnrollInstanceResult, Instance, InstanceScopeInput, Vault,
+};
 
 use super::shared::{json_output, print_json};
 
@@ -184,6 +190,119 @@ pub async fn handle_instance_deny(request_id: &str) {
     decide_request(request_id, false).await;
 }
 
+pub async fn handle_instance_bootstrap_create(
+    description: &str,
+    partitions: &[String],
+    projects: &[String],
+    credentials: &[String],
+    tags: &[String],
+    ttl: Option<&str>,
+    uses: Option<i64>,
+) {
+    let vault = open_vault();
+    let scopes = build_scope_inputs(partitions, projects, credentials, tags);
+    let ttl = ttl.map(parse_ttl).transpose().unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    });
+
+    match vault.create_bootstrap_token(description, &scopes, uses, ttl) {
+        Ok(result) => {
+            if json_output() {
+                print_json(bootstrap_create_json(&result));
+                return;
+            }
+            println!("Bootstrap token created.");
+            println!("ID: {}", result.token.id);
+            println!("Token: {}", result.plaintext_token);
+            println!("Token is shown once. Store it before closing this terminal.");
+            if !result.token.scopes.is_empty() {
+                println!("Scopes: {}", scope_input_summary(&result.token.scopes));
+            }
+        }
+        Err(error) => exit_error(error),
+    }
+}
+
+pub async fn handle_instance_bootstrap_list() {
+    let vault = open_vault();
+    match vault.list_bootstrap_tokens() {
+        Ok(tokens) => {
+            if json_output() {
+                print_json(serde_json::json!({
+                    "bootstrap_tokens": tokens.iter().map(bootstrap_token_json).collect::<Vec<_>>(),
+                }));
+                return;
+            }
+
+            println!(
+                "{:<36} {:<10} {:<11} {:<20} SCOPES",
+                "ID", "STATUS", "USES", "EXPIRES"
+            );
+            println!("{}", "-".repeat(104));
+            for token in &tokens {
+                let uses = token
+                    .max_uses
+                    .map(|max| format!("{}/{}", token.used_count, max))
+                    .unwrap_or_else(|| format!("{}/-", token.used_count));
+                let expires = token
+                    .expires_at
+                    .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M").to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{:<36} {:<10} {:<11} {:<20} {}",
+                    token.id,
+                    token.status,
+                    uses,
+                    expires,
+                    scope_input_summary(&token.scopes)
+                );
+            }
+            println!();
+            println!("{} bootstrap token(s)", tokens.len());
+        }
+        Err(error) => exit_error(error),
+    }
+}
+
+pub async fn handle_instance_bootstrap_revoke(id: &str) {
+    let vault = open_vault();
+    match vault.revoke_bootstrap_token(id) {
+        Ok(token) => {
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "bootstrap_token": bootstrap_token_json(&token),
+                }));
+                return;
+            }
+            println!("Bootstrap token '{}' revoked.", token.id);
+        }
+        Err(error) => exit_error(error),
+    }
+}
+
+pub async fn handle_instance_join(bootstrap_token: &str, name: &str) {
+    let vault = open_vault();
+    match vault.redeem_bootstrap_token(bootstrap_token, name) {
+        Ok(result) => {
+            audit_instance_joined(&vault, &result);
+            if json_output() {
+                print_json(join_json(&result));
+                return;
+            }
+            println!("Instance '{}' joined.", result.instance.name);
+            println!("ID: {}", result.instance.id);
+            println!("Secret: {}", result.secret);
+            println!("Secret is shown once. Store it before closing this terminal.");
+            if !result.instance.scopes.is_empty() {
+                println!("Scopes: {}", scope_summary(&result.instance));
+            }
+        }
+        Err(error) => exit_error(error),
+    }
+}
+
 async fn mutate_scopes(
     name: &str,
     partitions: &[String],
@@ -309,6 +428,31 @@ fn build_scope_inputs(
     scopes
 }
 
+fn parse_ttl(value: &str) -> Result<Duration, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("ttl must not be empty".to_string());
+    }
+    let (digits, unit) = value.split_at(
+        value
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(value.len()),
+    );
+    let amount: i64 = digits
+        .parse()
+        .map_err(|_| "ttl must start with a positive number".to_string())?;
+    if amount <= 0 {
+        return Err("ttl must be positive".to_string());
+    }
+    match unit {
+        "" | "s" => Ok(Duration::seconds(amount)),
+        "m" => Ok(Duration::minutes(amount)),
+        "h" => Ok(Duration::hours(amount)),
+        "d" => Ok(Duration::days(amount)),
+        _ => Err("ttl unit must be one of s, m, h, or d".to_string()),
+    }
+}
+
 fn requested_scope_group<'a>(
     partitions: &'a [String],
     projects: &'a [String],
@@ -338,6 +482,17 @@ fn scope_summary(instance: &Instance) -> String {
     }
     instance
         .scopes
+        .iter()
+        .map(|scope| format!("{}:{}", scope.scope_type, scope.scope_value))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn scope_input_summary(scopes: &[InstanceScopeInput]) -> String {
+    if scopes.is_empty() {
+        return "-".to_string();
+    }
+    scopes
         .iter()
         .map(|scope| format!("{}:{}", scope.scope_type, scope.scope_value))
         .collect::<Vec<_>>()
@@ -385,4 +540,70 @@ fn access_request_json(request: &AccessRequest) -> serde_json::Value {
         "created_at": request.created_at.to_rfc3339(),
         "decided_at": request.decided_at.map(|timestamp| timestamp.to_rfc3339()),
     })
+}
+
+fn bootstrap_create_json(result: &CreateBootstrapTokenResult) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "id": result.token.id,
+        "token": result.plaintext_token,
+        "bootstrap_token": bootstrap_token_json(&result.token),
+    })
+}
+
+fn bootstrap_token_json(token: &BootstrapToken) -> serde_json::Value {
+    serde_json::json!({
+        "id": token.id,
+        "description": token.description,
+        "scopes": token.scopes.iter().map(|scope| serde_json::json!({
+            "scope_type": scope.scope_type,
+            "scope_value": scope.scope_value,
+        })).collect::<Vec<_>>(),
+        "max_uses": token.max_uses,
+        "used_count": token.used_count,
+        "expires_at": token.expires_at.map(|timestamp| timestamp.to_rfc3339()),
+        "status": token.status,
+        "created_at": token.created_at.to_rfc3339(),
+    })
+}
+
+fn join_json(result: &BootstrapJoinResult) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "id": result.instance.id,
+        "name": result.instance.name,
+        "secret": result.secret,
+        "bootstrap_token_id": result.bootstrap_token_id,
+        "instance": instance_json(&result.instance),
+    })
+}
+
+pub(crate) fn audit_instance_joined(vault: &Vault, result: &BootstrapJoinResult) {
+    let scope_json = serde_json::to_string(
+        &result
+            .instance
+            .scopes
+            .iter()
+            .map(|scope| {
+                serde_json::json!({
+                    "scope_type": scope.scope_type,
+                    "scope_value": scope.scope_value,
+                })
+            })
+            .collect::<Vec<_>>(),
+    )
+    .unwrap_or_else(|_| "[]".to_string());
+    audit::log_event(
+        vault.db(),
+        "InstanceJoined",
+        Some(&result.instance.name),
+        None,
+        Some(&result.bootstrap_token_id),
+        None,
+        None,
+        None,
+        false,
+        Some(&scope_json),
+        None,
+    );
 }

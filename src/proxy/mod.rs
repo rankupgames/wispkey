@@ -33,7 +33,7 @@ mod tokens;
 pub mod transport;
 
 use lifecycle::{ProxyMetadata, ProxyState, StartDecision};
-use management::{handle_management_api, json_response};
+use management::{handle_instance_join_api, handle_management_api, json_response};
 use target::{authority_points_to_proxy, target_points_to_proxy};
 use tokens::{TokenRequestContext, inject_tokens_in_value, replace_tokens_in_uri};
 use transport::{BoundTransport, IdentityRequirement, ListenConfig, ListenSpec, ListenerMetadata};
@@ -293,6 +293,13 @@ async fn handle_request(
     if uri.path().starts_with("/api/") {
         if method == Method::OPTIONS {
             return Ok(cors_preflight());
+        }
+        if method == Method::POST && uri.path() == "/api/instances/join" {
+            let body_bytes = match collect_limited_body(req.into_body()).await {
+                Ok(bytes) => bytes,
+                Err(response) => return Ok(*response),
+            };
+            return Ok(handle_instance_join_api(&body_bytes).await);
         }
         if !management_request_authorized(&headers, runtime.management_token.as_ref()) {
             return Ok(json_response(
