@@ -344,6 +344,22 @@ impl Vault {
             create_instance_tables(db)?;
             db.execute(
                 "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                params!["7"],
+            )?;
+        }
+
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "7".to_string());
+
+        if version.as_str() == "7" {
+            create_bootstrap_token_table(db)?;
+            db.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
                 params![CURRENT_SCHEMA_VERSION],
             )?;
         }
@@ -403,6 +419,7 @@ impl Vault {
 			);",
         )?;
         create_instance_tables(db)?;
+        create_bootstrap_token_table(db)?;
         Ok(())
     }
 }
@@ -435,6 +452,23 @@ fn create_instance_tables(db: &Connection) -> Result<()> {
             reason TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             decided_at TEXT
+        );",
+    )?;
+    Ok(())
+}
+
+fn create_bootstrap_token_table(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS bootstrap_tokens (
+            id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            scope_json TEXT NOT NULL DEFAULT '[]',
+            max_uses INTEGER,
+            used_count INTEGER NOT NULL DEFAULT 0,
+            expires_at TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL
         );",
     )?;
     Ok(())

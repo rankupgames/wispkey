@@ -80,6 +80,27 @@ wispkey serve --listen unix:/run/wispkey/proxy.sock
 
 Instances authenticate every proxied request with `x-wispkey-instance-id` and `x-wispkey-instance-secret`. Scope checks fail closed; out-of-scope token use returns `403 out_of_scope`, queues or reuses an access request, and requires host approval with `wispkey instance approve <request-id>` before retry.
 
+For fleets, mint scoped bootstrap tokens and redeem them with `--token-file` so the token does not appear in argv:
+```bash
+wispkey instance bootstrap create --tag company:acme --ttl 1h --uses 50
+printf '%s' "$BOOTSTRAP_TOKEN" | wispkey instance join --token-file - --name worker-acme-001
+```
+
+Bootstrap redemption is atomic and race-safe; TTL and max-use limits are enforced under concurrent joins. The proxy management API also exposes `POST /api/instances/join` for first-contact self-enrollment authenticated only by the bootstrap token.
+
+## Secret Injection
+
+`wispkey exec`, `wispkey run`, and `wispkey inject` are audited, owner-only plaintext-egress tools for non-HTTP consumers that cannot use the token proxy.
+
+```bash
+wispkey exec --credential laptop-password --stdin -- sudo -S -p "" whoami
+wispkey exec --credential laptop-password --askpass -- sudo -A whoami
+wispkey run --manifest ./secrets/wispkey.toml -- npm test
+wispkey inject -i .env.template -o .env.local
+```
+
+`exec --askpass` creates a per-exec owner-only handoff capability file and passes it with `WISPKEY_ASKPASS_HANDOFF`; the hidden `wispkey askpass` helper refuses to run without a valid handoff from that child launch. The old `WISPKEY_ASKPASS_CRED` path is not supported.
+
 ## CLI Reference
 
 | Command | Purpose |
@@ -91,14 +112,19 @@ Instances authenticate every proxied request with `x-wispkey-instance-id` and `x
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
 | `wispkey remove <name>` | Delete credential |
 | `wispkey rotate <name>` | Regenerate wisp token |
+| `wispkey exec --credential <name> [--project P] [--stdin] [--env VAR]... [--askpass] -- <command> [args...]` | Audited child-process secret injection |
+| `wispkey run [--manifest PATH] [--project P] -- <command> [args...]` | Manifest-defined child-only environment injection |
+| `wispkey inject -i <infile|-> [-o <outfile>] [--project P] [--stdout]` | Render `{{ cred:<name> }}` references to owner-only file output or explicit stdout |
 | `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start proxy; `SPEC` supports `tcp://host:port`, `unix:/path.sock`, and feature-gated `vsock://cid:port` |
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Import .env file |
 | `wispkey status` | Vault + session + proxy status |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Audit log |
+| `wispkey audit export [--since TS] [--until TS] [--credential C] [--encoding jsonl|json] [-o FILE]` | Export matching audit events |
+| `wispkey audit tail [--follow] [--credential C]` | Stream newest audit events with a forward cursor when following |
 | `wispkey partition create/list/delete/assign/export/import` | Partition management |
 | `wispkey project create/list/delete/use/current/export/import` | Project management and encrypted project bundles |
 | `wispkey credential export/import` | Encrypted single-credential sharing bundles |
-| `wispkey instance enroll/list/show/scope/revoke/requests/approve/deny` | Manage instance identities, scopes, and access requests |
+| `wispkey instance enroll/list/show/scope/bootstrap/join/revoke/requests/approve/deny` | Manage instance identities, bootstrap self-enrollment, scopes, and access requests |
 | `wispkey mcp serve` | Start MCP server (stdio) |
 
 ## Credential Types
@@ -199,6 +225,7 @@ When the proxy is running (`wispkey serve`):
 | `DELETE /api/partitions/{name}` | Delete partition by name; honors `?project=` |
 | `GET /api/projects` | All projects with partition counts and active flag |
 | `GET /api/projects/{name}` | Single project details |
+| `POST /api/instances/join` | Redeem a bootstrap token for first-contact instance self-enrollment |
 
 ## Key Paths
 

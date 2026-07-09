@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::{Connection, Row};
 
 use super::{Credential, CredentialType, Partition, Project, Result, VaultError};
@@ -72,15 +72,34 @@ pub(super) fn table_has_column(db: &Connection, table: &str, column: &str) -> Re
 }
 
 pub(super) fn parse_datetime_column(column: usize, value: &str) -> rusqlite::Result<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(value)
-        .map(|datetime| datetime.with_timezone(&Utc))
-        .map_err(|error| {
-            rusqlite::Error::FromSqlConversionFailure(
-                column,
-                rusqlite::types::Type::Text,
-                Box::new(error),
-            )
-        })
+    parse_flexible_datetime(value).ok_or_else(|| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Text,
+            format!("unrecognized datetime format: {value:?}").into(),
+        )
+    })
+}
+
+/// Parses a stored timestamp. WispKey writes RFC 3339, but rows written through
+/// raw SQL or SQLite `CURRENT_TIMESTAMP` use the space-separated
+/// `YYYY-MM-DD HH:MM:SS` form (no `T`, no offset); accept both so a single
+/// legacy row can never make a whole listing fail.
+fn parse_flexible_datetime(value: &str) -> Option<DateTime<Utc>> {
+    if let Ok(datetime) = DateTime::parse_from_rfc3339(value) {
+        return Some(datetime.with_timezone(&Utc));
+    }
+    for format in [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ] {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(value, format) {
+            return Some(naive.and_utc());
+        }
+    }
+    None
 }
 
 pub(super) fn parse_credential_type_column(
@@ -109,4 +128,23 @@ pub(super) fn parse_csv(csv: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(|s| s.trim().to_string())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_flexible_datetime;
+
+    #[test]
+    fn parses_rfc3339_and_sqlite_timestamp_formats() {
+        // Canonical form WispKey writes.
+        assert!(parse_flexible_datetime("2026-04-09T19:58:57.966708+00:00").is_some());
+        // SQLite space-separated form (raw SQL / CURRENT_TIMESTAMP) must not brick a listing.
+        let sqlite_form =
+            parse_flexible_datetime("2026-05-18 22:14:55").expect("sqlite form parses");
+        assert_eq!(sqlite_form.to_rfc3339(), "2026-05-18T22:14:55+00:00");
+        // Fractional seconds in the space form.
+        assert!(parse_flexible_datetime("2026-07-04 01:33:13.5").is_some());
+        // Genuinely malformed input still fails.
+        assert!(parse_flexible_datetime("not-a-timestamp").is_none());
+    }
 }

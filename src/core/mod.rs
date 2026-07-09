@@ -29,7 +29,10 @@ mod session_store;
 #[cfg(test)]
 mod tests;
 
-pub use instances::{AccessRequest, EnrollInstanceResult, Instance, InstanceScopeInput};
+pub use instances::{
+    AccessRequest, BootstrapJoinResult, BootstrapToken, CreateBootstrapTokenResult,
+    EnrollInstanceResult, Instance, InstanceScopeInput,
+};
 use rows::{credential_from_row, parse_csv, partition_from_row, project_from_row};
 #[cfg(test)]
 use rows::{parse_credential_type_column, parse_datetime_column};
@@ -38,7 +41,7 @@ use rows::{parse_credential_type_column, parse_datetime_column};
 pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
-const CURRENT_SCHEMA_VERSION: &str = "7";
+const CURRENT_SCHEMA_VERSION: &str = "8";
 
 /// Errors returned by vault operations (I/O, crypto, schema, and business rules).
 #[derive(Error, Debug)]
@@ -92,6 +95,10 @@ pub enum VaultError {
     AccessRequestNotFound(String),
     #[error("access request '{0}' is already decided")]
     AccessRequestAlreadyDecided(String),
+    #[error("invalid, expired, exhausted, or revoked bootstrap token")]
+    InvalidBootstrapToken,
+    #[error("bootstrap token '{0}' not found")]
+    BootstrapTokenNotFound(String),
 }
 
 /// Convenient `Result` alias using [`VaultError`] as the error type.
