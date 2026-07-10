@@ -10,6 +10,7 @@ pub async fn handle_status() {
                 "initialized": false,
                 "vault_path": Vault::vault_dir().to_string_lossy(),
                 "session_active": false,
+                "session_protection": Vault::session_protection_label(),
                 "proxy_running": false,
                 "active_project": core::resolve_active_project(),
                 "credential_count": 0,
@@ -37,6 +38,7 @@ pub async fn handle_status() {
                     "created_at": created,
                     "credential_count": count,
                     "session_active": session_active,
+                    "session_protection": Vault::session_protection_label(),
                     "active_project": core::resolve_active_project(),
                     "proxy_running": proxy_status.running,
                     "proxy_status": proxy_status.state.as_str(),
@@ -53,6 +55,7 @@ pub async fn handle_status() {
                 "Session:     {}",
                 if session_active { "active" } else { "locked" }
             );
+            println!("Protection:  {}", Vault::session_protection_label());
 
             if let Some(metadata) = &proxy_status.metadata {
                 let detail = proxy_status

@@ -9,7 +9,8 @@ use crate::audit;
 use crate::core::{CredentialType, Vault};
 use crate::policy::PolicyEngine;
 
-use super::{ProxyActionResult, error_response};
+use super::management::json_response;
+use super::{InstanceIdentity, ProxyActionResult, error_response};
 
 const WISP_TOKEN_PREFIX: &str = "wk_";
 const VAULT_TOKEN_RANDOM_LEN: usize = 8;
@@ -94,6 +95,7 @@ pub(super) struct TokenRequestContext<'a> {
     pub(super) http_method: &'a str,
     pub(super) project_scope: &'a Option<String>,
     pub(super) policy_engine: &'a PolicyEngine,
+    pub(super) instance: Option<&'a InstanceIdentity>,
 }
 
 struct ResolvedToken {
@@ -257,6 +259,35 @@ fn try_resolve_exact_token_for_request(
                     StatusCode::FORBIDDEN,
                     &reason,
                 )));
+            }
+
+            if let Some(instance) = context.instance {
+                let in_scope = vault
+                    .credential_in_scope(&instance.id, &cred.name)
+                    .unwrap_or(false);
+                if !in_scope {
+                    let reason = format!("out_of_scope instance={}", instance.name);
+                    let access_request = vault
+                        .create_or_reuse_access_request(
+                            &instance.id,
+                            &cred.name,
+                            "access requested by proxy token injection",
+                        )
+                        .ok();
+                    audit_denial(
+                        vault,
+                        "CredentialDenied",
+                        Some(&cred.name),
+                        token,
+                        context,
+                        &reason,
+                    );
+                    return TokenResolution::Denied(Box::new(out_of_scope_response(
+                        &cred.name,
+                        instance,
+                        access_request.as_ref().map(|request| request.id.as_str()),
+                    )));
+                }
             }
 
             if !check_host_restriction(&cred.hosts, context.target_host) {
@@ -457,6 +488,23 @@ fn audit_denial(
         Some(reason),
         context.project_scope.as_deref(),
     );
+}
+
+fn out_of_scope_response(
+    credential_name: &str,
+    instance: &InstanceIdentity,
+    access_request_id: Option<&str>,
+) -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::FORBIDDEN,
+        &serde_json::json!({
+            "error": "out_of_scope",
+            "credential": credential_name,
+            "instance": instance.name,
+            "access_request": access_request_id,
+            "message": "access requested; awaiting host approval",
+        }),
+    )
 }
 
 /// Attempts to find a sideloaded credential value from environment variables.

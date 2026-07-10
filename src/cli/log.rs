@@ -1,18 +1,19 @@
 use crate::audit;
-use crate::core::Vault;
+use crate::core::{Vault, VaultError};
 
 use super::shared::{json_output, print_json};
 
 pub async fn handle_log(last: usize, credential: Option<&str>, since: Option<&str>) {
     let vault = match Vault::open() {
-        Ok(v) => v,
+        Ok(v) => Some(v),
+        Err(VaultError::NotFound) => None,
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);
         }
     };
 
-    let entries = audit::query_log(vault.db(), last, credential, since);
+    let entries = audit::query_combined_log(vault.as_ref().map(Vault::db), last, credential, since);
 
     if json_output() {
         let list: Vec<serde_json::Value> = entries
@@ -31,6 +32,7 @@ pub async fn handle_log(last: usize, credential: Option<&str>, since: Option<&st
                     "denied": entry.denied,
                     "deny_reason": entry.deny_reason,
                     "project_name": entry.project_name,
+                    "source": entry.source,
                 })
             })
             .collect();

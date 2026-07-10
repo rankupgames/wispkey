@@ -8,9 +8,13 @@
  * Last Modified: 2026-04-13
  */
 
-use chrono::Utc;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+
+use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::core::Vault;
 use crate::secure_files;
@@ -32,6 +36,7 @@ pub struct AuditEntry {
     pub denied: bool,
     pub deny_reason: Option<String>,
     pub project_name: Option<String>,
+    pub source: String,
 }
 
 /// Writes an audit event to the SQLite audit_log table.
@@ -72,6 +77,22 @@ struct FallbackAuditEntry<'a> {
     deny_reason: Option<&'a str>,
     project_name: Option<&'a str>,
     sink: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+struct FallbackAuditLine {
+    timestamp: String,
+    event_type: String,
+    credential_name: Option<String>,
+    wisp_token: Option<String>,
+    target_host: Option<String>,
+    target_path: Option<String>,
+    http_method: Option<String>,
+    response_status: Option<u16>,
+    denied: bool,
+    deny_reason: Option<String>,
+    project_name: Option<String>,
+    sink: Option<String>,
 }
 
 /// Writes an audit event when no unlocked vault database is available.
@@ -118,6 +139,34 @@ pub fn log_fallback_event(
     }
 }
 
+/// Queries both the vault-backed audit DB and the sideload fallback JSONL sink.
+pub fn query_combined_log(
+    db: Option<&Connection>,
+    last: usize,
+    credential: Option<&str>,
+    since: Option<&str>,
+) -> Vec<AuditEntry> {
+    let mut entries = db
+        .map(|db| query_log(db, last, credential, since))
+        .unwrap_or_default();
+    entries.extend(query_fallback_log(last, credential, since));
+    sort_and_limit(entries, last)
+}
+
+/// Queries both audit sinks without a row limit, ordered oldest to newest.
+pub fn query_combined_log_range(
+    db: Option<&Connection>,
+    credential: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Vec<AuditEntry> {
+    let mut entries = db
+        .map(|db| query_log_range(db, credential, since, until))
+        .unwrap_or_default();
+    entries.extend(query_fallback_log_range(credential, since, until));
+    sort_oldest_first(entries)
+}
+
 /// Queries the audit log with optional filters for credential name, date range, and row limit.
 pub fn query_log(
     db: &Connection,
@@ -131,13 +180,19 @@ pub fn query_log(
     let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(3);
 
     if let Some(cred) = credential {
-        query.push_str(" AND credential_name = ?");
-        param_values.push(Box::new(cred.to_string()));
+        if let Some(env_key) = sideload_env_key_filter(cred) {
+            query.push_str(" AND (credential_name = ? OR credential_name = ?)");
+            param_values.push(Box::new(cred.to_string()));
+            param_values.push(Box::new(env_key));
+        } else {
+            query.push_str(" AND credential_name = ?");
+            param_values.push(Box::new(cred.to_string()));
+        }
     }
 
     if let Some(since_date) = since {
         query.push_str(" AND timestamp >= ?");
-        param_values.push(Box::new(format!("{}T00:00:00Z", since_date)));
+        param_values.push(Box::new(since_lower_bound(since_date)));
     }
 
     query.push_str(" ORDER BY id DESC LIMIT ?");
@@ -178,6 +233,7 @@ pub fn query_log(
             denied: row.get::<_, i32>(9)? != 0,
             deny_reason: row.get(10)?,
             project_name: row.get(11)?,
+            source: "vault".to_string(),
         })
     }) {
         Ok(r) => r,
@@ -198,6 +254,297 @@ pub fn query_log(
         }
     }
     entries
+}
+
+/// Queries the audit log with optional credential and timestamp range filters, without a row limit.
+pub fn query_log_range(
+    db: &Connection,
+    credential: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Vec<AuditEntry> {
+    let mut query = String::from(
+        "SELECT id, timestamp, event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied, deny_reason, project_name FROM audit_log WHERE 1=1",
+    );
+    let mut param_values: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::with_capacity(4);
+
+    if let Some(cred) = credential {
+        if let Some(env_key) = sideload_env_key_filter(cred) {
+            query.push_str(" AND (credential_name = ? OR credential_name = ?)");
+            param_values.push(Box::new(cred.to_string()));
+            param_values.push(Box::new(env_key));
+        } else {
+            query.push_str(" AND credential_name = ?");
+            param_values.push(Box::new(cred.to_string()));
+        }
+    }
+
+    if let Some(since_date) = since {
+        query.push_str(" AND timestamp >= ?");
+        param_values.push(Box::new(lower_bound(since_date)));
+    }
+
+    if let Some(until_date) = until {
+        query.push_str(" AND timestamp <= ?");
+        param_values.push(Box::new(upper_bound(until_date)));
+    }
+
+    query.push_str(" ORDER BY timestamp ASC, id ASC");
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+        param_values.iter().map(|p| p.as_ref()).collect();
+
+    let mut stmt = match db.prepare(&query) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("Failed to query audit log: {}", e);
+            return Vec::new();
+        }
+    };
+
+    read_audit_rows(&mut stmt, params_ref.as_slice())
+}
+
+/// Queries vault-less env-sideload audit rows from the fallback JSONL sink.
+pub fn query_fallback_log(
+    last: usize,
+    credential: Option<&str>,
+    since: Option<&str>,
+) -> Vec<AuditEntry> {
+    query_fallback_log_from_path(
+        &Vault::vault_dir().join(SIDELOAD_FALLBACK_AUDIT_FILE),
+        last,
+        credential,
+        since,
+    )
+}
+
+/// Queries all vault-less env-sideload audit rows in a range.
+pub fn query_fallback_log_range(
+    credential: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Vec<AuditEntry> {
+    query_fallback_log_range_from_path(
+        &Vault::vault_dir().join(SIDELOAD_FALLBACK_AUDIT_FILE),
+        credential,
+        since,
+        until,
+    )
+}
+
+fn query_fallback_log_range_from_path(
+    path: &Path,
+    credential: Option<&str>,
+    since: Option<&str>,
+    until: Option<&str>,
+) -> Vec<AuditEntry> {
+    let mut entries = query_fallback_log_from_path(path, usize::MAX, credential, since)
+        .into_iter()
+        .filter(|entry| matches_until(&entry.timestamp, until))
+        .collect::<Vec<_>>();
+    entries = sort_oldest_first(entries);
+    entries
+}
+
+fn query_fallback_log_from_path(
+    path: &Path,
+    last: usize,
+    credential: Option<&str>,
+    since: Option<&str>,
+) -> Vec<AuditEntry> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            tracing::error!("Failed to open fallback audit log: {}", error);
+            return Vec::new();
+        }
+    };
+
+    let mut entries = Vec::new();
+    for (line_index, line) in BufReader::new(file).lines().enumerate() {
+        let line = match line {
+            Ok(line) => line,
+            Err(error) => {
+                tracing::error!("Failed to read fallback audit log line: {}", error);
+                continue;
+            }
+        };
+        if line.trim().is_empty() {
+            continue;
+        }
+
+        let row = match serde_json::from_str::<FallbackAuditLine>(&line) {
+            Ok(row) => row,
+            Err(error) => {
+                tracing::error!("Failed to parse fallback audit log line: {}", error);
+                continue;
+            }
+        };
+        if !matches_credential(row.credential_name.as_deref(), credential)
+            || !matches_since(&row.timestamp, since)
+        {
+            continue;
+        }
+
+        entries.push(AuditEntry {
+            id: -((line_index as i64) + 1),
+            timestamp: row.timestamp,
+            event_type: row.event_type,
+            credential_name: row.credential_name,
+            wisp_token: row.wisp_token,
+            target_host: row.target_host,
+            target_path: row.target_path,
+            http_method: row.http_method,
+            response_status: row.response_status,
+            denied: row.denied,
+            deny_reason: row.deny_reason,
+            project_name: row.project_name,
+            source: row
+                .sink
+                .unwrap_or_else(|| "sideload-fallback-jsonl".to_string()),
+        });
+    }
+
+    sort_and_limit(entries, last)
+}
+
+fn sort_and_limit(mut entries: Vec<AuditEntry>, last: usize) -> Vec<AuditEntry> {
+    entries.sort_by(|left, right| {
+        right
+            .timestamp
+            .cmp(&left.timestamp)
+            .then_with(|| right.id.cmp(&left.id))
+    });
+    entries.truncate(last);
+    entries
+}
+
+fn sort_oldest_first(mut entries: Vec<AuditEntry>) -> Vec<AuditEntry> {
+    entries.sort_by(|left, right| {
+        left.timestamp
+            .cmp(&right.timestamp)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    entries
+}
+
+fn read_audit_rows(
+    stmt: &mut rusqlite::Statement<'_>,
+    params_ref: &[&dyn rusqlite::types::ToSql],
+) -> Vec<AuditEntry> {
+    let rows = match stmt.query_map(params_ref, |row| {
+        Ok(AuditEntry {
+            id: row.get(0)?,
+            timestamp: row.get(1)?,
+            event_type: row.get(2)?,
+            credential_name: row.get(3)?,
+            wisp_token: row.get(4)?,
+            target_host: row.get(5)?,
+            target_path: row.get(6)?,
+            http_method: row.get(7)?,
+            response_status: row
+                .get::<_, Option<i64>>(8)?
+                .map(u16::try_from)
+                .transpose()
+                .map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        8,
+                        rusqlite::types::Type::Integer,
+                        Box::new(error),
+                    )
+                })?,
+            denied: row.get::<_, i32>(9)? != 0,
+            deny_reason: row.get(10)?,
+            project_name: row.get(11)?,
+            source: "vault".to_string(),
+        })
+    }) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::error!("Failed to query audit log: {}", e);
+            return Vec::new();
+        }
+    };
+
+    let mut entries = Vec::new();
+    for row in rows {
+        match row {
+            Ok(entry) => entries.push(entry),
+            Err(e) => {
+                tracing::error!("Failed to read audit log row: {}", e);
+                return Vec::new();
+            }
+        }
+    }
+    entries
+}
+
+fn matches_credential(entry_credential: Option<&str>, filter: Option<&str>) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    let Some(entry_credential) = entry_credential else {
+        return false;
+    };
+    entry_credential == filter
+        || sideload_env_key_filter(filter).as_deref() == Some(entry_credential)
+}
+
+fn sideload_env_key_filter(credential: &str) -> Option<String> {
+    if credential.starts_with("WISPKEY_SIDELOAD_") {
+        return None;
+    }
+    crate::env_sideload::env_key_for_name(credential)
+}
+
+fn since_lower_bound(since: &str) -> String {
+    lower_bound(since)
+}
+
+fn lower_bound(value: &str) -> String {
+    if value.contains('T') {
+        return value.to_string();
+    }
+    format!("{value}T00:00:00+00:00")
+}
+
+fn upper_bound(value: &str) -> String {
+    if value.contains('T') {
+        return value.to_string();
+    }
+    format!("{value}T23:59:59.999999999+00:00")
+}
+
+fn matches_since(timestamp: &str, since: Option<&str>) -> bool {
+    let Some(since) = since else {
+        return true;
+    };
+    let threshold = match DateTime::parse_from_rfc3339(&lower_bound(since)) {
+        Ok(threshold) => threshold.with_timezone(&Utc),
+        Err(_) => return false,
+    };
+    let timestamp = match DateTime::parse_from_rfc3339(timestamp) {
+        Ok(timestamp) => timestamp.with_timezone(&Utc),
+        Err(_) => return false,
+    };
+    timestamp >= threshold
+}
+
+fn matches_until(timestamp: &str, until: Option<&str>) -> bool {
+    let Some(until) = until else {
+        return true;
+    };
+    let threshold = match DateTime::parse_from_rfc3339(&upper_bound(until)) {
+        Ok(threshold) => threshold.with_timezone(&Utc),
+        Err(_) => return false,
+    };
+    let timestamp = match DateTime::parse_from_rfc3339(timestamp) {
+        Ok(timestamp) => timestamp.with_timezone(&Utc),
+        Err(_) => return false,
+    };
+    timestamp <= threshold
 }
 
 #[cfg(test)]
@@ -308,6 +655,31 @@ mod tests {
     }
 
     #[test]
+    fn query_log_matches_sideload_filter_by_user_facing_name() {
+        let db = test_db();
+        log_event(
+            &db,
+            "SideloadUsed",
+            Some("WISPKEY_SIDELOAD_OPENAI"),
+            Some("wk_env_openai"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+
+        let entries = query_log(&db, 10, Some("openai"), None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].credential_name.as_deref(),
+            Some("WISPKEY_SIDELOAD_OPENAI")
+        );
+    }
+
+    #[test]
     fn query_log_respects_limit() {
         let db = test_db();
         for index in 0..20 {
@@ -330,6 +702,20 @@ mod tests {
     }
 
     #[test]
+    fn query_log_since_includes_midnight_utc_rows() {
+        let db = test_db();
+        db.execute(
+            "INSERT INTO audit_log (timestamp, event_type, denied) VALUES ('2026-06-12T00:00:00+00:00', 'midnight', 0)",
+            [],
+        )
+        .unwrap();
+
+        let entries = query_log(&db, 10, None, Some("2026-06-12"));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].event_type, "midnight");
+    }
+
+    #[test]
     fn query_log_rejects_invalid_response_status() {
         let db = test_db();
         db.execute(
@@ -339,5 +725,40 @@ mod tests {
         .unwrap();
 
         assert!(query_log(&db, 10, None, None).is_empty());
+    }
+
+    #[test]
+    fn query_fallback_log_reads_sideload_jsonl_without_secret() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(SIDELOAD_FALLBACK_AUDIT_FILE);
+        let line = serde_json::json!({
+            "timestamp": Utc::now().to_rfc3339(),
+            "event_type": "SideloadUsed",
+            "credential_name": "WISPKEY_SIDELOAD_OPENAI",
+            "wisp_token": "wk_env_openai",
+            "target_host": "api.example.com",
+            "target_path": "/v1/test",
+            "http_method": "GET",
+            "response_status": 200,
+            "denied": false,
+            "deny_reason": "used env sideload credential without unlocked vault",
+            "project_name": null,
+            "sink": "sideload-fallback-jsonl"
+        });
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+
+        let entries = query_fallback_log_from_path(&path, 10, Some("openai"), None);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, -1);
+        assert_eq!(entries[0].event_type, "SideloadUsed");
+        assert_eq!(
+            entries[0].credential_name.as_deref(),
+            Some("WISPKEY_SIDELOAD_OPENAI")
+        );
+        assert_eq!(entries[0].wisp_token.as_deref(), Some("wk_env_openai"));
+        assert_eq!(entries[0].source, "sideload-fallback-jsonl");
+
+        let serialized = serde_json::to_string(&entries).unwrap();
+        assert!(!serialized.contains("sideload-secret"));
     }
 }

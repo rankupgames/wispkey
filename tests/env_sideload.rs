@@ -151,6 +151,115 @@ fn proxy_uses_env_sideload_token_without_master_password() {
         !fallback_audit.contains("sideload-secret"),
         "fallback audit must not expose env secret:\n{fallback_audit}"
     );
+
+    let log_output = wispkey_bin()
+        .args(["--format", "json", "log", "--credential", "openai"])
+        .env("WISPKEY_VAULT_PATH", vault_dir.path())
+        .env_remove("WISPKEY_PASSWORD")
+        .output()
+        .expect("query fallback audit log");
+    assert!(
+        log_output.status.success(),
+        "log command failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&log_output.stdout),
+        String::from_utf8_lossy(&log_output.stderr)
+    );
+    let log_json: Value = serde_json::from_slice(&log_output.stdout).expect("log json");
+    let entries = log_json["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["event_type"], "SideloadUsed");
+    assert_eq!(entries[0]["credential_name"], "WISPKEY_SIDELOAD_OPENAI");
+    assert_eq!(entries[0]["wisp_token"], "wk_env_openai");
+    assert_eq!(entries[0]["source"], "sideload-fallback-jsonl");
+    assert!(
+        !String::from_utf8_lossy(&log_output.stdout).contains("sideload-secret"),
+        "log output must not expose env secret"
+    );
+}
+
+#[test]
+fn management_logs_include_vaultless_sideload_fallback_rows_without_secret() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    let upstream = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    let upstream_port = upstream.local_addr().expect("upstream address").port();
+    let upstream_handle = thread::spawn(move || {
+        let (mut stream, _) = upstream.accept().expect("accept upstream request");
+        let mut buffer = [0u8; 8192];
+        let bytes_read = stream.read(&mut buffer).expect("read upstream request");
+        let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer sideload-secret"),
+            "upstream should receive env sideload secret, got:\n{request}"
+        );
+        stream
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+            .expect("write upstream response");
+    });
+
+    let (_guard, proxy_port) = start_sideload_proxy(vault_dir.path(), false);
+    let proxy_info = wait_for_proxy_info(vault_dir.path());
+    let management_token = proxy_info["management_token"]
+        .as_str()
+        .expect("management token")
+        .to_string();
+
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/test HTTP/1.1\r\n\
+         Host: 127.0.0.1:{upstream_port}\r\n\
+         Authorization: Bearer wk_env_openai\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let mut proxy_stream = TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect to proxy");
+    proxy_stream
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut proxy_response = String::new();
+    proxy_stream
+        .read_to_string(&mut proxy_response)
+        .expect("read proxy response");
+    assert!(
+        proxy_response.starts_with("HTTP/1.1 200 OK"),
+        "expected successful proxy response, got:\n{proxy_response}"
+    );
+    upstream_handle.join().expect("upstream assertion");
+
+    let management_request = format!(
+        "GET /api/logs?last=5&credential=openai HTTP/1.1\r\n\
+         Host: 127.0.0.1:{proxy_port}\r\n\
+         x-wispkey-management-token: {management_token}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    let mut management_stream =
+        TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect to management API");
+    management_stream
+        .write_all(management_request.as_bytes())
+        .expect("write management request");
+    let mut management_response = String::new();
+    management_stream
+        .read_to_string(&mut management_response)
+        .expect("read management response");
+    assert!(
+        management_response.starts_with("HTTP/1.1 200 OK"),
+        "expected successful management response, got:\n{management_response}"
+    );
+    assert!(
+        !management_response.contains("sideload-secret"),
+        "management log response must not expose env secret:\n{management_response}"
+    );
+
+    let body = management_response
+        .split("\r\n\r\n")
+        .nth(1)
+        .expect("management response body");
+    let log_json: Value = serde_json::from_str(body.trim()).expect("management log json");
+    let entries = log_json["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["event_type"], "SideloadUsed");
+    assert_eq!(entries[0]["credential_name"], "WISPKEY_SIDELOAD_OPENAI");
+    assert_eq!(entries[0]["wisp_token"], "wk_env_openai");
+    assert_eq!(entries[0]["source"], "sideload-fallback-jsonl");
 }
 
 #[test]

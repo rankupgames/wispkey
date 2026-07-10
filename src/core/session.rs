@@ -1,13 +1,7 @@
-use std::fs;
-use std::path::Path;
-
 use argon2::{Argon2, PasswordVerifier};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 
-use crate::secure_files;
-
+use super::session_store::{SessionStore, session_store};
 use super::{Result, Vault, VaultError};
 
 impl Vault {
@@ -89,84 +83,23 @@ impl Vault {
         let timeout = self
             .session_timeout_override
             .unwrap_or_else(Self::session_timeout_minutes);
-        let session_data = format!(
-            "{}\n{}\n{}",
-            BASE64.encode(key),
-            Utc::now().to_rfc3339(),
-            timeout
-        );
-        let session_path = Self::session_path();
-        secure_files::write_private(&session_path, session_data.as_bytes())?;
+        session_store().save(key, Utc::now(), timeout)?;
         Ok(())
     }
 
     pub(super) fn load_session(&mut self) -> Result<()> {
-        let session_path = Self::session_path();
-        if !session_path.exists() {
-            return Err(VaultError::Locked);
+        let store = session_store();
+        let record = store.load()?;
+        self.master_key = Some(record.key);
+        if store.should_upgrade(&record) {
+            store.save(&record.key, record.issued_at, record.timeout_minutes)?;
         }
-
-        let session_data = fs::read_to_string(&session_path)?;
-        let lines: Vec<&str> = session_data.lines().collect();
-
-        let (key_b64, timestamp_str, timeout) = if lines.len() >= 3 {
-            let timeout = match lines[2].parse::<i64>() {
-                Ok(timeout) => timeout,
-                Err(_) => {
-                    clear_invalid_session_file(&session_path)?;
-                    return Err(VaultError::SessionInvalid);
-                }
-            };
-            (lines[0], lines[1], timeout)
-        } else if lines.len() == 1 {
-            let parts: Vec<&str> = session_data.splitn(2, ':').collect();
-            if parts.len() != 2 {
-                clear_invalid_session_file(&session_path)?;
-                return Err(VaultError::SessionInvalid);
-            }
-            (parts[0], parts[1], 30i64)
-        } else {
-            clear_invalid_session_file(&session_path)?;
-            return Err(VaultError::SessionInvalid);
-        };
-
-        let timestamp = match DateTime::parse_from_rfc3339(timestamp_str) {
-            Ok(timestamp) => timestamp,
-            Err(_) => {
-                clear_invalid_session_file(&session_path)?;
-                return Err(VaultError::SessionInvalid);
-            }
-        };
-
-        let age = Utc::now() - timestamp.with_timezone(&Utc);
-        if timeout > 0 && age.num_minutes() > timeout {
-            clear_invalid_session_file(&session_path)?;
-            return Err(VaultError::SessionInvalid);
-        }
-
-        let key_bytes = match BASE64.decode(key_b64) {
-            Ok(key_bytes) => key_bytes,
-            Err(_) => {
-                clear_invalid_session_file(&session_path)?;
-                return Err(VaultError::SessionInvalid);
-            }
-        };
-        if key_bytes.len() != 32 {
-            clear_invalid_session_file(&session_path)?;
-            return Err(VaultError::SessionInvalid);
-        }
-
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&key_bytes);
-        self.master_key = Some(key);
         Ok(())
     }
-}
 
-fn clear_invalid_session_file(session_path: &Path) -> Result<()> {
-    match fs::remove_file(session_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(VaultError::Io(error)),
+    /// Reports the configured session-at-rest protection backend.
+    #[must_use]
+    pub fn session_protection_label() -> &'static str {
+        session_store().protection_label()
     }
 }

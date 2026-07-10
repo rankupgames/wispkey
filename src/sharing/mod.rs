@@ -85,7 +85,8 @@ pub fn export_project(
         let mut bundle_credentials = Vec::with_capacity(credentials.len());
 
         for credential in credentials {
-            let value = vault.decrypt_credential_value(&credential.name)?;
+            let value =
+                vault.decrypt_credential_value_in_project(project_name, &credential.name)?;
             bundle_credentials.push(BundleCredential {
                 name: credential.name,
                 description: credential.description,
@@ -169,7 +170,7 @@ pub fn export_credential(
         .get_partition_project_name(&partition.id)?
         .unwrap_or_else(|| DEFAULT_PROJECT_NAME.to_string());
 
-    let value = vault.decrypt_credential_value(&credential.name)?;
+    let value = vault.decrypt_credential_value_in_project(&project_name, &credential.name)?;
     let payload = CredentialBundlePayload {
         project: project_name,
         partition: partition.name,

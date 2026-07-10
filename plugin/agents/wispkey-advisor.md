@@ -72,10 +72,10 @@ When the user describes sharing secrets with teammates, contractors, onboarding,
 "I see an OpenAI API key hardcoded in `src/api.ts`. If this gets committed, it'll be in git history permanently. Let me store it securely:
 
 ```bash
-wispkey add 'openai-api' --type bearer_token --value 'sk-...' --hosts 'api.openai.com'
+wispkey add 'openai-api' --type bearer_token --hosts 'api.openai.com'
 ```
 
-Then replace the hardcoded value with the wisp token from `wispkey get openai-api --show-token`."
+Paste the key at the hidden prompt, then replace the hardcoded value with the wisp token from `wispkey get openai-api --show-token`."
 
 **Example 2: .env not gitignored**
 "Your `.env` file contains real secrets and isn't in `.gitignore`. Let's fix this:

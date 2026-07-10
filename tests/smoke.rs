@@ -98,3 +98,26 @@ fn vault_directory_and_session_file_are_owner_only_on_unix() {
     assert_eq!(file_mode(vault_dir.path()), 0o700);
     assert_eq!(file_mode(&vault_dir.path().join("session")), 0o600);
 }
+
+#[test]
+fn format_flag_is_global_after_subcommands() {
+    // Guards against dropping `global = true` on the top-level --format flag,
+    // which would make `--format` after a subcommand fail to parse.
+    for args in [
+        vec!["status", "--format", "json"],
+        vec!["instance", "list", "--format", "json"],
+        vec!["audit", "export", "--format", "jsonl"],
+    ] {
+        let output = wispkey_bin()
+            .args(&args)
+            .env("HOME", "/tmp/wispkey-test-nonexistent")
+            .output()
+            .expect("failed to run wispkey");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("unexpected argument '--format'"),
+            "--format must be accepted after `{}`; got: {stderr}",
+            args.join(" ")
+        );
+    }
+}

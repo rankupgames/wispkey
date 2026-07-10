@@ -272,7 +272,7 @@ fn policy_matches_credential(policy: &Policy, credential_name: &str) -> bool {
 fn policy_matches_agent(policy: &Policy, agent_name: Option<&str>) -> bool {
     match (&policy.agent, agent_name) {
         (Some(pattern), Some(name)) => glob_match::glob_match(pattern, name),
-        (Some(_), None) => false,
+        (Some(_), None) => true,
         (None, _) => true,
     }
 }
@@ -592,7 +592,7 @@ mod tests {
                 .evaluate("cred", Some("cursor"), "h", "/", "POST")
                 .is_none()
         );
-        assert!(engine.evaluate("cred", None, "h", "/", "POST").is_none());
+        assert!(engine.evaluate("cred", None, "h", "/", "POST").is_some());
     }
 
     #[test]

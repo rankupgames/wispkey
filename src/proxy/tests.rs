@@ -7,6 +7,36 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
 #[test]
+fn listen_spec_parses_supported_transports() {
+    let tcp = transport::ListenSpec::parse("tcp://127.0.0.1:7700").unwrap();
+    assert!(matches!(tcp, transport::ListenSpec::Tcp(_)));
+
+    let unix = transport::ListenSpec::parse("unix:/tmp/wispkey.sock").unwrap();
+    assert!(matches!(unix, transport::ListenSpec::Unix(_)));
+
+    let vsock = transport::ListenSpec::parse("vsock://3:7700").unwrap();
+    assert!(matches!(
+        vsock,
+        transport::ListenSpec::Vsock { cid: 3, port: 7700 }
+    ));
+}
+
+#[test]
+fn listener_identity_defaults_are_transport_specific() {
+    let tcp = transport::ListenConfig::new(
+        transport::ListenSpec::parse("tcp://127.0.0.1:7700").unwrap(),
+        transport::IdentityRequirement::Default,
+    );
+    let unix = transport::ListenConfig::new(
+        transport::ListenSpec::parse("unix:/tmp/wispkey.sock").unwrap(),
+        transport::IdentityRequirement::Default,
+    );
+
+    assert!(!tcp.require_identity);
+    assert!(unix.require_identity);
+}
+
+#[test]
 fn inject_bearer_replaces_token() {
     let result = inject_credential(
         &CredentialType::BearerToken,

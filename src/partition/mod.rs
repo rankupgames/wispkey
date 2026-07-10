@@ -62,7 +62,7 @@ pub fn export_partition(
     let mut bundle_credentials = Vec::with_capacity(credentials.len());
 
     for credential in &credentials {
-        let value = vault.decrypt_credential_value(&credential.name)?;
+        let value = vault.decrypt_credential_value_in_project(&active_project, &credential.name)?;
         let hosts = credential.hosts.join(",");
         let tags = credential.tags.join(",");
         bundle_credentials.push(BundleCredential {
