@@ -1,5 +1,20 @@
 # Changes
 
+## Unreleased
+
+### Cross-machine and Firecracker instance access
+
+- Added `firecracker-vsock:/absolute/base.sock:<port>` listeners for Firecracker's actual guest-to-host transport. WispKey binds Firecracker's required `<base>_<port>` Unix socket while preserving the existing feature-gated `vsock://<cid>:<port>` listener for Linux environments that expose host AF_VSOCK directly.
+- Non-loopback TCP listeners now require instance identity by default. The legacy `wispkey serve` loopback listener remains unchanged, and an explicit `--no-require-identity` override on non-loopback TCP prints a warning.
+- Added an operating-system-neutral TCP integration test for missing, invalid, scoped, out-of-scope, approved, and revoked instance identities so the flow can run natively on Windows as well as Linux and macOS.
+- Documented SSH-tunneled TCP as the encrypted cross-machine path for Windows and other servers; per-instance authentication is not transport encryption.
+- Closed a revocation time-of-check/time-of-use race: successful Argon2 verification now updates `last_seen_at` only while the instance is still active, so a revoke that lands during password hashing makes the in-flight authentication fail closed.
+- Added due-aware `instance rotate-secret` automation. Rotation atomically replaces the 48-character CSPRNG bearer secret, can skip secrets younger than `--if-older-than`, and keeps the previous secret for a bounded `--grace` window. The first successful use of the new secret retires the previous one early.
+- Migrated vaults to schema v9 with secret-rotation timestamps and bounded previous-secret metadata. Secret hashes remain Argon2id-protected; plaintext rotation output is shown only once.
+- Migrated vaults to schema v10 so credential selectors and access requests persist the exact credential ID. Unambiguous legacy name-only rows are backfilled; ambiguous same-name rows remain unbound and fail closed.
+- Denied env-sideload tokens for identity-authenticated instance requests because sideloads have no persisted credential ID that can be enrolled or approved.
+- Documented fail-closed hybrid post-quantum SSH key exchange for cross-machine tunnels. Instance-secret rotation limits exposure time but does not substitute for quantum-resistant transport key exchange.
+
 ## 0.4.0 (2026-07-08)
 
 ### Secret injection for subprocesses

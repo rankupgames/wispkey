@@ -672,7 +672,7 @@ fn schema_v6_to_current_migration_adds_instance_and_bootstrap_tables_without_tou
 }
 
 #[test]
-fn schema_v7_to_v8_migration_adds_bootstrap_tokens_without_touching_data() {
+fn schema_v7_to_current_migration_adds_bootstrap_and_rotation_columns_without_touching_data() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("vault.db");
     let db = Connection::open(&db_path).unwrap();
@@ -798,6 +798,21 @@ fn schema_v7_to_v8_migration_adds_bootstrap_tokens_without_touching_data() {
         .unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
 
+    let (secret_rotated_at, previous_secret_hash, previous_secret_expires_at): (
+        String,
+        Option<String>,
+        Option<String>,
+    ) = db
+        .query_row(
+            "SELECT secret_rotated_at, previous_secret_hash, previous_secret_expires_at FROM instances WHERE id = 'inst-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(secret_rotated_at, now);
+    assert!(previous_secret_hash.is_none());
+    assert!(previous_secret_expires_at.is_none());
+
     let bootstrap_table_count: usize = db
         .query_row(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'bootstrap_tokens'",
@@ -826,8 +841,107 @@ fn schema_v7_to_v8_migration_adds_bootstrap_tokens_without_touching_data() {
 }
 
 #[test]
+fn schema_v9_to_current_binds_only_unambiguous_legacy_credential_names() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch(
+        "CREATE TABLE vault_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE credentials (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL
+        );
+        CREATE TABLE instances (
+            id TEXT PRIMARY KEY
+        );
+        CREATE TABLE instance_scopes (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+            scope_type TEXT NOT NULL,
+            scope_value TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(instance_id, scope_type, scope_value)
+        );
+        CREATE TABLE access_requests (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+            credential_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            decided_at TEXT
+        );
+        INSERT INTO vault_meta (key, value) VALUES ('version', '9');
+        INSERT INTO credentials (id, name) VALUES
+            ('shared-default', 'shared'),
+            ('shared-client', 'shared'),
+            ('unique-id', 'unique');
+        INSERT INTO instances (id) VALUES ('worker');
+        INSERT INTO instance_scopes (id, instance_id, scope_type, scope_value, created_at) VALUES
+            ('shared-scope', 'worker', 'credential', 'shared', '2026-07-10T00:00:00Z'),
+            ('unique-scope', 'worker', 'credential', 'unique', '2026-07-10T00:00:00Z');
+        INSERT INTO access_requests (id, instance_id, credential_name, status, reason, created_at) VALUES
+            ('shared-request', 'worker', 'shared', 'approved', '', '2026-07-10T00:00:00Z'),
+            ('unique-request', 'worker', 'unique', 'approved', '', '2026-07-10T00:00:00Z');",
+    )
+    .unwrap();
+
+    Vault::migrate_schema(&db).unwrap();
+
+    let version: String = db
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key = 'version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let shared_scope_id: Option<String> = db
+        .query_row(
+            "SELECT credential_id FROM instance_scopes WHERE id = 'shared-scope'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let unique_scope_id: Option<String> = db
+        .query_row(
+            "SELECT credential_id FROM instance_scopes WHERE id = 'unique-scope'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let shared_request_id: Option<String> = db
+        .query_row(
+            "SELECT credential_id FROM access_requests WHERE id = 'shared-request'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let unique_request_id: Option<String> = db
+        .query_row(
+            "SELECT credential_id FROM access_requests WHERE id = 'unique-request'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    assert!(shared_scope_id.is_none());
+    assert_eq!(unique_scope_id.as_deref(), Some("unique-id"));
+    assert!(shared_request_id.is_none());
+    assert_eq!(unique_request_id.as_deref(), Some("unique-id"));
+}
+
+#[test]
 fn enroll_instance_creates_instance_and_scopes() {
     let vault = test_vault("pw");
+    let credential = vault
+        .add_credential(AddCredentialRequest::new(
+            "openai-key",
+            CredentialType::ApiKey,
+            "secret",
+        ))
+        .unwrap();
     let enrolled = vault
         .enroll_instance(
             "vm-one",
@@ -840,6 +954,11 @@ fn enroll_instance_creates_instance_and_scopes() {
             ],
         )
         .unwrap();
+
+    assert!(enrolled.instance.scopes.iter().any(|scope| {
+        scope.scope_type == "credential"
+            && scope.credential_id.as_deref() == Some(credential.id.as_str())
+    }));
 
     assert_eq!(enrolled.instance.name, "vm-one");
     assert_eq!(enrolled.instance.description, "ephemeral worker");
@@ -953,6 +1072,106 @@ fn instance_secret_verifies_and_wrong_secret_fails() {
 }
 
 #[test]
+fn instance_secret_rotation_is_due_aware_and_retires_grace_on_new_secret_use() {
+    let vault = test_vault("pw");
+    let enrolled = vault.enroll_instance("vm-rotate", "", &[]).unwrap();
+
+    let not_due = vault
+        .rotate_instance_secret(
+            &enrolled.instance.id,
+            Some(chrono::Duration::days(30)),
+            chrono::Duration::minutes(10),
+        )
+        .unwrap();
+    assert!(!not_due.rotated);
+    assert!(not_due.secret.is_none());
+
+    let rotated = vault
+        .rotate_instance_secret(&enrolled.instance.id, None, chrono::Duration::minutes(10))
+        .unwrap();
+    let new_secret = rotated.secret.as_deref().unwrap();
+    assert!(rotated.rotated);
+    assert!(rotated.instance.previous_secret_expires_at.is_some());
+    assert_ne!(new_secret, enrolled.secret);
+
+    assert!(
+        vault
+            .verify_instance_secret(&enrolled.instance.id, &enrolled.secret)
+            .unwrap()
+    );
+    assert!(
+        vault
+            .verify_instance_secret(&enrolled.instance.id, new_secret)
+            .unwrap()
+    );
+    assert!(
+        !vault
+            .verify_instance_secret(&enrolled.instance.id, &enrolled.secret)
+            .unwrap()
+    );
+
+    let confirmed = vault.get_instance(&enrolled.instance.id).unwrap();
+    assert!(confirmed.previous_secret_expires_at.is_none());
+}
+
+#[test]
+fn revoked_instance_secret_cannot_rotate() {
+    let vault = test_vault("pw");
+    let enrolled = vault.enroll_instance("vm-rotate-revoked", "", &[]).unwrap();
+    vault.revoke_instance(&enrolled.instance.id).unwrap();
+
+    let result =
+        vault.rotate_instance_secret(&enrolled.instance.id, None, chrono::Duration::minutes(10));
+
+    assert!(matches!(result, Err(VaultError::InstanceNotActive(_))));
+}
+
+#[test]
+fn instance_secret_rotation_rejects_an_unrepresentable_grace_deadline() {
+    let vault = test_vault("pw");
+    let enrolled = vault
+        .enroll_instance("vm-rotate-overflow", "", &[])
+        .unwrap();
+    let huge_grace = chrono::Duration::try_days(100_000_000).unwrap();
+
+    let result = vault.rotate_instance_secret(&enrolled.instance.id, None, huge_grace);
+
+    assert!(matches!(
+        result,
+        Err(VaultError::InvalidInstanceSecretRotation)
+    ));
+    assert!(
+        vault
+            .verify_instance_secret(&enrolled.instance.id, &enrolled.secret)
+            .unwrap()
+    );
+}
+
+#[test]
+fn previous_instance_secret_expiring_during_verification_fails_closed() {
+    let vault = test_vault("pw");
+    let enrolled = vault.enroll_instance("vm-rotate-expiry", "", &[]).unwrap();
+    vault
+        .rotate_instance_secret(&enrolled.instance.id, None, chrono::Duration::minutes(10))
+        .unwrap();
+
+    let verified = vault
+        .verify_instance_secret_with_hook(&enrolled.instance.id, &enrolled.secret, |db| {
+            db.execute(
+                "UPDATE instances SET previous_secret_expires_at = ?1 WHERE id = ?2",
+                params![
+                    (Utc::now() - chrono::Duration::minutes(1)).to_rfc3339(),
+                    enrolled.instance.id
+                ],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(!verified);
+}
+
+#[test]
 fn credential_in_scope_matches_each_selector_type() {
     let vault = test_vault("pw");
     vault.create_project("client", "").unwrap();
@@ -960,33 +1179,33 @@ fn credential_in_scope_matches_each_selector_type() {
         .create_partition("infra", "", Some("default"))
         .unwrap();
 
-    vault
+    let partition_credential = vault
         .add_credential(
             AddCredentialRequest::new("partition-cred", CredentialType::ApiKey, "secret")
                 .partition(Some("infra"))
                 .project(Some("default")),
         )
         .unwrap();
-    vault
+    let project_credential = vault
         .add_credential(
             AddCredentialRequest::new("project-cred", CredentialType::ApiKey, "secret")
                 .project(Some("client")),
         )
         .unwrap();
-    vault
+    let explicitly_scoped_credential = vault
         .add_credential(
             AddCredentialRequest::new("credential-cred", CredentialType::ApiKey, "secret")
                 .project(Some("default")),
         )
         .unwrap();
-    vault
+    let tagged_credential = vault
         .add_credential(
             AddCredentialRequest::new("tagged-cred", CredentialType::ApiKey, "secret")
                 .tags(Some("company:acme,prod"))
                 .project(Some("default")),
         )
         .unwrap();
-    vault
+    let outside_credential = vault
         .add_credential(
             AddCredentialRequest::new("outside-cred", CredentialType::ApiKey, "secret")
                 .project(Some("default")),
@@ -1008,27 +1227,27 @@ fn credential_in_scope_matches_each_selector_type() {
 
     assert!(
         vault
-            .credential_in_scope(&enrolled.instance.id, "partition-cred")
+            .credential_in_scope(&enrolled.instance.id, &partition_credential.id)
             .unwrap()
     );
     assert!(
         vault
-            .credential_in_scope(&enrolled.instance.id, "project-cred")
+            .credential_in_scope(&enrolled.instance.id, &project_credential.id)
             .unwrap()
     );
     assert!(
         vault
-            .credential_in_scope(&enrolled.instance.id, "credential-cred")
+            .credential_in_scope(&enrolled.instance.id, &explicitly_scoped_credential.id)
             .unwrap()
     );
     assert!(
         vault
-            .credential_in_scope(&enrolled.instance.id, "tagged-cred")
+            .credential_in_scope(&enrolled.instance.id, &tagged_credential.id)
             .unwrap()
     );
     assert!(
         !vault
-            .credential_in_scope(&enrolled.instance.id, "outside-cred")
+            .credential_in_scope(&enrolled.instance.id, &outside_credential.id)
             .unwrap()
     );
     assert!(
@@ -1041,7 +1260,7 @@ fn credential_in_scope_matches_each_selector_type() {
 #[test]
 fn approved_access_request_grants_scope_and_duplicate_pending_reuses() {
     let vault = test_vault("pw");
-    vault
+    let credential = vault
         .add_credential(
             AddCredentialRequest::new("needs-approval", CredentialType::ApiKey, "secret")
                 .project(Some("default")),
@@ -1051,17 +1270,18 @@ fn approved_access_request_grants_scope_and_duplicate_pending_reuses() {
 
     assert!(
         !vault
-            .credential_in_scope(&enrolled.instance.id, "needs-approval")
+            .credential_in_scope(&enrolled.instance.id, &credential.id)
             .unwrap()
     );
 
     let first = vault
-        .create_or_reuse_access_request(&enrolled.instance.id, "needs-approval", "deploy needs it")
+        .create_or_reuse_access_request(&enrolled.instance.id, &credential.id, "deploy needs it")
         .unwrap();
     let second = vault
-        .create_or_reuse_access_request(&enrolled.instance.id, "needs-approval", "same request")
+        .create_or_reuse_access_request(&enrolled.instance.id, &credential.id, "same request")
         .unwrap();
     assert_eq!(first.id, second.id);
+    assert_eq!(first.credential_id.as_deref(), Some(credential.id.as_str()));
 
     let pending = vault
         .list_access_requests(Some("vm-requester"), true)
@@ -1073,7 +1293,7 @@ fn approved_access_request_grants_scope_and_duplicate_pending_reuses() {
     assert!(approved.decided_at.is_some());
     assert!(
         vault
-            .credential_in_scope(&enrolled.instance.id, "needs-approval")
+            .credential_in_scope(&enrolled.instance.id, &credential.id)
             .unwrap()
     );
 }
@@ -1081,7 +1301,7 @@ fn approved_access_request_grants_scope_and_duplicate_pending_reuses() {
 #[test]
 fn denied_access_request_does_not_grant_scope() {
     let vault = test_vault("pw");
-    vault
+    let credential = vault
         .add_credential(
             AddCredentialRequest::new("denied-cred", CredentialType::ApiKey, "secret")
                 .project(Some("default")),
@@ -1089,14 +1309,14 @@ fn denied_access_request_does_not_grant_scope() {
         .unwrap();
     let enrolled = vault.enroll_instance("vm-denied", "", &[]).unwrap();
     let request = vault
-        .create_or_reuse_access_request(&enrolled.instance.id, "denied-cred", "")
+        .create_or_reuse_access_request(&enrolled.instance.id, &credential.id, "")
         .unwrap();
 
     let denied = vault.decide_access_request(&request.id, false).unwrap();
     assert_eq!(denied.status, "denied");
     assert!(
         !vault
-            .credential_in_scope(&enrolled.instance.id, "denied-cred")
+            .credential_in_scope(&enrolled.instance.id, &credential.id)
             .unwrap()
     );
 }
@@ -1112,5 +1332,28 @@ fn revoke_instance_flips_status_and_fails_auth() {
         !vault
             .verify_instance_secret(&enrolled.instance.id, &enrolled.secret)
             .unwrap()
+    );
+}
+
+#[test]
+fn revoke_during_instance_secret_verification_fails_closed() {
+    let vault = test_vault("pw");
+    let enrolled = vault.enroll_instance("vm-revoke-race", "", &[]).unwrap();
+    let instance_id = enrolled.instance.id.clone();
+
+    let verified = vault
+        .verify_instance_secret_with_hook(&instance_id, &enrolled.secret, |db| {
+            db.execute(
+                "UPDATE instances SET status = 'revoked' WHERE id = ?1",
+                params![instance_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+
+    assert!(!verified);
+    assert_eq!(
+        vault.get_instance(&enrolled.instance.id).unwrap().status,
+        "revoked"
     );
 }

@@ -41,7 +41,8 @@ pub use instances::{
     handle_instance_approve, handle_instance_bootstrap_create, handle_instance_bootstrap_list,
     handle_instance_bootstrap_revoke, handle_instance_deny, handle_instance_enroll,
     handle_instance_join, handle_instance_list, handle_instance_requests, handle_instance_revoke,
-    handle_instance_scope_add, handle_instance_scope_remove, handle_instance_show,
+    handle_instance_rotate_secret, handle_instance_scope_add, handle_instance_scope_remove,
+    handle_instance_show,
 };
 pub use log::handle_log;
 pub use mcp::handle_mcp_serve;

@@ -146,10 +146,9 @@ impl PolicyEngine {
         }
 
         if !policy.allowed_hosts.is_empty()
-            && !policy
-                .allowed_hosts
-                .iter()
-                .any(|h| glob_match::glob_match(h, host))
+            && !policy.allowed_hosts.iter().any(|h| {
+                glob_match::glob_match(&h.to_ascii_lowercase(), &host.to_ascii_lowercase())
+            })
         {
             return Some(PolicyDenial {
                 policy_name: policy.name.clone(),
@@ -162,7 +161,7 @@ impl PolicyEngine {
         if policy
             .denied_hosts
             .iter()
-            .any(|h| glob_match::glob_match(h, host))
+            .any(|h| glob_match::glob_match(&h.to_ascii_lowercase(), &host.to_ascii_lowercase()))
         {
             return Some(PolicyDenial {
                 policy_name: policy.name.clone(),
@@ -224,9 +223,16 @@ impl PolicyEngine {
             return Some(denial);
         }
 
-        if let Some(ref limit_str) = policy.rate_limit
-            && let Some(parsed) = parse_rate_limit(limit_str)
-        {
+        if let Some(ref limit_str) = policy.rate_limit {
+            let Some(parsed) = parse_rate_limit(limit_str) else {
+                return Some(PolicyDenial {
+                    policy_name: policy.name.clone(),
+                    reason: format!(
+                        "invalid rate limit '{}' for policy '{}'",
+                        limit_str, policy.name
+                    ),
+                });
+            };
             let bucket_key = format!("{}:{}", policy.name, credential_name);
             if let Ok(mut buckets) = self.rate_buckets.lock() {
                 let now = Instant::now();
@@ -299,11 +305,15 @@ fn parse_rate_limit(s: &str) -> Option<RateLimit> {
 fn check_time_window(policy_name: &str, window_str: &str) -> Option<PolicyDenial> {
     let parts: Vec<&str> = window_str.splitn(2, '-').collect();
     if parts.len() != 2 {
-        return None;
+        return Some(invalid_time_window_denial(policy_name, window_str));
     }
 
-    let start = NaiveTime::parse_from_str(parts[0].trim(), "%H:%M").ok()?;
-    let end = NaiveTime::parse_from_str(parts[1].trim(), "%H:%M").ok()?;
+    let Ok(start) = NaiveTime::parse_from_str(parts[0].trim(), "%H:%M") else {
+        return Some(invalid_time_window_denial(policy_name, window_str));
+    };
+    let Ok(end) = NaiveTime::parse_from_str(parts[1].trim(), "%H:%M") else {
+        return Some(invalid_time_window_denial(policy_name, window_str));
+    };
     let now = Local::now().time();
 
     let in_window = if start <= end {
@@ -326,26 +336,90 @@ fn check_time_window(policy_name: &str, window_str: &str) -> Option<PolicyDenial
     }
 }
 
+fn invalid_time_window_denial(policy_name: &str, window_str: &str) -> PolicyDenial {
+    PolicyDenial {
+        policy_name: policy_name.to_string(),
+        reason: format!(
+            "invalid time window '{}' for policy '{}'; expected HH:MM-HH:MM in local time",
+            window_str, policy_name
+        ),
+    }
+}
+
 /// Returns the path to the policies TOML file.
 pub fn policies_path() -> PathBuf {
     Vault::vault_dir().join("policies.toml")
 }
 
-/// Reads and parses the policies TOML file, returning empty config on failure.
+/// Reads and validates the policies TOML file, denying all credential use on failure.
 pub fn load_policies_from_disk() -> PolicyConfig {
     let path = policies_path();
     if !path.exists() {
         return PolicyConfig { policy: Vec::new() };
     }
     match std::fs::read_to_string(&path) {
-        Ok(content) => toml::from_str(&content).unwrap_or_else(|e| {
-            tracing::warn!("Failed to parse policies.toml: {}", e);
-            PolicyConfig { policy: Vec::new() }
-        }),
+        Ok(content) => match toml::from_str::<PolicyConfig>(&content) {
+            Ok(config) => match validate_policy_config(&config) {
+                Ok(()) => config,
+                Err(error) => {
+                    tracing::warn!("Invalid policies.toml: {}", error);
+                    invalid_policy_config()
+                }
+            },
+            Err(error) => {
+                tracing::warn!("Failed to parse policies.toml: {}", error);
+                invalid_policy_config()
+            }
+        },
         Err(e) => {
             tracing::warn!("Failed to read policies.toml: {}", e);
-            PolicyConfig { policy: Vec::new() }
+            invalid_policy_config()
         }
+    }
+}
+
+/// Validates policy fields whose string formats are enforced at request time.
+pub fn validate_policy_config(config: &PolicyConfig) -> Result<(), String> {
+    for policy in &config.policy {
+        if let Some(rate_limit) = &policy.rate_limit
+            && parse_rate_limit(rate_limit).is_none()
+        {
+            return Err(format!(
+                "policy '{}' has invalid rate_limit '{}'",
+                policy.name, rate_limit
+            ));
+        }
+        if let Some(time_window) = &policy.time_window {
+            let parts: Vec<&str> = time_window.splitn(2, '-').collect();
+            if parts.len() != 2
+                || NaiveTime::parse_from_str(parts[0].trim(), "%H:%M").is_err()
+                || NaiveTime::parse_from_str(parts[1].trim(), "%H:%M").is_err()
+            {
+                return Err(format!(
+                    "policy '{}' has invalid time_window '{}'; expected HH:MM-HH:MM in local time",
+                    policy.name, time_window
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn invalid_policy_config() -> PolicyConfig {
+    PolicyConfig {
+        policy: vec![Policy {
+            name: "invalid-policy-config".to_string(),
+            agent: None,
+            credential: None,
+            allowed_hosts: Vec::new(),
+            denied_hosts: Vec::new(),
+            allowed_methods: Vec::new(),
+            denied_paths: Vec::new(),
+            allowed_paths: Vec::new(),
+            rate_limit: None,
+            time_window: None,
+            deny: true,
+        }],
     }
 }
 
@@ -489,6 +563,11 @@ mod tests {
                 .evaluate("cred", None, "api.good.com", "/", "GET")
                 .is_none()
         );
+        assert!(
+            engine
+                .evaluate("cred", None, "API.EVIL.COM", "/", "GET")
+                .is_some()
+        );
     }
 
     #[test]
@@ -560,6 +639,47 @@ mod tests {
         assert!(parse_rate_limit("100/day").is_some());
         assert!(parse_rate_limit("1/second").is_some());
         assert!(parse_rate_limit("bad").is_none());
+    }
+
+    #[test]
+    fn invalid_policy_formats_fail_closed() {
+        let invalid_time = test_engine(vec![Policy {
+            name: "bad-time".into(),
+            agent: None,
+            credential: None,
+            allowed_hosts: vec![],
+            denied_hosts: vec![],
+            allowed_methods: vec![],
+            denied_paths: vec![],
+            allowed_paths: vec![],
+            rate_limit: None,
+            time_window: Some("09:00-17:00 America/New_York".into()),
+            deny: false,
+        }]);
+        assert!(
+            invalid_time
+                .evaluate("cred", None, "host", "/", "GET")
+                .is_some()
+        );
+
+        let invalid_rate = test_engine(vec![Policy {
+            name: "bad-rate".into(),
+            agent: None,
+            credential: None,
+            allowed_hosts: vec![],
+            denied_hosts: vec![],
+            allowed_methods: vec![],
+            denied_paths: vec![],
+            allowed_paths: vec![],
+            rate_limit: Some("not-a-rate".into()),
+            time_window: None,
+            deny: false,
+        }]);
+        assert!(
+            invalid_rate
+                .evaluate("cred", None, "host", "/", "GET")
+                .is_some()
+        );
     }
 
     #[test]

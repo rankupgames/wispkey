@@ -77,10 +77,11 @@ fn credential_replacement_value(credential_type: &CredentialType, real_value: &s
 }
 
 pub(super) fn check_host_restriction(allowed_hosts: &[String], target_host: &str) -> bool {
+    let target_host = target_host.to_ascii_lowercase();
     allowed_hosts.is_empty()
         || allowed_hosts
             .iter()
-            .any(|pattern| glob_match::glob_match(pattern, target_host))
+            .any(|pattern| glob_match::glob_match(&pattern.to_ascii_lowercase(), &target_host))
 }
 
 struct EnvCredentialResolution {
@@ -263,14 +264,14 @@ fn try_resolve_exact_token_for_request(
 
             if let Some(instance) = context.instance {
                 let in_scope = vault
-                    .credential_in_scope(&instance.id, &cred.name)
+                    .credential_in_scope(&instance.id, &cred.id)
                     .unwrap_or(false);
                 if !in_scope {
                     let reason = format!("out_of_scope instance={}", instance.name);
                     let access_request = vault
                         .create_or_reuse_access_request(
                             &instance.id,
-                            &cred.name,
+                            &cred.id,
                             "access requested by proxy token injection",
                         )
                         .ok();
@@ -394,6 +395,27 @@ fn resolve_env_token_for_request(
         return Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)));
     };
 
+    if let Some(instance) = context.instance {
+        let reason = format!(
+            "environment sideload credential '{}' is not available to identity-authenticated instances",
+            env_credential.env_key
+        );
+        if let Some(vault) = vault {
+            audit_denial(
+                vault,
+                "CredentialDenied",
+                Some(&env_credential.env_key),
+                token,
+                context,
+                &reason,
+            );
+        }
+        return Err(Box::new(sideload_out_of_scope_response(
+            &env_credential.env_key,
+            instance,
+        )));
+    }
+
     if let Some(denial) = context.policy_engine.evaluate(
         &env_credential.name,
         None,
@@ -503,6 +525,22 @@ fn out_of_scope_response(
             "instance": instance.name,
             "access_request": access_request_id,
             "message": "access requested; awaiting host approval",
+        }),
+    )
+}
+
+fn sideload_out_of_scope_response(
+    credential_name: &str,
+    instance: &InstanceIdentity,
+) -> Response<Full<Bytes>> {
+    json_response(
+        StatusCode::FORBIDDEN,
+        &serde_json::json!({
+            "error": "out_of_scope",
+            "credential": credential_name,
+            "instance": instance.name,
+            "access_request": null,
+            "message": "environment sideload credentials cannot be authorized for identity-authenticated instances",
         }),
     )
 }

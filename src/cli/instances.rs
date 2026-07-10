@@ -3,7 +3,7 @@ use chrono::Duration;
 use crate::audit;
 use crate::core::{
     AccessRequest, BootstrapJoinResult, BootstrapToken, CreateBootstrapTokenResult,
-    EnrollInstanceResult, Instance, InstanceScopeInput, Vault,
+    EnrollInstanceResult, Instance, InstanceScopeInput, RotateInstanceSecretResult, Vault,
 };
 
 use super::shared::{json_output, print_json};
@@ -91,6 +91,17 @@ pub async fn handle_instance_show(name: &str) {
             println!("Created: {}", instance.created_at.to_rfc3339());
             println!("Updated: {}", instance.updated_at.to_rfc3339());
             println!(
+                "Secret rotated: {}",
+                instance.secret_rotated_at.to_rfc3339()
+            );
+            println!(
+                "Previous secret expires: {}",
+                instance
+                    .previous_secret_expires_at
+                    .map(|timestamp| timestamp.to_rfc3339())
+                    .unwrap_or_else(|| "-".to_string())
+            );
+            println!(
                 "Last seen: {}",
                 instance
                     .last_seen_at
@@ -143,6 +154,62 @@ pub async fn handle_instance_revoke(name: &str) {
                 return;
             }
             println!("Instance '{}' revoked.", instance.name);
+        }
+        Err(error) => exit_error(error),
+    }
+}
+
+pub async fn handle_instance_rotate_secret(name: &str, if_older_than: Option<&str>, grace: &str) {
+    let if_older_than = if_older_than
+        .map(|value| parse_duration(value, "if-older-than", false))
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        });
+    let grace = parse_duration(grace, "grace", true).unwrap_or_else(|error| {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    });
+
+    let vault = open_vault();
+    match vault.rotate_instance_secret(name, if_older_than, grace) {
+        Ok(result) => {
+            if result.rotated {
+                audit_instance_secret_rotated(&vault, &result);
+            }
+            if json_output() {
+                print_json(rotation_json(&result));
+                return;
+            }
+            if !result.rotated {
+                println!(
+                    "Instance '{}' is not due for secret rotation.",
+                    result.instance.name
+                );
+                println!(
+                    "Last rotated: {}",
+                    result.instance.secret_rotated_at.to_rfc3339()
+                );
+                return;
+            }
+
+            println!("Instance '{}' secret rotated.", result.instance.name);
+            println!(
+                "Secret: {}",
+                result
+                    .secret
+                    .as_deref()
+                    .expect("rotated result has a secret")
+            );
+            println!("Secret is shown once. Store it before closing this terminal.");
+            match result.instance.previous_secret_expires_at {
+                Some(expires_at) => println!(
+                    "The previous secret remains valid until {} or until the new secret first authenticates.",
+                    expires_at.to_rfc3339()
+                ),
+                None => println!("The previous secret was retired immediately."),
+            }
         }
         Err(error) => exit_error(error),
     }
@@ -201,10 +268,13 @@ pub async fn handle_instance_bootstrap_create(
 ) {
     let vault = open_vault();
     let scopes = build_scope_inputs(partitions, projects, credentials, tags);
-    let ttl = ttl.map(parse_ttl).transpose().unwrap_or_else(|error| {
-        eprintln!("Error: {error}");
-        std::process::exit(1);
-    });
+    let ttl = ttl
+        .map(|value| parse_duration(value, "ttl", false))
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        });
 
     match vault.create_bootstrap_token(description, &scopes, uses, ttl) {
         Ok(result) => {
@@ -428,10 +498,10 @@ fn build_scope_inputs(
     scopes
 }
 
-fn parse_ttl(value: &str) -> Result<Duration, String> {
+fn parse_duration(value: &str, label: &str, allow_zero: bool) -> Result<Duration, String> {
     let value = value.trim();
     if value.is_empty() {
-        return Err("ttl must not be empty".to_string());
+        return Err(format!("{label} must not be empty"));
     }
     let (digits, unit) = value.split_at(
         value
@@ -440,17 +510,28 @@ fn parse_ttl(value: &str) -> Result<Duration, String> {
     );
     let amount: i64 = digits
         .parse()
-        .map_err(|_| "ttl must start with a positive number".to_string())?;
-    if amount <= 0 {
-        return Err("ttl must be positive".to_string());
+        .map_err(|_| format!("{label} must start with a number"))?;
+    if amount < 0 || (!allow_zero && amount == 0) {
+        return Err(format!(
+            "{label} must be {}",
+            if allow_zero {
+                "non-negative"
+            } else {
+                "positive"
+            }
+        ));
     }
-    match unit {
-        "" | "s" => Ok(Duration::seconds(amount)),
-        "m" => Ok(Duration::minutes(amount)),
-        "h" => Ok(Duration::hours(amount)),
-        "d" => Ok(Duration::days(amount)),
-        _ => Err("ttl unit must be one of s, m, h, or d".to_string()),
-    }
+    let seconds_per_unit = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        _ => return Err(format!("{label} unit must be one of s, m, h, or d")),
+    };
+    amount
+        .checked_mul(seconds_per_unit)
+        .and_then(Duration::try_seconds)
+        .ok_or_else(|| format!("{label} is too large"))
 }
 
 fn requested_scope_group<'a>(
@@ -526,6 +607,26 @@ fn instance_json(instance: &Instance) -> serde_json::Value {
         "created_at": instance.created_at.to_rfc3339(),
         "updated_at": instance.updated_at.to_rfc3339(),
         "last_seen_at": instance.last_seen_at.map(|timestamp| timestamp.to_rfc3339()),
+        "secret_rotated_at": instance.secret_rotated_at.to_rfc3339(),
+        "previous_secret_expires_at": instance
+            .previous_secret_expires_at
+            .map(|timestamp| timestamp.to_rfc3339()),
+    })
+}
+
+fn rotation_json(result: &RotateInstanceSecretResult) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "rotated": result.rotated,
+        "id": result.instance.id,
+        "name": result.instance.name,
+        "secret": result.secret,
+        "secret_rotated_at": result.instance.secret_rotated_at.to_rfc3339(),
+        "previous_secret_expires_at": result
+            .instance
+            .previous_secret_expires_at
+            .map(|timestamp| timestamp.to_rfc3339()),
+        "instance": instance_json(&result.instance),
     })
 }
 
@@ -604,6 +705,27 @@ pub(crate) fn audit_instance_joined(vault: &Vault, result: &BootstrapJoinResult)
         None,
         false,
         Some(&scope_json),
+        None,
+    );
+}
+
+fn audit_instance_secret_rotated(vault: &Vault, result: &RotateInstanceSecretResult) {
+    let details = result
+        .instance
+        .previous_secret_expires_at
+        .map(|timestamp| format!("previous_secret_expires_at={}", timestamp.to_rfc3339()))
+        .unwrap_or_else(|| "previous_secret_retired_immediately".to_string());
+    audit::log_event(
+        vault.db(),
+        "InstanceSecretRotated",
+        Some(&result.instance.name),
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+        Some(&details),
         None,
     );
 }

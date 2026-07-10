@@ -26,6 +26,8 @@ pub struct Instance {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub last_seen_at: Option<DateTime<Utc>>,
+    pub secret_rotated_at: DateTime<Utc>,
+    pub previous_secret_expires_at: Option<DateTime<Utc>>,
     pub scopes: Vec<InstanceScope>,
     pub pending_request_count: usize,
 }
@@ -37,6 +39,7 @@ pub struct InstanceScope {
     pub instance_id: String,
     pub scope_type: String,
     pub scope_value: String,
+    pub credential_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -84,6 +87,14 @@ pub struct EnrollInstanceResult {
     pub secret: String,
 }
 
+/// Due-aware rotation result containing a new one-time secret only when rotation occurred.
+#[derive(Debug, Clone, Serialize)]
+pub struct RotateInstanceSecretResult {
+    pub instance: Instance,
+    pub secret: Option<String>,
+    pub rotated: bool,
+}
+
 /// Bootstrap self-enrollment result containing the new one-time instance secret.
 #[derive(Debug, Clone, Serialize)]
 pub struct BootstrapJoinResult {
@@ -99,6 +110,7 @@ pub struct AccessRequest {
     pub instance_id: String,
     pub instance_name: String,
     pub credential_name: String,
+    pub credential_id: Option<String>,
     pub status: String,
     pub reason: String,
     pub created_at: DateTime<Utc>,
@@ -134,8 +146,17 @@ impl Vault {
         let now = Utc::now().to_rfc3339();
 
         self.db.execute(
-            "INSERT INTO instances (id, name, secret_hash, status, description, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![id, name, secret_hash, INSTANCE_STATUS_ACTIVE, description, now, now],
+            "INSERT INTO instances (id, name, secret_hash, status, description, created_at, updated_at, secret_rotated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                id,
+                name,
+                secret_hash,
+                INSTANCE_STATUS_ACTIVE,
+                description,
+                now,
+                now,
+                now
+            ],
         )?;
 
         for scope in scopes {
@@ -307,7 +328,7 @@ impl Vault {
     pub fn list_instances(&self) -> Result<Vec<Instance>> {
         let _ = self.ensure_unlocked()?;
         let mut stmt = self.db.prepare(
-            "SELECT id, name, status, description, created_at, updated_at, last_seen_at FROM instances ORDER BY name",
+            "SELECT id, name, status, description, created_at, updated_at, last_seen_at, secret_rotated_at, previous_secret_expires_at FROM instances ORDER BY name",
         )?;
         let basics = stmt
             .query_map([], instance_from_row)?
@@ -327,7 +348,7 @@ impl Vault {
         let mut instance = self
             .db
             .query_row(
-                "SELECT id, name, status, description, created_at, updated_at, last_seen_at FROM instances WHERE id = ?1 OR name = ?1 LIMIT 1",
+                "SELECT id, name, status, description, created_at, updated_at, last_seen_at, secret_rotated_at, previous_secret_expires_at FROM instances WHERE id = ?1 OR name = ?1 LIMIT 1",
                 params![identifier],
                 instance_from_row,
             )
@@ -346,14 +367,24 @@ impl Vault {
         let _ = self.ensure_unlocked()?;
         validate_scope_type(scope_type)?;
         self.ensure_instance_exists(instance_id)?;
+        let credential_id = if scope_type == "credential" {
+            Some(self.get_credential(scope_value)?.id)
+        } else {
+            None
+        };
 
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         self.db.execute(
-            "INSERT OR IGNORE INTO instance_scopes (id, instance_id, scope_type, scope_value, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, instance_id, scope_type, scope_value, now],
+            "INSERT OR IGNORE INTO instance_scopes (id, instance_id, scope_type, scope_value, credential_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, instance_id, scope_type, scope_value, credential_id, now],
         )?;
-        self.load_instance_scope(instance_id, scope_type, scope_value)
+        self.load_instance_scope(
+            instance_id,
+            scope_type,
+            scope_value,
+            credential_id.as_deref(),
+        )
     }
 
     /// Removes one scope selector from an instance.
@@ -367,10 +398,18 @@ impl Vault {
         validate_scope_type(scope_type)?;
         self.ensure_instance_exists(instance_id)?;
 
-        let affected = self.db.execute(
-            "DELETE FROM instance_scopes WHERE instance_id = ?1 AND scope_type = ?2 AND scope_value = ?3",
-            params![instance_id, scope_type, scope_value],
-        )?;
+        let affected = if scope_type == "credential" {
+            let credential = self.get_credential(scope_value)?;
+            self.db.execute(
+                "DELETE FROM instance_scopes WHERE instance_id = ?1 AND scope_type = ?2 AND credential_id = ?3",
+                params![instance_id, scope_type, credential.id],
+            )?
+        } else {
+            self.db.execute(
+                "DELETE FROM instance_scopes WHERE instance_id = ?1 AND scope_type = ?2 AND scope_value = ?3",
+                params![instance_id, scope_type, scope_value],
+            )?
+        };
         if affected == 0 {
             return Err(VaultError::InstanceScopeNotFound(format!(
                 "{scope_type}:{scope_value}"
@@ -394,16 +433,118 @@ impl Vault {
         self.get_instance(identifier)
     }
 
+    /// Rotates an active instance secret with an optional due-age check and overlap window.
+    pub fn rotate_instance_secret(
+        &self,
+        identifier: &str,
+        if_older_than: Option<Duration>,
+        grace: Duration,
+    ) -> Result<RotateInstanceSecretResult> {
+        let _ = self.ensure_unlocked()?;
+        if if_older_than.is_some_and(|age| age <= Duration::zero()) || grace < Duration::zero() {
+            return Err(VaultError::InvalidInstanceSecretRotation);
+        }
+
+        let instance = self.get_instance(identifier)?;
+        let (stored_status, stored_hash, stored_rotated_at): (String, String, String) =
+            self.db.query_row(
+                "SELECT status, secret_hash, secret_rotated_at FROM instances WHERE id = ?1",
+                params![instance.id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+        if stored_status != INSTANCE_STATUS_ACTIVE {
+            return Err(VaultError::InstanceNotActive(identifier.to_string()));
+        }
+
+        let now = Utc::now();
+        let stored_rotated_at_parsed = parse_datetime_column(2, &stored_rotated_at)?;
+        if if_older_than
+            .is_some_and(|age| now.signed_duration_since(stored_rotated_at_parsed) < age)
+        {
+            return Ok(RotateInstanceSecretResult {
+                instance: self.get_instance(&instance.id)?,
+                secret: None,
+                rotated: false,
+            });
+        }
+
+        let previous_secret_expires_at = if grace > Duration::zero() {
+            Some(
+                now.checked_add_signed(grace)
+                    .ok_or(VaultError::InvalidInstanceSecretRotation)?
+                    .to_rfc3339(),
+            )
+        } else {
+            None
+        };
+        let secret = crate::random::alphanumeric(48, false)?;
+        let secret_hash = hash_instance_secret(&secret)?;
+        let rotated_at = now.to_rfc3339();
+
+        let updated = self.db.execute(
+            "UPDATE instances
+             SET previous_secret_hash = CASE
+                     WHEN ?1 IS NULL THEN NULL
+                     ELSE secret_hash
+                 END,
+                 previous_secret_expires_at = ?1,
+                 secret_hash = ?2,
+                 secret_rotated_at = ?3,
+                 updated_at = ?3
+             WHERE id = ?4
+               AND status = ?5
+               AND secret_hash = ?6
+               AND secret_rotated_at = ?7",
+            params![
+                previous_secret_expires_at,
+                secret_hash,
+                rotated_at,
+                instance.id,
+                INSTANCE_STATUS_ACTIVE,
+                stored_hash,
+                stored_rotated_at
+            ],
+        )?;
+        if updated != 1 {
+            return Err(VaultError::InstanceSecretRotationConflict(
+                identifier.to_string(),
+            ));
+        }
+
+        Ok(RotateInstanceSecretResult {
+            instance: self.get_instance(&instance.id)?,
+            secret: Some(secret),
+            rotated: true,
+        })
+    }
+
     /// Verifies an instance secret. Revoked instances and wrong secrets fail closed.
     #[allow(dead_code)]
     pub fn verify_instance_secret(&self, instance_id: &str, secret: &str) -> Result<bool> {
+        self.verify_instance_secret_inner(instance_id, secret, |_| Ok(()))
+    }
+
+    fn verify_instance_secret_inner<F>(
+        &self,
+        instance_id: &str,
+        secret: &str,
+        after_hash: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<()>,
+    {
         let _ = self.ensure_unlocked()?;
-        let (status, stored_hash): (String, String) = self
+        let (status, stored_hash, previous_hash, previous_expires_at): (
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        ) = self
             .db
             .query_row(
-                "SELECT status, secret_hash FROM instances WHERE id = ?1",
+                "SELECT status, secret_hash, previous_secret_hash, previous_secret_expires_at FROM instances WHERE id = ?1",
                 params![instance_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .map_err(|_| VaultError::InstanceNotFound(instance_id.to_string()))?;
 
@@ -411,50 +552,92 @@ impl Vault {
             return Ok(false);
         }
 
-        let verified = verify_secret_hash(secret, &stored_hash)?;
-        if verified {
-            self.db.execute(
-                "UPDATE instances SET last_seen_at = ?1, updated_at = ?2 WHERE id = ?3",
-                params![
-                    Utc::now().to_rfc3339(),
-                    Utc::now().to_rfc3339(),
-                    instance_id
-                ],
-            )?;
+        let current_verified = verify_secret_hash(secret, &stored_hash)?;
+        let previous_verified = if current_verified {
+            false
+        } else if let (Some(previous_hash), Some(previous_expires_at)) =
+            (&previous_hash, &previous_expires_at)
+        {
+            let expires_at = parse_datetime_column(3, previous_expires_at)?;
+            expires_at > Utc::now() && verify_secret_hash(secret, previous_hash)?
+        } else {
+            false
+        };
+        if !current_verified && !previous_verified {
+            return Ok(false);
         }
-        Ok(verified)
+        after_hash(&self.db)?;
+
+        let now = Utc::now().to_rfc3339();
+        let updated = if current_verified {
+            self.db.execute(
+                "UPDATE instances
+                 SET last_seen_at = ?1,
+                     updated_at = ?1,
+                     previous_secret_hash = NULL,
+                     previous_secret_expires_at = NULL
+                 WHERE id = ?2 AND status = ?3 AND secret_hash = ?4",
+                params![now, instance_id, INSTANCE_STATUS_ACTIVE, stored_hash],
+            )?
+        } else {
+            self.db.execute(
+                "UPDATE instances
+                 SET last_seen_at = ?1, updated_at = ?1
+                 WHERE id = ?2
+                   AND status = ?3
+                   AND previous_secret_hash = ?4
+                   AND previous_secret_expires_at = ?5
+                   AND julianday(previous_secret_expires_at) > julianday(?1)",
+                params![
+                    now,
+                    instance_id,
+                    INSTANCE_STATUS_ACTIVE,
+                    previous_hash,
+                    previous_expires_at
+                ],
+            )?
+        };
+        Ok(updated == 1)
     }
 
-    /// Returns true when a credential name matches any explicit or approved instance scope.
+    #[cfg(test)]
+    pub(super) fn verify_instance_secret_with_hook<F>(
+        &self,
+        instance_id: &str,
+        secret: &str,
+        after_hash: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&rusqlite::Connection) -> Result<()>,
+    {
+        self.verify_instance_secret_inner(instance_id, secret, after_hash)
+    }
+
+    /// Returns true when an exact credential ID matches an explicit or approved instance scope.
     #[allow(dead_code)]
-    pub fn credential_in_scope(&self, instance_id: &str, credential_name: &str) -> Result<bool> {
+    pub fn credential_in_scope(&self, instance_id: &str, credential_id: &str) -> Result<bool> {
         let _ = self.ensure_unlocked()?;
         let instance = self.get_instance(instance_id)?;
         if instance.status != INSTANCE_STATUS_ACTIVE {
             return Ok(false);
         }
 
-        let credentials = self.credentials_named_across_projects(credential_name)?;
-        if credentials.is_empty() {
-            return Ok(false);
-        }
+        let credential = match self.get_credential_by_id(credential_id) {
+            Ok(credential) => credential,
+            Err(VaultError::CredentialNotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
 
         let approved: bool = self.db.query_row(
-            "SELECT COUNT(*) > 0 FROM access_requests WHERE instance_id = ?1 AND credential_name = ?2 AND status = ?3",
-            params![instance.id, credential_name, REQUEST_STATUS_APPROVED],
+            "SELECT COUNT(*) > 0 FROM access_requests WHERE instance_id = ?1 AND credential_id = ?2 AND status = ?3",
+            params![instance.id, credential.id, REQUEST_STATUS_APPROVED],
             |row| row.get(0),
         )?;
         if approved {
             return Ok(true);
         }
 
-        for credential in credentials {
-            if self.credential_matches_instance_scopes(&instance, &credential)? {
-                return Ok(true);
-            }
-        }
-
-        Ok(false)
+        self.credential_matches_instance_scopes(&instance, &credential)
     }
 
     /// Creates a pending request for a credential, or reuses an existing pending row.
@@ -462,27 +645,30 @@ impl Vault {
     pub fn create_or_reuse_access_request(
         &self,
         instance_id: &str,
-        credential_name: &str,
+        credential_id: &str,
         reason: &str,
     ) -> Result<AccessRequest> {
         let _ = self.ensure_unlocked()?;
         self.ensure_instance_exists(instance_id)?;
-        if self
-            .credentials_named_across_projects(credential_name)?
-            .is_empty()
-        {
-            return Err(VaultError::CredentialNotFound(credential_name.to_string()));
-        }
+        let credential = self.get_credential_by_id(credential_id)?;
 
-        if let Some(existing) = self.find_pending_access_request(instance_id, credential_name)? {
+        if let Some(existing) = self.find_pending_access_request(instance_id, credential_id)? {
             return Ok(existing);
         }
 
         let id = Uuid::new_v4().to_string();
         let now = Utc::now().to_rfc3339();
         self.db.execute(
-            "INSERT INTO access_requests (id, instance_id, credential_name, status, reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, instance_id, credential_name, REQUEST_STATUS_PENDING, reason, now],
+            "INSERT INTO access_requests (id, instance_id, credential_name, credential_id, status, reason, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                instance_id,
+                credential.name,
+                credential.id,
+                REQUEST_STATUS_PENDING,
+                reason,
+                now
+            ],
         )?;
         self.get_access_request(&id)
     }
@@ -555,7 +741,7 @@ impl Vault {
 
     fn load_instance_scopes(&self, instance_id: &str) -> Result<Vec<InstanceScope>> {
         let mut stmt = self.db.prepare(
-            "SELECT id, instance_id, scope_type, scope_value, created_at FROM instance_scopes WHERE instance_id = ?1 ORDER BY scope_type, scope_value",
+            "SELECT id, instance_id, scope_type, scope_value, created_at, credential_id FROM instance_scopes WHERE instance_id = ?1 ORDER BY scope_type, scope_value",
         )?;
         let scopes = stmt
             .query_map(params![instance_id], instance_scope_from_row)?
@@ -568,14 +754,22 @@ impl Vault {
         instance_id: &str,
         scope_type: &str,
         scope_value: &str,
+        credential_id: Option<&str>,
     ) -> Result<InstanceScope> {
-        self.db
-            .query_row(
-                "SELECT id, instance_id, scope_type, scope_value, created_at FROM instance_scopes WHERE instance_id = ?1 AND scope_type = ?2 AND scope_value = ?3",
+        let result = if let Some(credential_id) = credential_id {
+            self.db.query_row(
+                "SELECT id, instance_id, scope_type, scope_value, created_at, credential_id FROM instance_scopes WHERE instance_id = ?1 AND scope_type = ?2 AND credential_id = ?3",
+                params![instance_id, scope_type, credential_id],
+                instance_scope_from_row,
+            )
+        } else {
+            self.db.query_row(
+                "SELECT id, instance_id, scope_type, scope_value, created_at, credential_id FROM instance_scopes WHERE instance_id = ?1 AND scope_type = ?2 AND scope_value = ?3 AND credential_id IS NULL",
                 params![instance_id, scope_type, scope_value],
                 instance_scope_from_row,
             )
-            .map_err(|_| VaultError::InstanceScopeNotFound(format!("{scope_type}:{scope_value}")))
+        };
+        result.map_err(|_| VaultError::InstanceScopeNotFound(format!("{scope_type}:{scope_value}")))
     }
 
     fn pending_access_request_count(&self, instance_id: &str) -> Result<usize> {
@@ -587,14 +781,14 @@ impl Vault {
         Ok(count)
     }
 
-    fn credentials_named_across_projects(&self, credential_name: &str) -> Result<Vec<Credential>> {
-        let mut stmt = self.db.prepare(
-            "SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials WHERE name = ?1 ORDER BY name",
-        )?;
-        let credentials = stmt
-            .query_map(params![credential_name], super::rows::credential_from_row)?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(credentials)
+    fn get_credential_by_id(&self, credential_id: &str) -> Result<Credential> {
+        self.db
+            .query_row(
+                "SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials WHERE id = ?1",
+                params![credential_id],
+                super::rows::credential_from_row,
+            )
+            .map_err(|_| VaultError::CredentialNotFound(credential_id.to_string()))
     }
 
     fn credential_matches_instance_scopes(
@@ -604,7 +798,9 @@ impl Vault {
     ) -> Result<bool> {
         for scope in &instance.scopes {
             match scope.scope_type.as_str() {
-                "credential" if credential.name == scope.scope_value => return Ok(true),
+                "credential" if scope.credential_id.as_deref() == Some(credential.id.as_str()) => {
+                    return Ok(true);
+                }
                 "tag" if credential.tags.iter().any(|tag| tag == &scope.scope_value) => {
                     return Ok(true);
                 }
@@ -649,12 +845,12 @@ impl Vault {
     fn find_pending_access_request(
         &self,
         instance_id: &str,
-        credential_name: &str,
+        credential_id: &str,
     ) -> Result<Option<AccessRequest>> {
         self.db
             .query_row(
-                "SELECT ar.id, ar.instance_id, i.name, ar.credential_name, ar.status, ar.reason, ar.created_at, ar.decided_at FROM access_requests ar JOIN instances i ON ar.instance_id = i.id WHERE ar.instance_id = ?1 AND ar.credential_name = ?2 AND ar.status = ?3 ORDER BY ar.created_at LIMIT 1",
-                params![instance_id, credential_name, REQUEST_STATUS_PENDING],
+                "SELECT ar.id, ar.instance_id, i.name, ar.credential_name, ar.credential_id, ar.status, ar.reason, ar.created_at, ar.decided_at FROM access_requests ar JOIN instances i ON ar.instance_id = i.id WHERE ar.instance_id = ?1 AND ar.credential_id = ?2 AND ar.status = ?3 ORDER BY ar.created_at LIMIT 1",
+                params![instance_id, credential_id, REQUEST_STATUS_PENDING],
                 access_request_from_row,
             )
             .optional()
@@ -664,7 +860,7 @@ impl Vault {
     fn get_access_request(&self, request_id: &str) -> Result<AccessRequest> {
         self.db
             .query_row(
-                "SELECT ar.id, ar.instance_id, i.name, ar.credential_name, ar.status, ar.reason, ar.created_at, ar.decided_at FROM access_requests ar JOIN instances i ON ar.instance_id = i.id WHERE ar.id = ?1",
+                "SELECT ar.id, ar.instance_id, i.name, ar.credential_name, ar.credential_id, ar.status, ar.reason, ar.created_at, ar.decided_at FROM access_requests ar JOIN instances i ON ar.instance_id = i.id WHERE ar.id = ?1",
                 params![request_id],
                 access_request_from_row,
             )
@@ -687,7 +883,7 @@ impl Vault {
         P: rusqlite::Params,
     {
         let sql = format!(
-            "SELECT ar.id, ar.instance_id, i.name, ar.credential_name, ar.status, ar.reason, ar.created_at, ar.decided_at FROM access_requests ar JOIN instances i ON ar.instance_id = i.id {where_clause} ORDER BY ar.created_at DESC"
+            "SELECT ar.id, ar.instance_id, i.name, ar.credential_name, ar.credential_id, ar.status, ar.reason, ar.created_at, ar.decided_at FROM access_requests ar JOIN instances i ON ar.instance_id = i.id {where_clause} ORDER BY ar.created_at DESC"
         );
         let mut stmt = self.db.prepare(&sql)?;
         let requests = stmt
@@ -732,6 +928,8 @@ fn instance_from_row(row: &Row<'_>) -> rusqlite::Result<Instance> {
     let created_str: String = row.get(4)?;
     let updated_str: String = row.get(5)?;
     let last_seen_str: Option<String> = row.get(6)?;
+    let secret_rotated_str: String = row.get(7)?;
+    let previous_secret_expires_str: Option<String> = row.get(8)?;
     Ok(Instance {
         id: row.get(0)?,
         name: row.get(1)?,
@@ -742,6 +940,11 @@ fn instance_from_row(row: &Row<'_>) -> rusqlite::Result<Instance> {
         last_seen_at: last_seen_str
             .as_deref()
             .map(|value| parse_datetime_column(6, value))
+            .transpose()?,
+        secret_rotated_at: parse_datetime_column(7, &secret_rotated_str)?,
+        previous_secret_expires_at: previous_secret_expires_str
+            .as_deref()
+            .map(|value| parse_datetime_column(8, value))
             .transpose()?,
         scopes: Vec::new(),
         pending_request_count: 0,
@@ -755,24 +958,26 @@ fn instance_scope_from_row(row: &Row<'_>) -> rusqlite::Result<InstanceScope> {
         instance_id: row.get(1)?,
         scope_type: row.get(2)?,
         scope_value: row.get(3)?,
+        credential_id: row.get(5)?,
         created_at: parse_datetime_column(4, &created_str)?,
     })
 }
 
 fn access_request_from_row(row: &Row<'_>) -> rusqlite::Result<AccessRequest> {
-    let created_str: String = row.get(6)?;
-    let decided_str: Option<String> = row.get(7)?;
+    let created_str: String = row.get(7)?;
+    let decided_str: Option<String> = row.get(8)?;
     Ok(AccessRequest {
         id: row.get(0)?,
         instance_id: row.get(1)?,
         instance_name: row.get(2)?,
         credential_name: row.get(3)?,
-        status: row.get(4)?,
-        reason: row.get(5)?,
-        created_at: parse_datetime_column(6, &created_str)?,
+        credential_id: row.get(4)?,
+        status: row.get(5)?,
+        reason: row.get(6)?,
+        created_at: parse_datetime_column(7, &created_str)?,
         decided_at: decided_str
             .as_deref()
-            .map(|value| parse_datetime_column(7, value))
+            .map(|value| parse_datetime_column(8, value))
             .transpose()?,
     })
 }

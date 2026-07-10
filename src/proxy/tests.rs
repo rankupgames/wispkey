@@ -19,6 +19,14 @@ fn listen_spec_parses_supported_transports() {
         vsock,
         transport::ListenSpec::Vsock { cid: 3, port: 7700 }
     ));
+
+    let firecracker =
+        transport::ListenSpec::parse("firecracker-vsock:/run/firecracker/worker.vsock:7700")
+            .unwrap();
+    assert!(matches!(
+        firecracker,
+        transport::ListenSpec::FirecrackerVsock { port: 7700, .. }
+    ));
 }
 
 #[test]
@@ -34,6 +42,29 @@ fn listener_identity_defaults_are_transport_specific() {
 
     assert!(!tcp.require_identity);
     assert!(unix.require_identity);
+}
+
+#[test]
+fn non_loopback_tcp_requires_identity_by_default() {
+    let tcp = transport::ListenConfig::new(
+        transport::ListenSpec::parse("tcp://0.0.0.0:7700").unwrap(),
+        transport::IdentityRequirement::Default,
+    );
+
+    assert!(tcp.require_identity);
+    assert!(tcp.spec.is_non_loopback_tcp());
+}
+
+#[test]
+#[cfg(unix)]
+fn firecracker_vsock_uses_the_guest_destination_port_suffix() {
+    assert_eq!(
+        transport::firecracker_guest_socket_path(
+            std::path::Path::new("/run/firecracker/worker.vsock"),
+            7700,
+        ),
+        std::path::PathBuf::from("/run/firecracker/worker.vsock_7700")
+    );
 }
 
 #[test]
@@ -128,6 +159,7 @@ fn host_restriction_empty_allows_all() {
 fn host_restriction_exact_match() {
     let hosts = vec!["api.example.com".to_string()];
     assert!(check_host_restriction(&hosts, "api.example.com"));
+    assert!(check_host_restriction(&hosts, "API.EXAMPLE.COM"));
     assert!(!check_host_restriction(&hosts, "evil.com"));
 }
 
