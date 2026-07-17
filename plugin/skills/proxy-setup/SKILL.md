@@ -19,6 +19,15 @@ wispkey serve
 
 Default: `http://localhost:7700`. Custom port: `wispkey serve --port 8800`.
 
+For multi-instance deployments, use one or more explicit listeners:
+```bash
+wispkey serve \
+  --listen tcp://127.0.0.1:7700 \
+  --listen unix:/run/wispkey/proxy.sock
+```
+
+Unix domain socket and feature-gated Linux vsock listeners require per-request instance identity by default. TCP listeners keep the trusted-local default unless `--require-identity` is set.
+
 For sideload-only proxy use, launch with the same sideload env var that the MCP server uses:
 ```bash
 WISPKEY_SIDELOAD_OPENAI="$OPENAI_API_KEY" wispkey serve
@@ -40,7 +49,7 @@ For HTTPS token substitution, call the local reverse proxy target:
 ```typescript
 const response = await fetch("http://localhost:7700", {
   headers: {
-    "X-Target-Url": "https://api.example.com/test",
+    "X-Target-Url": "https://api.example.com/test?api_key=wk_your_token_here",
     "Authorization": "Bearer wk_your_token_here"
   }
 });
@@ -49,10 +58,14 @@ const response = await fetch("http://localhost:7700", {
 ### Python
 ```python
 requests.get("http://localhost:7700", headers={
-    "X-Target-Url": "https://api.example.com/test",
+    "X-Target-Url": "https://api.example.com/test?api_key=wk_your_token_here",
     "Authorization": "Bearer wk_your_token_here",
 })
 ```
+
+Reverse proxy mode replaces wisp tokens in request headers, supported text bodies, and the query string inside `X-Target-Url`.
+
+Agent-scoped policies fail closed when no trusted agent identity is available. Today the proxy does not have a trusted agent identity source, so `agent = "..."` policies still apply to proxy requests without an agent name.
 
 ### Docker Compose
 ```yaml
@@ -101,7 +114,7 @@ wispkey status
 
 # Test an HTTPS proxied request that swaps the wisp token
 curl http://localhost:7700 \
-  -H "X-Target-Url: https://api.example.com/test" \
+  -H "X-Target-Url: https://api.example.com/test?api_key=wk_your_token_here" \
   -H "Authorization: Bearer wk_your_token_here"
 
 # Check the audit log

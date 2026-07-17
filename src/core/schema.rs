@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
@@ -47,6 +47,7 @@ impl Vault {
         secure_files::ensure_private_directory(&vault_dir)?;
 
         let db = Connection::open(&db_path)?;
+        harden_db_file(&db_path)?;
         Self::create_schema(&db)?;
 
         let salt = SaltString::generate(&mut argon2::password_hash::rand_core::OsRng);
@@ -103,6 +104,7 @@ impl Vault {
             return Err(VaultError::NotFound);
         }
         let db = Connection::open(&db_path)?;
+        harden_db_file(&db_path)?;
         Self::migrate_schema(&db)?;
         Ok(Self {
             db,
@@ -118,7 +120,7 @@ impl Vault {
         Ok(vault)
     }
 
-    fn migrate_schema(db: &Connection) -> Result<()> {
+    pub(super) fn migrate_schema(db: &Connection) -> Result<()> {
         let version: String = db
             .query_row(
                 "SELECT value FROM vault_meta WHERE key = 'version'",
@@ -287,6 +289,77 @@ impl Vault {
 
             db.execute(
                 "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                params!["5"],
+            )?;
+        }
+
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "5".to_string());
+
+        if version.as_str() == "5" {
+            db.execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                CREATE TABLE IF NOT EXISTS credentials_v6 (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    credential_type TEXT NOT NULL,
+                    encrypted_value TEXT NOT NULL,
+                    wisp_token TEXT UNIQUE NOT NULL,
+                    hosts TEXT NOT NULL DEFAULT '',
+                    tags TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    last_used_at TEXT,
+                    partition_id TEXT REFERENCES partitions(id)
+                );
+                INSERT INTO credentials_v6 (id, name, description, credential_type, encrypted_value, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id)
+                    SELECT id, name, description, credential_type, encrypted_value, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id
+                    FROM credentials;
+                DROP TABLE credentials;
+                ALTER TABLE credentials_v6 RENAME TO credentials;
+                PRAGMA foreign_keys = ON;",
+            )?;
+
+            db.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                params!["6"],
+            )?;
+        }
+
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "6".to_string());
+
+        if version.as_str() == "6" {
+            create_instance_tables(db)?;
+            db.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                params!["7"],
+            )?;
+        }
+
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "7".to_string());
+
+        if version.as_str() == "7" {
+            create_bootstrap_token_table(db)?;
+            db.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
                 params![CURRENT_SCHEMA_VERSION],
             )?;
         }
@@ -315,13 +388,13 @@ impl Vault {
 				created_at TEXT NOT NULL,
 				updated_at TEXT NOT NULL,
 				UNIQUE(project_id, name)
-			);
-			CREATE TABLE IF NOT EXISTS credentials (
-				id TEXT PRIMARY KEY,
-				name TEXT UNIQUE NOT NULL,
-				description TEXT NOT NULL DEFAULT '',
-				credential_type TEXT NOT NULL,
-				encrypted_value TEXT NOT NULL,
+				);
+				CREATE TABLE IF NOT EXISTS credentials (
+					id TEXT PRIMARY KEY,
+					name TEXT NOT NULL,
+					description TEXT NOT NULL DEFAULT '',
+					credential_type TEXT NOT NULL,
+					encrypted_value TEXT NOT NULL,
 				wisp_token TEXT UNIQUE NOT NULL,
 				hosts TEXT NOT NULL DEFAULT '',
 				tags TEXT NOT NULL DEFAULT '',
@@ -345,6 +418,72 @@ impl Vault {
 				project_name TEXT
 			);",
         )?;
+        create_instance_tables(db)?;
+        create_bootstrap_token_table(db)?;
         Ok(())
     }
+}
+
+fn create_instance_tables(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS instances (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            secret_hash TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'active',
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_seen_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS instance_scopes (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+            scope_type TEXT NOT NULL,
+            scope_value TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(instance_id, scope_type, scope_value)
+        );
+        CREATE TABLE IF NOT EXISTS access_requests (
+            id TEXT PRIMARY KEY,
+            instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
+            credential_name TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            reason TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            decided_at TEXT
+        );",
+    )?;
+    Ok(())
+}
+
+fn create_bootstrap_token_table(db: &Connection) -> Result<()> {
+    db.execute_batch(
+        "CREATE TABLE IF NOT EXISTS bootstrap_tokens (
+            id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            scope_json TEXT NOT NULL DEFAULT '[]',
+            max_uses INTEGER,
+            used_count INTEGER NOT NULL DEFAULT 0,
+            expires_at TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL
+        );",
+    )?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn harden_db_file(path: &Path) -> Result<()> {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn harden_db_file(_path: &Path) -> Result<()> {
+    Ok(())
 }

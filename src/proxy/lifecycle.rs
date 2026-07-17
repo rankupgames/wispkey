@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::core::Vault;
+use crate::proxy::transport::ListenerMetadata;
 
 pub const MANAGEMENT_TOKEN_HEADER: &str = "x-wispkey-management-token";
 pub const DEFAULT_PROXY_ADDRESS: &str = "http://localhost:7700";
@@ -30,10 +31,18 @@ pub struct ProxyMetadata {
     pub started_at: String,
     pub parent_pid: Option<u32>,
     pub management_token: String,
+    #[serde(default)]
+    pub listeners: Vec<ListenerMetadata>,
 }
 
 impl ProxyMetadata {
-    pub fn new(port: u16, address: String, project_scope: Option<String>, token: String) -> Self {
+    pub fn new(
+        port: u16,
+        address: String,
+        project_scope: Option<String>,
+        token: String,
+        listeners: Vec<ListenerMetadata>,
+    ) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
             instance_id: crate::random::alphanumeric(24, true)
@@ -46,6 +55,7 @@ impl ProxyMetadata {
             started_at: Utc::now().to_rfc3339(),
             parent_pid: current_parent_pid(),
             management_token: token,
+            listeners,
         }
     }
 
@@ -60,6 +70,7 @@ impl ProxyMetadata {
             "project_scope": self.project_scope,
             "started_at": self.started_at,
             "parent_pid": self.parent_pid,
+            "listeners": self.listeners,
         })
     }
 }
@@ -387,6 +398,7 @@ fn metadata_from_value(value: Value) -> Option<ProxyMetadata> {
         .get("parent_pid")
         .and_then(Value::as_u64)
         .and_then(|pid| u32::try_from(pid).ok());
+    let listeners = listeners_from_value(value.get("listeners"), &address, port);
 
     Some(ProxyMetadata {
         schema_version: u8::try_from(
@@ -405,6 +417,40 @@ fn metadata_from_value(value: Value) -> Option<ProxyMetadata> {
         started_at,
         parent_pid,
         management_token,
+        listeners,
+    })
+}
+
+fn listeners_from_value(value: Option<&Value>, address: &str, port: u16) -> Vec<ListenerMetadata> {
+    value
+        .and_then(Value::as_array)
+        .map(|listeners| {
+            listeners
+                .iter()
+                .filter_map(listener_from_value)
+                .collect::<Vec<_>>()
+        })
+        .filter(|listeners| !listeners.is_empty())
+        .unwrap_or_else(|| {
+            vec![ListenerMetadata {
+                transport: "tcp".to_string(),
+                address: address
+                    .strip_prefix("http://")
+                    .map(|address| format!("tcp://{address}"))
+                    .unwrap_or_else(|| format!("tcp://127.0.0.1:{port}")),
+                require_identity: false,
+            }]
+        })
+}
+
+fn listener_from_value(value: &Value) -> Option<ListenerMetadata> {
+    Some(ListenerMetadata {
+        transport: value.get("transport")?.as_str()?.to_string(),
+        address: value.get("address")?.as_str()?.to_string(),
+        require_identity: value
+            .get("require_identity")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 

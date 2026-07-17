@@ -1,6 +1,6 @@
 # WispKey -- Agent Reference
 
-> Local-first credential vault with wisp token proxy.
+> Local-first credential firewall for AI agents with wisp token proxy.
 > Agents get opaque `wk_*` tokens; the proxy swaps them for real secrets at the network boundary.
 
 ## Quick Start (New User)
@@ -14,8 +14,8 @@ export PATH="$PWD/target/release:$PATH"
 wispkey init
 
 # 3. Add credentials
-wispkey add "openai-key" --type bearer_token --value "sk-..." --hosts "api.openai.com"
-wispkey add "db-creds" --type basic_auth --value "user:pass" --tags "database"
+printf '%s' "$OPENAI_API_KEY" | wispkey add "openai-key" --type bearer_token --value-file - --hosts "api.openai.com"
+printf '%s' "$BASIC_AUTH_VALUE" | wispkey add "db-creds" --type basic_auth --value-file - --tags "database"
 wispkey add "ssh-key" --type api_key --value-file ~/.ssh/my_key --partition "ssh-keys"
 
 # 4. Start proxy
@@ -32,13 +32,16 @@ Set `WISPKEY_PASSWORD` to skip interactive prompts:
 export WISPKEY_PASSWORD='your-master-password'
 wispkey init        # no prompt
 wispkey unlock      # no prompt
-wispkey add "key" --type api_key --value "secret"  # no prompt
+printf '%s' "$SECRET_VALUE" | wispkey add "key" --type api_key --value-file -  # no prompt
 ```
+
+`wispkey add --value` still works, but warns on stderr because command-line arguments can be exposed through shell history and process listings. Prefer `--value-file <path>` or `--value-file -` for non-interactive secret input.
 
 ## Project Scoping
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v7 automatically.
 
 ```bash
 # Create a project
@@ -66,24 +69,62 @@ wispkey serve
 wispkey serve --all-projects
 ```
 
+## Multi-Instance Access
+
+The default `wispkey serve` listener remains loopback TCP with no instance identity requirement for the original trusted-local workflow. For untrusted ephemeral VMs or worker instances, enroll an instance and use identity-required listeners such as Unix domain sockets or feature-gated Linux vsock:
+
+```bash
+wispkey instance enroll "worker-acme-001" --credential openai-key --tag company:acme
+wispkey serve --listen unix:/run/wispkey/proxy.sock
+```
+
+Instances authenticate every proxied request with `x-wispkey-instance-id` and `x-wispkey-instance-secret`. Scope checks fail closed; out-of-scope token use returns `403 out_of_scope`, queues or reuses an access request, and requires host approval with `wispkey instance approve <request-id>` before retry.
+
+For fleets, mint scoped bootstrap tokens and redeem them with `--token-file` so the token does not appear in argv:
+```bash
+wispkey instance bootstrap create --tag company:acme --ttl 1h --uses 50
+printf '%s' "$BOOTSTRAP_TOKEN" | wispkey instance join --token-file - --name worker-acme-001
+```
+
+Bootstrap redemption is atomic and race-safe; TTL and max-use limits are enforced under concurrent joins. The proxy management API also exposes `POST /api/instances/join` for first-contact self-enrollment authenticated only by the bootstrap token.
+
+## Secret Injection
+
+`wispkey exec`, `wispkey run`, and `wispkey inject` are audited, owner-only plaintext-egress tools for non-HTTP consumers that cannot use the token proxy.
+
+```bash
+wispkey exec --credential laptop-password --stdin -- sudo -S -p "" whoami
+wispkey exec --credential laptop-password --askpass -- sudo -A whoami
+wispkey run --manifest ./secrets/wispkey.toml -- npm test
+wispkey inject -i .env.template -o .env.local
+```
+
+`exec --askpass` creates a per-exec owner-only handoff capability file and passes it with `WISPKEY_ASKPASS_HANDOFF`; the hidden `wispkey askpass` helper refuses to run without a valid handoff from that child launch. The old `WISPKEY_ASKPASS_CRED` path is not supported.
+
 ## CLI Reference
 
 | Command | Purpose |
 |---------|---------|
 | `wispkey init` | Create vault + master password |
 | `wispkey unlock` | Unlock vault (30 min session) |
-| `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH] [--hosts H] [--tags T] [--partition P]` | Store credential |
+| `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store credential |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials (names only) |
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
 | `wispkey remove <name>` | Delete credential |
 | `wispkey rotate <name>` | Regenerate wisp token |
-| `wispkey serve [--port 7700] [--all-projects] [--daemon]` | Start proxy (HTTP + HTTPS reverse) |
+| `wispkey exec --credential <name> [--project P] [--stdin] [--env VAR]... [--askpass] -- <command> [args...]` | Audited child-process secret injection |
+| `wispkey run [--manifest PATH] [--project P] -- <command> [args...]` | Manifest-defined child-only environment injection |
+| `wispkey inject -i <infile|-> [-o <outfile>] [--project P] [--stdout]` | Render `{{ cred:<name> }}` references to owner-only file output or explicit stdout |
+| `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start proxy; `SPEC` supports `tcp://host:port`, `unix:/path.sock`, and feature-gated `vsock://cid:port` |
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Import .env file |
 | `wispkey status` | Vault + session + proxy status |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Audit log |
+| `wispkey audit export [--since TS] [--until TS] [--credential C] [--encoding jsonl|json] [-o FILE]` | Export matching audit events |
+| `wispkey audit tail [--follow] [--credential C]` | Stream newest audit events with a forward cursor when following |
 | `wispkey partition create/list/delete/assign/export/import` | Partition management |
 | `wispkey project create/list/delete/use/current/export/import` | Project management and encrypted project bundles |
 | `wispkey credential export/import` | Encrypted single-credential sharing bundles |
+| `wispkey instance enroll/list/show/scope/bootstrap/join/revoke/requests/approve/deny` | Manage instance identities, bootstrap self-enrollment, scopes, and access requests |
 | `wispkey mcp serve` | Start MCP server (stdio) |
 
 ## Credential Types
@@ -98,7 +139,9 @@ wispkey serve --all-projects
 
 WispKey stores arbitrary encrypted secret values, not only API keys. Use `api_key` as the generic opaque type for passwords, database URLs, SSH/private-key files via `--value-file`, webhook secrets, OAuth tokens, service-account JSON, and other secret material. The credential type controls proxy injection behavior, not what can be stored.
 
-The proxy scans and replaces wisp tokens in three locations: **headers**, **request body** (text/json/form only), and **URL query parameters**.
+The proxy scans and replaces wisp tokens in three locations: **headers**, **request body** (text/json/form only), and **URL query parameters**. In reverse-proxy mode, this includes wisp tokens in the `X-Target-Url` query string.
+
+Agent-scoped policies fail closed when the requester's agent identity is unavailable. The proxy currently has no trusted agent identity source, so a policy with an `agent = "..."` scope applies to proxy requests even when no agent name is known.
 
 ## Encrypted Export Bundles
 
@@ -166,6 +209,8 @@ curl http://localhost:7700 \
 
 The proxy terminates TLS upstream, swaps wisp tokens, and forwards. The agent never sees the real credential.
 
+Management API tokens are compared in constant time.
+
 ## Proxy Management API
 
 When the proxy is running (`wispkey serve`):
@@ -173,20 +218,25 @@ When the proxy is running (`wispkey serve`):
 | Endpoint | Returns |
 |----------|---------|
 | `GET /api/status` | Vault info, credential count, session state |
-| `GET /api/credentials` | All credentials with tokens (no plaintext values) |
+| `GET /api/credentials` | All credentials with tokens (no plaintext values); honors `?project=` |
+| `GET /api/credentials/{name}` | Single credential by name; honors `?project=` |
+| `DELETE /api/credentials/{name}` | Delete credential by name; honors `?project=` |
 | `GET /api/partitions` | All partitions with credential counts |
+| `DELETE /api/partitions/{name}` | Delete partition by name; honors `?project=` |
 | `GET /api/projects` | All projects with partition counts and active flag |
 | `GET /api/projects/{name}` | Single project details |
+| `POST /api/instances/join` | Redeem a bootstrap token for first-contact instance self-enrollment |
 
 ## Key Paths
 
 | Path | Purpose |
 |------|---------|
-| `~/.wispkey/vault.db` | Encrypted credential database |
+| `~/.wispkey/vault.db` | Encrypted credential database (owner-only permissions on Unix) |
 | `~/.wispkey/session` | Session key (30 min TTL; owner-only permissions on Unix, restricted ACL on Windows) |
 | `~/.wispkey/proxy.pid` | Proxy PID (written on `serve`) |
 | `~/.wispkey/proxy.json` | Proxy discovery file with management token (owner-only permissions/ACL) |
 | `~/.wispkey/active_project` | Persistent active project (set by `project use`) |
+| `.env.wispkey` | Generated import output with wisp tokens (owner-only permissions on Unix) |
 | `WISPKEY_VAULT_PATH` | Override vault directory |
 | `WISPKEY_PROJECT` | Override active project per-terminal |
 | `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import |
@@ -199,4 +249,4 @@ When the proxy is running (`wispkey serve`):
 - Hosts: comma-separated globs on `--hosts` (e.g. `--hosts "api.cloudflare.com,*.workers.dev"`)
 - Partitions: logical grouping (e.g. `infrastructure`, `cloud-services`, `ci-cd`)
 - Projects: team/project isolation (e.g. `client-alpha`, `internal-tools`)
-- Values starting with `-`: use `--value='-1abc...'` (equals syntax)
+- Values starting with `-`: use `--value='-1abc...'` (equals syntax), though `--value-file` is preferred for secret material

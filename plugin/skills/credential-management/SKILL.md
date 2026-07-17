@@ -9,31 +9,35 @@ description: Manage credentials in the WispKey vault -- add, list, rotate, remov
 
 ### Adding a Credential
 ```bash
-wispkey add "<name>" --type <type> --value "<secret>" [--hosts "<hosts>"] [--tags "<tags>"] [--partition "<partition>"]
+wispkey add "<name>" --type <type> --value-file <path|-> [--hosts "<hosts>"] [--tags "<tags>"] [--partition "<partition>"] [--project "<project>"]
 ```
 
 Types: `bearer_token` (default), `api_key`, `basic_auth`, `custom_header`, `query_param`
 
 `api_key` is the generic opaque-secret type. Use it for passwords, database URLs, SSH/private-key files, webhook secrets, OAuth tokens, service-account JSON, and other encrypted values that do not need a more specific proxy injection behavior.
 
+Prefer `--value-file <path>` for non-interactive secret input, or `--value-file -` to read from stdin. `--value` still works, but WispKey warns on stderr because the value can be exposed through shell history and process listings. Omitting both flags uses the hidden prompt.
+
 Optional **`--partition`** places the credential inside a named partition. Create the partition first with `wispkey partition create` if it does not exist (see the partition-management skill).
 
 Example:
 ```bash
-wispkey add "openai-prod" --type bearer_token --value "sk-abc123..." --hosts "api.openai.com" --tags "ai,production"
+printf '%s' "$OPENAI_API_KEY" | wispkey add "openai-prod" --type bearer_token --value-file - --hosts "api.openai.com" --tags "ai,production"
 ```
 
 Example with partition:
 ```bash
-wispkey add "openai-prod" --type bearer_token --value "sk-abc123..." --hosts "api.openai.com" --partition "ml-services"
+wispkey add "openai-prod" --type bearer_token --value-file ./openai.key --hosts "api.openai.com" --partition "ml-services"
 ```
 
 Examples for non-API-key secrets:
 ```bash
-wispkey add "db-password" --type api_key --value "<password>" --tags "database"
+wispkey add "db-password" --type api_key --value-file ./db-password.txt --tags "database"
 wispkey add "ssh-private-key" --type api_key --value-file ~/.ssh/id_ed25519 --partition "ssh-keys"
 wispkey add "service-account-json" --type api_key --value-file ./service-account.json --tags "gcp"
 ```
+
+Credential names are unique per project, not vault-wide. The same name can exist in different projects; `add`, `list`, and import workflows can use `--project`, while `get`, `remove`, and `rotate` resolve names in the active project.
 
 ### Listing Credentials
 ```bash
@@ -67,7 +71,7 @@ wispkey remove "<name>"
 
 Bind credentials to specific hosts for defense-in-depth:
 ```bash
-wispkey add "stripe-key" --type bearer_token --value "sk_live_..." --hosts "api.stripe.com"
+printf '%s' "$STRIPE_API_KEY" | wispkey add "stripe-key" --type bearer_token --value-file - --hosts "api.stripe.com"
 ```
 Glob patterns supported: `--hosts "*.amazonaws.com"`
 
@@ -75,7 +79,7 @@ Glob patterns supported: `--hosts "*.amazonaws.com"`
 
 Organize credentials:
 ```bash
-wispkey add "db-prod" --type basic_auth --value "user:pass" --tags "database,production"
+printf '%s' "$DB_BASIC_AUTH" | wispkey add "db-prod" --type basic_auth --value-file - --tags "database,production"
 ```
 
 ## Session Management

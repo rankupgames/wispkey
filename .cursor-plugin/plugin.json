@@ -1,8 +1,8 @@
 {
   "name": "wispkey",
   "displayName": "WispKey",
-  "version": "0.1.0",
-  "description": "AI credential vault with phantom token proxy. Secures secrets from AI agents by replacing real credentials with opaque wisp tokens, intercepting requests to inject the real values at the proxy layer. Includes MCP tools, shell hooks for leak prevention, and proactive secret detection.",
+  "version": "0.4.0",
+  "description": "AI credential firewall with wisp token proxy. Secures secrets from AI agents by replacing real credentials with opaque wisp tokens, intercepting requests to inject the real values at the proxy layer, supporting scoped multi-instance access, and providing audited owner-run exec/run/inject workflows. Includes MCP tools, shell hooks for leak prevention, and proactive secret detection.",
   "author": {
     "name": "RankUp Games LLC",
     "url": "https://rankupgames.cloud"
@@ -20,7 +20,8 @@
     "api-keys",
     "vault",
     "mcp",
-    "phantom-tokens"
+    "wisp-tokens",
+    "credential-firewall"
   ],
   "category": "security",
   "tags": [

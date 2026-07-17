@@ -8,9 +8,11 @@
  */
 
 use std::fs;
+use std::io::ErrorKind;
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -19,6 +21,8 @@ use crate::core::{Vault, VaultError};
 use crate::secure_files;
 
 const COMING_SOON: &str = "WispKey Cloud is coming soon. Cloud $1.99/mo | Enterprise: contact us";
+const DEFAULT_CLERK_SIGN_IN_URL: &str = "https://clerk.wispkey.com/sign-in";
+const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 
 // INTEGRATION NOTE: Login flow will use Clerk browser-based auth.
 // 1. Start localhost callback server on random port
@@ -64,8 +68,8 @@ pub enum CloudTier {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CloudConfig {
     pub api_url: String,
-    pub access_token: Option<String>,
-    pub refresh_token: Option<String>,
+    #[serde(default, alias = "access_token")]
+    pub clerk_session_token: Option<String>,
     pub user_id: Option<String>,
     pub org_id: Option<String>,
     pub tier: CloudTier,
@@ -76,8 +80,7 @@ impl Default for CloudConfig {
     fn default() -> Self {
         Self {
             api_url: default_api_url(),
-            access_token: None,
-            refresh_token: None,
+            clerk_session_token: None,
             user_id: None,
             org_id: None,
             tier: CloudTier::Personal,
@@ -154,8 +157,8 @@ impl CloudClient {
     /// Opens the browser to the Clerk sign-in page and waits for the session token
     /// to arrive via a localhost callback. Returns the updated config with the token stored.
     pub async fn login(&mut self) -> CloudResult<CloudConfig> {
-        let (token, user_email) = browser_login_flow(&self.config.api_url).await?;
-        self.config.access_token = Some(token);
+        let (token, user_email) = browser_login_flow().await?;
+        self.config.clerk_session_token = Some(token);
         self.config.user_id = user_email.clone();
         save_config(&self.config)?;
         Ok(self.config.clone())
@@ -163,8 +166,7 @@ impl CloudClient {
 
     /// Clears cloud credentials and resets to Personal tier.
     pub fn logout(&mut self) -> CloudResult<()> {
-        self.config.access_token = None;
-        self.config.refresh_token = None;
+        self.config.clerk_session_token = None;
         self.config.user_id = None;
         self.config.org_id = None;
         self.config.last_sync = None;
@@ -235,7 +237,7 @@ impl CloudClient {
     fn ensure_authenticated(&self) -> CloudResult<()> {
         if self
             .config
-            .access_token
+            .clerk_session_token
             .as_ref()
             .is_some_and(|token| !token.is_empty())
         {
@@ -247,19 +249,19 @@ impl CloudClient {
 
 /// Starts a localhost HTTP server, opens the browser to the Clerk sign-in page,
 /// and waits for the callback with a session token. Returns (token, optional email).
-async fn browser_login_flow(api_url: &str) -> CloudResult<(String, Option<String>)> {
+async fn browser_login_flow() -> CloudResult<(String, Option<String>)> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .map_err(|e| CloudError::ApiError(format!("failed to bind localhost listener: {e}")))?;
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| CloudError::ApiError(format!("failed to configure callback listener: {e}")))?;
     let callback_port = listener
         .local_addr()
         .map_err(|e| CloudError::ApiError(format!("failed to get listener address: {e}")))?
         .port();
 
     let callback_url = format!("http://127.0.0.1:{callback_port}/callback");
-    let sign_in_url = format!(
-        "{api_url}/auth/cli-login?callback={}",
-        urlencoding::encode(&callback_url)
-    );
+    let sign_in_url = clerk_cli_sign_in_url(&callback_url);
 
     eprintln!("Opening browser for WispKey Cloud sign-in...");
     eprintln!("If the browser doesn't open, visit: {sign_in_url}");
@@ -271,8 +273,19 @@ async fn browser_login_flow(api_url: &str) -> CloudResult<(String, Option<String
     eprintln!("Waiting for authentication...");
 
     let (token, email) = tokio::task::spawn_blocking(move || -> CloudResult<(String, Option<String>)> {
-        let (stream, _) = listener.accept()
-            .map_err(|e| CloudError::ApiError(format!("callback accept failed: {e}")))?;
+        let deadline = Instant::now() + LOGIN_TIMEOUT;
+        let (stream, _) = loop {
+            match listener.accept() {
+                Ok(accepted) => break accepted,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if Instant::now() >= deadline {
+                        return Err(CloudError::ApiError("authentication timed out after 120 seconds".into()));
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(error) => return Err(CloudError::ApiError(format!("callback accept failed: {error}"))),
+            }
+        };
 
         let mut reader = BufReader::new(&stream);
         let mut request_line = String::new();
@@ -313,6 +326,17 @@ async fn browser_login_flow(api_url: &str) -> CloudResult<(String, Option<String
     .map_err(|e| CloudError::ApiError(format!("callback task panicked: {e}")))??;
 
     Ok((token, email))
+}
+
+fn clerk_cli_sign_in_url(callback_url: &str) -> String {
+    let base_url = std::env::var("WISPKEY_CLOUD_SIGN_IN_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_CLERK_SIGN_IN_URL.to_string());
+    format!(
+        "{base_url}?redirect_url={}",
+        urlencoding::encode(callback_url)
+    )
 }
 
 /// Returns the default WispKey Cloud API URL.
@@ -386,7 +410,7 @@ pub fn storage_limit_bytes_for_tier(tier: &CloudTier) -> u64 {
 pub fn summarize_local_cloud_status(config: &CloudConfig) -> CloudResult<CloudStatus> {
     let manifests = load_sync_manifests()?;
     let authenticated = config
-        .access_token
+        .clerk_session_token
         .as_ref()
         .is_some_and(|token| !token.is_empty());
     Ok(CloudStatus {
@@ -408,7 +432,7 @@ mod tests {
     fn default_config_is_personal_tier() {
         let config = CloudConfig::default();
         assert_eq!(config.tier, CloudTier::Personal);
-        assert!(config.access_token.is_none());
+        assert!(config.clerk_session_token.is_none());
         assert_eq!(config.api_url, "https://api.wispkey.com");
     }
 
@@ -438,7 +462,7 @@ mod tests {
     fn enterprise_tier_allows_all() {
         let config = CloudConfig {
             tier: CloudTier::Enterprise,
-            access_token: Some("token".into()),
+            clerk_session_token: Some("token".into()),
             ..CloudConfig::default()
         };
         let client = CloudClient::new(config);
@@ -450,8 +474,7 @@ mod tests {
     fn config_roundtrip_serialization() {
         let config = CloudConfig {
             api_url: "https://custom.example.com".into(),
-            access_token: Some("tok_abc".into()),
-            refresh_token: None,
+            clerk_session_token: Some("tok_abc".into()),
             user_id: Some("user_123".into()),
             org_id: None,
             tier: CloudTier::Cloud,
@@ -460,23 +483,44 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let parsed: CloudConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.tier, CloudTier::Cloud);
-        assert_eq!(parsed.access_token.as_deref(), Some("tok_abc"));
+        assert_eq!(parsed.clerk_session_token.as_deref(), Some("tok_abc"));
         assert_eq!(parsed.user_id.as_deref(), Some("user_123"));
+    }
+
+    #[test]
+    fn legacy_access_token_config_migrates_to_clerk_session_token() {
+        let json = r#"{
+            "api_url": "https://api.wispkey.com",
+            "access_token": "legacy_token",
+            "refresh_token": "legacy_refresh",
+            "user_id": "user_123",
+            "org_id": null,
+            "tier": "Cloud",
+            "last_sync": null
+        }"#;
+        let parsed: CloudConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.clerk_session_token.as_deref(), Some("legacy_token"));
+        assert_eq!(parsed.user_id.as_deref(), Some("user_123"));
+    }
+
+    #[test]
+    fn clerk_cli_sign_in_url_targets_hosted_clerk_by_default() {
+        let url = clerk_cli_sign_in_url("http://127.0.0.1:1234/callback");
+        assert!(url.starts_with("https://clerk.wispkey.com/sign-in?redirect_url="));
+        assert!(url.contains("127.0.0.1"));
     }
 
     #[test]
     fn logout_clears_credentials() {
         let config = CloudConfig {
-            access_token: Some("tok".into()),
-            refresh_token: Some("ref".into()),
+            clerk_session_token: Some("tok".into()),
             user_id: Some("uid".into()),
             tier: CloudTier::Cloud,
             ..CloudConfig::default()
         };
         let mut client = CloudClient::new(config);
         let _ = client.logout();
-        assert!(client.config.access_token.is_none());
-        assert!(client.config.refresh_token.is_none());
+        assert!(client.config.clerk_session_token.is_none());
         assert!(client.config.user_id.is_none());
         assert_eq!(client.config.tier, CloudTier::Personal);
     }

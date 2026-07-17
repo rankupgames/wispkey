@@ -19,7 +19,7 @@ pub async fn handle_cloud_status() {
     if !status.authenticated {
         println!("WispKey Cloud: not connected");
         println!("Run `wispkey cloud login` to connect.");
-        println!("Pricing: Pro $1.99/mo | Team $9.99/user/mo");
+        println!("Pricing: Personal free local-only | Cloud $1.99/mo | Enterprise contact us");
         println!("API: {}", config.api_url);
         return;
     }

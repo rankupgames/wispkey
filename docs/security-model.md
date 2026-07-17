@@ -1,0 +1,68 @@
+# WispKey Security Model
+
+WispKey is a credential firewall for AI agents. Its main boundary is between a prompt-injectable agent process and plaintext credentials. Agents receive opaque `wk_*` tokens; WispKey substitutes approved tokens for real credentials at the proxy boundary and keeps plaintext secrets out of normal agent-visible CLI and MCP outputs.
+
+## Defended Cases
+
+- Prompt-injected or compromised agents reading plaintext credentials through normal WispKey CLI or MCP surfaces. `wispkey_get_token` returns wisp tokens, not raw values.
+- Agents accidentally or intentionally sending vault-backed credentials before the proxy boundary. The proxy replaces valid wisp tokens in headers, supported text bodies, and URL query parameters.
+- Credential use outside configured boundaries when host restrictions or TOML policies are configured. Policies can restrict hosts, paths, methods, time windows, and rate limits.
+- Untrusted VM or worker instances using credentials outside their enrolled scope when served over identity-required transports. Instance requests must authenticate with an enrollment secret, scope checks fail closed, and out-of-scope use is denied before forwarding.
+- VM fleet first-contact enrollment. Bootstrap tokens are scoped, optional-TTL-limited, optional-use-limited, revocable bearer tokens stored only as Argon2id hashes. The join endpoint is authenticated only by the bootstrap token and returns a per-instance identity.
+- Silent privilege escalation by enrolled instances. Out-of-scope use creates a pending access request that must be approved by the host before the instance can retry successfully.
+- Silent vault-backed credential use. WispKey writes use and denial events to the SQLite audit log. Env-sideload-only proxy use without an unlocked vault writes fallback JSONL audit events.
+- Owner-approved plaintext egress. `wispkey exec` records `CredentialExec` audit events when it injects a credential into a child process through stdin, a child-only environment variable, or askpass. `wispkey run` records `CredentialRun` events for manifest-based child environment injection, and `wispkey inject` records `CredentialInject` events for template rendering.
+- Accidental env-sideload disclosure. `WISPKEY_SIDELOAD_<SLUG>` values are exposed to agents as deterministic `wk_env_<slug>` tokens; the raw env value is not printed or logged.
+- Timing disclosure of proxy management tokens through direct string comparison. Management API tokens are compared in constant time.
+
+## Explicit Limits
+
+- HTTPS CONNECT is a blind TCP tunnel. WispKey cannot substitute tokens inside CONNECT traffic. Use reverse proxy mode with `X-Target-Url` when HTTPS requests need token substitution.
+- Default loopback TCP clients are trusted by design for backward compatibility. Keep the default proxy bound to loopback and run it only on trusted machines unless you explicitly require instance identity.
+- Instance identities are bearer credentials. Protect `x-wispkey-instance-id` and `x-wispkey-instance-secret` in the VM environment or metadata channel. Rotate by revoking the instance and enrolling a replacement.
+- A compromised instance can use credentials that are already in its scope. Scope limits reduce blast radius; they do not make an in-scope credential safe after the instance is compromised.
+- Transport security for untrusted instances depends on the channel. Bind UDS listeners to host-only socket paths, keep socket permissions tight, and use vsock only for the intended host/guest boundary. Do not expose identity-required listeners on networks where the instance secret can be intercepted.
+- WispKey does not defend against a same-OS-user local process that can read all local WispKey files, read the device seed, reconstruct machine inputs, call local OS APIs available to that user, attach a debugger, or inspect process memory.
+- Root, Administrator, kernel-level compromise, malware with equivalent local privileges, or a malicious WispKey binary are out of scope.
+- Body substitution is limited to text-like content types such as JSON, text, form-urlencoded, and XML. Binary or opaque body rewriting is intentionally not supported.
+- Secrets are no longer protected by WispKey after they are intentionally sent upstream. The upstream service, SDKs, logs, and process memory are outside WispKey's boundary.
+- `wispkey exec`, `wispkey run`, and `wispkey inject` are deliberate plaintext-egress paths for owner-run non-HTTP tools, similar in trust level to `op run` or `aws-vault exec`. A compromised owner shell can still run these commands or use the child process or rendered file to misuse the credential.
+- Plaintext secrets stored in external client configuration, shell startup files, or MCP `env` blocks are outside the vault. Prefer process environment forwarding or an OS credential manager when available.
+
+## Session Boundary
+
+The default unlocked session file is machine-bound and encrypted. WispKey derives a local wrapping key from an owner-only device seed, machine identity inputs, and the OS username, then encrypts the session payload.
+
+This prevents a simple read of `~/.wispkey/session` from recovering the vault key. It is not a same-user security boundary. A same-user process with broad local file access or memory inspection can still recover or use unlocked credentials.
+
+`WISPKEY_SESSION_PLAINTEXT=1` writes the legacy plaintext session format for explicit debugging or rollback. It is not the default and is reported as plaintext protection in `wispkey --format json status`.
+
+## Exec, Run, And Inject Boundary
+
+`wispkey exec` exists for non-HTTP consumers that cannot use the token-substituting proxy. It requires an unlocked vault session, resolves the credential inside the WispKey process, and injects the value only into the child through selected channels:
+
+- `--stdin` writes one secret line to child stdin and closes it.
+- `--env <VAR>` sets `VAR=<secret>` only on the child `Command`.
+- `--askpass` configures `SUDO_ASKPASS`, `SSH_ASKPASS`, and `GIT_ASKPASS` to an internal helper. `SSH_ASKPASS_REQUIRE=force` is set for SSH askpass flows, and sudo commands should use `sudo -A`.
+
+The askpass channel uses a per-exec owner-only handoff capability file. `exec --askpass` writes a small handoff under WispKey's private vault directory and passes the path to the spawned child as `WISPKEY_ASKPASS_HANDOFF`. The hidden helper reads and consumes that handoff, resolves only the named credential for that launch, and refuses to run without a valid handoff. The removed `WISPKEY_ASKPASS_CRED` environment path is not supported, so `wispkey askpass` is no longer a standalone plaintext oracle.
+
+The plaintext value must not transit child argv, parent environment variables other than child-only askpass handoff metadata, WispKey stdout/stderr, tracing logs, or audit fields. Audit rows store the credential name, child program name only, channel summary, project, and exit status. They do not store the value or full child argument list.
+
+`wispkey run` uses the same unlocked-vault resolution boundary for `[env]` manifest entries. Values of the form `cred:<name>` are resolved in-process and set only through `Command::env` on the child. Plain string manifest values are passed through unchanged. Run audit rows store credential names, the child program name only, project, and exit status.
+
+`wispkey inject` renders `{{ cred:<name> }}` template references in-process. File output uses WispKey's owner-only writer, which is 0600 on Unix and restricted with Windows ACLs where available. `--stdout` is an explicit plaintext disclosure to the caller. Inject audit rows store credential names, the output destination path or `stdout`, and project.
+
+## Agent-Scoped Policies
+
+Agent-scoped policies fail closed when the requester agent identity is unavailable. The proxy currently has no trusted agent identity source, so a policy with an `agent = "..."` scope applies to proxy requests even when no agent name is known.
+
+## Instance Boundary
+
+Multi-instance access adds an authenticated untrusted-client boundary for ephemeral VMs and worker instances. Each instance enrolls on the host with a unique id and one-time secret. The secret is Argon2id-hashed at rest and must be presented on every proxied request with `x-wispkey-instance-id` and `x-wispkey-instance-secret`.
+
+Fleet self-enrollment uses bootstrap tokens for first contact. A host mints a bootstrap token with partition, project, credential, or tag scopes plus optional TTL and use limits. The plaintext bootstrap token is shown once, stored only as an Argon2id hash, and can be revoked. Redemption is atomic/race-safe, so max-use limits are strictly enforced under concurrent joins. `POST /api/instances/join` intentionally does not require a management token or existing instance identity; possession of a valid bootstrap token is the authenticator for that endpoint. On success, WispKey returns a new instance id and one-time instance secret, then future proxy requests must use that per-instance identity.
+
+Unix domain socket and vsock listeners require instance identity by default. Loopback TCP keeps the original no-identity default unless `--require-identity` is set. Missing, invalid, or revoked instance identity returns HTTP 401.
+
+After authentication, WispKey checks instance scope before injecting a vault credential. Scope selectors can match by partition, project, credential name, or exact tag. If a token is out of scope, WispKey returns HTTP 403 with `error: "out_of_scope"`, queues or reuses a pending access request, audits the denial, and does not forward the upstream request. Host approval makes that credential available to the instance on retry.

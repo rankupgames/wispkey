@@ -84,7 +84,9 @@ wispkey partition import ./handoff/onboarding-kit.wkbundle \
 wispkey partition import ./path/to/file.wkbundle
 ```
 
-Unlock the vault if needed, then enter the **same bundle passphrase** used at export. The CLI prints counts for imported, skipped, and errored credentials. If the partition name already exists, it is reused; credentials whose names already exist in the vault are counted as **skipped** rather than overwritten.
+Unlock the vault if needed, then enter the **same bundle passphrase** used at export. The CLI prints counts for imported, skipped, and errored credentials. If the partition name already exists, it is reused; credentials whose names already exist in the target project are counted as **skipped** rather than overwritten.
+
+Credential names are unique per project, so duplicate detection happens inside the target project. The same credential name may exist in another project without blocking the import.
 
 ## Use Cases
 
