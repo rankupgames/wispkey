@@ -31,7 +31,7 @@ mod tests;
 
 pub use instances::{
     AccessRequest, BootstrapJoinResult, BootstrapToken, CreateBootstrapTokenResult,
-    EnrollInstanceResult, Instance, InstanceScopeInput,
+    EnrollInstanceResult, Instance, InstanceScopeInput, RotateInstanceSecretResult,
 };
 use rows::{credential_from_row, parse_csv, partition_from_row, project_from_row};
 #[cfg(test)]
@@ -41,7 +41,7 @@ use rows::{parse_credential_type_column, parse_datetime_column};
 pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
-const CURRENT_SCHEMA_VERSION: &str = "8";
+const CURRENT_SCHEMA_VERSION: &str = "10";
 
 /// Errors returned by vault operations (I/O, crypto, schema, and business rules).
 #[derive(Error, Debug)]
@@ -87,6 +87,12 @@ pub enum VaultError {
     DuplicateInstance(String),
     #[error("instance '{0}' not found")]
     InstanceNotFound(String),
+    #[error("instance '{0}' is not active")]
+    InstanceNotActive(String),
+    #[error("instance secret rotation for '{0}' raced another state change; retry")]
+    InstanceSecretRotationConflict(String),
+    #[error("instance secret rotation intervals must be positive and grace must not be negative")]
+    InvalidInstanceSecretRotation,
     #[error("invalid instance scope type: {0}")]
     InvalidInstanceScope(String),
     #[error("instance scope '{0}' not found")]

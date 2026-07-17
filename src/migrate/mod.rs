@@ -158,13 +158,19 @@ fn parse_env(content: &str) -> Vec<EnvEntry> {
                 value = value[1..value.len() - 1].to_string();
             }
 
-            if !key.is_empty() && !value.is_empty() {
+            if is_valid_env_key(&key) && !value.is_empty() {
                 entries.push(EnvEntry { key, value });
             }
         }
     }
 
     entries
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut characters = key.chars();
+    matches!(characters.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
 struct CredentialPatterns {
@@ -369,5 +375,13 @@ mod tests {
         let entries = parse_env(content);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "VALID");
+    }
+
+    #[test]
+    fn parse_env_rejects_nonportable_keys() {
+        let content = "SAFE_KEY=value\ntrue; attacker-command #=value\n1INVALID=value";
+        let entries = parse_env(content);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].key, "SAFE_KEY");
     }
 }

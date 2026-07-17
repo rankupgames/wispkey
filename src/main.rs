@@ -226,7 +226,7 @@ enum Commands {
         #[arg(long)]
         all_projects: bool,
 
-        /// Add a listener: tcp://127.0.0.1:7700, unix:/absolute/path.sock, or vsock://<cid>:<port>
+        /// Add a listener: TCP, Unix socket, Linux vsock, or Firecracker UDS-backed vsock
         #[arg(long = "listen")]
         listen: Vec<String>,
 
@@ -584,6 +584,16 @@ enum InstanceCommands {
     },
     /// Revoke an instance without deleting audit history
     Revoke { name: String },
+    /// Rotate an instance bearer secret, optionally only when it is old enough
+    RotateSecret {
+        name: String,
+        /// Rotate only when the current secret is at least this old, for example 30d
+        #[arg(long)]
+        if_older_than: Option<String>,
+        /// Keep the previous secret valid during rollout, or until the new secret first succeeds
+        #[arg(long, default_value = "10m")]
+        grace: String,
+    },
     /// List access requests
     Requests {
         #[arg(long)]
@@ -1063,6 +1073,11 @@ async fn main() {
                 cli::handle_instance_join(&bootstrap_token, &name).await
             }
             InstanceCommands::Revoke { name } => cli::handle_instance_revoke(&name).await,
+            InstanceCommands::RotateSecret {
+                name,
+                if_older_than,
+                grace,
+            } => cli::handle_instance_rotate_secret(&name, if_older_than.as_deref(), &grace).await,
             InstanceCommands::Requests { instance, pending } => {
                 cli::handle_instance_requests(instance.as_deref(), pending).await
             }

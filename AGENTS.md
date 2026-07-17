@@ -41,7 +41,7 @@ printf '%s' "$SECRET_VALUE" | wispkey add "key" --type api_key --value-file -  #
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v7 automatically.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v10 automatically.
 
 ```bash
 # Create a project
@@ -71,14 +71,17 @@ wispkey serve --all-projects
 
 ## Multi-Instance Access
 
-The default `wispkey serve` listener remains loopback TCP with no instance identity requirement for the original trusted-local workflow. For untrusted ephemeral VMs or worker instances, enroll an instance and use identity-required listeners such as Unix domain sockets or feature-gated Linux vsock:
+The default `wispkey serve` listener remains loopback TCP with no instance identity requirement for the original trusted-local workflow. For untrusted ephemeral VMs or worker instances, enroll an instance and use identity-required listeners such as Unix domain sockets, non-loopback TCP, feature-gated Linux AF_VSOCK, or Firecracker's UDS-backed vsock bridge:
 
 ```bash
 wispkey instance enroll "worker-acme-001" --credential openai-key --tag company:acme
 wispkey serve --listen unix:/run/wispkey/proxy.sock
+wispkey serve --listen firecracker-vsock:/run/wispkey/worker.vsock:7700
 ```
 
-Instances authenticate every proxied request with `x-wispkey-instance-id` and `x-wispkey-instance-secret`. Scope checks fail closed; out-of-scope token use returns `403 out_of_scope`, queues or reuses an access request, and requires host approval with `wispkey instance approve <request-id>` before retry.
+Instances authenticate every proxied request with `x-wispkey-instance-id` and `x-wispkey-instance-secret`. Credential selectors and approvals bind to the resolved credential ID, so same-named credentials in other projects remain out of scope. Out-of-scope vault-token use returns `403 out_of_scope`, queues or reuses an access request, and requires host approval with `wispkey instance approve <request-id>` before retry. Env-sideload credentials have no enrollable credential ID and are denied for instance-authenticated requests.
+
+Rotate instance secrets from a protected scheduler path with `wispkey --format json instance rotate-secret <name> --if-older-than 30d --grace 15m`. Treat stdout as a one-time secret channel. The old secret remains valid only for the grace window and is retired early after the new secret first authenticates.
 
 For fleets, mint scoped bootstrap tokens and redeem them with `--token-file` so the token does not appear in argv:
 ```bash
@@ -115,7 +118,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey exec --credential <name> [--project P] [--stdin] [--env VAR]... [--askpass] -- <command> [args...]` | Audited child-process secret injection |
 | `wispkey run [--manifest PATH] [--project P] -- <command> [args...]` | Manifest-defined child-only environment injection |
 | `wispkey inject -i <infile|-> [-o <outfile>] [--project P] [--stdout]` | Render `{{ cred:<name> }}` references to owner-only file output or explicit stdout |
-| `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start proxy; `SPEC` supports `tcp://host:port`, `unix:/path.sock`, and feature-gated `vsock://cid:port` |
+| `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start proxy; `SPEC` supports TCP, Unix sockets, feature-gated Linux AF_VSOCK, and Firecracker UDS-backed vsock |
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Import .env file |
 | `wispkey status` | Vault + session + proxy status |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Audit log |
@@ -125,6 +128,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey project create/list/delete/use/current/export/import` | Project management and encrypted project bundles |
 | `wispkey credential export/import` | Encrypted single-credential sharing bundles |
 | `wispkey instance enroll/list/show/scope/bootstrap/join/revoke/requests/approve/deny` | Manage instance identities, bootstrap self-enrollment, scopes, and access requests |
+| `wispkey instance rotate-secret <name> [--if-older-than AGE] [--grace AGE]` | Due-aware instance-secret rotation for protected automation |
 | `wispkey mcp serve` | Start MCP server (stdio) |
 
 ## Credential Types
