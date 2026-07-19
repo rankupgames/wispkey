@@ -33,6 +33,23 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     harden_file(path)
 }
 
+/// Writes a private file without changing permissions on its existing parent
+/// directory. Use this for sensitive files stored inside user-managed projects.
+pub(crate) fn write_private_in_existing_directory(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(VaultError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("parent directory does not exist: {}", parent.display()),
+        )));
+    }
+    write_private_file(path, bytes)?;
+    harden_file(path)
+}
+
 /// Appends sensitive bytes to disk and then applies owner-only protection.
 pub(crate) fn append_private(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path

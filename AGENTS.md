@@ -21,9 +21,11 @@ wispkey add "ssh-key" --type api_key --value-file ~/.ssh/my_key --partition "ssh
 # 4. Start proxy
 wispkey serve
 
-# 5. Use in your agent environment
+# 5. Use as a forward proxy for inspectable HTTP traffic
 export HTTP_PROXY=http://localhost:7700
 ```
+
+`HTTPS_PROXY` uses blind CONNECT tunneling and cannot substitute tokens inside TLS. Send HTTPS requests that contain `wk_*` tokens to reverse proxy mode at `http://localhost:7700` with `X-Target-Url`, or use `exec`/`run`/`inject` for non-HTTP consumers.
 
 ## Non-Interactive Mode (CI / Agents)
 
@@ -68,6 +70,29 @@ wispkey serve
 # Start proxy allowing all projects
 wispkey serve --all-projects
 ```
+
+For local `.env` workflows, organization/account scope remains external, a WispKey project represents the source project, and each attached `.env*` maps to an environment partition. `.env` maps to `default`; `.env.production` maps to `production`. Credential names are environment-prefixed so the same variable name can be attached in multiple environments.
+
+```bash
+# Discover files without reading their contents
+wispkey env list .
+wispkey env list ~ --format json
+
+# Auto-create project "client-alpha" and environment partition "production"
+# Only selected keys are imported and replaced; PORT and other settings stay intact.
+wispkey env attach .env.production \
+  --project client-alpha \
+  --key OPENAI_API_KEY
+wispkey project use client-alpha
+```
+
+Attachment rewrites the same file atomically with owner-only permissions. Re-attaching matching values or tokens is idempotent. A credential with a different stored value or environment fails closed without changing the `.env` file.
+
+Attach only values consumed through a WispKey token-substitution request path. A tokenized database URL, port, filesystem path, or other non-HTTP value is not automatically converted back to plaintext when an application reads its environment; use `wispkey run`, `exec`, or `inject` for those values.
+
+The proxy and MCP default to the active project. After attaching to another project, run `wispkey project use <project>` before starting them, or start the proxy with `--all-projects` when cross-project token resolution is intentional.
+
+`env attach` cannot infer target hosts. It creates unrestricted credentials unless the matching environment-prefixed credential already exists with host restrictions. Configure `--hosts` during pre-provisioning or enforce a policy before giving attached tokens to an untrusted agent.
 
 ## Multi-Instance Access
 
@@ -119,16 +144,22 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey run [--manifest PATH] [--project P] -- <command> [args...]` | Manifest-defined child-only environment injection |
 | `wispkey inject -i <infile|-> [-o <outfile>] [--project P] [--stdout]` | Render `{{ cred:<name> }}` references to owner-only file output or explicit stdout |
 | `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start proxy; `SPEC` supports TCP, Unix sockets, feature-gated Linux AF_VSOCK, and Firecracker UDS-backed vsock |
-| `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Import .env file |
+| `wispkey proxy status/stop/cleanup` | Inspect and manage local proxy lifecycle state |
+| `wispkey env list [directory]` | Discover attachable `.env*` files; supports global `--format json` output |
+| `wispkey env attach <path> --project P --key NAME... [--environment E]` | Attach selected secrets to a project/environment and tokenize them in-place |
+| `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Legacy whole-file import that writes `.env.wispkey` |
 | `wispkey status` | Vault + session + proxy status |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Audit log |
 | `wispkey audit export [--since TS] [--until TS] [--credential C] [--encoding jsonl|json] [-o FILE]` | Export matching audit events |
 | `wispkey audit tail [--follow] [--credential C]` | Stream newest audit events with a forward cursor when following |
+| `wispkey policy list/init/check` | List, initialize, or validate access policies |
 | `wispkey partition create/list/delete/assign/export/import` | Partition management |
 | `wispkey project create/list/delete/use/current/export/import` | Project management and encrypted project bundles |
 | `wispkey credential export/import` | Encrypted single-credential sharing bundles |
 | `wispkey instance enroll/list/show/scope/bootstrap/join/revoke/requests/approve/deny` | Manage instance identities, bootstrap self-enrollment, scopes, and access requests |
 | `wispkey instance rotate-secret <name> [--if-older-than AGE] [--grace AGE]` | Due-aware instance-secret rotation for protected automation |
+| `wispkey cloud status/login/logout` | Local Cloud session groundwork |
+| `wispkey cloud push/pull/sync` | Reserved sync commands; currently return `coming soon` |
 | `wispkey mcp serve` | Start MCP server (stdio) |
 
 ## Credential Types
@@ -241,6 +272,7 @@ When the proxy is running (`wispkey serve`):
 | `~/.wispkey/proxy.json` | Proxy discovery file with management token (owner-only permissions/ACL) |
 | `~/.wispkey/active_project` | Persistent active project (set by `project use`) |
 | `.env.wispkey` | Generated import output with wisp tokens (owner-only permissions on Unix) |
+| `.env*` attached with `wispkey env attach` | Existing environment file with selected values replaced by tokens (owner-only permissions/ACL) |
 | `WISPKEY_VAULT_PATH` | Override vault directory |
 | `WISPKEY_PROJECT` | Override active project per-terminal |
 | `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import |
@@ -251,6 +283,6 @@ When the proxy is running (`wispkey serve`):
 - Credential names: lowercase, hyphen-separated (e.g. `cloudflare-api-token`)
 - Tags: comma-separated on `--tags` (e.g. `--tags "cloudflare,production"`)
 - Hosts: comma-separated globs on `--hosts` (e.g. `--hosts "api.cloudflare.com,*.workers.dev"`)
-- Partitions: logical grouping (e.g. `infrastructure`, `cloud-services`, `ci-cd`)
+- Partitions: environments or other logical groups inside a project (e.g. `production`, `infrastructure`, `ci-cd`)
 - Projects: team/project isolation (e.g. `client-alpha`, `internal-tools`)
 - Values starting with `-`: use `--value='-1abc...'` (equals syntax), though `--value-file` is preferred for secret material

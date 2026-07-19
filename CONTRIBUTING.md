@@ -13,7 +13,7 @@ cargo test
 
 ### Prerequisites
 
-- **Rust 1.94+** via [rustup](https://rustup.rs)
+- Current stable **Rust** via [rustup](https://rustup.rs)
 - That's it -- SQLite is bundled via `rusqlite`
 
 ## Development Workflow
@@ -23,9 +23,9 @@ cargo test
 3. Run the full check suite:
 
 ```bash
-cargo fmt --check
-cargo clippy -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
 ```
 
 4. Open a PR against `main`

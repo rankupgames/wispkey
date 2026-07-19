@@ -9,11 +9,16 @@
  * Last Modified: 2026-04-08
  */
 
+use std::collections::HashSet;
+use std::ffi::OsStr;
 use std::fs;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
 
 use regex::Regex;
+use serde::Serialize;
+use uuid::Uuid;
 
 use crate::audit;
 use crate::core::{AddCredentialRequest, CredentialType, Vault, VaultError};
@@ -27,9 +32,650 @@ pub struct ImportResults {
     pub output_path: String,
 }
 
+/// One directory that could not be read during `.env` discovery.
+#[derive(Debug, Serialize)]
+pub struct EnvDiscoveryWarning {
+    pub path: String,
+    pub error: String,
+}
+
+/// Absolute paths and explicit traversal warnings from `.env` discovery.
+pub struct EnvDiscoveryResults {
+    pub directory: String,
+    pub files: Vec<String>,
+    pub warnings: Vec<EnvDiscoveryWarning>,
+}
+
+/// One environment variable attached to a vault credential.
+#[derive(Debug, Serialize)]
+pub struct AttachedEnvCredential {
+    pub env_key: String,
+    pub credential: String,
+    pub wisp_token: String,
+}
+
+/// Summary of an in-place `.env` attachment.
+#[derive(Debug, Serialize)]
+pub struct AttachEnvResults {
+    pub path: String,
+    pub project: String,
+    pub environment: String,
+    pub partition: String,
+    pub imported: usize,
+    pub reused: usize,
+    pub already_attached: usize,
+    pub updated: usize,
+    pub project_created: bool,
+    pub environment_created: bool,
+    pub credentials: Vec<AttachedEnvCredential>,
+}
+
 struct EnvEntry {
     key: String,
     value: String,
+}
+
+#[derive(Debug)]
+struct SelectedEnvEntry {
+    key: String,
+    value: String,
+    value_range: Range<usize>,
+}
+
+struct AttachPlan {
+    entry: SelectedEnvEntry,
+    credential_name: String,
+    credential: Option<crate::core::Credential>,
+    already_tokenized: bool,
+}
+
+const MAX_ATTACH_FILE_BYTES: u64 = 10 * 1024 * 1024;
+const RESERVED_ENV_FILES: &[&str] = &[
+    ".env.example",
+    ".env.keys",
+    ".env.me",
+    ".env.project",
+    ".env.wispkey",
+    ".env.x",
+];
+const SKIPPED_DIRECTORIES: &[&str] = &[".git", ".hg", ".svn", "node_modules", "target"];
+
+/// Recursively finds attachable `.env` files without reading their contents.
+pub fn discover_env_files(directory: &str) -> std::io::Result<EnvDiscoveryResults> {
+    let root = fs::canonicalize(directory)?;
+    if !root.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} is not a directory", root.display()),
+        ));
+    }
+
+    let mut files = Vec::new();
+    let mut warnings = Vec::new();
+    let mut directories = vec![root.clone()];
+
+    while let Some(current) = directories.pop() {
+        let entries = match fs::read_dir(&current) {
+            Ok(entries) => entries,
+            Err(error) if current == root => return Err(error),
+            Err(error) => {
+                warnings.push(EnvDiscoveryWarning {
+                    path: current.to_string_lossy().into_owned(),
+                    error: error.to_string(),
+                });
+                continue;
+            }
+        };
+
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warnings.push(EnvDiscoveryWarning {
+                        path: current.to_string_lossy().into_owned(),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) => {
+                    warnings.push(EnvDiscoveryWarning {
+                        path: path.to_string_lossy().into_owned(),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                if !is_skipped_directory(&entry.file_name()) {
+                    directories.push(path);
+                }
+                continue;
+            }
+            if file_type.is_file() && is_attachable_env_file(&entry.file_name()) {
+                files.push(path.to_string_lossy().into_owned());
+            }
+        }
+    }
+
+    files.sort();
+    warnings.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(EnvDiscoveryResults {
+        directory: root.to_string_lossy().into_owned(),
+        files,
+        warnings,
+    })
+}
+
+/// Imports selected `.env` entries into a project/environment and atomically
+/// replaces their plaintext values with WispKey tokens in the same file.
+pub fn attach_env_file(
+    vault: &Vault,
+    path: &str,
+    keys: &[String],
+    project: &str,
+    environment_override: Option<&str>,
+) -> crate::core::Result<AttachEnvResults> {
+    let input_path = Path::new(path);
+    let input_metadata = fs::symlink_metadata(input_path)?;
+    if input_metadata.file_type().is_symlink() || !input_metadata.is_file() {
+        return Err(VaultError::InvalidEnvFile(format!(
+            "{} must be a regular, non-symlink file",
+            input_path.display()
+        )));
+    }
+    if input_metadata.len() > MAX_ATTACH_FILE_BYTES {
+        return Err(VaultError::InvalidEnvFile(format!(
+            "{} exceeds the {} byte size limit",
+            input_path.display(),
+            MAX_ATTACH_FILE_BYTES
+        )));
+    }
+
+    let canonical_path = fs::canonicalize(input_path)?;
+    let original = fs::read_to_string(&canonical_path)?;
+    let entries = selected_env_entries(&original, keys)?;
+    let environment = resolve_environment_name(&canonical_path, environment_override)?;
+
+    let mut credential_names = HashSet::new();
+    let mut named_entries = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let credential_name = format!("{}-{}", environment, env_key_to_credential_name(&entry.key));
+        if !credential_names.insert(credential_name.clone()) {
+            return Err(VaultError::InvalidEnvFile(format!(
+                "selected keys map to duplicate credential '{credential_name}'"
+            )));
+        }
+        named_entries.push((entry, credential_name));
+    }
+
+    let project_created = match vault.get_project(project) {
+        Ok(_) => false,
+        Err(VaultError::ProjectNotFound(_)) => {
+            if let Some((entry, _)) = named_entries
+                .iter()
+                .find(|(entry, _)| entry.value.starts_with("wk_"))
+            {
+                return Err(VaultError::EnvCredentialConflict(format!(
+                    "token for '{}' cannot be attached because project '{project}' does not exist",
+                    entry.key
+                )));
+            }
+            vault.create_project(project, "")?;
+            true
+        }
+        Err(error) => return Err(error),
+    };
+    let (partition, environment_created) = match vault
+        .get_partition_in_project(project, &environment)
+    {
+        Ok(partition) => (partition, false),
+        Err(VaultError::PartitionNotFound(_)) => {
+            if let Some((entry, _)) = named_entries
+                .iter()
+                .find(|(entry, _)| entry.value.starts_with("wk_"))
+            {
+                return Err(VaultError::EnvCredentialConflict(format!(
+                    "token for '{}' cannot be attached because environment '{environment}' does not exist",
+                    entry.key
+                )));
+            }
+            for (_, credential_name) in &named_entries {
+                match vault.get_credential_in_project(project, credential_name) {
+                    Ok(_) => {
+                        return Err(VaultError::EnvCredentialConflict(format!(
+                            "credential '{credential_name}' belongs to a different environment"
+                        )));
+                    }
+                    Err(VaultError::CredentialNotFound(_)) => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            (
+                vault.create_partition(
+                    &environment,
+                    "Environment attached from a .env file",
+                    Some(project),
+                )?,
+                true,
+            )
+        }
+        Err(error) => return Err(error),
+    };
+
+    let mut plans = Vec::with_capacity(named_entries.len());
+    for (entry, credential_name) in named_entries {
+        let already_tokenized = entry.value.starts_with("wk_");
+        let credential = match vault.get_credential_in_project(project, &credential_name) {
+            Ok(credential) => {
+                if credential.partition_id.as_deref() != Some(partition.id.as_str()) {
+                    return Err(VaultError::EnvCredentialConflict(format!(
+                        "credential '{credential_name}' belongs to a different environment"
+                    )));
+                }
+                if already_tokenized {
+                    if credential.wisp_token != entry.value {
+                        return Err(VaultError::EnvCredentialConflict(format!(
+                            "token for '{}' does not match credential '{credential_name}'",
+                            entry.key
+                        )));
+                    }
+                } else {
+                    let existing_value =
+                        vault.decrypt_credential_value_in_project(project, &credential_name)?;
+                    if !secret_values_match(&existing_value, &entry.value) {
+                        return Err(VaultError::EnvCredentialConflict(format!(
+                            "credential '{credential_name}' already stores a different value"
+                        )));
+                    }
+                }
+                Some(credential)
+            }
+            Err(VaultError::CredentialNotFound(_)) if already_tokenized => {
+                return Err(VaultError::EnvCredentialConflict(format!(
+                    "token for '{}' is not attached to credential '{credential_name}'",
+                    entry.key
+                )));
+            }
+            Err(VaultError::CredentialNotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+
+        plans.push(AttachPlan {
+            entry,
+            credential_name,
+            credential,
+            already_tokenized,
+        });
+    }
+
+    let mut imported = 0;
+    let mut reused = 0;
+    let mut already_attached = 0;
+    for plan in &mut plans {
+        if plan.credential.is_none() {
+            let credential = vault.add_credential(AddCredentialRequest {
+                name: &plan.credential_name,
+                credential_type: detect_credential_type(&plan.entry.value),
+                value: &plan.entry.value,
+                description: None,
+                hosts: None,
+                tags: Some("attached"),
+                partition: Some(&environment),
+                project: Some(project),
+            })?;
+            audit::log_event(
+                vault.db(),
+                "CredentialAdded",
+                Some(&credential.name),
+                Some(&credential.wisp_token),
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                Some(project),
+            );
+            plan.credential = Some(credential);
+            imported += 1;
+        } else if plan.already_tokenized {
+            already_attached += 1;
+        } else {
+            reused += 1;
+        }
+    }
+
+    let mut replacements = Vec::new();
+    let mut credentials = Vec::with_capacity(plans.len());
+    for plan in plans {
+        let credential = plan
+            .credential
+            .expect("attach plan must resolve a credential before file replacement");
+        if !plan.already_tokenized {
+            replacements.push((plan.entry.value_range, credential.wisp_token.clone()));
+        }
+        credentials.push(AttachedEnvCredential {
+            env_key: plan.entry.key,
+            credential: credential.name,
+            wisp_token: credential.wisp_token,
+        });
+    }
+
+    let updated = replacements.len();
+    if updated > 0 {
+        replacements.sort_by(|left, right| right.0.start.cmp(&left.0.start));
+        let mut attached = original.clone();
+        for (range, token) in replacements {
+            attached.replace_range(range, &token);
+        }
+        replace_env_file(&canonical_path, original.as_bytes(), attached.as_bytes())?;
+    }
+
+    Ok(AttachEnvResults {
+        path: canonical_path.to_string_lossy().into_owned(),
+        project: project.to_string(),
+        environment: environment.clone(),
+        partition: environment,
+        imported,
+        reused,
+        already_attached,
+        updated,
+        project_created,
+        environment_created,
+        credentials,
+    })
+}
+
+fn is_skipped_directory(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    SKIPPED_DIRECTORIES.contains(&name.as_ref())
+}
+
+fn is_attachable_env_file(name: &OsStr) -> bool {
+    let name = name.to_string_lossy();
+    (name == ".env" || name.starts_with(".env."))
+        && !name.ends_with(".previous")
+        && !RESERVED_ENV_FILES.contains(&name.as_ref())
+}
+
+fn resolve_environment_name(
+    path: &Path,
+    environment_override: Option<&str>,
+) -> crate::core::Result<String> {
+    let raw_name = if let Some(environment) = environment_override {
+        environment.to_string()
+    } else {
+        let file_name = path
+            .file_name()
+            .ok_or_else(|| VaultError::InvalidEnvFile("missing file name".into()))?;
+        if !is_attachable_env_file(file_name) {
+            return Err(VaultError::InvalidEnvFile(format!(
+                "{} is not an attachable .env file",
+                path.display()
+            )));
+        }
+        let file_name = file_name.to_string_lossy();
+        if file_name == ".env" {
+            "default".to_string()
+        } else {
+            file_name
+                .strip_prefix(".env.")
+                .expect("attachable environment file has .env. prefix")
+                .to_string()
+        }
+    };
+
+    let normalized = normalize_scope_component(&raw_name);
+    if normalized.is_empty() {
+        return Err(VaultError::InvalidEnvFile(
+            "environment name must contain an ASCII letter or number".into(),
+        ));
+    }
+    Ok(normalized)
+}
+
+fn normalize_scope_component(value: &str) -> String {
+    let mut normalized = String::with_capacity(value.len());
+    for character in value.chars() {
+        if character.is_ascii_alphanumeric() {
+            normalized.push(character.to_ascii_lowercase());
+        } else if !normalized.is_empty() && !normalized.ends_with('-') {
+            normalized.push('-');
+        }
+    }
+    normalized.trim_matches('-').to_string()
+}
+
+fn selected_env_entries(
+    content: &str,
+    keys: &[String],
+) -> crate::core::Result<Vec<SelectedEnvEntry>> {
+    if keys.is_empty() {
+        return Err(VaultError::InvalidEnvFile(
+            "select at least one secret key with --key".into(),
+        ));
+    }
+
+    let mut selected = HashSet::new();
+    for key in keys {
+        if !is_valid_env_key(key) {
+            return Err(VaultError::InvalidEnvFile(format!(
+                "'{key}' is not a portable environment variable name"
+            )));
+        }
+        selected.insert(key.as_str());
+    }
+
+    let mut entries = Vec::with_capacity(selected.len());
+    let mut found = HashSet::new();
+    let mut offset = 0;
+    for segment in content.split_inclusive('\n') {
+        let line = segment.strip_suffix('\n').unwrap_or(segment);
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(entry) = parse_selected_assignment(line, offset, &selected)? {
+            if !found.insert(entry.key.clone()) {
+                return Err(VaultError::InvalidEnvFile(format!(
+                    "selected key '{}' is defined more than once",
+                    entry.key
+                )));
+            }
+            if entry.value.is_empty() {
+                return Err(VaultError::InvalidEnvFile(format!(
+                    "selected key '{}' has an empty value",
+                    entry.key
+                )));
+            }
+            entries.push(entry);
+        }
+        offset += segment.len();
+    }
+
+    let mut missing: Vec<&str> = selected
+        .into_iter()
+        .filter(|key| !found.contains(*key))
+        .collect();
+    if !missing.is_empty() {
+        missing.sort_unstable();
+        return Err(VaultError::InvalidEnvFile(format!(
+            "selected key(s) not found: {}",
+            missing.join(", ")
+        )));
+    }
+
+    Ok(entries)
+}
+
+fn parse_selected_assignment(
+    line: &str,
+    line_offset: usize,
+    selected: &HashSet<&str>,
+) -> crate::core::Result<Option<SelectedEnvEntry>> {
+    let bytes = line.as_bytes();
+    let mut cursor = 0;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if cursor == bytes.len() || bytes[cursor] == b'#' {
+        return Ok(None);
+    }
+
+    if line[cursor..].starts_with("export")
+        && bytes
+            .get(cursor + "export".len())
+            .is_some_and(u8::is_ascii_whitespace)
+    {
+        cursor += "export".len();
+        while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+            cursor += 1;
+        }
+    }
+
+    let key_start = cursor;
+    if bytes
+        .get(cursor)
+        .is_none_or(|byte| *byte != b'_' && !byte.is_ascii_alphabetic())
+    {
+        return Ok(None);
+    }
+    cursor += 1;
+    while cursor < bytes.len() && (bytes[cursor] == b'_' || bytes[cursor].is_ascii_alphanumeric()) {
+        cursor += 1;
+    }
+    let key = &line[key_start..cursor];
+    if !selected.contains(key) {
+        return Ok(None);
+    }
+
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+    if bytes.get(cursor) != Some(&b'=') {
+        return Err(VaultError::InvalidEnvFile(format!(
+            "selected key '{key}' is not a KEY=value assignment"
+        )));
+    }
+    cursor += 1;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
+        cursor += 1;
+    }
+
+    let (value, range) = if matches!(bytes.get(cursor), Some(b'\'' | b'"')) {
+        let quote = bytes[cursor];
+        let value_start = cursor + 1;
+        let mut value_end = value_start;
+        let mut closed = false;
+        while value_end < bytes.len() {
+            if bytes[value_end] == quote {
+                closed = true;
+                break;
+            }
+            if quote == b'"' && bytes[value_end] == b'\\' && value_end + 1 < bytes.len() {
+                value_end += 2;
+            } else {
+                value_end += 1;
+            }
+        }
+        if !closed {
+            return Err(VaultError::InvalidEnvFile(format!(
+                "selected key '{key}' has an unterminated quoted value"
+            )));
+        }
+        let trailing = line[value_end + 1..].trim_start();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return Err(VaultError::InvalidEnvFile(format!(
+                "selected key '{key}' has invalid content after its quoted value"
+            )));
+        }
+        let raw_value = &line[value_start..value_end];
+        (
+            if quote == b'"' {
+                decode_double_quoted_value(raw_value)
+            } else {
+                raw_value.to_string()
+            },
+            line_offset + value_start..line_offset + value_end,
+        )
+    } else {
+        let value_start = cursor;
+        let mut value_end = bytes.len();
+        for index in value_start..bytes.len() {
+            if bytes[index] == b'#'
+                && (index == value_start || bytes[index - 1].is_ascii_whitespace())
+            {
+                value_end = index;
+                break;
+            }
+        }
+        while value_end > value_start && bytes[value_end - 1].is_ascii_whitespace() {
+            value_end -= 1;
+        }
+        (
+            line[value_start..value_end].to_string(),
+            line_offset + value_start..line_offset + value_end,
+        )
+    };
+
+    Ok(Some(SelectedEnvEntry {
+        key: key.to_string(),
+        value,
+        value_range: range,
+    }))
+}
+
+fn decode_double_quoted_value(value: &str) -> String {
+    let mut decoded = String::with_capacity(value.len());
+    let mut characters = value.chars();
+    while let Some(character) = characters.next() {
+        if character != '\\' {
+            decoded.push(character);
+            continue;
+        }
+
+        match characters.next() {
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some('t') => decoded.push('\t'),
+            Some('"') => decoded.push('"'),
+            Some('\\') => decoded.push('\\'),
+            Some(other) => {
+                decoded.push('\\');
+                decoded.push(other);
+            }
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
+}
+
+fn secret_values_match(left: &str, right: &str) -> bool {
+    left.as_bytes() == right.as_bytes()
+}
+
+fn replace_env_file(path: &Path, original: &[u8], attached: &[u8]) -> crate::core::Result<()> {
+    if fs::read(path)? != original {
+        return Err(VaultError::InvalidEnvFile(format!(
+            "{} changed while it was being attached; retry",
+            path.display()
+        )));
+    }
+
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temp_path = parent.join(format!(".{file_name}.wispkey-{}.tmp", Uuid::new_v4()));
+    secure_files::write_private_in_existing_directory(&temp_path, attached)?;
+    if let Err(error) = fs::rename(&temp_path, path) {
+        let _ = fs::remove_file(&temp_path);
+        return Err(VaultError::Io(error));
+    }
+    Ok(())
 }
 
 /// Parses a `.env` file, auto-detects credential types, and imports each entry into the vault.
@@ -383,5 +1029,15 @@ mod tests {
         let entries = parse_env(content);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].key, "SAFE_KEY");
+    }
+
+    #[test]
+    fn selected_entry_decodes_double_quoted_escapes_and_preserves_byte_range() {
+        let content = "PORT=3000\r\nPRIVATE_KEY=\"first\\nsecond\" # comment\r\n";
+        let entries = selected_env_entries(content, &["PRIVATE_KEY".to_string()]).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].value, "first\nsecond");
+        assert_eq!(&content[entries[0].value_range.clone()], "first\\nsecond");
     }
 }

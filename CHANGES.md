@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Native .env discovery and attachment
+
+- Added `wispkey env list [directory]` to recursively discover attachable `.env*` files without opening them. Global `--format json` output returns absolute paths and explicit traversal warnings for agent automation.
+- Added `wispkey env attach <path> --project <project> --key <name>... [--environment <environment>]`. It imports only explicitly selected values, auto-creates the project and environment partition, preserves ordinary settings and comments, and atomically replaces selected plaintext values with `wk_*` tokens in the same file.
+- `.env` maps to the `default` environment and `.env.<name>` maps to `<name>`. Credential names receive the environment prefix so identical variable names can coexist across environment partitions despite project-wide credential-name uniqueness.
+- Attachment is idempotent for matching stored values and existing tokens. Missing keys, unknown tokens, cross-environment credentials, and value conflicts fail without rewriting the source file.
+
 ### Cross-machine and Firecracker instance access
 
 - Added `firecracker-vsock:/absolute/base.sock:<port>` listeners for Firecracker's actual guest-to-host transport. WispKey binds Firecracker's required `<base>_<port>` Unix socket while preserving the existing feature-gated `vsock://<cid>:<port>` listener for Linux environments that expose host AF_VSOCK directly.

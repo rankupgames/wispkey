@@ -15,6 +15,7 @@ WispKey is a credential firewall for AI agents. Its main boundary is between a p
 - Silent vault-backed credential use. WispKey writes use and denial events to the SQLite audit log. Env-sideload-only proxy use without an unlocked vault writes fallback JSONL audit events.
 - Owner-approved plaintext egress. `wispkey exec` records `CredentialExec` audit events when it injects a credential into a child process through stdin, a child-only environment variable, or askpass. `wispkey run` records `CredentialRun` events for manifest-based child environment injection, and `wispkey inject` records `CredentialInject` events for template rendering.
 - Accidental env-sideload disclosure. `WISPKEY_SIDELOAD_<SLUG>` values are exposed to agents as deterministic `wk_env_<slug>` tokens; the raw env value is not printed or logged.
+- Plaintext `.env` persistence after successful attachment. `wispkey env attach` imports only explicitly selected keys and atomically replaces those values in the existing file with owner-only `wk_*` tokens while preserving unselected settings.
 - Timing disclosure of proxy management tokens through direct string comparison. Management API tokens are compared in constant time.
 
 ## Explicit Limits
@@ -31,6 +32,9 @@ WispKey is a credential firewall for AI agents. Its main boundary is between a p
 - Secrets are no longer protected by WispKey after they are intentionally sent upstream. The upstream service, SDKs, logs, and process memory are outside WispKey's boundary.
 - `wispkey exec`, `wispkey run`, and `wispkey inject` are deliberate plaintext-egress paths for owner-run non-HTTP tools, similar in trust level to `op run` or `aws-vault exec`. A compromised owner shell can still run these commands or use the child process or rendered file to misuse the credential.
 - Plaintext secrets stored in external client configuration, shell startup files, or MCP `env` blocks are outside the vault. Prefer process environment forwarding or an OS credential manager when available.
+- Wisp tokens are capabilities, not harmless identifiers. Without a credential host allowlist or a restrictive policy, a prompt-injected agent can direct a substitution-capable request to an unintended host and cause WispKey to send the plaintext credential there. Configure host restrictions and policies before exposing tokens to untrusted agents. `env attach` cannot infer host allowlists.
+- A `wk_*` value in `.env` is an opaque placeholder, not automatic plaintext environment injection. It works only when the consuming request passes through a substitution-capable WispKey path. HTTPS CONNECT is blind, and database URLs, ports, paths, and other non-HTTP values should use `run`, `exec`, or `inject` instead of `env attach`.
+- `.env` replacement and vault insertion are not one cross-resource transaction. Credential conflicts are preflighted before insertion and do not rewrite the file, but a final filesystem failure can leave newly imported credentials in the vault while the original `.env` remains unchanged. Fix the filesystem error and re-run attachment; matching stored values are idempotently reused.
 
 ## Session Boundary
 

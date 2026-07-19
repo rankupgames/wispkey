@@ -1,0 +1,254 @@
+mod common;
+
+use std::fs;
+use std::path::PathBuf;
+
+use common::*;
+
+#[test]
+fn env_list_discovers_attachable_files_without_generated_or_dependency_files() {
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    fs::create_dir_all(workspace.path().join("apps/api")).expect("create app directory");
+    fs::create_dir_all(workspace.path().join("node_modules/package"))
+        .expect("create dependency directory");
+    fs::write(workspace.path().join(".env"), "ROOT_SECRET=value\n").expect("write root env");
+    fs::write(
+        workspace.path().join("apps/api/.env.production"),
+        "API_SECRET=value\n",
+    )
+    .expect("write nested env");
+    fs::write(workspace.path().join(".env.example"), "EXAMPLE=value\n").expect("write example env");
+    fs::write(workspace.path().join(".env.wispkey"), "TOKEN=wk_example\n")
+        .expect("write generated env");
+    fs::write(
+        workspace.path().join("node_modules/package/.env"),
+        "DEPENDENCY_SECRET=value\n",
+    )
+    .expect("write dependency env");
+
+    let directory = workspace.path().to_str().expect("utf-8 workspace path");
+    let output = wispkey_bin()
+        .args(["env", "list", directory, "--format", "json"])
+        .output()
+        .expect("run env list");
+    let value = output_json(&["env", "list"], output);
+    let files: Vec<PathBuf> = value["files"]
+        .as_array()
+        .expect("files array")
+        .iter()
+        .map(|path| PathBuf::from(path.as_str().expect("file path")))
+        .collect();
+
+    assert_eq!(files.len(), 2);
+    assert!(files.contains(&fs::canonicalize(workspace.path().join(".env")).expect("root env")));
+    assert!(
+        files.contains(
+            &fs::canonicalize(workspace.path().join("apps/api/.env.production"))
+                .expect("production env")
+        )
+    );
+    assert_eq!(value["warnings"].as_array().expect("warnings").len(), 0);
+}
+
+#[test]
+fn env_attach_creates_project_environment_and_only_tokenizes_selected_keys() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let env_path = workspace.path().join(".env.production");
+    let openai_secret = "test-openai-secret";
+    let database_secret = "postgres://user:pass@localhost/app";
+    fs::write(
+        &env_path,
+        format!(
+            "PORT=3000\nOPENAI_API_KEY={openai_secret}\nDATABASE_URL=\"{database_secret}\" # local database\n"
+        ),
+    )
+    .expect("write env");
+    let env_path_string = env_path.to_str().expect("utf-8 env path");
+    let args = [
+        "env",
+        "attach",
+        env_path_string,
+        "--project",
+        "weather-app",
+        "--key",
+        "OPENAI_API_KEY",
+        "--key",
+        "DATABASE_URL",
+        "--format",
+        "json",
+    ];
+
+    let attached = run_wispkey_json(vault_dir.path(), &args);
+    assert_eq!(attached["project"], "weather-app");
+    assert_eq!(attached["environment"], "production");
+    assert_eq!(attached["partition"], "production");
+    assert_eq!(attached["imported"], 2);
+    assert_eq!(attached["updated"], 2);
+    assert_eq!(attached["project_created"], true);
+    assert_eq!(attached["environment_created"], true);
+
+    let rewritten = fs::read_to_string(&env_path).expect("read attached env");
+    assert!(rewritten.contains("PORT=3000"));
+    assert!(rewritten.contains(" # local database"));
+    assert!(!rewritten.contains(openai_secret));
+    assert!(!rewritten.contains(database_secret));
+    for credential in attached["credentials"]
+        .as_array()
+        .expect("attached credentials")
+    {
+        let token = credential["wisp_token"].as_str().expect("wisp token");
+        assert!(rewritten.contains(token));
+    }
+
+    let listed = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "list",
+            "--project",
+            "weather-app",
+            "--partition",
+            "production",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        credential_names(&listed),
+        vec![
+            "production-database-url".to_string(),
+            "production-openai-api-key".to_string(),
+        ]
+    );
+
+    let attached_again = run_wispkey_json(vault_dir.path(), &args);
+    assert_eq!(attached_again["imported"], 0);
+    assert_eq!(attached_again["already_attached"], 2);
+    assert_eq!(attached_again["updated"], 0);
+
+    #[cfg(unix)]
+    assert_eq!(file_mode(&env_path), 0o600);
+}
+
+#[test]
+fn env_attach_conflict_leaves_file_unchanged() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let env_path = workspace.path().join(".env.local");
+    fs::write(&env_path, "API_TOKEN=first-secret\n").expect("write first env");
+    let env_path_string = env_path.to_str().expect("utf-8 env path");
+    let args = [
+        "env",
+        "attach",
+        env_path_string,
+        "--project",
+        "conflict-app",
+        "--key",
+        "API_TOKEN",
+        "--format",
+        "json",
+    ];
+    run_wispkey_json(vault_dir.path(), &args);
+
+    let conflicting = "API_TOKEN=different-secret\n";
+    fs::write(&env_path, conflicting).expect("replace with conflicting env");
+    let output = run_wispkey(vault_dir.path(), &args);
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(&env_path).expect("read conflicting env"),
+        conflicting
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("different value"), "stderr: {stderr}");
+    assert!(!stderr.contains("different-secret"));
+}
+
+#[test]
+fn env_attach_scopes_the_same_key_to_separate_environment_partitions() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let development_path = workspace.path().join(".env.development");
+    let production_path = workspace.path().join(".env.production");
+    fs::write(&development_path, "API_TOKEN=development-secret\n").expect("write development");
+    fs::write(&production_path, "API_TOKEN=production-secret\n").expect("write production");
+
+    for (path, environment) in [
+        (&development_path, "development"),
+        (&production_path, "production"),
+    ] {
+        let attached = run_wispkey_json(
+            vault_dir.path(),
+            &[
+                "env",
+                "attach",
+                path.to_str().expect("utf-8 env path"),
+                "--project",
+                "multi-env-app",
+                "--key",
+                "API_TOKEN",
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(attached["environment"], environment);
+
+        let listed = run_wispkey_json(
+            vault_dir.path(),
+            &[
+                "list",
+                "--project",
+                "multi-env-app",
+                "--partition",
+                environment,
+                "--format",
+                "json",
+            ],
+        );
+        assert_eq!(
+            credential_names(&listed),
+            vec![format!("{environment}-api-token")]
+        );
+    }
+}
+
+#[test]
+fn env_attach_missing_key_does_not_create_project_or_modify_file() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let env_path = workspace.path().join(".env");
+    let original = "PORT=3000\n";
+    fs::write(&env_path, original).expect("write env");
+    let output = run_wispkey(
+        vault_dir.path(),
+        &[
+            "env",
+            "attach",
+            env_path.to_str().expect("utf-8 env path"),
+            "--project",
+            "missing-key-app",
+            "--key",
+            "API_TOKEN",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert!(!output.status.success());
+    assert_eq!(fs::read_to_string(&env_path).expect("read env"), original);
+    let projects = run_wispkey_json(vault_dir.path(), &["project", "list", "--format", "json"]);
+    assert!(
+        projects["projects"]
+            .as_array()
+            .expect("projects")
+            .iter()
+            .all(|project| project["name"] != "missing-key-app")
+    );
+}
