@@ -76,6 +76,15 @@ pub async fn handle_serve(
         }
     };
 
+    if listener_configs
+        .iter()
+        .any(|config| config.spec.is_non_loopback_tcp() && !config.require_identity)
+    {
+        eprintln!(
+            "Warning: a non-loopback TCP listener has instance authentication disabled. Use only inside a protected tunnel or trusted host-only network."
+        );
+    }
+
     if listen_specs.is_empty() && port == 0 {
         println!("Starting WispKey proxy on a random port...");
     } else if listen_specs.is_empty() {
@@ -331,5 +340,8 @@ fn listen_config_display(config: &ListenConfig) -> String {
         ListenSpec::Tcp(addr) => format!("tcp://{addr}"),
         ListenSpec::Unix(path) => format!("unix:{}", path.display()),
         ListenSpec::Vsock { cid, port } => format!("vsock://{cid}:{port}"),
+        ListenSpec::FirecrackerVsock { uds_path, port } => {
+            format!("firecracker-vsock:{}:{port}", uds_path.display())
+        }
     }
 }

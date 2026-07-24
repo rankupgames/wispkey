@@ -98,16 +98,22 @@ pub async fn handle_policy_check() {
         std::process::exit(1);
     });
     match toml::from_str::<crate::policy::PolicyConfig>(&content) {
-        Ok(config) => {
-            println!(
-                "OK -- {} policies parsed from {}",
-                config.policy.len(),
-                path.display()
-            );
-            for policy in &config.policy {
-                println!("  [{}] ok", policy.name);
+        Ok(config) => match crate::policy::validate_policy_config(&config) {
+            Ok(()) => {
+                println!(
+                    "OK -- {} policies parsed from {}",
+                    config.policy.len(),
+                    path.display()
+                );
+                for policy in &config.policy {
+                    println!("  [{}] ok", policy.name);
+                }
             }
-        }
+            Err(error) => {
+                eprintln!("INVALID -- {}", error);
+                std::process::exit(1);
+            }
+        },
         Err(e) => {
             eprintln!("INVALID -- parse error in {}", path.display());
             eprintln!("{}", e);

@@ -62,6 +62,9 @@ pub(super) fn table_has_column(db: &Connection, table: &str, column: &str) -> Re
         "audit_log" => "PRAGMA table_info(audit_log)",
         "credentials" => "PRAGMA table_info(credentials)",
         "partitions" => "PRAGMA table_info(partitions)",
+        "instances" => "PRAGMA table_info(instances)",
+        "instance_scopes" => "PRAGMA table_info(instance_scopes)",
+        "access_requests" => "PRAGMA table_info(access_requests)",
         _ => return Err(VaultError::Database(rusqlite::Error::InvalidQuery)),
     };
     let mut stmt = db.prepare(query)?;

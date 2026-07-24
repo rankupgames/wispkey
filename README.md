@@ -49,7 +49,8 @@ Four commands from zero to protected. The AI process never touches your real sec
 - **Wisp token proxy** -- HTTP forward proxy + blind HTTPS CONNECT tunneling + HTTPS reverse proxy mode (`X-Target-Url` header) on localhost:7700
 - **CLI** -- Credential lifecycle, project and partition management, encrypted bundle import/export, proxy serving, subprocess/template injection, instance administration, and audit export/tail
 - **MCP server** -- Native integration with Cursor, Claude Code, Windsurf via stdio JSON-RPC, including first-class env-sideloaded credentials for locked-vault use
-- **Multi-instance access** -- Enroll ephemeral VMs or worker instances with per-request identity, least-privilege credential scope, scoped bootstrap-token self-enrollment, UDS/vsock-ready proxy listeners, and host-approved access escalation
+- **Multi-instance access** -- Enroll ephemeral VMs or worker instances with per-request identity, least-privilege credential scope, scoped bootstrap-token self-enrollment, cross-platform TCP, Unix, Linux AF_VSOCK, and Firecracker UDS-backed vsock listeners, plus host-approved access escalation
+- **Rotation-ready instance identities** -- Schedule due-aware 48-character CSPRNG secret rotation with a bounded rollout grace window; the previous secret is retired as soon as the new secret first authenticates
 - **.env importer** -- One-command migration with auto-detection of OpenAI, GitHub, Slack, AWS, and bearer token patterns
 
 ### Organization
@@ -166,7 +167,7 @@ args = ["mcp", "serve"]
 env_vars = ["WISPKEY_SIDELOAD_OPENAI"]
 ```
 
-Start the WispKey proxy with the same `WISPKEY_SIDELOAD_<SLUG>` env var if you want the proxy to substitute the `wk_env_<slug>` token in outbound requests.
+Start the WispKey proxy with the same `WISPKEY_SIDELOAD_<SLUG>` env var if you want the proxy to substitute the `wk_env_<slug>` token in outbound requests. Env sideloads are limited to the trusted local workflow; identity-authenticated instances cannot use them because sideloads have no persisted credential ID that can be enrolled or approved.
 
 For JSON-style MCP configs that do not support `env_vars`, set the sideload variable in the client process environment or in the MCP server's `env` block:
 
@@ -225,12 +226,22 @@ printf '%s' "$BOOTSTRAP_TOKEN" | wispkey instance join --token-file - --name wor
 
 Remote first-contact self-enrollment can use `POST /api/instances/join`; that endpoint is authenticated by the bootstrap token and does not require a management token or existing instance identity.
 
-Unix domain socket and vsock listeners require instance identity by default. Loopback TCP keeps the original trusted-local behavior unless `--require-identity` is set. Out-of-scope token use returns `403 out_of_scope`, queues an access request, and can be approved by the host:
+Unix domain socket, Linux vsock, Firecracker vsock, and non-loopback TCP listeners require instance identity by default. Loopback TCP keeps the original trusted-local behavior unless `--require-identity` is set. For Windows or another server, keep WispKey on loopback and reach it through an SSH tunnel, or use an identity-required host-only TCP network. Credential selectors and approvals bind to the resolved credential ID rather than its project-local display name. Out-of-scope vault-token use returns `403 out_of_scope`, queues an access request, and can be approved by the host; env-sideload tokens are always out of scope for authenticated instances:
 
 ```bash
 wispkey instance requests --pending
 wispkey instance approve req_...
 ```
+
+Instance secrets can be rotated safely from cron, systemd timers, CI, or Windows Task Scheduler. The command emits a new one-time secret only when rotation is due:
+
+```bash
+wispkey --format json instance rotate-secret worker-acme-001 \
+  --if-older-than 30d \
+  --grace 15m
+```
+
+Deliver the JSON result through a protected deployment channel and do not log its stdout. During the grace window both secrets work; the first successful request with the new secret retires the previous secret immediately.
 
 See [`docs/multi-instance-deployment.md`](docs/multi-instance-deployment.md) for the deployment model, listener options, and a Firecracker microVM example.
 
@@ -256,7 +267,7 @@ allowed_methods = ["GET"]
 denied_paths = ["/admin/**", "/delete/**"]
 allowed_hosts = ["api.aws.com"]
 rate_limit = "10/minute"
-time_window = "09:00-17:00 America/New_York"
+time_window = "09:00-17:00" # local machine time
 ```
 
 Manage policies via CLI:
@@ -273,7 +284,7 @@ Agent-scoped policies fail closed when the requester agent identity is unavailab
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 Each project gets its own `personal` partition, so partition names are project-scoped.
-Credential names are unique within a project, not across the whole vault. The same credential name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve against the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v7 automatically.
+Credential names are unique within a project, not across the whole vault. The same credential name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve against the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v10 automatically.
 
 ```bash
 wispkey project create "client-alpha" --description "Client Alpha credentials"
@@ -304,7 +315,7 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey exec --credential <name> [--project P] [--stdin] [--env VAR]... [--askpass] -- <command> [args...]` | Inject a credential into a child process through audited stdin, child-only env, or askpass channels |
 | `wispkey run [--manifest PATH] [--project P] -- <command> [args...]` | Run a child process with manifest-defined child-only environment variables |
 | `wispkey inject -i <infile|-> [-o <outfile>] [--project P] [--stdout]` | Render `{{ cred:<name> }}` template references to an owner-only file or explicit stdout |
-| `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start the proxy; `SPEC` supports `tcp://host:port`, `unix:/path.sock`, and feature-gated `vsock://cid:port` |
+| `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start the proxy; `SPEC` supports `tcp://host:port`, `unix:/path.sock`, feature-gated Linux `vsock://cid:port`, and `firecracker-vsock:/path.sock:port` |
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Import credentials from a `.env` file |
 | `wispkey status` | Show vault, session, and proxy status |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Query audit events |
@@ -315,6 +326,7 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey credential export/import` | Export or import one encrypted credential bundle |
 | `wispkey instance enroll <name> [--description D] [--partition P]... [--project P]... [--credential C]... [--tag T]...` | Enroll a host-managed instance identity |
 | `wispkey instance list/show/scope/revoke/requests/approve/deny` | List, inspect, scope, revoke, and approve or deny instance access requests |
+| `wispkey instance rotate-secret <name> [--if-older-than 30d] [--grace 10m]` | Schedule-safe instance-secret rotation with bounded overlap |
 | `wispkey instance bootstrap create/list/revoke` | Manage scoped, atomic bootstrap tokens for fleet self-enrollment |
 | `wispkey instance join [<bootstrap-token>] [--token-file <path|->] --name <instance-name>` | Redeem a bootstrap token; prefer `--token-file -` to avoid argv exposure |
 | `wispkey mcp serve` | Start the MCP server over stdio |

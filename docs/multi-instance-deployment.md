@@ -2,7 +2,7 @@
 
 WispKey can serve untrusted ephemeral VMs and worker instances without giving them plaintext secrets. The host keeps the vault and proxy. Each instance receives only opaque `wk_*` tokens plus a per-instance identity, and WispKey swaps tokens for real credentials only at the proxy boundary.
 
-This guide covers stages 1-2 of multi-instance access: enrollment, scoped token injection, host-approved escalation, and multi-transport proxy listeners.
+This guide covers enrollment, scoped token injection, host-approved escalation, and cross-machine or VM proxy listeners.
 
 ## Model
 
@@ -22,7 +22,7 @@ Scope selectors are ORed. A credential is in scope if it matches any selector:
 - `--credential <name>`
 - `--tag <tag>`
 
-Tag matching is exact, so tags such as `company:acme` are useful for tenant or customer grouping. Approved access requests also act as implicit credential scope. In-scope credentials work automatically; out-of-scope credentials fail closed, create a pending request, and require host approval before retry.
+Tag matching is exact, so tags such as `company:acme` are useful for tenant or customer grouping. Credential selectors resolve the name in the active project and persist that credential's exact ID. Approved access requests also bind to the exact credential ID, so same-named credentials in other projects remain out of scope. In-scope vault credentials work automatically; out-of-scope vault credentials fail closed, create a pending request, and require host approval before retry. Env-sideload tokens cannot be enrolled or approved and are denied for instance-authenticated requests.
 
 ## Host Workflow
 
@@ -103,19 +103,80 @@ Supported listener specs:
 
 | Transport | Example | Default identity requirement |
 |-----------|---------|------------------------------|
-| TCP | `tcp://127.0.0.1:7700` | `false` |
+| Loopback TCP | `tcp://127.0.0.1:7700` | `false` |
+| Non-loopback TCP | `tcp://192.168.4.20:7700` | `true` |
 | Unix domain socket | `unix:/run/wispkey/proxy.sock` | `true` |
-| vsock | `vsock://2:7700` | `true` |
+| Linux AF_VSOCK | `vsock://2:7700` | `true` |
+| Firecracker UDS-backed vsock | `firecracker-vsock:/run/wispkey/worker.vsock:7700` | `true` |
 
 Use `--require-identity` or `--no-require-identity` to override the default for all listeners in one `serve` invocation.
 
-Use identity-required listeners for untrusted instances. TCP is best kept on loopback or a host-only network. Unix sockets and vsock are better fits for VM-to-host proxying because they avoid exposing a general network port.
+Use identity-required listeners for untrusted instances. TCP is best kept on loopback behind an SSH tunnel or on an encrypted host-only network. Per-instance authentication does not encrypt TCP, so do not send the instance bearer secret over an observable LAN or public network. Unix sockets and vsock are better fits for same-host VM-to-host proxying because they avoid exposing a general network port.
 
 The Unix socket file is created with mode `0600`. If WispKey creates the parent directory, it hardens that directory; it does not chmod a pre-existing parent directory. This allows shared system directories such as `/run` to keep their existing ownership and mode.
 
 Unix socket paths must be short because the OS stores them in a fixed-size field. macOS is commonly limited to about 104 bytes. Prefer `unix:/run/wispkey/proxy.sock`.
 
-Vsock is Linux-only and compiled behind the optional `vsock` feature. Without that feature, `vsock://...` listeners return a clear "vsock support not compiled in" error. The vsock path is intended for guest-to-host VM networking and is currently unverified on macOS.
+The `vsock://` listener is Linux-only, compiled behind the optional `vsock` feature, and uses host AF_VSOCK directly. Without that feature it returns a clear "vsock support not compiled in" error.
+
+Firecracker does not expose guest connections through host AF_VSOCK. It maps guest AF_VSOCK port `P` to a host Unix socket named `<uds_path>_P`. Use `firecracker-vsock:` for Firecracker; it is UDS-backed and works in the default build on Unix hosts.
+
+## Windows And Remote Servers
+
+Windows clients use the TCP transport. The safest simple topology is to keep the WispKey host listener on loopback and carry it through OpenSSH, which is available on current Windows installations.
+
+On the WispKey host:
+
+```bash
+wispkey serve --listen tcp://127.0.0.1:7700 --require-identity
+```
+
+On the remote Linux server, macOS machine, or Windows PowerShell session, open a local tunnel to the WispKey host:
+
+```powershell
+ssh -o KexAlgorithms=mlkem768x25519-sha256 `
+  -o UpdateHostKeys=yes `
+  -o ExitOnForwardFailure=yes `
+  -N -L 17700:127.0.0.1:7700 wispkey-host
+```
+
+The explicit `KexAlgorithms` setting fails closed instead of falling back to a classical-only exchange. OpenSSH 9.9 added `mlkem768x25519-sha256`, and OpenSSH 10.0 made it the default. Check support with `ssh -Q kex`; if either endpoint lacks the algorithm, upgrade OpenSSH before relying on the tunnel for store-now-decrypt-later protection. Windows in-box OpenSSH can lag current releases, so follow Microsoft's supported [OpenSSH upgrade guidance](https://learn.microsoft.com/en-us/troubleshoot/windows-server/system-management-components/upgrade-in-box-openssh-to-latest-openssh-release).
+
+`UpdateHostKeys=yes` lets a trusted server advertise replacement host keys and helps ordinary host-key rotation. It is not a substitute for hybrid post-quantum key exchange, and current post-quantum SSH host-signature support remains version-dependent. See the [OpenSSH release notes](https://www.openssh.com/releasenotes.html).
+
+The remote machine now reaches WispKey at `127.0.0.1:17700`. Send the enrolled instance id and secret on every request. For example in PowerShell:
+
+```powershell
+$env:WISPKEY_INSTANCE_ID = "inst_..."
+$env:WISPKEY_INSTANCE_SECRET = "..."
+$env:OPENAI_API_KEY = "wk_openai_prod_a7x9m2k4"
+
+curl.exe http://127.0.0.1:17700 `
+  -H "X-Target-Url: https://api.openai.com/v1/chat/completions" `
+  -H "Authorization: Bearer $env:OPENAI_API_KEY" `
+  -H "x-wispkey-instance-id: $env:WISPKEY_INSTANCE_ID" `
+  -H "x-wispkey-instance-secret: $env:WISPKEY_INSTANCE_SECRET" `
+  -H "Content-Type: application/json" `
+  -d '{"model":"gpt-4.1-mini","messages":[{"role":"user","content":"hello"}]}'
+```
+
+This tunnel keeps the instance bearer identity and request contents off the LAN. WispKey removes the identity headers before forwarding upstream. A direct non-loopback TCP listener automatically requires identity, but it still needs an encrypted private channel if other machines can observe that network.
+
+## Automatic Instance Secret Rotation
+
+Instance identities use 48 uniformly generated mixed-alphanumeric characters, approximately 286 bits of symmetric entropy. Quantum-resistant transport and secret rotation solve different problems: hybrid SSH key exchange protects captured traffic, while rotation limits how long a copied bearer secret remains useful.
+
+Run this command from cron, a systemd timer, CI, launchd, or Windows Task Scheduler:
+
+```bash
+wispkey --format json instance rotate-secret worker-acme-001 --if-older-than 30d --grace 15m
+```
+
+The JSON response always includes `rotated`. When it is `false`, no secret changed and `secret` is `null`. When it is `true`, `secret` contains the new value exactly once. Send that value to the instance through the hybrid post-quantum tunnel or another protected deployment channel, update the remote secret store atomically, and do not retain scheduler stdout in logs.
+
+The previous secret remains valid until the grace deadline so a failed deployment does not immediately strand the instance. Its first successful request with the new secret confirms rollout and retires the previous secret early. Use `--grace 0s` only when the consumer update is atomic with the rotation command.
+
+The host stores only Argon2id hashes for both the current and grace-period secrets. Rotation uses a compare-and-swap update against the active instance, current hash, and rotation timestamp, so concurrent rotation or revocation fails closed rather than overwriting newer state.
 
 ## Instance Request Flow
 
@@ -170,7 +231,7 @@ wispkey instance approve req_...
 wispkey instance deny req_...
 ```
 
-After approval, the instance can retry the same request and WispKey treats the approved request as an implicit credential scope.
+After approval, the instance can retry the same request and WispKey treats the approved credential ID as an implicit scope.
 
 ## Firecracker / boring-computers Example
 
@@ -182,18 +243,33 @@ A practical Firecracker setup uses the host as the credential boundary:
 4. The microVM routes egress through WispKey.
 5. WispKey authenticates the instance, checks scope, applies credential host restrictions and policies, writes audit events, and swaps `wk_*` tokens for real secrets only at the proxy boundary.
 
-Host setup with a Unix socket:
+Host setup with Firecracker's UDS-backed vsock bridge:
 
 ```bash
 wispkey instance enroll bc-acme-build-001 \
   --tag company:acme \
   --partition customer-acme
 
-wispkey serve --listen unix:/run/wispkey/proxy.sock
+wispkey serve --listen firecracker-vsock:/run/wispkey/bc-acme-build-001.vsock:7700
 ```
 
-The boring-computers launcher records the one-time enrollment output and starts the microVM with `WISPKEY_INSTANCE_ID`, `WISPKEY_INSTANCE_SECRET`, and only the `wk_*` tokens it should use. How the guest reaches the listener depends on the runtime: expose a short host Unix socket path, forward a host-only helper to the UDS, or use `vsock://<cid>:<port>` on Linux builds compiled with `--features vsock`.
+Configure the Firecracker VM with the same base socket path and a unique guest CID:
+
+```json
+{
+  "vsock": {
+    "guest_cid": 3,
+    "uds_path": "/run/wispkey/bc-acme-build-001.vsock"
+  }
+}
+```
+
+WispKey binds `/run/wispkey/bc-acme-build-001.vsock_7700`. Inside the guest, connect AF_VSOCK to host CID `2`, port `7700`. Firecracker bridges that connection to WispKey's Unix socket. Use a unique base path and instance identity per microVM.
+
+This path was verified on a real Firecracker guest on RUG-DEV-1 on 2026-07-09 with scoped injection, out-of-scope denial, host approval and retry, and revocation. The verification used a disposable vault and synthetic credentials.
+
+The boring-computers launcher records the one-time enrollment output and starts the microVM with `WISPKEY_INSTANCE_ID`, `WISPKEY_INSTANCE_SECRET`, and only the `wk_*` tokens it should use. Generic hypervisors that expose host AF_VSOCK directly can instead use `vsock://<cid>:<port>` on Linux builds compiled with `--features vsock`.
 
 The invariant is that the guest receives no plaintext secrets. A compromised microVM can use credentials already in its WispKey scope, but out-of-scope credentials fail closed and require a host approval step before retry.
 
-Operationally, treat the instance secret as a bearer credential, rotate it by revoking and re-enrolling, prefer narrow selectors such as `--credential` or tenant tags, keep UDS paths short and host-owned, and keep using credential host restrictions and TOML policies. Instance scope is an additional gate, not a replacement for policy.
+Operationally, treat the instance secret as a bearer credential, rotate it with `instance rotate-secret`, prefer narrow selectors such as `--credential` or tenant tags, keep UDS paths short and host-owned, and keep using credential host restrictions and TOML policies. Instance scope is an additional gate, not a replacement for policy.

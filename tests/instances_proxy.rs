@@ -29,6 +29,33 @@ fn start_uds_proxy(vault_dir: &std::path::Path, socket_path: &std::path::Path) -
     ChildGuard(child)
 }
 
+fn start_all_projects_uds_proxy(
+    vault_dir: &std::path::Path,
+    socket_path: &std::path::Path,
+    sideload: bool,
+) -> ChildGuard {
+    let mut command = wispkey_bin();
+    command
+        .args([
+            "serve",
+            "--all-projects",
+            "--listen",
+            &format!("unix:{}", socket_path.display()),
+        ])
+        .env("WISPKEY_VAULT_PATH", vault_dir)
+        .env("WISPKEY_PASSWORD", "test-password")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if sideload {
+        command.env("WISPKEY_SIDELOAD_OPENAI", "sideload-secret");
+    }
+
+    let child = command.spawn().expect("spawn all-projects uds proxy");
+    let _ = wait_for_proxy_info(vault_dir);
+    wait_for_socket(socket_path);
+    ChildGuard(child)
+}
+
 fn wait_for_socket(path: &std::path::Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -50,6 +77,40 @@ fn send_uds_request(socket_path: &std::path::Path, request: &str) -> String {
         .read_to_string(&mut response)
         .expect("read uds response");
     response
+}
+
+#[test]
+fn firecracker_vsock_listener_binds_the_guest_destination_socket() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    let socket_dir = tempfile::tempdir().expect("socket dir");
+    let uds_path = socket_dir.path().join("worker.vsock");
+    let guest_socket = socket_dir.path().join("worker.vsock_7700");
+    init_vault(vault_dir.path());
+
+    let listen_spec = format!("firecracker-vsock:{}:7700", uds_path.display());
+    let child = wispkey_bin()
+        .args(["serve", "--listen", &listen_spec])
+        .env("WISPKEY_VAULT_PATH", vault_dir.path())
+        .env("WISPKEY_PASSWORD", "test-password")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn Firecracker vsock proxy");
+    let metadata = wait_for_proxy_info(vault_dir.path());
+    wait_for_socket(&guest_socket);
+    let _proxy = ChildGuard(child);
+
+    assert_eq!(metadata["listeners"][0]["transport"], "firecracker-vsock");
+    assert_eq!(metadata["listeners"][0]["require_identity"], true);
+
+    let missing_identity = send_uds_request(
+        &guest_socket,
+        &request_without_identity(9, "wk_fake_12345678"),
+    );
+    assert!(
+        missing_identity.starts_with("HTTP/1.1 401 Unauthorized"),
+        "Firecracker bridge must require instance identity by default:\n{missing_identity}"
+    );
 }
 
 fn request_with_identity(
@@ -337,5 +398,186 @@ fn uds_listener_requires_instance_identity_and_enforces_scopes() {
     assert!(
         revoked.starts_with("HTTP/1.1 401 Unauthorized"),
         "revoked instance should be rejected:\n{revoked}"
+    );
+}
+
+#[test]
+fn credential_scope_does_not_authorize_same_name_in_another_project() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    let socket_dir = tempfile::tempdir().expect("socket dir");
+    let socket_path = socket_dir.path().join("wispkey.sock");
+    init_vault(vault_dir.path());
+
+    run_wispkey_json(
+        vault_dir.path(),
+        &["--format", "json", "project", "create", "client"],
+    );
+    run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "add",
+            "shared-name",
+            "--type",
+            "bearer_token",
+            "--value",
+            "default-secret",
+        ],
+    );
+    let client_credential = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "add",
+            "shared-name",
+            "--project",
+            "client",
+            "--type",
+            "bearer_token",
+            "--value",
+            "client-secret",
+        ],
+    );
+    let client_token = client_credential["credential"]["wisp_token"]
+        .as_str()
+        .expect("client token");
+    let enrolled = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "instance",
+            "enroll",
+            "credential-scoped-worker",
+            "--credential",
+            "shared-name",
+        ],
+    );
+    let instance_id = enrolled["id"].as_str().expect("instance id");
+    let instance_secret = enrolled["secret"].as_str().expect("instance secret");
+    let _proxy = start_all_projects_uds_proxy(vault_dir.path(), &socket_path, false);
+
+    let response = send_uds_request(
+        &socket_path,
+        &request_with_identity(9, client_token, instance_id, instance_secret),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden")
+            && response.contains("\"error\":\"out_of_scope\""),
+        "same-named credential from another project must remain out of scope:\n{response}"
+    );
+}
+
+#[test]
+fn approved_request_does_not_authorize_same_name_in_another_project() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    let socket_dir = tempfile::tempdir().expect("socket dir");
+    let socket_path = socket_dir.path().join("wispkey.sock");
+    init_vault(vault_dir.path());
+
+    run_wispkey_json(
+        vault_dir.path(),
+        &["--format", "json", "project", "create", "client"],
+    );
+    let default_credential = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "add",
+            "approval-name",
+            "--type",
+            "bearer_token",
+            "--value",
+            "default-secret",
+        ],
+    );
+    let client_credential = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "add",
+            "approval-name",
+            "--project",
+            "client",
+            "--type",
+            "bearer_token",
+            "--value",
+            "client-secret",
+        ],
+    );
+    let default_token = default_credential["credential"]["wisp_token"]
+        .as_str()
+        .expect("default token");
+    let client_token = client_credential["credential"]["wisp_token"]
+        .as_str()
+        .expect("client token");
+    let enrolled = run_wispkey_json(
+        vault_dir.path(),
+        &["--format", "json", "instance", "enroll", "approval-worker"],
+    );
+    let instance_id = enrolled["id"].as_str().expect("instance id");
+    let instance_secret = enrolled["secret"].as_str().expect("instance secret");
+    let _proxy = start_all_projects_uds_proxy(vault_dir.path(), &socket_path, false);
+
+    let initial = send_uds_request(
+        &socket_path,
+        &request_with_identity(9, default_token, instance_id, instance_secret),
+    );
+    assert!(initial.starts_with("HTTP/1.1 403 Forbidden"));
+    let requests = run_wispkey_json(
+        vault_dir.path(),
+        &["--format", "json", "instance", "requests", "--pending"],
+    );
+    let request_id = requests["requests"][0]["id"].as_str().expect("request id");
+    run_wispkey_json(
+        vault_dir.path(),
+        &["--format", "json", "instance", "approve", request_id],
+    );
+
+    let response = send_uds_request(
+        &socket_path,
+        &request_with_identity(9, client_token, instance_id, instance_secret),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden")
+            && response.contains("\"error\":\"out_of_scope\""),
+        "approval for one credential ID must not authorize a same-named credential:\n{response}"
+    );
+}
+
+#[test]
+fn instance_authenticated_request_denies_env_sideload() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    let socket_dir = tempfile::tempdir().expect("socket dir");
+    let socket_path = socket_dir.path().join("wispkey.sock");
+    init_vault(vault_dir.path());
+    let enrolled = run_wispkey_json(
+        vault_dir.path(),
+        &["--format", "json", "instance", "enroll", "sideload-worker"],
+    );
+    let instance_id = enrolled["id"].as_str().expect("instance id");
+    let instance_secret = enrolled["secret"].as_str().expect("instance secret");
+    let _proxy = start_all_projects_uds_proxy(vault_dir.path(), &socket_path, true);
+
+    let response = send_uds_request(
+        &socket_path,
+        &request_with_identity(9, "wk_env_openai", instance_id, instance_secret),
+    );
+
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden")
+            && response.contains("\"error\":\"out_of_scope\"")
+            && response.contains("WISPKEY_SIDELOAD_OPENAI"),
+        "identity-authenticated sideload use must fail closed:\n{response}"
+    );
+    assert!(
+        !response.contains("sideload-secret"),
+        "sideload denial must not expose the secret"
     );
 }

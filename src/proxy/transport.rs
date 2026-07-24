@@ -41,6 +41,7 @@ pub enum ListenSpec {
     Tcp(SocketAddr),
     Unix(PathBuf),
     Vsock { cid: u32, port: u32 },
+    FirecrackerVsock { uds_path: PathBuf, port: u32 },
 }
 
 impl ListenSpec {
@@ -79,8 +80,33 @@ impl ListenSpec {
             return Ok(Self::Vsock { cid, port });
         }
 
+        if let Some(address) = spec.strip_prefix("firecracker-vsock:") {
+            let (uds_path, port) = address.rsplit_once(':').ok_or_else(|| {
+                TransportError::InvalidListenSpec(format!(
+                    "invalid Firecracker vsock listen address '{spec}', expected firecracker-vsock:/absolute/path.sock:<port>"
+                ))
+            })?;
+            let uds_path = PathBuf::from(uds_path);
+            if !uds_path.is_absolute() {
+                return Err(TransportError::InvalidListenSpec(format!(
+                    "invalid Firecracker vsock path '{spec}', expected firecracker-vsock:/absolute/path.sock:<port>"
+                )));
+            }
+            let port = port.parse::<u32>().map_err(|_| {
+                TransportError::InvalidListenSpec(format!(
+                    "invalid Firecracker vsock port in '{spec}'"
+                ))
+            })?;
+            if port == 0 {
+                return Err(TransportError::InvalidListenSpec(format!(
+                    "invalid Firecracker vsock port in '{spec}': port must be greater than zero"
+                )));
+            }
+            return Ok(Self::FirecrackerVsock { uds_path, port });
+        }
+
         Err(TransportError::InvalidListenSpec(format!(
-            "unsupported listen spec '{spec}', expected tcp://host:port, unix:/path.sock, or vsock://cid:port"
+            "unsupported listen spec '{spec}', expected tcp://host:port, unix:/path.sock, vsock://cid:port, or firecracker-vsock:/path.sock:port"
         )))
     }
 
@@ -89,7 +115,14 @@ impl ListenSpec {
     }
 
     pub fn default_requires_identity(&self) -> bool {
-        !matches!(self, Self::Tcp(_))
+        match self {
+            Self::Tcp(address) => !address.ip().is_loopback(),
+            Self::Unix(_) | Self::Vsock { .. } | Self::FirecrackerVsock { .. } => true,
+        }
+    }
+
+    pub fn is_non_loopback_tcp(&self) -> bool {
+        matches!(self, Self::Tcp(address) if !address.ip().is_loopback())
     }
 }
 
@@ -137,6 +170,9 @@ impl BoundTransport {
             }
             ListenSpec::Unix(path) => bind_unix(path, config.require_identity).await,
             ListenSpec::Vsock { cid, port } => bind_vsock(cid, port, config.require_identity).await,
+            ListenSpec::FirecrackerVsock { uds_path, port } => {
+                bind_firecracker_vsock(uds_path, port, config.require_identity).await
+            }
         }
     }
 
@@ -200,6 +236,33 @@ async fn bind_unix(
     path: PathBuf,
     require_identity: bool,
 ) -> Result<BoundTransport, TransportError> {
+    let address = format!("unix:{}", path.display());
+    bind_unix_socket(path, "unix", address, require_identity).await
+}
+
+#[cfg(unix)]
+async fn bind_unix_socket(
+    path: PathBuf,
+    transport: &str,
+    address: String,
+    require_identity: bool,
+) -> Result<BoundTransport, TransportError> {
+    prepare_unix_socket_path(&path)?;
+    let listener = tokio::net::UnixListener::bind(&path)?;
+    harden_socket_file(&path)?;
+    Ok(BoundTransport {
+        listener: BoundListener::Unix(listener),
+        metadata: ListenerMetadata {
+            transport: transport.to_string(),
+            address,
+            require_identity,
+        },
+        cleanup_path: Some(path),
+    })
+}
+
+#[cfg(unix)]
+fn prepare_unix_socket_path(path: &Path) -> Result<(), TransportError> {
     if let Some(parent) = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -212,22 +275,41 @@ async fn bind_unix(
             crate::secure_files::ensure_private_directory(parent)?;
         }
     }
-    match std::fs::remove_file(&path) {
+    match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e.into()),
     }
-    let listener = tokio::net::UnixListener::bind(&path)?;
-    harden_socket_file(&path)?;
-    Ok(BoundTransport {
-        listener: BoundListener::Unix(listener),
-        metadata: ListenerMetadata {
-            transport: "unix".to_string(),
-            address: format!("unix:{}", path.display()),
-            require_identity,
-        },
-        cleanup_path: Some(path),
-    })
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(super) fn firecracker_guest_socket_path(uds_path: &Path, port: u32) -> PathBuf {
+    let mut socket_path = uds_path.as_os_str().to_owned();
+    socket_path.push(format!("_{port}"));
+    socket_path.into()
+}
+
+#[cfg(unix)]
+async fn bind_firecracker_vsock(
+    uds_path: PathBuf,
+    port: u32,
+    require_identity: bool,
+) -> Result<BoundTransport, TransportError> {
+    let socket_path = firecracker_guest_socket_path(&uds_path, port);
+    let address = format!("firecracker-vsock:{}:{port}", uds_path.display());
+    bind_unix_socket(socket_path, "firecracker-vsock", address, require_identity).await
+}
+
+#[cfg(not(unix))]
+async fn bind_firecracker_vsock(
+    _uds_path: PathBuf,
+    _port: u32,
+    _require_identity: bool,
+) -> Result<BoundTransport, TransportError> {
+    Err(TransportError::Unsupported(
+        "Firecracker vsock transport requires a Unix host".to_string(),
+    ))
 }
 
 #[cfg(not(unix))]

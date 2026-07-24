@@ -360,6 +360,105 @@ impl Vault {
             create_bootstrap_token_table(db)?;
             db.execute(
                 "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                params!["8"],
+            )?;
+        }
+
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "8".to_string());
+
+        if version.as_str() == "8" {
+            if !table_has_column(db, "instances", "secret_rotated_at")? {
+                db.execute(
+                    "ALTER TABLE instances ADD COLUMN secret_rotated_at TEXT",
+                    [],
+                )?;
+            }
+            if !table_has_column(db, "instances", "previous_secret_hash")? {
+                db.execute(
+                    "ALTER TABLE instances ADD COLUMN previous_secret_hash TEXT",
+                    [],
+                )?;
+            }
+            if !table_has_column(db, "instances", "previous_secret_expires_at")? {
+                db.execute(
+                    "ALTER TABLE instances ADD COLUMN previous_secret_expires_at TEXT",
+                    [],
+                )?;
+            }
+            db.execute(
+                "UPDATE instances SET secret_rotated_at = created_at WHERE secret_rotated_at IS NULL",
+                [],
+            )?;
+            db.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                params!["9"],
+            )?;
+        }
+
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "9".to_string());
+
+        if version.as_str() == "9" {
+            if !table_has_column(db, "instance_scopes", "credential_id")? {
+                db.execute(
+                    "ALTER TABLE instance_scopes ADD COLUMN credential_id TEXT REFERENCES credentials(id) ON DELETE CASCADE",
+                    [],
+                )?;
+            }
+            if !table_has_column(db, "access_requests", "credential_id")? {
+                db.execute(
+                    "ALTER TABLE access_requests ADD COLUMN credential_id TEXT REFERENCES credentials(id) ON DELETE CASCADE",
+                    [],
+                )?;
+            }
+            db.execute(
+                "UPDATE instance_scopes
+                 SET credential_id = (
+                     SELECT c.id FROM credentials c
+                     WHERE c.name = instance_scopes.scope_value
+                     LIMIT 1
+                 )
+                 WHERE scope_type = 'credential'
+                   AND credential_id IS NULL
+                   AND 1 = (
+                       SELECT COUNT(*) FROM credentials c
+                       WHERE c.name = instance_scopes.scope_value
+                   )",
+                [],
+            )?;
+            db.execute(
+                "UPDATE access_requests
+                 SET credential_id = (
+                     SELECT c.id FROM credentials c
+                     WHERE c.name = access_requests.credential_name
+                     LIMIT 1
+                 )
+                 WHERE credential_id IS NULL
+                   AND 1 = (
+                       SELECT COUNT(*) FROM credentials c
+                       WHERE c.name = access_requests.credential_name
+                   )",
+                [],
+            )?;
+            db.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_instance_scopes_credential_id
+                    ON instance_scopes(instance_id, credential_id);
+                 CREATE INDEX IF NOT EXISTS idx_access_requests_credential_id
+                    ON access_requests(instance_id, credential_id, status);",
+            )?;
+            db.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
                 params![CURRENT_SCHEMA_VERSION],
             )?;
         }
@@ -434,13 +533,17 @@ fn create_instance_tables(db: &Connection) -> Result<()> {
             description TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
-            last_seen_at TEXT
+            last_seen_at TEXT,
+            secret_rotated_at TEXT NOT NULL,
+            previous_secret_hash TEXT,
+            previous_secret_expires_at TEXT
         );
         CREATE TABLE IF NOT EXISTS instance_scopes (
             id TEXT PRIMARY KEY,
             instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
             scope_type TEXT NOT NULL,
             scope_value TEXT NOT NULL,
+            credential_id TEXT REFERENCES credentials(id) ON DELETE CASCADE,
             created_at TEXT NOT NULL,
             UNIQUE(instance_id, scope_type, scope_value)
         );
@@ -448,11 +551,16 @@ fn create_instance_tables(db: &Connection) -> Result<()> {
             id TEXT PRIMARY KEY,
             instance_id TEXT NOT NULL REFERENCES instances(id) ON DELETE CASCADE,
             credential_name TEXT NOT NULL,
+            credential_id TEXT REFERENCES credentials(id) ON DELETE CASCADE,
             status TEXT NOT NULL DEFAULT 'pending',
             reason TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL,
             decided_at TEXT
-        );",
+        );
+        CREATE INDEX IF NOT EXISTS idx_instance_scopes_credential_id
+            ON instance_scopes(instance_id, credential_id);
+        CREATE INDEX IF NOT EXISTS idx_access_requests_credential_id
+            ON access_requests(instance_id, credential_id, status);",
     )?;
     Ok(())
 }
