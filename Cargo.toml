@@ -45,6 +45,16 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # TLS provider (explicit dep so we can install the process-wide CryptoProvider at startup)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
+# PKI (CA-held leaf issuance). RSA generation uses the `rsa` crate because
+# rcgen's ring backend can sign with RSA keys but cannot generate them.
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "x509-parser"] }
+rsa = { version = "0.9", default-features = false, features = ["std", "pem", "u64_digit"] }
+p256 = { version = "0.13", default-features = false, features = ["std", "pem", "pkcs8", "arithmetic"] }
+p384 = { version = "0.13", default-features = false, features = ["std", "pem", "pkcs8", "arithmetic"] }
+rand = { version = "0.8", default-features = false, features = ["std", "std_rng"] }
+x509-parser = { version = "0.17", features = ["verify"] }
+time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
+
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }

@@ -101,3 +101,5 @@ wispkey mcp serve
 ```
 
 The MCP tool returns a deterministic `wk_env_openai` token and the env key name only. Start `wispkey serve` with the same `WISPKEY_SIDELOAD_OPENAI` variable when outbound requests need token substitution. Never print or log the raw sideload value.
+
+Store a CA private key as a normal `api_key` credential, preferably a PEM bundle of the CA certificate plus the PKCS#8 private key. Agents can then call `wispkey_issue_cert` with `ca_credential` to mint a leaf certificate without receiving the CA key. Pass `ca_cert` only when the stored credential is the key alone. Treat the returned leaf private key as a new secret.

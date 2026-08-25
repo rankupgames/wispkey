@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### PKI-aware certificate issuance
+
+- Added the `wispkey_issue_cert` MCP tool so a CA private key can stay in the vault while agents request leaf identities. The tool either generates an EC P-256/P-384 or RSA 2048/4096 keypair or signs a PEM CSR.
+- The CA credential must be PEM. A bundled CA certificate is preferred; `ca_cert` supplies the issuer certificate when the credential is key-only. Issuance fails closed unless the certificate is a CA with certificate-signing key usage when that extension is present.
+- Returned material is the leaf certificate PEM and, for generated keys, the leaf private key PEM. The CA private key is never included in the MCP response, audit log, or error text.
+- Successful issuance writes a `CertificateIssued` audit event with the CA credential name, leaf CN, SAN/key/validity/serial metadata, and project. Audit rows do not store PEM or key material.
+- Leaf certificates are X.509 v3 end-entity certs with Digital Signature plus RSA Key Encipherment or EC Key Agreement, and Extended Key Usage for TLS server and client authentication.
+
 ### Cross-machine and Firecracker instance access
 
 - Added `firecracker-vsock:/absolute/base.sock:<port>` listeners for Firecracker's actual guest-to-host transport. WispKey binds Firecracker's required `<base>_<port>` Unix socket while preserving the existing feature-gated `vsock://<cid>:<port>` listener for Linux environments that expose host AF_VSOCK directly.

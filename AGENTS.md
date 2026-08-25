@@ -202,6 +202,7 @@ Available tools:
 - **`wispkey_project_list`** -- List all projects with partition counts and active indicator
 - **`wispkey_set`** -- Create or update a credential (`name`, `value` required; `type`, `description`, `hosts`, `tags`, `project`, `header_name`, `param_name` optional). Refuses to overwrite unless `overwrite: true`. On update, the wisp token is preserved.
 - **`wispkey_delete`** -- Delete a credential by `name` (optional `project` scope)
+- **`wispkey_issue_cert`** -- Issue an X.509 leaf certificate with a CA private key held in the vault (`ca_credential` required). Generates an `ec-p256` keypair by default or signs a PEM `csr`. Returns the leaf certificate and, when generated, the leaf private key. The CA private key never leaves the vault. Optional: `common_name`, `san`, `validity_days` (default 365, max 3650), `key_type` (`ec-p256`, `ec-p384`, `rsa-2048`, `rsa-4096`), `ca_cert` when the credential is key-only, `project`.
 
 ## HTTPS Proxy (Reverse Proxy Mode)
 

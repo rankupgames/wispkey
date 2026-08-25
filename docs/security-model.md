@@ -16,6 +16,7 @@ WispKey is a credential firewall for AI agents. Its main boundary is between a p
 - Owner-approved plaintext egress. `wispkey exec` records `CredentialExec` audit events when it injects a credential into a child process through stdin, a child-only environment variable, or askpass. `wispkey run` records `CredentialRun` events for manifest-based child environment injection, and `wispkey inject` records `CredentialInject` events for template rendering.
 - Accidental env-sideload disclosure. `WISPKEY_SIDELOAD_<SLUG>` values are exposed to agents as deterministic `wk_env_<slug>` tokens; the raw env value is not printed or logged.
 - Timing disclosure of proxy management tokens through direct string comparison. Management API tokens are compared in constant time.
+- CA private keys used for `wispkey_issue_cert`. The MCP tool decrypts the CA material in-process, signs a generated keypair or CSR, and returns only the leaf certificate and (when generated) the leaf private key. Env-sideload values cannot be used as CA material.
 
 ## Explicit Limits
 
@@ -30,6 +31,7 @@ WispKey is a credential firewall for AI agents. Its main boundary is between a p
 - Body substitution is limited to text-like content types such as JSON, text, form-urlencoded, and XML. Binary or opaque body rewriting is intentionally not supported.
 - Secrets are no longer protected by WispKey after they are intentionally sent upstream. The upstream service, SDKs, logs, and process memory are outside WispKey's boundary.
 - `wispkey exec`, `wispkey run`, and `wispkey inject` are deliberate plaintext-egress paths for owner-run non-HTTP tools, similar in trust level to `op run` or `aws-vault exec`. A compromised owner shell can still run these commands or use the child process or rendered file to misuse the credential.
+- `wispkey_issue_cert` is a deliberate MCP plaintext-egress path for a newly generated leaf private key, not for the CA. A caller that can invoke the tool receives the leaf identity and can use it until the certificate expires or is revoked by an external process. WispKey does not currently revoke issued leaves.
 - Plaintext secrets stored in external client configuration, shell startup files, or MCP `env` blocks are outside the vault. Prefer process environment forwarding or an OS credential manager when available.
 
 ## Session Boundary
