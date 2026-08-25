@@ -88,7 +88,7 @@ fn main() {
 
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip(&vault_tooltip())
+        .with_tooltip(vault_tooltip())
         .with_icon(tray_icon_image())
         .build()
         .expect("tray icon");
@@ -265,14 +265,15 @@ fn vault_tooltip() -> String {
 }
 
 fn refresh_tooltip(tray: &Rc<RefCell<TrayIcon>>) {
-    if let Err(error) = tray.borrow().set_tooltip(Some(&vault_tooltip())) {
+    let tooltip = vault_tooltip();
+    if let Err(error) = tray.borrow().set_tooltip(Some(&tooltip)) {
         tracing::error!(error = %error, "failed to update tray tooltip");
     }
 }
 
 fn tray_icon_image() -> Icon {
     let mut rgba = vec![0u8; 32 * 32 * 4];
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel[0] = 0x1a;
         pixel[1] = 0x73;
         pixel[2] = 0xe8;
