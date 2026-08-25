@@ -11,8 +11,11 @@ fn listen_spec_parses_supported_transports() {
     let tcp = transport::ListenSpec::parse("tcp://127.0.0.1:7700").unwrap();
     assert!(matches!(tcp, transport::ListenSpec::Tcp(_)));
 
-    let unix = transport::ListenSpec::parse("unix:/tmp/wispkey.sock").unwrap();
-    assert!(matches!(unix, transport::ListenSpec::Unix(_)));
+    #[cfg(unix)]
+    {
+        let unix = transport::ListenSpec::parse("unix:/tmp/wispkey.sock").unwrap();
+        assert!(matches!(unix, transport::ListenSpec::Unix(_)));
+    }
 
     let vsock = transport::ListenSpec::parse("vsock://3:7700").unwrap();
     assert!(matches!(
@@ -35,13 +38,16 @@ fn listener_identity_defaults_are_transport_specific() {
         transport::ListenSpec::parse("tcp://127.0.0.1:7700").unwrap(),
         transport::IdentityRequirement::Default,
     );
-    let unix = transport::ListenConfig::new(
-        transport::ListenSpec::parse("unix:/tmp/wispkey.sock").unwrap(),
-        transport::IdentityRequirement::Default,
-    );
-
     assert!(!tcp.require_identity);
-    assert!(unix.require_identity);
+
+    #[cfg(unix)]
+    {
+        let unix = transport::ListenConfig::new(
+            transport::ListenSpec::parse("unix:/tmp/wispkey.sock").unwrap(),
+            transport::IdentityRequirement::Default,
+        );
+        assert!(unix.require_identity);
+    }
 }
 
 #[test]
