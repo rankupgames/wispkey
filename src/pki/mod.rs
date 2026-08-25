@@ -104,8 +104,13 @@ pub fn issue_certificate(request: IssueCertRequest<'_>) -> Result<IssuedCertific
     let validity_days = request.validity_days.unwrap_or(DEFAULT_VALIDITY_DAYS);
     validate_validity_days(validity_days)?;
 
-    let issuer = load_issuer(request.ca_pem, request.ca_cert_pem)?;
+    let (issuer, ca_not_after) = load_issuer(request.ca_pem, request.ca_cert_pem)?;
     let window = validity_window(validity_days);
+    if window.not_after > ca_not_after {
+        return Err(PkiError::InvalidInput(
+            "validity_days extends past the CA certificate expiration".into(),
+        ));
+    }
 
     if let Some(csr_pem) = request.csr_pem {
         return issue_from_csr(
@@ -118,10 +123,10 @@ pub fn issue_certificate(request: IssueCertRequest<'_>) -> Result<IssuedCertific
         );
     }
 
-    let common_name = request
-        .common_name
-        .ok_or_else(|| PkiError::InvalidInput("missing required argument: common_name".into()))?;
-    validate_common_name(common_name)?;
+    let common_name =
+        normalize_common_name(request.common_name.ok_or_else(|| {
+            PkiError::InvalidInput("missing required argument: common_name".into())
+        })?)?;
     let sans = resolve_sans(common_name, request.san)?;
     let key_type = request.key_type.unwrap_or_default();
     let leaf_key = generate_leaf_key(key_type)?;
@@ -162,10 +167,7 @@ fn issue_from_csr(
         .map_err(|error| PkiError::InvalidInput(format!("invalid CSR PEM: {error}")))?;
 
     let resolved_cn = match common_name {
-        Some(value) => {
-            validate_common_name(value)?;
-            value.to_string()
-        }
+        Some(value) => normalize_common_name(value)?.to_string(),
         None => csr_common_name(&csr.params).ok_or_else(|| {
             PkiError::InvalidInput(
                 "CSR has no common name; pass common_name to set the leaf subject".into(),
@@ -250,7 +252,7 @@ fn finish_issued(
 fn load_issuer(
     ca_pem: &str,
     ca_cert_override: Option<&str>,
-) -> Result<Issuer<'static, KeyPair>, PkiError> {
+) -> Result<(Issuer<'static, KeyPair>, OffsetDateTime), PkiError> {
     let blocks = split_pem_blocks(ca_pem);
     if blocks.is_empty() {
         return Err(PkiError::InvalidCaMaterial(
@@ -282,7 +284,7 @@ fn load_issuer(
             )
         })?;
 
-    validate_ca_certificate(&cert_pem)?;
+    let ca_not_after = validate_ca_certificate(&cert_pem)?;
     let normalized_key = normalize_private_key_pem(&key_pem)?;
     let key_pair = KeyPair::from_pem(&normalized_key).map_err(|error| {
         PkiError::InvalidCaMaterial(format!(
@@ -291,11 +293,13 @@ fn load_issuer(
     })?;
     ensure_key_matches_certificate(&cert_pem, &key_pair)?;
 
-    Issuer::from_ca_cert_pem(&cert_pem, key_pair)
-        .map_err(|error| PkiError::InvalidCaMaterial(format!("failed to load CA issuer: {error}")))
+    let issuer = Issuer::from_ca_cert_pem(&cert_pem, key_pair).map_err(|error| {
+        PkiError::InvalidCaMaterial(format!("failed to load CA issuer: {error}"))
+    })?;
+    Ok((issuer, ca_not_after))
 }
 
-fn validate_ca_certificate(cert_pem: &str) -> Result<(), PkiError> {
+fn validate_ca_certificate(cert_pem: &str) -> Result<OffsetDateTime, PkiError> {
     let der = pem_der(cert_pem, "CERTIFICATE")?;
     let certificate = X509Certificate::from_der(&der)
         .map_err(|error| PkiError::InvalidCaMaterial(format!("invalid CA certificate: {error}")))?
@@ -328,7 +332,14 @@ fn validate_ca_certificate(cert_pem: &str) -> Result<(), PkiError> {
         ));
     }
 
-    Ok(())
+    let not_after = certificate.validity().not_after.to_datetime();
+    if not_after <= OffsetDateTime::now_utc() {
+        return Err(PkiError::InvalidCaMaterial(
+            "CA certificate is expired".into(),
+        ));
+    }
+
+    Ok(not_after)
 }
 
 fn ensure_key_matches_certificate(cert_pem: &str, key_pair: &KeyPair) -> Result<(), PkiError> {
@@ -542,7 +553,7 @@ fn resolve_sans(common_name: &str, sans: &[String]) -> Result<Vec<String>, PkiEr
     Ok(resolved)
 }
 
-fn validate_common_name(value: &str) -> Result<(), PkiError> {
+fn normalize_common_name(value: &str) -> Result<&str, PkiError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err(PkiError::InvalidInput("common_name cannot be empty".into()));
@@ -557,7 +568,7 @@ fn validate_common_name(value: &str) -> Result<(), PkiError> {
             "common_name cannot contain control characters".into(),
         ));
     }
-    Ok(())
+    Ok(trimmed)
 }
 
 fn validate_validity_days(days: u32) -> Result<(), PkiError> {
@@ -593,7 +604,12 @@ fn csr_common_name(params: &CertificateParams) -> Option<String> {
 }
 
 fn csr_sans(params: &CertificateParams) -> Vec<String> {
-    params.subject_alt_names.iter().map(san_to_string).collect()
+    params
+        .subject_alt_names
+        .iter()
+        .map(san_to_string)
+        .filter(|name| !name.is_empty())
+        .collect()
 }
 
 fn san_to_string(san: &SanType) -> String {
@@ -720,6 +736,14 @@ mod tests {
     use rcgen::{BasicConstraints, IsCa};
 
     fn test_ca(is_ca: bool, key_cert_sign: bool) -> (String, String, String) {
+        test_ca_with_validity(is_ca, key_cert_sign, None)
+    }
+
+    fn test_ca_with_validity(
+        is_ca: bool,
+        key_cert_sign: bool,
+        not_after: Option<OffsetDateTime>,
+    ) -> (String, String, String) {
         let mut params = CertificateParams::new(Vec::new()).unwrap();
         params
             .distinguished_name
@@ -733,6 +757,10 @@ mod tests {
         if key_cert_sign {
             params.key_usages.push(KeyUsagePurpose::KeyCertSign);
             params.key_usages.push(KeyUsagePurpose::CrlSign);
+        }
+        if let Some(not_after) = not_after {
+            params.not_before = not_after - Duration::days(2);
+            params.not_after = not_after;
         }
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
         let cert = params.self_signed(&key).unwrap();
@@ -914,8 +942,8 @@ mod tests {
         assert!(LeafKeyType::parse("dsa").is_err());
         assert!(validate_validity_days(0).is_err());
         assert!(validate_validity_days(3651).is_err());
-        assert!(validate_common_name("").is_err());
-        assert!(validate_common_name(&"n".repeat(65)).is_err());
+        assert!(normalize_common_name("").is_err());
+        assert!(normalize_common_name(&"n".repeat(65)).is_err());
     }
 
     #[test]
@@ -925,5 +953,36 @@ mod tests {
         let (bundle, _, _) = test_ca(true, true);
         let issued = issue_ok(&bundle, "localhost", &["127.0.0.1"], LeafKeyType::EcP256);
         assert_eq!(issued.san, vec!["127.0.0.1".to_string()]);
+    }
+
+    #[test]
+    fn rejects_expired_ca_and_leaf_past_ca_expiry() {
+        let expired = OffsetDateTime::now_utc() - Duration::days(1);
+        let (bundle, _, _) = test_ca_with_validity(true, true, Some(expired));
+        let error = issue_certificate(IssueCertRequest {
+            ca_pem: &bundle,
+            ca_cert_pem: None,
+            common_name: Some("svc.internal"),
+            san: &[],
+            validity_days: Some(7),
+            key_type: None,
+            csr_pem: None,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("expired"), "{error}");
+
+        let soon = OffsetDateTime::now_utc() + Duration::days(3);
+        let (short_ca, _, _) = test_ca_with_validity(true, true, Some(soon));
+        let error = issue_certificate(IssueCertRequest {
+            ca_pem: &short_ca,
+            ca_cert_pem: None,
+            common_name: Some("svc.internal"),
+            san: &[],
+            validity_days: Some(30),
+            key_type: None,
+            csr_pem: None,
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("extends past the CA"), "{error}");
     }
 }
