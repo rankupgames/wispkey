@@ -305,6 +305,12 @@ enum Commands {
         command: CredentialCommands,
     },
 
+    /// Generate and manage website logins without exposing passwords
+    Login {
+        #[command(subcommand)]
+        command: LoginCommands,
+    },
+
     /// Manage access policies
     Policy {
         #[command(subcommand)]
@@ -528,6 +534,66 @@ enum CredentialCommands {
         /// Destination partition override
         #[arg(long)]
         partition: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum LoginCommands {
+    /// Generate a unique website login and store it encrypted
+    Generate {
+        /// Credential name
+        name: String,
+        /// Username or email for the site
+        #[arg(long)]
+        username: String,
+        /// Website URL (https only; stored as an exact origin)
+        #[arg(long)]
+        url: String,
+        /// Project override (default: active project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Partition to add to (default: personal)
+        #[arg(long)]
+        partition: Option<String>,
+        /// Review interval such as 180d, or 'none'
+        #[arg(long, default_value = "180d")]
+        review_after: String,
+        /// Password length (must keep at least 128 bits of entropy)
+        #[arg(long)]
+        length: Option<usize>,
+        /// Omit symbols for site compatibility (length still must meet 128 bits)
+        #[arg(long)]
+        no_symbols: bool,
+    },
+    /// List website logins (metadata only)
+    List {
+        /// Filter by project (default: active project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Show logins across all projects
+        #[arg(long)]
+        all_projects: bool,
+        /// Show only logins whose review date is due (never deletes)
+        #[arg(long)]
+        due: bool,
+    },
+    /// Archive a website login without deleting it
+    Archive {
+        name: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Restore an archived website login to pending
+    Restore {
+        name: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Mark a pending website login as active
+    Activate {
+        name: String,
+        #[arg(long)]
+        project: Option<String>,
     },
 }
 
@@ -982,6 +1048,44 @@ async fn main() {
                     bundle_passphrase_file.as_deref(),
                 )
                 .await
+            }
+        },
+        Commands::Login { command } => match command {
+            LoginCommands::Generate {
+                name,
+                username,
+                url,
+                project,
+                partition,
+                review_after,
+                length,
+                no_symbols,
+            } => {
+                cli::handle_generate(cli::GenerateLoginArgs {
+                    name: &name,
+                    username: &username,
+                    url: &url,
+                    project: project.as_deref(),
+                    partition: partition.as_deref(),
+                    review_after: Some(review_after.as_str()),
+                    length,
+                    no_symbols,
+                })
+                .await
+            }
+            LoginCommands::List {
+                project,
+                all_projects,
+                due,
+            } => cli::handle_login_list(project.as_deref(), all_projects, due).await,
+            LoginCommands::Archive { name, project } => {
+                cli::handle_archive(&name, project.as_deref()).await
+            }
+            LoginCommands::Restore { name, project } => {
+                cli::handle_restore(&name, project.as_deref()).await
+            }
+            LoginCommands::Activate { name, project } => {
+                cli::handle_activate(&name, project.as_deref()).await
             }
         },
         Commands::Policy { command } => match command {

@@ -267,6 +267,9 @@ fn import_credentials(
             tags,
             partition: Some(partition_name),
             project: Some(project_name),
+            origin: None,
+            lifecycle_state: None,
+            review_at: None,
         }) {
             Ok(_) => results.imported += 1,
             Err(VaultError::DuplicateCredential(_)) => results.skipped += 1,

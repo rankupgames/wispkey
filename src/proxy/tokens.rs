@@ -68,7 +68,8 @@ fn credential_replacement_value(credential_type: &CredentialType, real_value: &s
         CredentialType::BearerToken
         | CredentialType::ApiKey
         | CredentialType::CustomHeader { .. }
-        | CredentialType::QueryParam { .. } => real_value.to_string(),
+        | CredentialType::QueryParam { .. }
+        | CredentialType::WebsiteLogin => real_value.to_string(),
         CredentialType::BasicAuth => {
             let encoded = BASE64.encode(real_value.as_bytes());
             format!("Basic {}", encoded)

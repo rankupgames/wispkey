@@ -15,6 +15,7 @@ mod exec;
 mod inject;
 mod instances;
 mod log;
+mod login;
 mod mcp;
 mod partitions;
 mod policy;
@@ -45,6 +46,10 @@ pub use instances::{
     handle_instance_show,
 };
 pub use log::handle_log;
+pub use login::{
+    GenerateLoginArgs, handle_activate, handle_archive, handle_generate,
+    handle_list as handle_login_list, handle_restore,
+};
 pub use mcp::handle_mcp_serve;
 pub use partitions::{
     handle_partition_assign, handle_partition_create, handle_partition_delete,

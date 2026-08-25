@@ -154,6 +154,24 @@ async fn handle_jsonrpc(request: &Value) -> Option<Value> {
                             }
                         },
                         {
+                            "name": "wispkey_generate_login",
+                            "description": "Generate a unique website login password, store username+password encrypted in the vault, and return non-secret metadata only. Never returns the password. Use this instead of wispkey_set for website_login credentials.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string", "description": "Credential name (lowercase, hyphen-separated)" },
+                                    "username": { "type": "string", "description": "Username or email for the website" },
+                                    "url": { "type": "string", "description": "Website URL; must be https and is stored as an exact origin" },
+                                    "project": { "type": "string", "description": "Project to scope to (default: active project)" },
+                                    "partition": { "type": "string", "description": "Partition to add to (default: personal)" },
+                                    "review_after": { "type": "string", "description": "Review interval such as 180d, or none" },
+                                    "length": { "type": "integer", "description": "Password length; must keep at least 128 bits of entropy" },
+                                    "symbols": { "type": "boolean", "description": "Include symbols (default true)" }
+                                },
+                                "required": ["name", "username", "url"]
+                            }
+                        },
+                        {
                             "name": "wispkey_delete",
                             "description": "Delete a credential from the vault by name. Returns confirmation on success or an error if the credential does not exist.",
                             "inputSchema": {
@@ -180,6 +198,7 @@ async fn handle_jsonrpc(request: &Value) -> Option<Value> {
                 "wispkey_proxy_status" => handle_tool_proxy_status().await,
                 "wispkey_project_list" => handle_tool_project_list(),
                 "wispkey_set" => handle_tool_set(&arguments),
+                "wispkey_generate_login" => handle_tool_generate_login(&arguments),
                 "wispkey_delete" => handle_tool_delete(&arguments),
                 _ => tool_error(&format!("unknown tool: {}", tool_name)),
             };
@@ -530,6 +549,11 @@ fn handle_tool_set(arguments: &Value) -> Value {
 
     let credential_type =
         match CredentialType::from_str_with_params(type_str, header_name, param_name) {
+            Ok(CredentialType::WebsiteLogin) => {
+                return tool_error(
+                    "website_login credentials must be created with wispkey_generate_login",
+                );
+            }
             Ok(t) => t,
             Err(e) => return tool_error(&format!("invalid credential type: {}", e)),
         };
@@ -603,6 +627,9 @@ fn handle_tool_set(arguments: &Value) -> Value {
             tags,
             partition: None,
             project: Some(&active),
+            origin: None,
+            lifecycle_state: None,
+            review_at: None,
         }) {
             Ok(cred) => {
                 audit::log_event(
@@ -635,6 +662,117 @@ fn handle_tool_set(arguments: &Value) -> Value {
             }
             Err(e) => tool_error(&format!("failed to add credential: {}", e)),
         }
+    }
+}
+
+fn handle_tool_generate_login(arguments: &Value) -> Value {
+    let name = match arguments.get("name").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => return tool_error("missing required argument: name"),
+    };
+    let username = match arguments.get("username").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => return tool_error("missing required argument: username"),
+    };
+    let url = match arguments.get("url").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => return tool_error("missing required argument: url"),
+    };
+    let project = arguments.get("project").and_then(|p| p.as_str());
+    let partition = arguments.get("partition").and_then(|p| p.as_str());
+    let review_after = arguments.get("review_after").and_then(|p| p.as_str());
+    let length = arguments
+        .get("length")
+        .and_then(|p| p.as_u64())
+        .map(|n| n as usize);
+    let symbols = arguments
+        .get("symbols")
+        .and_then(|p| p.as_bool())
+        .unwrap_or(true);
+
+    let review_at = match review_after {
+        Some("none") => None,
+        Some(value) => match parse_review_after(value) {
+            Ok(duration) => Some(chrono::Utc::now() + duration),
+            Err(error) => return tool_error(&error),
+        },
+        None => Some(chrono::Utc::now() + chrono::Duration::days(180)),
+    };
+
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => return tool_error(&format!("vault error: {}", e)),
+    };
+    let active = project
+        .map(String::from)
+        .unwrap_or_else(core::resolve_active_project);
+
+    match vault.generate_website_login(core::GenerateWebsiteLoginRequest {
+        name,
+        username,
+        url,
+        project: Some(&active),
+        partition,
+        review_at,
+        length,
+        symbols,
+    }) {
+        Ok(cred) => {
+            audit::log_event(
+                vault.db(),
+                "WebsiteLoginCreated",
+                Some(name),
+                Some(&cred.wisp_token),
+                Some(&cred.origin),
+                None,
+                None,
+                None,
+                false,
+                None,
+                Some(&active),
+            );
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&json!({
+                        "action": "created",
+                        "name": cred.name,
+                        "type": cred.credential_type.display_name(),
+                        "origin": cred.origin,
+                        "lifecycle_state": cred.lifecycle_state,
+                        "review_at": cred.review_at.map(|value| value.to_rfc3339()),
+                        "username": username,
+                        "project": active,
+                    })).expect("json serialize")
+                }]
+            })
+        }
+        Err(e) => tool_error(&format!("failed to generate website login: {}", e)),
+    }
+}
+
+fn parse_review_after(value: &str) -> std::result::Result<chrono::Duration, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("review_after must not be empty".into());
+    }
+    let (digits, unit) = value.split_at(
+        value
+            .find(|character: char| !character.is_ascii_digit())
+            .unwrap_or(value.len()),
+    );
+    let amount: i64 = digits
+        .parse()
+        .map_err(|_| "review_after must start with a number".to_string())?;
+    if amount <= 0 {
+        return Err("review_after must be positive".into());
+    }
+    match unit {
+        "" | "d" => Ok(chrono::Duration::days(amount)),
+        "h" => Ok(chrono::Duration::hours(amount)),
+        "m" => Ok(chrono::Duration::minutes(amount)),
+        "s" => Ok(chrono::Duration::seconds(amount)),
+        _ => Err("review_after unit must be one of s, m, h, or d".into()),
     }
 }
 

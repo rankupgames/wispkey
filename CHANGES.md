@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Website login generation
+
+- Added `wispkey login generate` as the canonical generate-and-store path for unique website logins. Passwords come from the OS CSPRNG with a default policy of at least 128 bits of entropy and are stored with the username in encrypted credential material.
+- Added schema v11 `origin`, `lifecycle_state`, and `review_at` columns. Existing credentials migrate to `active` with an empty origin. Review dates never auto-delete; `login list --due` only reports them.
+- CLI and MCP (`wispkey_generate_login`) return metadata only. `wispkey add --type website_login` and `wispkey_set` refuse this type so agents cannot supply or retrieve the generated password.
+- Lifecycle commands `login archive`, `login restore`, and `login activate` are audited without secret values. Browser fill remains a follow-up slice.
+
 ### Cross-machine and Firecracker instance access
 
 - Added `firecracker-vsock:/absolute/base.sock:<port>` listeners for Firecracker's actual guest-to-host transport. WispKey binds Firecracker's required `<base>_<port>` Unix socket while preserving the existing feature-gated `vsock://<cid>:<port>` listener for Linux environments that expose host AF_VSOCK directly.

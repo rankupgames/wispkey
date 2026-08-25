@@ -31,6 +31,12 @@ pub async fn handle_add(args: AddCredentialArgs<'_>) {
         args.header_name,
         args.param_name,
     ) {
+        Ok(CredentialType::WebsiteLogin) => {
+            eprintln!(
+                "Error: website_login credentials must be created with `wispkey login generate`"
+            );
+            std::process::exit(1);
+        }
         Ok(t) => t,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -66,6 +72,9 @@ pub async fn handle_add(args: AddCredentialArgs<'_>) {
         tags: args.tags,
         partition: args.partition,
         project: args.project,
+        origin: None,
+        lifecycle_state: None,
+        review_at: None,
     }) {
         Ok(cred) => {
             audit::log_event(
@@ -227,6 +236,15 @@ pub async fn handle_get(name: &str, show_token: bool) {
             }
             if !cred.tags.is_empty() {
                 println!("Tags:       {}", cred.tags.join(", "));
+            }
+            if !cred.origin.is_empty() {
+                println!("Origin:     {}", cred.origin);
+            }
+            if cred.credential_type == crate::core::CredentialType::WebsiteLogin {
+                println!("Lifecycle:  {}", cred.lifecycle_state);
+                if let Some(review_at) = cred.review_at {
+                    println!("Review at:  {}", review_at.format("%Y-%m-%d %H:%M:%S UTC"));
+                }
             }
             println!(
                 "Created:    {}",
