@@ -256,3 +256,12 @@ When the proxy is running (`wispkey serve`):
 - Partitions: logical grouping (e.g. `infrastructure`, `cloud-services`, `ci-cd`)
 - Projects: team/project isolation (e.g. `client-alpha`, `internal-tools`)
 - Values starting with `-`: use `--value='-1abc...'` (equals syntax), though `--value-file` is preferred for secret material
+
+## Cursor Cloud specific instructions
+
+Single Rust crate (no services/DB to boot; SQLite is bundled via `rusqlite`). Standard dev commands live in `CONTRIBUTING.md` (`cargo build`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`) and the CI matrix in `.github/workflows/ci.yml`.
+
+- Toolchain: the base image's default Rust is too old to compile this crate (`edition = "2024"` needs Rust ≥ 1.85; the project targets 1.94+). The startup update script installs and defaults the `stable` toolchain (currently 1.98) with `clippy`/`rustfmt`, so just use `cargo`/`clippy`/`fmt` normally. If a session ever lands on old Rust, run `rustup default stable`.
+- `cargo test` compiles and boots real loopback TCP proxies; the full suite takes ~2-3 min. This is expected, not a hang.
+- Running the CLI/proxy non-interactively: set `WISPKEY_PASSWORD` to skip master-password prompts, and set `WISPKEY_VAULT_PATH` to a scratch dir (e.g. `/tmp/wk-demo`) so you never touch a real `~/.wispkey` vault.
+- `wispkey serve` is a long-running foreground process — run it in a tmux session (or `serve --daemon`). Forward-proxy (`HTTP_PROXY`) token swapping only works for plain HTTP; HTTPS requires reverse-proxy mode via the `X-Target-Url` header (see "HTTPS Proxy" above).
