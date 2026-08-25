@@ -2,18 +2,22 @@
  * Author: Miguel A. Lopez
  * Company: RankUp Games LLC
  * Project: WispKey
- * Description: MCP (Model Context Protocol) server over stdio. Exposes wispkey_list,
- *              wispkey_get_token, wispkey_proxy_status, and wispkey_project_list tools
- *              via JSON-RPC 2.0. Handles full MCP lifecycle (initialize, ping, tools).
+ * Description: MCP (Model Context Protocol) server over stdio. Exposes read tools
+ *              (wispkey_list, wispkey_get_token, wispkey_proxy_status, wispkey_project_list)
+ *              and write tools (wispkey_set, wispkey_delete) via JSON-RPC 2.0.
+ *              Handles full MCP lifecycle (initialize, ping, tools).
  * Created: 2026-04-07
- * Last Modified: 2026-04-13
+ * Last Modified: 2026-08-25
  */
 
 use std::io::{self, BufRead, Write};
 
 use serde_json::{Value, json};
 
-use crate::core::{self, Vault, VaultError};
+use crate::audit;
+use crate::core::{
+    self, AddCredentialRequest, CredentialType, UpdateCredentialRequest, Vault, VaultError,
+};
 use crate::env_sideload::EnvSideloadCredential;
 use crate::proxy::lifecycle;
 
@@ -128,6 +132,38 @@ async fn handle_jsonrpc(request: &Value) -> Option<Value> {
                             "name": "wispkey_project_list",
                             "description": "List all projects. Shows project name, partition count, and whether it is the active project.",
                             "inputSchema": { "type": "object", "properties": {} }
+                        },
+                        {
+                            "name": "wispkey_set",
+                            "description": "Create or update a named credential in the vault. On create, a new wisp token is generated. On update (overwrite: true), the secret value and metadata are replaced but the wisp token is preserved. Refuses to silently overwrite; set overwrite to true to replace an existing credential.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string", "description": "Credential name (lowercase, hyphen-separated)" },
+                                    "value": { "type": "string", "description": "The secret value to store" },
+                                    "type": { "type": "string", "description": "Credential type: bearer_token (default), api_key, basic_auth, custom_header, query_param", "default": "bearer_token" },
+                                    "description": { "type": "string", "description": "Short human-readable description" },
+                                    "hosts": { "type": "string", "description": "Allowed target hosts (comma-separated, glob patterns)" },
+                                    "tags": { "type": "string", "description": "Tags (comma-separated)" },
+                                    "project": { "type": "string", "description": "Project to scope to (default: active project)" },
+                                    "header_name": { "type": "string", "description": "Custom header name (required when type is custom_header)" },
+                                    "param_name": { "type": "string", "description": "Query parameter name (required when type is query_param)" },
+                                    "overwrite": { "type": "boolean", "description": "If true, update an existing credential in place. If false (default), refuse if the name already exists.", "default": false }
+                                },
+                                "required": ["name", "value"]
+                            }
+                        },
+                        {
+                            "name": "wispkey_delete",
+                            "description": "Delete a credential from the vault by name. Returns confirmation on success or an error if the credential does not exist.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string", "description": "Credential name to delete" },
+                                    "project": { "type": "string", "description": "Project to scope to (default: active project)" }
+                                },
+                                "required": ["name"]
+                            }
                         }
                     ]
                 }
@@ -143,6 +179,8 @@ async fn handle_jsonrpc(request: &Value) -> Option<Value> {
                 "wispkey_get_token" => handle_tool_get_token(&arguments),
                 "wispkey_proxy_status" => handle_tool_proxy_status().await,
                 "wispkey_project_list" => handle_tool_project_list(),
+                "wispkey_set" => handle_tool_set(&arguments),
+                "wispkey_delete" => handle_tool_delete(&arguments),
                 _ => tool_error(&format!("unknown tool: {}", tool_name)),
             };
 
@@ -464,6 +502,186 @@ fn edit_distance(left: &str, right: &str) -> usize {
     }
 
     previous[right_chars.len()]
+}
+
+fn handle_tool_set(arguments: &Value) -> Value {
+    let name = match arguments.get("name").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => return tool_error("missing required argument: name"),
+    };
+    let value = match arguments.get("value").and_then(|v| v.as_str()) {
+        Some(v) => v,
+        None => return tool_error("missing required argument: value"),
+    };
+    let type_str = arguments
+        .get("type")
+        .and_then(|t| t.as_str())
+        .unwrap_or("bearer_token");
+    let header_name = arguments.get("header_name").and_then(|h| h.as_str());
+    let param_name = arguments.get("param_name").and_then(|p| p.as_str());
+    let description = arguments.get("description").and_then(|d| d.as_str());
+    let hosts = arguments.get("hosts").and_then(|h| h.as_str());
+    let tags = arguments.get("tags").and_then(|t| t.as_str());
+    let project = arguments.get("project").and_then(|p| p.as_str());
+    let overwrite = arguments
+        .get("overwrite")
+        .and_then(|o| o.as_bool())
+        .unwrap_or(false);
+
+    let credential_type =
+        match CredentialType::from_str_with_params(type_str, header_name, param_name) {
+            Ok(t) => t,
+            Err(e) => return tool_error(&format!("invalid credential type: {}", e)),
+        };
+
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => return tool_error(&format!("vault error: {}", e)),
+    };
+
+    let active = project
+        .map(String::from)
+        .unwrap_or_else(core::resolve_active_project);
+
+    let existing = vault.get_credential_in_project(&active, name).ok();
+
+    if existing.is_some() && !overwrite {
+        return tool_error(&format!(
+            "credential '{}' already exists. Set overwrite: true to replace it.",
+            name
+        ));
+    }
+
+    if existing.is_some() {
+        match vault.update_credential(UpdateCredentialRequest {
+            name,
+            credential_type,
+            value,
+            description,
+            hosts,
+            tags,
+            project: Some(&active),
+        }) {
+            Ok(cred) => {
+                audit::log_event(
+                    vault.db(),
+                    "CredentialUpdated",
+                    Some(name),
+                    Some(&cred.wisp_token),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some(&active),
+                );
+                json!({
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::to_string_pretty(&json!({
+                            "action": "updated",
+                            "name": cred.name,
+                            "type": cred.credential_type.display_name(),
+                            "wisp_token": cred.wisp_token,
+                            "hosts": cred.hosts,
+                            "tags": cred.tags,
+                            "project": active,
+                        })).expect("json serialize")
+                    }]
+                })
+            }
+            Err(e) => tool_error(&format!("failed to update credential: {}", e)),
+        }
+    } else {
+        match vault.add_credential(AddCredentialRequest {
+            name,
+            credential_type,
+            value,
+            description,
+            hosts,
+            tags,
+            partition: None,
+            project: Some(&active),
+        }) {
+            Ok(cred) => {
+                audit::log_event(
+                    vault.db(),
+                    "CredentialAdded",
+                    Some(name),
+                    Some(&cred.wisp_token),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                    Some(&active),
+                );
+                json!({
+                    "content": [{
+                        "type": "text",
+                        "text": serde_json::to_string_pretty(&json!({
+                            "action": "created",
+                            "name": cred.name,
+                            "type": cred.credential_type.display_name(),
+                            "wisp_token": cred.wisp_token,
+                            "hosts": cred.hosts,
+                            "tags": cred.tags,
+                            "project": active,
+                        })).expect("json serialize")
+                    }]
+                })
+            }
+            Err(e) => tool_error(&format!("failed to add credential: {}", e)),
+        }
+    }
+}
+
+fn handle_tool_delete(arguments: &Value) -> Value {
+    let name = match arguments.get("name").and_then(|n| n.as_str()) {
+        Some(n) => n,
+        None => return tool_error("missing required argument: name"),
+    };
+    let project = arguments.get("project").and_then(|p| p.as_str());
+
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => return tool_error(&format!("vault error: {}", e)),
+    };
+
+    let active = project
+        .map(String::from)
+        .unwrap_or_else(core::resolve_active_project);
+
+    match vault.remove_credential_in_project(&active, name) {
+        Ok(()) => {
+            audit::log_event(
+                vault.db(),
+                "CredentialRemoved",
+                Some(name),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                Some(&active),
+            );
+            json!({
+                "content": [{
+                    "type": "text",
+                    "text": serde_json::to_string_pretty(&json!({
+                        "action": "deleted",
+                        "name": name,
+                        "project": active,
+                    })).expect("json serialize")
+                }]
+            })
+        }
+        Err(e) => tool_error(&format!("failed to delete credential '{}': {}", name, e)),
+    }
 }
 
 fn tool_error(message: &str) -> Value {

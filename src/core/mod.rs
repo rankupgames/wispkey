@@ -245,6 +245,18 @@ impl<'a> AddCredentialRequest<'a> {
     }
 }
 
+/// Parameters for updating an existing credential in place (preserves wisp token and id).
+#[derive(Debug, Clone)]
+pub struct UpdateCredentialRequest<'a> {
+    pub name: &'a str,
+    pub credential_type: CredentialType,
+    pub value: &'a str,
+    pub description: Option<&'a str>,
+    pub hosts: Option<&'a str>,
+    pub tags: Option<&'a str>,
+    pub project: Option<&'a str>,
+}
+
 /// A named bucket of credentials within a project.
 #[derive(Debug, Clone, Serialize)]
 pub struct Partition {
@@ -337,6 +349,54 @@ impl Vault {
             hosts: parse_csv(hosts_csv),
             tags: parse_csv(tags_csv),
             created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_used_at: None,
+            partition_id: Some(partition_id),
+        })
+    }
+
+    /// Updates an existing credential in place: re-encrypts with a new value and
+    /// patches metadata fields while preserving the wisp token, id, and partition.
+    pub fn update_credential(&self, request: UpdateCredentialRequest<'_>) -> Result<Credential> {
+        let key = self.ensure_unlocked()?;
+        let active = resolve_active_project();
+        let project_name = request.project.unwrap_or(&active);
+        let project_id = self.resolve_project_id(project_name)?;
+
+        let (cred_id, partition_id, created_at_str, wisp_token): (String, String, String, String) = self
+            .db
+            .query_row(
+                "SELECT c.id, c.partition_id, c.created_at, c.wisp_token FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
+                params![project_id, request.name],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .map_err(|_| VaultError::CredentialNotFound(request.name.to_string()))?;
+
+        let encrypted_value = self.encrypt_bytes(key, request.value.as_bytes())?;
+        let type_json = serde_json::to_string(&request.credential_type)
+            .expect("CredentialType serializes to json");
+        let desc = request.description.unwrap_or("");
+        let hosts_csv = request.hosts.unwrap_or("");
+        let tags_csv = request.tags.unwrap_or("");
+        let now = Utc::now().to_rfc3339();
+
+        self.db.execute(
+            "UPDATE credentials SET credential_type = ?1, encrypted_value = ?2, description = ?3, hosts = ?4, tags = ?5, updated_at = ?6 WHERE id = ?7",
+            params![type_json, BASE64.encode(&encrypted_value), desc, hosts_csv, tags_csv, now, cred_id],
+        )?;
+
+        let created_at =
+            rows::parse_datetime_column(0, &created_at_str).unwrap_or_else(|_| Utc::now());
+
+        Ok(Credential {
+            id: cred_id,
+            name: request.name.to_string(),
+            description: desc.to_string(),
+            credential_type: request.credential_type,
+            wisp_token,
+            hosts: parse_csv(hosts_csv),
+            tags: parse_csv(tags_csv),
+            created_at,
             updated_at: Utc::now(),
             last_used_at: None,
             partition_id: Some(partition_id),

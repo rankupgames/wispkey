@@ -200,6 +200,8 @@ Available tools:
 - **`wispkey_get_token`** -- Get wisp token for a credential by `name`
 - **`wispkey_proxy_status`** -- Check vault/session/proxy state
 - **`wispkey_project_list`** -- List all projects with partition counts and active indicator
+- **`wispkey_set`** -- Create or update a credential (`name`, `value` required; `type`, `description`, `hosts`, `tags`, `project`, `header_name`, `param_name` optional). Refuses to overwrite unless `overwrite: true`. On update, the wisp token is preserved.
+- **`wispkey_delete`** -- Delete a credential by `name` (optional `project` scope)
 
 ## HTTPS Proxy (Reverse Proxy Mode)
 
