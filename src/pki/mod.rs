@@ -13,11 +13,8 @@ use std::net::IpAddr;
 use rcgen::string::Ia5String;
 use rcgen::{
     CertificateParams, CertificateSigningRequestParams, DistinguishedName, DnType, DnValue,
-    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, SanType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, RsaKeySize, SanType,
 };
-use rsa::RsaPrivateKey;
-use rsa::pkcs1::DecodeRsaPrivateKey;
-use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use thiserror::Error;
 use time::{Duration, OffsetDateTime};
 use x509_parser::prelude::{FromDer, X509Certificate};
@@ -288,7 +285,7 @@ fn load_issuer(
     let normalized_key = normalize_private_key_pem(&key_pem)?;
     let key_pair = KeyPair::from_pem(&normalized_key).map_err(|error| {
         PkiError::InvalidCaMaterial(format!(
-            "CA private key is not a supported PEM key (PKCS#8, PKCS#1 RSA, or SEC1 EC): {error}"
+            "CA private key is not a supported PEM key (PKCS#8, PKCS#1, or SEC1): {error}"
         ))
     })?;
     ensure_key_matches_certificate(&cert_pem, &key_pair)?;
@@ -360,51 +357,11 @@ fn ensure_key_matches_certificate(cert_pem: &str, key_pair: &KeyPair) -> Result<
 fn normalize_private_key_pem(pem: &str) -> Result<String, PkiError> {
     let label = pem_label(pem).unwrap_or_default();
     match label.as_str() {
-        "PRIVATE KEY" => Ok(pem.to_string()),
-        "RSA PRIVATE KEY" => {
-            let key = RsaPrivateKey::from_pkcs1_pem(pem).map_err(|error| {
-                PkiError::InvalidCaMaterial(format!("invalid PKCS#1 RSA private key: {error}"))
-            })?;
-            Ok(key
-                .to_pkcs8_pem(LineEnding::LF)
-                .map_err(|error| {
-                    PkiError::InvalidCaMaterial(format!(
-                        "failed to convert RSA key to PKCS#8: {error}"
-                    ))
-                })?
-                .to_string())
-        }
-        "EC PRIVATE KEY" => sec1_to_pkcs8(pem),
+        "PRIVATE KEY" | "RSA PRIVATE KEY" | "EC PRIVATE KEY" => Ok(pem.to_string()),
         other => Err(PkiError::InvalidCaMaterial(format!(
             "unsupported private key PEM label '{other}'"
         ))),
     }
-}
-
-fn sec1_to_pkcs8(pem: &str) -> Result<String, PkiError> {
-    if let Ok(key) = p256::SecretKey::from_sec1_pem(pem) {
-        return key
-            .to_pkcs8_pem(LineEnding::LF)
-            .map(|pem| pem.to_string())
-            .map_err(|error| {
-                PkiError::InvalidCaMaterial(format!(
-                    "failed to convert P-256 key to PKCS#8: {error}"
-                ))
-            });
-    }
-    if let Ok(key) = p384::SecretKey::from_sec1_pem(pem) {
-        return key
-            .to_pkcs8_pem(LineEnding::LF)
-            .map(|pem| pem.to_string())
-            .map_err(|error| {
-                PkiError::InvalidCaMaterial(format!(
-                    "failed to convert P-384 key to PKCS#8: {error}"
-                ))
-            });
-    }
-    Err(PkiError::InvalidCaMaterial(
-        "EC PRIVATE KEY must be a P-256 or P-384 SEC1 key".into(),
-    ))
 }
 
 fn generate_leaf_key(key_type: LeafKeyType) -> Result<KeyPair, PkiError> {
@@ -419,22 +376,17 @@ fn generate_leaf_key(key_type: LeafKeyType) -> Result<KeyPair, PkiError> {
                 PkiError::IssueFailed(format!("failed to generate P-384 key: {error}"))
             })
         }
-        LeafKeyType::Rsa2048 => generate_rsa_key(2048),
-        LeafKeyType::Rsa4096 => generate_rsa_key(4096),
+        LeafKeyType::Rsa2048 => {
+            KeyPair::generate_rsa_for(&rcgen::PKCS_RSA_SHA256, RsaKeySize::_2048).map_err(|error| {
+                PkiError::IssueFailed(format!("failed to generate RSA-2048 key: {error}"))
+            })
+        }
+        LeafKeyType::Rsa4096 => {
+            KeyPair::generate_rsa_for(&rcgen::PKCS_RSA_SHA256, RsaKeySize::_4096).map_err(|error| {
+                PkiError::IssueFailed(format!("failed to generate RSA-4096 key: {error}"))
+            })
+        }
     }
-}
-
-fn generate_rsa_key(bits: usize) -> Result<KeyPair, PkiError> {
-    let mut rng = rand::rngs::OsRng;
-    let key = RsaPrivateKey::new(&mut rng, bits).map_err(|error| {
-        PkiError::IssueFailed(format!("failed to generate RSA-{bits} key: {error}"))
-    })?;
-    let pem = key
-        .to_pkcs8_pem(LineEnding::LF)
-        .map_err(|error| PkiError::IssueFailed(format!("failed to encode RSA key: {error}")))?;
-    KeyPair::from_pem(pem.as_str()).map_err(|error| {
-        PkiError::IssueFailed(format!("failed to load generated RSA key: {error}"))
-    })
 }
 
 fn leaf_params(
