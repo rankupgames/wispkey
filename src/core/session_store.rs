@@ -207,6 +207,16 @@ impl SessionFileStore {
         let seed = fs::read(&self.device_seed_path)?;
         seed.try_into().map_err(|_| VaultError::SessionInvalid)
     }
+
+    pub(super) fn encrypt_for_device(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        let wrap_key = self.derive_wrap_key(true)?;
+        encrypt_session_payload(&wrap_key, plaintext)
+    }
+
+    pub(super) fn decrypt_for_device(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        let wrap_key = self.derive_wrap_key(false)?;
+        decrypt_session_payload(&wrap_key, ciphertext)
+    }
 }
 
 impl SessionStore for SessionFileStore {
@@ -312,9 +322,20 @@ fn validate_session_record(
     let age = Utc::now() - record.issued_at;
     if record.timeout_minutes > 0 && age.num_minutes() > record.timeout_minutes {
         store.clear()?;
-        return Err(VaultError::SessionInvalid);
+        return Err(VaultError::SessionExpired);
     }
     Ok(record)
+}
+
+pub(super) fn is_timeout_expired(issued_at: DateTime<Utc>, timeout_minutes: i64) -> bool {
+    timeout_minutes > 0 && (Utc::now() - issued_at).num_minutes() > timeout_minutes
+}
+
+pub(super) fn validate_timeout_minutes(timeout_minutes: i64) -> Result<i64> {
+    if timeout_minutes < 0 {
+        return Err(VaultError::InvalidSessionTimeout);
+    }
+    Ok(timeout_minutes)
 }
 
 fn encrypt_session_payload(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>> {
@@ -495,6 +516,18 @@ mod tests {
         .unwrap();
 
         assert!(matches!(store.load(), Err(VaultError::SessionInvalid)));
+        assert!(!store.session_path.exists());
+    }
+
+    #[test]
+    fn expired_session_is_cleared_with_distinct_error() {
+        let (_dir, store) = test_store(SessionBackend::MachineBound);
+        let key = [3u8; 32];
+        store
+            .save(&key, Utc::now() - chrono::Duration::minutes(45), 30)
+            .unwrap();
+
+        assert!(matches!(store.load(), Err(VaultError::SessionExpired)));
         assert!(!store.session_path.exists());
     }
 }

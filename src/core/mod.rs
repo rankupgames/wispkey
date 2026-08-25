@@ -22,6 +22,7 @@ use crate::secure_files;
 
 mod crypto;
 mod instances;
+mod protector;
 mod rows;
 mod schema;
 mod session;
@@ -67,8 +68,20 @@ pub enum VaultError {
     Database(#[from] rusqlite::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("session expired -- run `wispkey unlock` to mint a new session")]
+    SessionExpired,
     #[error("session expired or invalid")]
     SessionInvalid,
+    #[error("remembered unlock expired -- run `wispkey unlock` with the master password")]
+    ProtectorExpired,
+    #[error(
+        "no remembered unlock is available -- run `wispkey unlock` with --password-file, WISPKEY_PASSWORD, or an interactive prompt; use --remember to store an OS-backed or local protector"
+    )]
+    ProtectorUnavailable,
+    #[error("{0}")]
+    ProtectorUnavailableOs(String),
+    #[error("session timeout must be zero or a positive number of minutes")]
+    InvalidSessionTimeout,
     #[error("partition '{0}' already exists")]
     DuplicatePartition(String),
     #[error("partition '{0}' not found")]

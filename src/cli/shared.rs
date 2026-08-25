@@ -1,6 +1,6 @@
 use crate::core::{self, Vault};
 use crate::secure_files;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Read};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -77,6 +77,36 @@ pub(super) fn prompt_password(prompt: &str) -> String {
         eprintln!("Hint: set WISPKEY_PASSWORD env var for non-interactive use.");
         std::process::exit(1);
     })
+}
+
+/// Reads an unlock secret from `--password-file`, `WISPKEY_PASSWORD`, or a TTY prompt.
+/// Returns `Ok(None)` for non-interactive callers so they can use a remembered protector.
+pub(super) fn read_unlock_password(password_file: Option<&str>) -> Result<Option<String>, String> {
+    if let Some(path) = password_file {
+        return Ok(Some(read_master_password_file(path)?));
+    }
+    if let Ok(password) = std::env::var("WISPKEY_PASSWORD") {
+        return Ok(Some(password));
+    }
+    if std::io::stdin().is_terminal() {
+        return Ok(Some(prompt_password("Enter master password: ")));
+    }
+    Ok(None)
+}
+
+fn read_master_password_file(path: &str) -> Result<String, String> {
+    if path == "-" {
+        let mut password = String::new();
+        std::io::stdin()
+            .read_to_string(&mut password)
+            .map_err(|error| format!("reading password from stdin: {error}"))?;
+        return Ok(password.trim_end_matches(['\n', '\r']).to_string());
+    }
+
+    let password =
+        secure_files::read_private_string(Path::new(path), MAX_BUNDLE_PASSPHRASE_FILE_BYTES)
+            .map_err(|error| format!("reading password file: {error}"))?;
+    Ok(password.trim_end_matches(['\n', '\r']).to_string())
 }
 
 pub(super) fn prompt_password_confirm(prompt1: &str, prompt2: &str) -> Option<String> {
