@@ -7,6 +7,7 @@
  * Last Modified: 2026-04-12
  */
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 
@@ -26,6 +27,7 @@ mod rows;
 mod schema;
 mod session;
 mod session_store;
+mod templates;
 #[cfg(test)]
 mod tests;
 
@@ -36,6 +38,9 @@ pub use instances::{
 use rows::{credential_from_row, parse_csv, partition_from_row, project_from_row};
 #[cfg(test)]
 use rows::{parse_credential_type_column, parse_datetime_column};
+pub use templates::{
+    OVH_API_TEMPLATE, OvhApiTemplate, OwnedAddCredentialRequest, expand_credential_template,
+};
 
 /// Default partition name used when none is specified (`personal`).
 pub const DEFAULT_PARTITION_NAME: &str = "personal";
@@ -61,6 +66,12 @@ pub enum VaultError {
     CredentialNotFound(String),
     #[error("invalid credential type: {0}")]
     InvalidCredentialType(String),
+    #[error("credential name must not be empty")]
+    EmptyCredentialName,
+    #[error("credential value must not be empty")]
+    EmptyCredentialValue,
+    #[error("invalid credential template: {0}")]
+    InvalidCredentialTemplate(String),
     #[error("encryption error: {0}")]
     Encryption(String),
     #[error("database error: {0}")]
@@ -308,7 +319,59 @@ impl Vault {
 
     /// Inserts a new credential (encrypted secret, wisp token, optional description/hosts/tags/partition).
     pub fn add_credential(&self, request: AddCredentialRequest<'_>) -> Result<Credential> {
+        self.add_credentials_atomic(&[request])?
+            .pop()
+            .ok_or_else(|| VaultError::Encryption("credential insert produced no row".into()))
+    }
+
+    /// Inserts every credential in one transaction. Any failure rolls back the whole batch.
+    pub fn add_credentials_atomic(
+        &self,
+        requests: &[AddCredentialRequest<'_>],
+    ) -> Result<Vec<Credential>> {
+        if requests.is_empty() {
+            return Err(VaultError::InvalidCredentialTemplate(
+                "at least one credential is required".into(),
+            ));
+        }
+
+        let mut seen_names = HashSet::new();
+        for request in requests {
+            validate_add_request(request)?;
+            if !seen_names.insert(request.name) {
+                return Err(VaultError::DuplicateCredential(request.name.to_string()));
+            }
+        }
+
         let key = self.ensure_unlocked()?;
+        self.db.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+        let inserted = (|| {
+            let mut created = Vec::with_capacity(requests.len());
+            for request in requests {
+                created.push(self.insert_credential_row(key, request)?);
+            }
+            Ok(created)
+        })();
+        match inserted {
+            Ok(created) => {
+                if let Err(error) = self.db.execute_batch("COMMIT") {
+                    let _ = self.db.execute_batch("ROLLBACK");
+                    return Err(error.into());
+                }
+                Ok(created)
+            }
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                Err(error)
+            }
+        }
+    }
+
+    fn insert_credential_row(
+        &self,
+        key: &[u8; 32],
+        request: &AddCredentialRequest<'_>,
+    ) -> Result<Credential> {
         let active = resolve_active_project();
         let project_name = request.project.unwrap_or(&active);
         let project_id = self.resolve_project_id(project_name)?;
@@ -344,7 +407,7 @@ impl Vault {
             id,
             name: request.name.to_string(),
             description: desc.to_string(),
-            credential_type: request.credential_type,
+            credential_type: request.credential_type.clone(),
             wisp_token,
             hosts: parse_csv(hosts_csv),
             tags: parse_csv(tags_csv),
@@ -925,6 +988,16 @@ impl Vault {
             }
         }
     }
+}
+
+fn validate_add_request(request: &AddCredentialRequest<'_>) -> Result<()> {
+    if request.name.trim().is_empty() {
+        return Err(VaultError::EmptyCredentialName);
+    }
+    if request.value.trim().is_empty() {
+        return Err(VaultError::EmptyCredentialValue);
+    }
+    Ok(())
 }
 
 /// Active project name: `WISPKEY_PROJECT`, else `active_project` file, else [`DEFAULT_PROJECT_NAME`].

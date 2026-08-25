@@ -1,0 +1,304 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>WispKey</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+        background: #10141c;
+        color: #e7ecf5;
+      }
+      body { margin: 0; }
+      main { padding: 1.25rem; }
+      h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+      label, .meta { display: block; font-size: 0.8rem; margin: 0.7rem 0 0.25rem; color: #9aa7bd; }
+      input, select, textarea {
+        width: 100%;
+        box-sizing: border-box;
+        border: 1px solid #2b3648;
+        background: #1a2230;
+        color: inherit;
+        border-radius: 8px;
+        padding: 0.55rem 0.7rem;
+      }
+      .row { display: flex; gap: 0.5rem; }
+      .secret-row { display: flex; gap: 0.5rem; align-items: center; }
+      .secret-row input { flex: 1; }
+      button {
+        border: 0;
+        border-radius: 8px;
+        padding: 0.55rem 0.8rem;
+        background: #1a73e8;
+        color: white;
+        cursor: pointer;
+      }
+      button.secondary { background: #2b3648; }
+      .status { margin-top: 0.8rem; min-height: 1.2rem; color: #9aa7bd; }
+      .list { margin: 0; padding: 0; list-style: none; }
+      .list li { padding: 0.55rem 0; border-bottom: 1px solid #2b3648; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1 id="title">WispKey</h1>
+      <section id="view"></section>
+      <p class="status" id="status"></p>
+    </main>
+    <script>
+      const initialView = "WISPKEY_INITIAL_VIEW";
+      const state = { view: initialView === "WISPKEY_INITIAL_VIEW" ? "add" : initialView, reveal: false, timeoutId: null };
+
+      function ipc(request) {
+        return new Promise((resolve) => {
+          const id = crypto.randomUUID();
+          window.__wispkeyPending = window.__wispkeyPending || {};
+          window.__wispkeyPending[id] = resolve;
+          request.id = id;
+          if (window.ipc && window.ipc.postMessage) {
+            window.ipc.postMessage(JSON.stringify(request));
+          } else {
+            resolve({ ok: false, error: { message: "IPC unavailable" } });
+          }
+        });
+      }
+      window.__wispkeyResolve = function (id, payload) {
+        const pending = (window.__wispkeyPending || {})[id];
+        if (pending) {
+          delete window.__wispkeyPending[id];
+          pending(payload);
+        }
+      };
+
+      function clearSecrets() {
+        document.querySelectorAll("input[data-secret]").forEach((input) => {
+          input.value = "";
+        });
+        state.reveal = false;
+        document.querySelectorAll("input[data-secret]").forEach((input) => {
+          input.type = "password";
+        });
+      }
+
+      function setStatus(message) {
+        document.getElementById("status").textContent = message;
+      }
+
+      function armTimeout() {
+        if (state.timeoutId) clearTimeout(state.timeoutId);
+        state.timeoutId = setTimeout(() => {
+          clearSecrets();
+          setStatus("Secrets cleared after idle timeout");
+        }, 120000);
+      }
+
+      async function copyValue(id) {
+        const input = document.getElementById(id);
+        if (!input || !input.value) return;
+        try {
+          if (navigator.clipboard && navigator.clipboard.writeText) {
+            await navigator.clipboard.writeText(input.value);
+          } else {
+            input.select();
+            document.execCommand("copy");
+          }
+          setStatus("Copied");
+        } catch (_error) {
+          setStatus("Copy failed");
+        }
+      }
+
+      function bindReveal() {
+        const reveal = document.getElementById("reveal");
+        if (!reveal) return;
+        reveal.onclick = () => {
+          state.reveal = !state.reveal;
+          document.querySelectorAll("input[data-secret]").forEach((input) => {
+            input.type = state.reveal ? "text" : "password";
+          });
+        };
+      }
+
+      function secretField(id, label) {
+        return "<label>" + label + "</label><div class='secret-row'><input data-secret id='" + id + "' type='password'><button class='secondary' type='button' data-copy='" + id + "'>Copy</button></div>";
+      }
+
+      function render() {
+        const root = document.getElementById("view");
+        const title = document.getElementById("title");
+        if (state.view === "list") {
+          title.textContent = "Credentials";
+          root.innerHTML = "<ul class='list' id='cred-list'><li>Loading…</li></ul>";
+          ipc({ method: "list_credentials" }).then((response) => {
+            const items = ((((response.result || {}).credentials) || [])
+              .map((item) => "<li><strong>" + item.name + "</strong><div class='meta'>" + (item.type || "") + " · " + ((item.tags || []).join(", ")) + "</div></li>")
+              .join("")) || "<li>No credentials</li>";
+            const list = document.getElementById("cred-list");
+            if (list) list.innerHTML = items;
+          });
+          return;
+        }
+        if (state.view === "settings") {
+          title.textContent = "Settings";
+          root.innerHTML = `
+            <label><input id="start-at-login" type="checkbox"> Start at login</label>
+            <div class="row" style="margin-top:1rem"><button id="save-settings">Save</button></div>`;
+          ipc({ method: "get_settings" }).then((response) => {
+            const checkbox = document.getElementById("start-at-login");
+            if (checkbox) checkbox.checked = !!(response.result || {}).start_at_login;
+          });
+          document.getElementById("save-settings").onclick = async () => {
+            const enabled = document.getElementById("start-at-login").checked;
+            const response = await ipc({ method: "set_settings", params: { start_at_login: enabled } });
+            setStatus(response.ok ? "Saved" : (response.error || {}).message || "Failed");
+          };
+          return;
+        }
+        if (state.view === "unlock") {
+          title.textContent = "Unlock vault";
+          root.innerHTML = `
+            ${secretField("password", "Master password")}
+            <div class="row" style="margin-top:1rem">
+              <button id="unlock">Unlock</button>
+              <button class="secondary" id="reveal" type="button">Reveal</button>
+              <button class="secondary" id="cancel">Cancel</button>
+            </div>`;
+          bindReveal();
+          document.querySelector("[data-copy='password']").onclick = () => copyValue("password");
+          document.getElementById("cancel").onclick = () => {
+            clearSecrets();
+            window.close();
+          };
+          document.getElementById("unlock").onclick = async () => {
+            const response = await ipc({
+              method: "unlock",
+              params: { password: document.getElementById("password").value }
+            });
+            clearSecrets();
+            if (response.ok) {
+              setStatus("Unlocked");
+            } else {
+              setStatus((response.error || {}).message || "Unlock failed");
+            }
+          };
+          return;
+        }
+        title.textContent = "Add credential";
+        root.innerHTML = `
+          <label>Mode</label>
+          <select id="mode"><option value="single">Single credential</option><option value="ovh_api">OVH API template</option></select>
+          <div id="form"></div>
+          <div class="row" style="margin-top:1rem">
+            <button id="save">Save</button>
+            <button class="secondary" id="cancel">Cancel</button>
+          </div>`;
+        const form = document.getElementById("form");
+        function renderForm() {
+          if (document.getElementById("mode").value === "ovh_api") {
+            form.innerHTML = `
+              <label>Name prefix</label><input id="name_prefix" placeholder="ovh-prod">
+              ${secretField("application_key", "Application Key")}
+              ${secretField("application_secret", "Application Secret")}
+              ${secretField("consumer_key", "Consumer Key")}
+              <label>Project</label><input id="project">
+              <label>Partition</label><input id="partition" placeholder="personal">
+              <label>Hosts</label><input id="hosts" placeholder="eu.api.ovh.com">
+              <label>Tags</label><input id="tags" value="ovh">
+              <div class="row"><button class="secondary" id="reveal" type="button">Reveal</button></div>`;
+          } else {
+            form.innerHTML = `
+              <label>Name</label><input id="name" placeholder="openai-key">
+              <label>Type</label>
+              <select id="type">
+                <option value="bearer_token">bearer_token</option>
+                <option value="api_key">api_key</option>
+                <option value="basic_auth">basic_auth</option>
+                <option value="custom_header">custom_header</option>
+                <option value="query_param">query_param</option>
+              </select>
+              <div id="type-extra"></div>
+              ${secretField("value", "Value")}
+              <label>Description</label><input id="description">
+              <label>Tags</label><input id="tags">
+              <label>Hosts</label><input id="hosts">
+              <label>Project</label><input id="project">
+              <label>Partition</label><input id="partition" placeholder="personal">
+              <div class="row"><button class="secondary" id="reveal" type="button">Reveal</button></div>`;
+            const extra = document.getElementById("type-extra");
+            const typeSelect = document.getElementById("type");
+            function renderExtra() {
+              if (typeSelect.value === "custom_header") {
+                extra.innerHTML = "<label>Header name</label><input id='header_name'>";
+              } else if (typeSelect.value === "query_param") {
+                extra.innerHTML = "<label>Param name</label><input id='param_name'>";
+              } else {
+                extra.innerHTML = "";
+              }
+            }
+            typeSelect.onchange = renderExtra;
+            renderExtra();
+          }
+          bindReveal();
+          form.querySelectorAll("[data-copy]").forEach((button) => {
+            button.onclick = () => copyValue(button.getAttribute("data-copy"));
+          });
+        }
+        document.getElementById("mode").onchange = renderForm;
+        renderForm();
+        document.getElementById("cancel").onclick = () => {
+          clearSecrets();
+          window.close();
+        };
+        document.getElementById("save").onclick = async () => {
+          const mode = document.getElementById("mode").value;
+          let response;
+          if (mode === "ovh_api") {
+            response = await ipc({
+              method: "add_template",
+              params: {
+                template: "ovh_api",
+                name_prefix: document.getElementById("name_prefix").value,
+                application_key: document.getElementById("application_key").value,
+                application_secret: document.getElementById("application_secret").value,
+                consumer_key: document.getElementById("consumer_key").value,
+                project: document.getElementById("project").value,
+                partition: document.getElementById("partition").value,
+                hosts: document.getElementById("hosts").value,
+                tags: document.getElementById("tags").value
+              }
+            });
+          } else {
+            response = await ipc({
+              method: "add_credential",
+              params: {
+                name: document.getElementById("name").value,
+                type: document.getElementById("type").value,
+                value: document.getElementById("value").value,
+                description: document.getElementById("description").value,
+                tags: document.getElementById("tags").value,
+                hosts: document.getElementById("hosts").value,
+                project: document.getElementById("project").value,
+                partition: document.getElementById("partition").value,
+                header_name: (document.getElementById("header_name") || {}).value,
+                param_name: (document.getElementById("param_name") || {}).value
+              }
+            });
+          }
+          clearSecrets();
+          if (response.ok) {
+            setStatus("Saved");
+          } else {
+            setStatus((response.error || {}).message || "Save failed");
+          }
+        };
+      }
+
+      window.addEventListener("pagehide", clearSecrets);
+      document.addEventListener("input", armTimeout);
+      document.addEventListener("keydown", armTimeout);
+      armTimeout();
+      render();
+    </script>
+  </body>
+</html>

@@ -102,4 +102,11 @@ impl Vault {
     pub fn session_protection_label() -> &'static str {
         session_store().protection_label()
     }
+
+    /// Clears the on-disk session and drops the in-memory master key.
+    pub fn lock(&mut self) -> Result<()> {
+        session_store().clear()?;
+        self.master_key = None;
+        Ok(())
+    }
 }

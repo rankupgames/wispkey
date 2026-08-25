@@ -10,24 +10,10 @@
 #![deny(clippy::correctness)]
 #![warn(clippy::suspicious, clippy::style, clippy::perf, clippy::complexity)]
 
-mod audit;
-mod bundle;
-mod cli;
-mod cloud;
-mod core;
-mod env_sideload;
-mod mcp;
-mod migrate;
-mod partition;
-mod policy;
-mod proxy;
-mod random;
-mod secure_files;
-mod sharing;
-
 use std::io::Read;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use wispkey::cli;
 
 #[derive(Parser)]
 #[command(name = "wispkey")]
@@ -58,6 +44,16 @@ enum Commands {
         /// Session timeout in minutes (default: 30, 0 = no expiry)
         #[arg(long)]
         timeout: Option<i64>,
+    },
+
+    /// Lock the vault by clearing the current session
+    Lock,
+
+    /// Start the owner IPC server and optional tray UI
+    Tray {
+        /// Serve authenticated owner IPC without opening the tray UI
+        #[arg(long)]
+        ipc_only: bool,
     },
 
     /// Add a credential to the vault
@@ -722,6 +718,12 @@ async fn main() {
         }
         Commands::Unlock { timeout } => {
             cli::handle_unlock(timeout).await;
+        }
+        Commands::Lock => {
+            cli::handle_lock().await;
+        }
+        Commands::Tray { ipc_only } => {
+            cli::handle_tray(ipc_only).await;
         }
         Commands::Add {
             name,

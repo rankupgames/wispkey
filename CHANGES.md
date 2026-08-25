@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Optional secure tray GUI
+
+- Added `wispkey lock` to clear the current session and drop the in-memory master key.
+- Added `wispkey tray [--ipc-only]` for authenticated, current-user-only owner IPC (Unix socket with same-UID `SO_PEERCRED`, Windows named pipe).
+- Added optional `wispkey-tray` desktop crate with tray-icon plus a Svelte 5 webview for single-credential and atomic OVH API template entry. Closing a dialog does not quit the tray.
+- `add_credential` now rejects empty names and values. Compound saves use `add_credentials_atomic` so a duplicate or invalid later row rolls back the whole batch.
+- Owner IPC responses and logs never include plaintext secret values; known secret fields are redacted before tracing.
+- Default `cargo test` still skips the GUI crate. Documented the tray boundary in `docs/tray.md` and `docs/security-model.md`.
+
 ### Cross-machine and Firecracker instance access
 
 - Added `firecracker-vsock:/absolute/base.sock:<port>` listeners for Firecracker's actual guest-to-host transport. WispKey binds Firecracker's required `<base>_<port>` Unix socket while preserving the existing feature-gated `vsock://<cid>:<port>` listener for Linux environments that expose host AF_VSOCK directly.

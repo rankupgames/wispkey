@@ -23,6 +23,7 @@ mod proxy;
 mod run;
 mod shared;
 mod status;
+mod tray;
 mod vault;
 
 pub use audit::{AuditExportFormat, handle_audit_export, handle_audit_tail};
@@ -59,4 +60,5 @@ pub use proxy::{handle_proxy_cleanup, handle_proxy_status, handle_proxy_stop, ha
 pub use run::{RunArgs, handle_run};
 pub use shared::set_json_output;
 pub use status::handle_status;
+pub use tray::{handle_lock, handle_tray};
 pub use vault::{handle_init, handle_unlock};

@@ -40,6 +40,20 @@ This prevents a simple read of `~/.wispkey/session` from recovering the vault ke
 
 `WISPKEY_SESSION_PLAINTEXT=1` writes the legacy plaintext session format for explicit debugging or rollback. It is not the default and is reported as plaintext protection in `wispkey --format json status`.
 
+## Owner IPC And Tray Boundary
+
+The optional tray is a desktop extension of the CLI, not a second credential store. `wispkey tray` serves an owner-only local endpoint; `wispkey-tray` talks to that endpoint from a native webview. There is no unauthenticated localhost HTTP form.
+
+On Unix the endpoint is `owner.sock` under the vault directory, mode `0600`, with same-UID `SO_PEERCRED` checks. On Windows it is a per-user named pipe. The `owner.json` discovery file stores pid, protocol version, and endpoint only.
+
+Secrets in IPC requests are resolved in-process and never returned in responses, written to tracing logs, put on argv, or shown in notifications. Known secret JSON fields are redacted before log formatting. List and add responses include names, types, tags, hosts, wisp tokens, and project/partition metadata only.
+
+Compound OVH API saves insert three `api_key` credentials in one transaction. Any empty field, duplicate name, or insert failure rolls back all three. A locked vault, unauthorized peer, missing endpoint, or malformed request fails closed. `wispkey lock` clears the session file and the in-memory master key.
+
+Closing a tray dialog must not stop the background process. Quit or the `shutdown` IPC method stops it. Start-at-login writes a user autostart desktop file on Linux; it does not change permissions on `~/.config/autostart`.
+
+The tray does not add a same-OS-user security boundary. A process running as the vault owner can still attach to the socket, inspect memory, or read local files.
+
 ## Exec, Run, And Inject Boundary
 
 `wispkey exec` exists for non-HTTP consumers that cannot use the token-substituting proxy. It requires an unlocked vault session, resolves the credential inside the WispKey process, and injects the value only into the child through selected channels:

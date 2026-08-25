@@ -1357,3 +1357,158 @@ fn revoke_during_instance_secret_verification_fails_closed() {
         "revoked"
     );
 }
+
+#[test]
+fn add_credential_rejects_empty_value() {
+    let vault = test_vault("pw");
+    let result = vault.add_credential(
+        AddCredentialRequest::new("empty-val", CredentialType::ApiKey, "").project(Some("default")),
+    );
+    assert!(matches!(result, Err(VaultError::EmptyCredentialValue)));
+    assert_eq!(vault.credential_count().unwrap(), 0);
+}
+
+#[test]
+fn add_credential_rejects_whitespace_value() {
+    let vault = test_vault("pw");
+    let result = vault.add_credential(
+        AddCredentialRequest::new("blank-val", CredentialType::ApiKey, "   ")
+            .project(Some("default")),
+    );
+    assert!(matches!(result, Err(VaultError::EmptyCredentialValue)));
+}
+
+#[test]
+fn add_credential_rejects_empty_name() {
+    let vault = test_vault("pw");
+    let result = vault.add_credential(
+        AddCredentialRequest::new("  ", CredentialType::ApiKey, "secret").project(Some("default")),
+    );
+    assert!(matches!(result, Err(VaultError::EmptyCredentialName)));
+}
+
+#[test]
+fn add_credentials_atomic_saves_all() {
+    let vault = test_vault("pw");
+    let first =
+        AddCredentialRequest::new("ovh-ak", CredentialType::ApiKey, "ak").project(Some("default"));
+    let second =
+        AddCredentialRequest::new("ovh-as", CredentialType::ApiKey, "as").project(Some("default"));
+    let created = vault.add_credentials_atomic(&[first, second]).unwrap();
+    assert_eq!(created.len(), 2);
+    assert_eq!(vault.credential_count().unwrap(), 2);
+    assert_eq!(
+        vault
+            .decrypt_credential_value_in_project("default", "ovh-ak")
+            .unwrap(),
+        "ak"
+    );
+}
+
+#[test]
+fn add_credentials_atomic_rolls_back_duplicate() {
+    let vault = test_vault("pw");
+    vault
+        .add_credential(
+            AddCredentialRequest::new("keep-me", CredentialType::ApiKey, "original")
+                .project(Some("default")),
+        )
+        .unwrap();
+    let first = AddCredentialRequest::new("new-one", CredentialType::ApiKey, "one")
+        .project(Some("default"));
+    let second = AddCredentialRequest::new("keep-me", CredentialType::ApiKey, "two")
+        .project(Some("default"));
+    let result = vault.add_credentials_atomic(&[first, second]);
+    assert!(matches!(result, Err(VaultError::DuplicateCredential(_))));
+    assert_eq!(vault.credential_count().unwrap(), 1);
+    assert!(vault.get_credential("new-one").is_err());
+}
+
+#[test]
+fn add_credentials_atomic_rolls_back_invalid_later_value() {
+    let vault = test_vault("pw");
+    let first = AddCredentialRequest::new("batch-ok", CredentialType::ApiKey, "ok")
+        .project(Some("default"));
+    let second =
+        AddCredentialRequest::new("batch-bad", CredentialType::ApiKey, "").project(Some("default"));
+    let result = vault.add_credentials_atomic(&[first, second]);
+    assert!(matches!(result, Err(VaultError::EmptyCredentialValue)));
+    assert_eq!(vault.credential_count().unwrap(), 0);
+}
+
+#[test]
+fn ovh_template_expands_three_api_keys() {
+    let requests = expand_credential_template(
+        OVH_API_TEMPLATE,
+        OvhApiTemplate {
+            name_prefix: "ovh-prod",
+            application_key: "ak-secret",
+            application_secret: "as-secret",
+            consumer_key: "ck-secret",
+            description: None,
+            hosts: Some("api.ovh.com"),
+            tags: None,
+            partition: None,
+            project: Some("default"),
+        },
+    )
+    .unwrap();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0].name, "ovh-prod-application-key");
+    assert_eq!(requests[1].name, "ovh-prod-application-secret");
+    assert_eq!(requests[2].name, "ovh-prod-consumer-key");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.credential_type == CredentialType::ApiKey)
+    );
+}
+
+#[test]
+fn ovh_template_save_is_atomic() {
+    let vault = test_vault("pw");
+    let owned = expand_credential_template(
+        OVH_API_TEMPLATE,
+        OvhApiTemplate {
+            name_prefix: "ovh-prod",
+            application_key: "ak-secret",
+            application_secret: "as-secret",
+            consumer_key: "ck-secret",
+            description: None,
+            hosts: None,
+            tags: Some("ovh"),
+            partition: None,
+            project: Some("default"),
+        },
+    )
+    .unwrap();
+    let requests: Vec<_> = owned
+        .iter()
+        .map(OwnedAddCredentialRequest::as_request)
+        .collect();
+    let created = vault.add_credentials_atomic(&requests).unwrap();
+    assert_eq!(created.len(), 3);
+    assert_eq!(vault.credential_count().unwrap(), 3);
+}
+
+#[test]
+fn ovh_template_unknown_id_fails() {
+    let result = expand_credential_template(
+        "not-a-template",
+        OvhApiTemplate {
+            name_prefix: "ovh-prod",
+            application_key: "ak",
+            application_secret: "as",
+            consumer_key: "ck",
+            description: None,
+            hosts: None,
+            tags: None,
+            partition: None,
+            project: None,
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(VaultError::InvalidCredentialTemplate(_))
+    ));
+}
