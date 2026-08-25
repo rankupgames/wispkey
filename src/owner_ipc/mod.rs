@@ -119,16 +119,10 @@ pub async fn call(path: &Path, request: Value) -> Result<Value, OwnerIpcError> {
     }
 }
 
+#[cfg(unix)]
 fn current_uid() -> u32 {
-    #[cfg(unix)]
-    {
-        // SAFETY: getuid has no preconditions and cannot fail.
-        unsafe { libc::getuid() }
-    }
-    #[cfg(windows)]
-    {
-        0
-    }
+    // SAFETY: getuid has no preconditions and cannot fail.
+    unsafe { libc::getuid() }
 }
 
 fn write_metadata(path: &Path) -> Result<(), OwnerIpcError> {
@@ -475,19 +469,6 @@ fn error_body(code: &str, message: &str) -> Value {
     json!({ "code": code, "message": message })
 }
 
-fn autostart_exec_line() -> String {
-    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("wispkey"));
-    let name = exe
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("wispkey");
-    if name.starts_with("wispkey-tray") {
-        format!("\"{}\"", exe.display())
-    } else {
-        format!("\"{}\" tray", exe.display())
-    }
-}
-
 fn settings_path() -> PathBuf {
     Vault::vault_dir().join("tray.json")
 }
@@ -507,6 +488,20 @@ fn write_start_at_login(enabled: bool) -> Result<(), VaultError> {
     #[cfg(target_os = "linux")]
     write_linux_autostart(enabled)?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn autostart_exec_line() -> String {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("wispkey"));
+    let name = exe
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("wispkey");
+    if name.starts_with("wispkey-tray") {
+        format!("\"{}\"", exe.display())
+    } else {
+        format!("\"{}\" tray", exe.display())
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -637,7 +632,7 @@ mod windows {
         tracing::info!(pipe = %name, "owner ipc listening");
         let mut first = true;
         loop {
-            let mut server = ServerOptions::new()
+            let server = ServerOptions::new()
                 .first_pipe_instance(first)
                 .create(&name)?;
             first = false;
