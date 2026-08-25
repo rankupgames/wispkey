@@ -23,13 +23,16 @@ fn listen_spec_parses_supported_transports() {
         transport::ListenSpec::Vsock { cid: 3, port: 7700 }
     ));
 
-    let firecracker =
-        transport::ListenSpec::parse("firecracker-vsock:/run/firecracker/worker.vsock:7700")
-            .unwrap();
-    assert!(matches!(
-        firecracker,
-        transport::ListenSpec::FirecrackerVsock { port: 7700, .. }
-    ));
+    #[cfg(unix)]
+    {
+        let firecracker =
+            transport::ListenSpec::parse("firecracker-vsock:/run/firecracker/worker.vsock:7700")
+                .unwrap();
+        assert!(matches!(
+            firecracker,
+            transport::ListenSpec::FirecrackerVsock { port: 7700, .. }
+        ));
+    }
 }
 
 #[test]
