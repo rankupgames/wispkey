@@ -143,10 +143,8 @@ fn proxy_uses_env_sideload_token_without_master_password() {
         fallback_audit.contains("WISPKEY_SIDELOAD_OPENAI"),
         "expected sideload env key in audit event:\n{fallback_audit}"
     );
-    assert!(
-        fallback_audit.contains("wk_env_openai"),
-        "expected sideload token in audit event:\n{fallback_audit}"
-    );
+    assert!(fallback_audit.contains("token_fingerprint"));
+    assert!(!fallback_audit.contains("wk_env_openai"));
     assert!(
         !fallback_audit.contains("sideload-secret"),
         "fallback audit must not expose env secret:\n{fallback_audit}"
@@ -169,7 +167,12 @@ fn proxy_uses_env_sideload_token_without_master_password() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["event_type"], "SideloadUsed");
     assert_eq!(entries[0]["credential_name"], "WISPKEY_SIDELOAD_OPENAI");
-    assert_eq!(entries[0]["wisp_token"], "wk_env_openai");
+    assert!(
+        entries[0]["token_fingerprint"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("hmac-sha256:"))
+    );
+    assert!(entries[0].get("wisp_token").is_none());
     assert_eq!(entries[0]["source"], "sideload-fallback-jsonl");
     assert!(
         !String::from_utf8_lossy(&log_output.stdout).contains("sideload-secret"),
@@ -258,7 +261,12 @@ fn management_logs_include_vaultless_sideload_fallback_rows_without_secret() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0]["event_type"], "SideloadUsed");
     assert_eq!(entries[0]["credential_name"], "WISPKEY_SIDELOAD_OPENAI");
-    assert_eq!(entries[0]["wisp_token"], "wk_env_openai");
+    assert!(
+        entries[0]["token_fingerprint"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("hmac-sha256:"))
+    );
+    assert!(entries[0].get("wisp_token").is_none());
     assert_eq!(entries[0]["source"], "sideload-fallback-jsonl");
 }
 

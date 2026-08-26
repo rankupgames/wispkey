@@ -45,6 +45,27 @@ pub(crate) fn append_private(path: &Path, bytes: &[u8]) -> Result<()> {
     harden_file(path)
 }
 
+/// Creates a new owner-only file without replacing an existing file.
+/// Returns `false` when another process created the file first.
+pub(crate) fn create_private(path: &Path, bytes: &[u8]) -> Result<bool> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ensure_private_directory(parent)?;
+    }
+    match create_private_file(path, bytes) {
+        Ok(()) => {
+            harden_file(path)?;
+            Ok(true)
+        }
+        Err(VaultError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Reads a small sensitive text file after rejecting obviously unsafe inputs
 /// such as directories, oversized files, and broad Unix permissions.
 pub(crate) fn read_private_string(path: &Path, max_bytes: u64) -> Result<String> {
@@ -96,6 +117,21 @@ fn append_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn create_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(path, bytes)?;
@@ -108,6 +144,16 @@ fn append_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let mut file = OpenOptions::new().append(true).create(true).open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;
     Ok(())
 }

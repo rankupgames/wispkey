@@ -365,12 +365,9 @@ fn missing_token_response(
     context: &TokenRequestContext<'_>,
 ) -> Box<Response<Full<Bytes>>> {
     let reason = if vault.is_some() {
-        format!("wisp token '{}' was not found in the active vault", token)
+        "wisp token was not found in the active vault".to_string()
     } else {
-        format!(
-            "wisp token '{}' requires an unlocked vault or matching WISPKEY_SIDELOAD_* env var",
-            token
-        )
+        "wisp token requires an unlocked vault or matching WISPKEY_SIDELOAD_* env var".to_string()
     };
     if let Some(vault) = vault {
         audit_denial(vault, "CredentialDenied", None, token, context, &reason);
@@ -385,12 +382,10 @@ fn resolve_env_token_for_request(
 ) -> ProxyActionResult<ResolvedToken> {
     let Some(env_credential) = try_env_sideload(token) else {
         let reason = if vault.is_some() {
-            format!("wisp token '{}' was not found in the active vault", token)
+            "wisp token was not found in the active vault".to_string()
         } else {
-            format!(
-                "wisp token '{}' requires an unlocked vault or matching WISPKEY_SIDELOAD_* env var",
-                token
-            )
+            "wisp token requires an unlocked vault or matching WISPKEY_SIDELOAD_* env var"
+                .to_string()
         };
         return Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)));
     };
