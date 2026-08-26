@@ -4,7 +4,7 @@
  * Project: WispKey
  * Description: Authenticated current-user owner IPC for tray and desktop clients.
  * Created: 2026-08-25
- * Last Modified: 2026-08-25
+ * Last Modified: 2026-08-26
  */
 
 use std::path::{Path, PathBuf};
@@ -729,10 +729,14 @@ mod windows {
             bInheritHandle: 0,
         };
         // SAFETY: attributes and its owned security descriptor remain valid for the create call.
+        // Tokio takes a raw *mut c_void, matching CreateNamedPipeW's lpSecurityAttributes.
         let server = unsafe {
             ServerOptions::new()
                 .first_pipe_instance(first)
-                .create_with_security_attributes_raw(name, &mut attributes)
+                .create_with_security_attributes_raw(
+                    name,
+                    std::ptr::from_mut(&mut attributes).cast(),
+                )
         }?;
         Ok(server)
     }
