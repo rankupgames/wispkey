@@ -19,6 +19,7 @@ mod env_sideload;
 mod mcp;
 mod migrate;
 mod partition;
+mod pki;
 mod policy;
 mod proxy;
 mod random;

@@ -206,6 +206,9 @@ Available MCP tools:
 - `wispkey_get_token` -- Get wisp token for a credential
 - `wispkey_proxy_status` -- Check vault/session/proxy state
 - `wispkey_project_list` -- List all projects with partition counts
+- `wispkey_set` -- Create or update a credential (requires `overwrite: true` to replace)
+- `wispkey_delete` -- Delete a credential by name
+- `wispkey_issue_cert` -- Issue a leaf certificate from a CA key stored in the vault; the CA private key is never returned
 
 ## HTTPS Proxy
 

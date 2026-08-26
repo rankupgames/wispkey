@@ -45,6 +45,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # TLS provider (explicit dep so we can install the process-wide CryptoProvider at startup)
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
+# PKI (CA-held leaf issuance). aws-lc-rs is required for RSA key generation;
+# rcgen's ring backend cannot generate RSA keys.
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+x509-parser = { version = "0.17", features = ["verify"] }
+time = { version = "0.3", default-features = false, features = ["std", "formatting"] }
+
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
