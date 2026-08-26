@@ -52,8 +52,7 @@ fn check_project_scope(
     }
 }
 
-#[cfg(test)]
-pub(super) fn inject_credential(
+pub(crate) fn inject_credential(
     credential_type: &CredentialType,
     real_value: &str,
     original_header_value: &str,
@@ -61,6 +60,27 @@ pub(super) fn inject_credential(
 ) -> String {
     let replacement = credential_replacement_value(credential_type, real_value);
     original_header_value.replacen(token, &replacement, 1)
+}
+
+/// Proves header token substitution with generated material, never a vault credential.
+pub(crate) fn prove_synthetic_token_substitution() -> Result<(), String> {
+    let token_suffix = crate::random::alphanumeric(8, true)
+        .map_err(|error| format!("generating diagnostic token: {error}"))?;
+    let secret_suffix = crate::random::alphanumeric(20, true)
+        .map_err(|error| format!("generating diagnostic secret: {error}"))?;
+    let token = format!("wk_env_doctor{token_suffix}");
+    let secret = format!("synth{secret_suffix}");
+    let pattern = Regex::new(r"wk_[a-z0-9_]+").expect("static wisp token regex must compile");
+    if !pattern.is_match(&token) {
+        return Err("generated diagnostic token was not recognized as a wisp token".to_string());
+    }
+
+    let header = format!("Bearer {token}");
+    let replaced = inject_credential(&CredentialType::BearerToken, &secret, &header, &token);
+    if replaced == format!("Bearer {secret}") && !replaced.contains(&token) {
+        return Ok(());
+    }
+    Err("synthetic token substitution did not replace the generated test token".to_string())
 }
 
 fn credential_replacement_value(credential_type: &CredentialType, real_value: &str) -> String {

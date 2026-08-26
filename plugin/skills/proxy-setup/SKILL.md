@@ -109,8 +109,10 @@ The agent can then call:
 ## Verify Setup
 
 ```bash
-# Check status
+# Check status and run secret-safe diagnostics
 wispkey status
+wispkey doctor
+wispkey integrate cursor --print
 
 # Test an HTTPS proxied request that swaps the wisp token
 curl http://localhost:7700 \

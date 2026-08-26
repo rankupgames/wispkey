@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Doctor checks and MCP client setup
+
+- Added `wispkey doctor` and `wispkey doctor --format json` for secret-safe diagnostics with stable check IDs and remediation text.
+- Doctor verifies binary version, vault permissions, session state, proxy ownership/readiness, policy validity, audit writability, MCP stdio initialization, supported transport, and a synthetic token-substitution probe that uses generated test material rather than a vault credential.
+- Added `wispkey integrate cursor|codex|claude-code|generic-mcp [--print] [--path FILE]`. Generated commands use `wispkey` from PATH, contain no secret values, warn before JSON formats that need plaintext `env` blocks, and merge idempotently without dropping unrelated client settings.
+
 ### Optional secure tray GUI
 
 - Added `wispkey lock` to clear the current session and drop the in-memory master key.

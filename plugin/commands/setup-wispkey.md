@@ -34,10 +34,17 @@ Quick setup for a new project.
 5. **Verify**:
    ```bash
    wispkey status
+   wispkey doctor
    wispkey list
    ```
 
-6. **Configure MCP** (add to Cursor settings). Keep `command` as `wispkey` so the client uses the normal installed binary from `PATH`:
+6. **Configure MCP**. Prefer the generator so the command stays `wispkey` on PATH and unrelated client settings are preserved:
+   ```bash
+   wispkey integrate cursor --print
+   wispkey integrate cursor
+   ```
+
+   Or add the snippet to Cursor settings manually. Keep `command` as `wispkey` so the client uses the normal installed binary from `PATH`:
    ```json
    {
      "mcpServers": {
