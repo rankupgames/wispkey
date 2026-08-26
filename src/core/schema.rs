@@ -463,6 +463,12 @@ impl Vault {
             )?;
         }
 
+        // Older releases stored reusable capability tokens in audit rows. Remove
+        // them on every open so databases do not retain credentials in history.
+        if table_has_column(db, "audit_log", "wisp_token")? {
+            crate::audit::redact_legacy_audit_tokens(db)?;
+        }
+
         Ok(())
     }
 
