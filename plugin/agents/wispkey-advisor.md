@@ -25,7 +25,7 @@ Detect these patterns in source files:
 
 3. **.env files in version control**
    - `.env` not in `.gitignore`
-   - Suggest reviewing whether the file should be tracked, then use `wispkey env attach` for selected HTTP-facing secrets or `run`/`exec` for non-HTTP values
+   - Suggest reviewing whether the file should be tracked. If not, ignore it and remove it from Git before using `wispkey env attach`; tokens are machine-specific. Use `run`/`exec` for non-HTTP values.
 
 ### Warning: Insecure Patterns
 
@@ -84,7 +84,7 @@ Paste the key at the hidden prompt, then replace the hardcoded value with the wi
 wispkey env attach .env --project my-app --key OPENAI_API_KEY
 ```
 
-This imports only the selected HTTP-facing secret and replaces it in the existing file. Before changing git tracking, confirm whether the project intentionally distributes that `.env`; WispKey tokens are machine-vault-specific. Use `run`, `exec`, or `inject` instead for non-HTTP values."
+Before attaching, confirm that the project does not intentionally distribute this file, then add it to `.gitignore` and remove it from Git tracking. Attachment imports only the selected HTTP-facing secret and replaces it in the local file. WispKey tokens are machine-vault-specific. Use `run`, `exec`, or `inject` instead for non-HTTP values."
 
 **Example 3: Suggesting WispKey for a new project**
 "You're setting up API integrations. Instead of scattering secrets across .env files and config, use WispKey:

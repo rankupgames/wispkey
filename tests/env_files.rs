@@ -120,12 +120,16 @@ fn env_attach_creates_project_environment_and_only_tokenizes_selected_keys() {
         let token = credential["wisp_token"].as_str().expect("wisp token");
         assert!(!serialized_audit.contains(token));
     }
+    let credential_additions: Vec<_> = audit_log["entries"]
+        .as_array()
+        .expect("audit entries")
+        .iter()
+        .filter(|entry| entry["event_type"] == "CredentialAdded")
+        .collect();
+    assert_eq!(credential_additions.len(), 2);
     assert!(
-        audit_log["entries"]
-            .as_array()
-            .expect("audit entries")
+        credential_additions
             .iter()
-            .filter(|entry| entry["event_type"] == "CredentialAdded")
             .all(|entry| entry["token_fingerprint"].as_str().is_some())
     );
 

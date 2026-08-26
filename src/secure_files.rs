@@ -59,19 +59,7 @@ pub(crate) fn create_private(path: &Path, bytes: &[u8]) -> Result<bool> {
     {
         ensure_private_directory(parent)?;
     }
-    match create_private_file(path, bytes) {
-        Ok(()) => {
-            if let Err(error) = harden_file(path) {
-                let _ = fs::remove_file(path);
-                return Err(error);
-            }
-            Ok(true)
-        }
-        Err(VaultError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(false)
-        }
-        Err(error) => Err(error),
-    }
+    create_private_in_existing_directory(path, bytes)
 }
 
 /// Creates a new private file without changing permissions on its existing

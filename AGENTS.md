@@ -78,7 +78,7 @@ For local `.env` workflows, organization/account scope remains external, a WispK
 ```bash
 # Discover files without reading their contents
 wispkey env list .
-wispkey env list ~ --format json
+wispkey env list . --format json
 
 # Auto-create project "client-alpha" and environment partition "production"
 # Only selected keys are imported and replaced; PORT and other settings stay intact.

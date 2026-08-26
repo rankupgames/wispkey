@@ -25,7 +25,7 @@ Quick setup for a new project.
    wispkey project use my-app
    ```
 
-   This keeps the same file, preserves unselected settings, and replaces selected values with `wk_*` tokens. Do not attach ports, paths, database URLs, or other non-HTTP values; use `wispkey run`, `exec`, or `inject` for those.
+   This keeps the same file, preserves unselected settings, and replaces selected values with `wk_*` tokens. Do not attach ports, paths, database URLs, or other non-HTTP values; use `wispkey run`, `exec`, or `inject` for those. Before exposing tokens to an untrusted agent, pre-provision matching host-restricted credentials or configure a restrictive policy.
 
 4. **Start the proxy**:
    ```bash

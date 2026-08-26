@@ -10,7 +10,7 @@ description: Migrate .env files to WispKey wisp tokens. Use when the user wants 
 Find existing environment files without reading their contents:
 ```bash
 wispkey env list .
-wispkey env list ~ --format json
+wispkey env list . --format json
 ```
 
 Attach only the secret-bearing keys. The project and environment partition are created when missing:

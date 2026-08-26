@@ -14,10 +14,8 @@ use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::ops::Range;
 use std::path::Path;
-use std::sync::OnceLock;
 
 use fs2::FileExt;
-use regex::Regex;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -311,7 +309,7 @@ pub fn attach_env_file(
                 } else {
                     let existing_value =
                         vault.decrypt_credential_value_in_project(project, &credential_name)?;
-                    if !secret_values_match(&existing_value, &entry.value) {
+                    if existing_value != entry.value {
                         return Err(VaultError::EnvCredentialConflict(format!(
                             "credential '{credential_name}' already stores a different value"
                         )));
@@ -738,10 +736,6 @@ fn decode_double_quoted_value(value: &str) -> String {
     decoded
 }
 
-fn secret_values_match(left: &str, right: &str) -> bool {
-    left.as_bytes() == right.as_bytes()
-}
-
 fn replace_env_file(path: &Path, original: &[u8], attached: &[u8]) -> crate::core::Result<()> {
     if fs::read(path)? != original {
         return Err(VaultError::InvalidEnvFile(format!(
@@ -913,30 +907,6 @@ fn is_valid_env_key(key: &str) -> bool {
         && characters.all(|character| character == '_' || character.is_ascii_alphanumeric())
 }
 
-struct CredentialPatterns {
-    openai: Regex,
-    github_pat: Regex,
-    github_app: Regex,
-    slack_bot: Regex,
-    slack_user: Regex,
-    aws_access: Regex,
-    bearer: Regex,
-}
-
-static CREDENTIAL_PATTERNS: OnceLock<CredentialPatterns> = OnceLock::new();
-
-fn get_patterns() -> &'static CredentialPatterns {
-    CREDENTIAL_PATTERNS.get_or_init(|| CredentialPatterns {
-        openai: Regex::new(r"^sk-[a-zA-Z0-9]{20,}$").expect("static regex"),
-        github_pat: Regex::new(r"^ghp_[a-zA-Z0-9]{36}$").expect("static regex"),
-        github_app: Regex::new(r"^ghs_[a-zA-Z0-9]{36}$").expect("static regex"),
-        slack_bot: Regex::new(r"^xoxb-[0-9]+-[a-zA-Z0-9]+$").expect("static regex"),
-        slack_user: Regex::new(r"^xoxp-[0-9]+-[a-zA-Z0-9]+$").expect("static regex"),
-        aws_access: Regex::new(r"^AKIA[A-Z0-9]{16}$").expect("static regex"),
-        bearer: Regex::new(r"^Bearer [a-zA-Z0-9._\-]+$").expect("static regex"),
-    })
-}
-
 fn env_key_to_credential_name(key: &str) -> String {
     let mut result = String::with_capacity(key.len() + 8);
     let chars: Vec<char> = key.chars().collect();
@@ -971,19 +941,12 @@ fn env_key_to_credential_name(key: &str) -> String {
 }
 
 fn detect_credential_type(value: &str) -> CredentialType {
-    let patterns = get_patterns();
-
-    if patterns.openai.is_match(value)
-        || patterns.github_pat.is_match(value)
-        || patterns.github_app.is_match(value)
-        || patterns.slack_bot.is_match(value)
-        || patterns.slack_user.is_match(value)
-        || patterns.bearer.is_match(value)
+    if value.len() == 20
+        && value.starts_with("AKIA")
+        && value[4..]
+            .chars()
+            .all(|character| character.is_ascii_uppercase() || character.is_ascii_digit())
     {
-        return CredentialType::BearerToken;
-    }
-
-    if patterns.aws_access.is_match(value) {
         return CredentialType::ApiKey;
     }
 
