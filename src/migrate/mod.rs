@@ -409,7 +409,7 @@ pub fn attach_env_file(
 
     let updated = replacements.len();
     if updated > 0 {
-        replacements.sort_by(|left, right| right.0.start.cmp(&left.0.start));
+        replacements.sort_by_key(|replacement| std::cmp::Reverse(replacement.0.start));
         let mut attached = original.clone();
         for (range, token) in replacements {
             attached.replace_range(range, &token);
