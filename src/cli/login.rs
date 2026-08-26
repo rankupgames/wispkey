@@ -30,8 +30,12 @@ pub async fn handle_generate(args: GenerateLoginArgs<'_>) {
 
     let review_at = match args.review_after {
         Some("none") => None,
-        Some(value) => match parse_duration(value) {
-            Ok(duration) => Some(Utc::now() + duration),
+        Some(value) => match parse_duration(value).and_then(|duration| {
+            Utc::now()
+                .checked_add_signed(duration)
+                .ok_or_else(|| "review-after is too large".to_string())
+        }) {
+            Ok(review_at) => Some(review_at),
             Err(error) => {
                 eprintln!("Error: {error}");
                 std::process::exit(1);
@@ -238,11 +242,11 @@ fn parse_duration(value: &str) -> Result<Duration, String> {
         return Err("review-after must be positive".into());
     }
     let duration = match unit {
-        "" | "d" => Duration::days(amount),
-        "h" => Duration::hours(amount),
-        "m" => Duration::minutes(amount),
-        "s" => Duration::seconds(amount),
+        "" | "d" => Duration::try_days(amount),
+        "h" => Duration::try_hours(amount),
+        "m" => Duration::try_minutes(amount),
+        "s" => Duration::try_seconds(amount),
         _ => return Err("review-after unit must be one of s, m, h, or d".into()),
     };
-    Ok(duration)
+    duration.ok_or_else(|| "review-after is too large".into())
 }

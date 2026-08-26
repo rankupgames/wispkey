@@ -343,6 +343,11 @@ fn handle_tool_get_token(arguments: &Value) -> Value {
     match Vault::open_with_session() {
         Ok(vault) => match vault.get_credential(name) {
             Ok(cred) => {
+                if cred.credential_type == CredentialType::WebsiteLogin {
+                    return tool_error(
+                        "website login credentials require an approved local fill flow",
+                    );
+                }
                 json!({
                     "content": [{
                         "type": "text",
@@ -692,8 +697,12 @@ fn handle_tool_generate_login(arguments: &Value) -> Value {
 
     let review_at = match review_after {
         Some("none") => None,
-        Some(value) => match parse_review_after(value) {
-            Ok(duration) => Some(chrono::Utc::now() + duration),
+        Some(value) => match parse_review_after(value).and_then(|duration| {
+            chrono::Utc::now()
+                .checked_add_signed(duration)
+                .ok_or_else(|| "review_after is too large".to_string())
+        }) {
+            Ok(review_at) => Some(review_at),
             Err(error) => return tool_error(&error),
         },
         None => Some(chrono::Utc::now() + chrono::Duration::days(180)),
@@ -768,12 +777,13 @@ fn parse_review_after(value: &str) -> std::result::Result<chrono::Duration, Stri
         return Err("review_after must be positive".into());
     }
     match unit {
-        "" | "d" => Ok(chrono::Duration::days(amount)),
-        "h" => Ok(chrono::Duration::hours(amount)),
-        "m" => Ok(chrono::Duration::minutes(amount)),
-        "s" => Ok(chrono::Duration::seconds(amount)),
-        _ => Err("review_after unit must be one of s, m, h, or d".into()),
+        "" | "d" => chrono::Duration::try_days(amount),
+        "h" => chrono::Duration::try_hours(amount),
+        "m" => chrono::Duration::try_minutes(amount),
+        "s" => chrono::Duration::try_seconds(amount),
+        _ => return Err("review_after unit must be one of s, m, h, or d".into()),
     }
+    .ok_or_else(|| "review_after is too large".into())
 }
 
 fn handle_tool_delete(arguments: &Value) -> Value {

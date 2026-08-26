@@ -18,6 +18,7 @@ const LOWERCASE: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
 const DIGITS: &[u8] = b"0123456789";
 const SYMBOLS: &[u8] = b"!@#$%^&*-_=+?";
 const DEFAULT_PASSWORD_LENGTH: usize = 24;
+const MAX_PASSWORD_LENGTH: usize = 1024;
 const TARGET_PASSWORD_ENTROPY_BITS: f64 = 128.0;
 
 /// Password generation policy for website logins. The default is at least 128
@@ -94,6 +95,11 @@ impl PasswordPolicy {
             return Err(VaultError::Encryption(
                 "password length is shorter than the number of required character classes".into(),
             ));
+        }
+        if self.length > MAX_PASSWORD_LENGTH {
+            return Err(VaultError::Encryption(format!(
+                "password length exceeds the maximum of {MAX_PASSWORD_LENGTH}"
+            )));
         }
         let bits_per_char = (charset.len() as f64).log2();
         let min_length = (TARGET_PASSWORD_ENTROPY_BITS / bits_per_char).ceil() as usize;
@@ -185,14 +191,17 @@ fn sample_index(rng: &SystemRandom, len: usize) -> Result<usize> {
     if len == 0 {
         return Err(VaultError::Encryption("cannot sample empty range".into()));
     }
-    let threshold = (256 / len) * len;
+    let len = u64::try_from(len)
+        .map_err(|_| VaultError::Encryption("sample range is too large".into()))?;
+    let threshold = u64::MAX - (u64::MAX % len);
     loop {
-        let mut bytes = [0u8; 1];
+        let mut bytes = [0u8; 8];
         rng.fill(&mut bytes)
             .map_err(|_| VaultError::Encryption("RNG failure".into()))?;
-        let value = bytes[0] as usize;
+        let value = u64::from_le_bytes(bytes);
         if value < threshold {
-            return Ok(value % len);
+            return usize::try_from(value % len)
+                .map_err(|_| VaultError::Encryption("sample index is too large".into()));
         }
     }
 }
@@ -234,5 +243,14 @@ mod tests {
             assert!(password.chars().any(|c| c.is_ascii_digit()));
             assert!(password.chars().any(|c| SYMBOLS.contains(&(c as u8))));
         }
+    }
+
+    #[test]
+    fn password_generation_supports_lengths_above_one_byte() {
+        let policy = PasswordPolicy {
+            length: 300,
+            ..PasswordPolicy::default_strong()
+        };
+        assert_eq!(generate_password(&policy).unwrap().len(), 300);
     }
 }

@@ -171,6 +171,23 @@ fn login_rejects_http_and_add_bypass() {
         add_err.contains("login generate"),
         "expected generate-path error, got {add_err}"
     );
+
+    let excessive_review = run_wispkey(
+        vault_dir.path(),
+        &[
+            "login",
+            "generate",
+            "bad-review",
+            "--username",
+            "user@example.com",
+            "--url",
+            "https://careers.example.com",
+            "--review-after",
+            "9223372036854775807d",
+        ],
+    );
+    assert!(!excessive_review.status.success());
+    assert!(String::from_utf8_lossy(&excessive_review.stderr).contains("too large"));
 }
 
 #[test]
@@ -275,6 +292,24 @@ fn mcp_generate_login_returns_metadata_without_password() {
         refused_text.contains("wispkey_generate_login"),
         "expected generate-path refusal, got {refused_text}"
     );
+
+    let token_refused = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_get_token",
+                "arguments": { "name": "mcp-login" }
+            }
+        }),
+    );
+    let token_refused_text = token_refused["result"]["content"][0]["text"]
+        .as_str()
+        .expect("token refusal text");
+    assert!(token_refused_text.contains("approved local fill flow"));
+    assert!(!token_refused_text.contains("wk_"));
 }
 
 fn call_mcp_tool(vault_dir: &std::path::Path, request: Value) -> Value {

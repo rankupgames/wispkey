@@ -9,6 +9,18 @@
 - CLI and MCP (`wispkey_generate_login`) return metadata only. `wispkey add --type website_login` and `wispkey_set` refuse this type so agents cannot supply or retrieve the generated password.
 - Lifecycle commands `login archive`, `login restore`, and `login activate` are audited without secret values. Browser fill remains a follow-up slice.
 
+### Safer headless unlock
+
+- Added `wispkey unlock --remember` to store the derived vault key (never the master password) in macOS Keychain or Windows Credential Manager, with a machine-bound `session-protector` file fallback on Linux and when the OS store is unavailable.
+- Added `wispkey lock [--forget]`, `--password-file` unlock input, protector/session timeouts, and fail-closed errors for locked, expired, and forgotten sessions.
+- Unlock, lock, remember, forget, and session-expiry paths emit audit events without passwords or raw credential values.
+- Documented host-side Boring Computer smoke-test authorization and recovery in `docs/headless-unlock.md`.
+
+### Audit capability redaction
+
+- Audit records now store an HMAC-SHA-256 fingerprint for within-sink wisp-token correlation instead of the reusable token. Log, management API, export, and tail JSON use `token_fingerprint` and never return the capability or the fingerprint key.
+- Opening an existing vault converts legacy SQLite token fields to keyed fingerprints and redacts token copies from free-text audit fields. Legacy fallback JSONL token fields are omitted when read; existing fallback files created by older releases must still be handled as sensitive local data.
+
 ### Cross-machine and Firecracker instance access
 
 - Added `firecracker-vsock:/absolute/base.sock:<port>` listeners for Firecracker's actual guest-to-host transport. WispKey binds Firecracker's required `<base>_<port>` Unix socket while preserving the existing feature-gated `vsock://<cid>:<port>` listener for Linux environments that expose host AF_VSOCK directly.

@@ -45,7 +45,7 @@ Four commands from zero to protected. The AI process never touches your real sec
 ## Features
 
 ### Core
-- **Encrypted local vault** -- AES-256-GCM at rest, Argon2id master key derivation, SQLite backend, configurable session timeout (default 30 min), machine-bound encrypted session file by default
+- **Encrypted local vault** -- AES-256-GCM at rest, Argon2id master key derivation, SQLite backend, configurable session timeout (default 30 min), machine-bound encrypted session file by default, optional OS-backed or file remembered unlock
 - **Wisp token proxy** -- HTTP forward proxy + blind HTTPS CONNECT tunneling + HTTPS reverse proxy mode (`X-Target-Url` header) on localhost:7700
 - **CLI** -- Credential lifecycle, project and partition management, encrypted bundle import/export, proxy serving, subprocess/template injection, instance administration, and audit export/tail
 - **MCP server** -- Native integration with Cursor, Claude Code, Windsurf via stdio JSON-RPC, including first-class env-sideloaded credentials for locked-vault use
@@ -322,7 +322,8 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | Command | Purpose |
 |---------|---------|
 | `wispkey init` | Create vault and master password |
-| `wispkey unlock` | Unlock vault for the current session |
+| `wispkey unlock [--timeout N] [--remember] [--protector-timeout N] [--password-file PATH\|-]` | Unlock vault for the current session; `--remember` stores a password-free re-unlock protector |
+| `wispkey lock [--forget]` | Revoke the current session; `--forget` also deletes the remembered protector |
 | `wispkey add <name> [--type TYPE] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store a credential |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials |
 | `wispkey get <name> [--show-token]` | Show credential metadata and wisp token |
@@ -383,7 +384,16 @@ wispkey credential import openai-key.wkcred --project client-alpha --partition p
 
 ## Non-Interactive Mode (CI / Agents)
 
-Set `WISPKEY_PASSWORD` to skip interactive prompts:
+Do not pass the master password as a CLI argument. Prefer a remembered protector or an owner-only password file:
+
+```bash
+wispkey unlock --remember --password-file ~/.wispkey/master.pass
+wispkey lock                 # revoke the 30-minute session
+wispkey unlock               # remint a session from the protector, no password prompt
+wispkey lock --forget        # drop the protector too
+```
+
+`WISPKEY_PASSWORD` still skips interactive prompts for trusted local automation:
 
 ```bash
 export WISPKEY_PASSWORD='your-master-password'

@@ -68,8 +68,10 @@ fn credential_replacement_value(credential_type: &CredentialType, real_value: &s
         CredentialType::BearerToken
         | CredentialType::ApiKey
         | CredentialType::CustomHeader { .. }
-        | CredentialType::QueryParam { .. }
-        | CredentialType::WebsiteLogin => real_value.to_string(),
+        | CredentialType::QueryParam { .. } => real_value.to_string(),
+        CredentialType::WebsiteLogin => {
+            unreachable!("website logins must be denied before generic token substitution")
+        }
         CredentialType::BasicAuth => {
             let encoded = BASE64.encode(real_value.as_bytes());
             format!("Basic {}", encoded)
@@ -248,6 +250,21 @@ fn try_resolve_exact_token_for_request(
 
     match vault.lookup_by_wisp_token(token) {
         Ok((cred, real_value)) => {
+            if cred.credential_type == CredentialType::WebsiteLogin {
+                let reason = "website login credentials require an approved local fill flow";
+                audit_denial(
+                    vault,
+                    "CredentialDenied",
+                    Some(&cred.name),
+                    token,
+                    context,
+                    reason,
+                );
+                return TokenResolution::Denied(Box::new(error_response(
+                    StatusCode::FORBIDDEN,
+                    reason,
+                )));
+            }
             if let Some(reason) = check_project_scope(vault, &cred, context.project_scope) {
                 audit_denial(
                     vault,
@@ -366,12 +383,9 @@ fn missing_token_response(
     context: &TokenRequestContext<'_>,
 ) -> Box<Response<Full<Bytes>>> {
     let reason = if vault.is_some() {
-        format!("wisp token '{}' was not found in the active vault", token)
+        "wisp token was not found in the active vault".to_string()
     } else {
-        format!(
-            "wisp token '{}' requires an unlocked vault or matching WISPKEY_SIDELOAD_* env var",
-            token
-        )
+        "wisp token requires an unlocked vault or matching WISPKEY_SIDELOAD_* env var".to_string()
     };
     if let Some(vault) = vault {
         audit_denial(vault, "CredentialDenied", None, token, context, &reason);
@@ -386,12 +400,10 @@ fn resolve_env_token_for_request(
 ) -> ProxyActionResult<ResolvedToken> {
     let Some(env_credential) = try_env_sideload(token) else {
         let reason = if vault.is_some() {
-            format!("wisp token '{}' was not found in the active vault", token)
+            "wisp token was not found in the active vault".to_string()
         } else {
-            format!(
-                "wisp token '{}' requires an unlocked vault or matching WISPKEY_SIDELOAD_* env var",
-                token
-            )
+            "wisp token requires an unlocked vault or matching WISPKEY_SIDELOAD_* env var"
+                .to_string()
         };
         return Err(Box::new(error_response(StatusCode::FORBIDDEN, &reason)));
     };

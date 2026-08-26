@@ -100,7 +100,15 @@ The vault auto-locks after 30 minutes. Unlock with:
 wispkey unlock
 ```
 
-For non-interactive/CI usage:
+To avoid retyping the master password during a longer verification window, remember an OS-backed or local protector after the first unlock:
+```bash
+wispkey unlock --remember --password-file ~/.wispkey/master.pass
+wispkey lock
+wispkey unlock
+wispkey lock --forget
+```
+
+For non-interactive/CI usage, prefer `--password-file` or a remembered protector. `WISPKEY_PASSWORD` still works for trusted local automation:
 ```bash
 export WISPKEY_PASSWORD=<master-password>
 ```

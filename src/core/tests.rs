@@ -623,6 +623,11 @@ fn schema_v6_to_current_migration_adds_instance_and_bootstrap_tables_without_tou
     )
     .unwrap();
     db.execute(
+        "INSERT INTO vault_meta (key, value) VALUES ('password_hash', 'migration-test-key')",
+        [],
+    )
+    .unwrap();
+    db.execute(
         "INSERT INTO projects (id, name, description, created_at, updated_at) VALUES ('default', 'default', 'Default project', ?1, ?2)",
         params![now, now],
     )
@@ -637,6 +642,16 @@ fn schema_v6_to_current_migration_adds_instance_and_bootstrap_tables_without_tou
         params![now, now],
     )
     .unwrap();
+    db.execute(
+        "INSERT INTO audit_log (timestamp, event_type, credential_name, wisp_token, target_path, deny_reason) VALUES (?1, 'CredentialUsed', 'kept', 'wk_kept_12345678', '/use/wk_kept_12345678', 'denied wk_kept_12345678')",
+        params![now],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO audit_log (timestamp, event_type, credential_name, target_path) VALUES (?1, 'CredentialDenied', 'missing', '/use/foowk_missing_12345678')",
+        params![now],
+    )
+    .unwrap();
 
     Vault::migrate_schema(&db).unwrap();
 
@@ -648,6 +663,29 @@ fn schema_v6_to_current_migration_adds_instance_and_bootstrap_tables_without_tou
         )
         .unwrap();
     assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+    let audit_token: String = db
+        .query_row("SELECT wisp_token FROM audit_log", [], |row| row.get(0))
+        .unwrap();
+    assert!(audit_token.starts_with("hmac-sha256:"));
+    assert!(!audit_token.contains("wk_kept_12345678"));
+    let (audit_path, audit_reason): (String, String) = db
+        .query_row(
+            "SELECT target_path, deny_reason FROM audit_log",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(audit_path, "/use/[wisp-token]");
+    assert_eq!(audit_reason, "denied [wisp-token]");
+    let free_text_path: String = db
+        .query_row(
+            "SELECT target_path FROM audit_log WHERE id = 2",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(free_text_path, "/use/foo[wisp-token]");
 
     for table in [
         "instances",
@@ -1374,6 +1412,8 @@ fn parse_https_origin_requires_https_and_strips_path() {
     );
     assert!(parse_https_origin("http://careers.example.com").is_err());
     assert!(parse_https_origin("https://user:pass@careers.example.com").is_err());
+    assert!(parse_https_origin("https://*.example.com").is_err());
+    assert!(parse_https_origin("https://example..com").is_err());
 }
 
 #[test]

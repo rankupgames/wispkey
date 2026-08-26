@@ -58,6 +58,25 @@ enum Commands {
         /// Session timeout in minutes (default: 30, 0 = no expiry)
         #[arg(long)]
         timeout: Option<i64>,
+
+        /// Remember this unlock in the OS protector (Keychain/Credential Manager/Secret Service) or a local file protector
+        #[arg(long)]
+        remember: bool,
+
+        /// Remembered-protector timeout in minutes (default: 480, 0 = until `lock --forget`)
+        #[arg(long)]
+        protector_timeout: Option<i64>,
+
+        /// Read the master password from a file, or '-' for stdin. Never pass the password as a CLI argument.
+        #[arg(long)]
+        password_file: Option<String>,
+    },
+
+    /// Lock the current session and optionally forget a remembered unlock
+    Lock {
+        /// Also delete the OS or file protector so later unlocks require the master password
+        #[arg(long)]
+        forget: bool,
     },
 
     /// Add a credential to the vault
@@ -786,8 +805,16 @@ async fn main() {
         Commands::Init => {
             cli::handle_init().await;
         }
-        Commands::Unlock { timeout } => {
-            cli::handle_unlock(timeout).await;
+        Commands::Unlock {
+            timeout,
+            remember,
+            protector_timeout,
+            password_file,
+        } => {
+            cli::handle_unlock(timeout, remember, protector_timeout, password_file).await;
+        }
+        Commands::Lock { forget } => {
+            cli::handle_lock(forget).await;
         }
         Commands::Add {
             name,

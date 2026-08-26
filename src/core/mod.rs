@@ -22,6 +22,7 @@ use crate::secure_files;
 
 mod crypto;
 mod instances;
+mod protector;
 mod rows;
 mod schema;
 mod session;
@@ -67,8 +68,20 @@ pub enum VaultError {
     Database(#[from] rusqlite::Error),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("session expired -- run `wispkey unlock` to mint a new session")]
+    SessionExpired,
     #[error("session expired or invalid")]
     SessionInvalid,
+    #[error("remembered unlock expired -- run `wispkey unlock` with the master password")]
+    ProtectorExpired,
+    #[error(
+        "no remembered unlock is available -- run `wispkey unlock` with --password-file, WISPKEY_PASSWORD, or an interactive prompt; use --remember to store an OS-backed or local protector"
+    )]
+    ProtectorUnavailable,
+    #[error("{0}")]
+    ProtectorUnavailableOs(String),
+    #[error("session timeout must be zero or a positive number of minutes")]
+    InvalidSessionTimeout,
     #[error("partition '{0}' already exists")]
     DuplicatePartition(String),
     #[error("partition '{0}' not found")]
@@ -1123,27 +1136,49 @@ pub fn set_active_project(name: &str) -> Result<()> {
 
 /// Returns the exact HTTPS origin (`https://host[:port]`) for website-login policy binding.
 pub fn parse_https_origin(raw: &str) -> Result<String> {
-    let trimmed = raw.trim();
-    let rest = trimmed
-        .strip_prefix("https://")
-        .ok_or_else(|| VaultError::InvalidOrigin("website login URL must use https".into()))?;
-    if rest.contains('@') {
+    let parsed = url::Url::parse(raw.trim()).map_err(|error| {
+        VaultError::InvalidOrigin(format!("invalid website login URL: {error}"))
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(VaultError::InvalidOrigin(
+            "website login URL must use https".into(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err(VaultError::InvalidOrigin(
             "website login URL must not include userinfo".into(),
         ));
     }
-    let hostport = rest.split(['/', '?', '#']).next().unwrap_or("");
-    if hostport.is_empty() || hostport.starts_with('.') || hostport.starts_with(':') {
-        return Err(VaultError::InvalidOrigin(
-            "website login URL is missing a host".into(),
-        ));
-    }
-    if hostport.chars().any(char::is_whitespace) {
-        return Err(VaultError::InvalidOrigin(
-            "website login URL host is invalid".into(),
-        ));
-    }
-    Ok(format!("https://{}", hostport.to_ascii_lowercase()))
+    let host = match parsed.host() {
+        Some(url::Host::Domain(domain)) => {
+            let valid = !domain.is_empty()
+                && domain.split('.').all(|label| {
+                    !label.is_empty()
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                });
+            if !valid {
+                return Err(VaultError::InvalidOrigin(
+                    "website login URL host is invalid".into(),
+                ));
+            }
+            domain.to_string()
+        }
+        Some(url::Host::Ipv4(address)) => address.to_string(),
+        Some(url::Host::Ipv6(address)) => format!("[{address}]"),
+        None => {
+            return Err(VaultError::InvalidOrigin(
+                "website login URL is missing a host".into(),
+            ));
+        }
+    };
+    Ok(match parsed.port() {
+        Some(port) => format!("https://{host}:{port}"),
+        None => format!("https://{host}"),
+    })
 }
 
 fn origin_host(origin: &str) -> String {

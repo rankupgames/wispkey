@@ -13,6 +13,7 @@ WispKey is a credential firewall for AI agents. Its main boundary is between a p
 - Revocation racing an in-flight instance authentication. WispKey conditionally commits successful Argon2 verification only if the instance is still active, so a concurrent revoke fails the request closed.
 - Brittle instance-secret rollout. Due-aware rotation atomically installs a new secret and can retain the previous hash for a bounded grace window. Successful authentication with the new secret clears the previous hash early.
 - Silent vault-backed credential use. WispKey writes use and denial events to the SQLite audit log. Env-sideload-only proxy use without an unlocked vault writes fallback JSONL audit events.
+- Audit token disclosure. New audit records store only an HMAC-SHA-256 fingerprint of a wisp token for correlation within each audit sink. The HMAC key stays in vault-only metadata or an owner-only local key file. Audit queries and exports redact token-like values from free-text fields and do not return reusable token capabilities or the fingerprint key.
 - Owner-approved plaintext egress. `wispkey exec` records `CredentialExec` audit events when it injects a credential into a child process through stdin, a child-only environment variable, or askpass. `wispkey run` records `CredentialRun` events for manifest-based child environment injection, and `wispkey inject` records `CredentialInject` events for template rendering.
 - Accidental env-sideload disclosure. `WISPKEY_SIDELOAD_<SLUG>` values are exposed to agents as deterministic `wk_env_<slug>` tokens; the raw env value is not printed or logged.
 - Timing disclosure of proxy management tokens through direct string comparison. Management API tokens are compared in constant time.
@@ -33,12 +34,15 @@ WispKey is a credential firewall for AI agents. Its main boundary is between a p
 - Secrets are no longer protected by WispKey after they are intentionally sent upstream. The upstream service, SDKs, logs, and process memory are outside WispKey's boundary.
 - `wispkey exec`, `wispkey run`, and `wispkey inject` are deliberate plaintext-egress paths for owner-run non-HTTP tools, similar in trust level to `op run` or `aws-vault exec`. A compromised owner shell can still run these commands or use the child process or rendered file to misuse the credential.
 - Plaintext secrets stored in external client configuration, shell startup files, or MCP `env` blocks are outside the vault. Prefer process environment forwarding or an OS credential manager when available.
+- Fallback JSONL audit files created by releases before token fingerprinting can contain reusable `wk_*` values. Keep those owner-only files private and remove or archive them through a protected channel after upgrading.
 
 ## Session Boundary
 
 The default unlocked session file is machine-bound and encrypted. WispKey derives a local wrapping key from an owner-only device seed, machine identity inputs, and the OS username, then encrypts the session payload.
 
 This prevents a simple read of `~/.wispkey/session` from recovering the vault key. It is not a same-user security boundary. A same-user process with broad local file access or memory inspection can still recover or use unlocked credentials.
+
+`wispkey unlock --remember` stores the derived vault key (never the master password) in the platform credential store when available: macOS Keychain or Windows Credential Manager. Linux and other hosts fall back to a machine-bound `session-protector` file with its own timeout so WispKey stays free of D-Bus/libsecret build dependencies. `wispkey lock` revokes the short-lived session; `wispkey lock --forget` also deletes the protector. Headless callers should use `--password-file` rather than a CLI password argument. See [`docs/headless-unlock.md`](headless-unlock.md) for recovery and the Boring Computer smoke-test sequence.
 
 `WISPKEY_SESSION_PLAINTEXT=1` writes the legacy plaintext session format for explicit debugging or rollback. It is not the default and is reported as plaintext protection in `wispkey --format json status`.
 

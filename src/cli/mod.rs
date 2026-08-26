@@ -64,4 +64,4 @@ pub use proxy::{handle_proxy_cleanup, handle_proxy_status, handle_proxy_stop, ha
 pub use run::{RunArgs, handle_run};
 pub use shared::set_json_output;
 pub use status::handle_status;
-pub use vault::{handle_init, handle_unlock};
+pub use vault::{handle_init, handle_lock, handle_unlock};

@@ -37,6 +37,8 @@ printf '%s' "$SECRET_VALUE" | wispkey add "key" --type api_key --value-file -  #
 
 `wispkey add --value` still works, but warns on stderr because command-line arguments can be exposed through shell history and process listings. Prefer `--value-file <path>` or `--value-file -` for non-interactive secret input.
 
+For repeated headless unlocks, prefer `wispkey unlock --remember --password-file ~/.wispkey/master.pass` so later `wispkey unlock` calls can remint a bounded session without the password. `wispkey lock` revokes the session; `wispkey lock --forget` also drops the remembered protector. See `docs/headless-unlock.md`.
+
 ## Project Scoping
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
@@ -109,7 +111,8 @@ wispkey inject -i .env.template -o .env.local
 | Command | Purpose |
 |---------|---------|
 | `wispkey init` | Create vault + master password |
-| `wispkey unlock` | Unlock vault (30 min session) |
+| `wispkey unlock [--timeout N] [--remember] [--password-file PATH]` | Unlock vault (30 min session); `--remember` stores a password-free protector |
+| `wispkey lock [--forget]` | Revoke the current session; `--forget` also deletes the remembered protector |
 | `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store credential |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials (names only) |
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
@@ -243,12 +246,16 @@ When the proxy is running (`wispkey serve`):
 |------|---------|
 | `~/.wispkey/vault.db` | Encrypted credential database (owner-only permissions on Unix) |
 | `~/.wispkey/session` | Session key (30 min TTL; owner-only permissions on Unix, restricted ACL on Windows) |
+| `~/.wispkey/session-protector` | Optional machine-bound remembered unlock (used when the OS credential store is unavailable) |
 | `~/.wispkey/proxy.pid` | Proxy PID (written on `serve`) |
 | `~/.wispkey/proxy.json` | Proxy discovery file with management token (owner-only permissions/ACL) |
 | `~/.wispkey/active_project` | Persistent active project (set by `project use`) |
 | `.env.wispkey` | Generated import output with wisp tokens (owner-only permissions on Unix) |
 | `WISPKEY_VAULT_PATH` | Override vault directory |
 | `WISPKEY_PROJECT` | Override active project per-terminal |
+| `WISPKEY_SESSION_TIMEOUT` | Unlocked session lifetime in minutes (default 30; `0` means no expiry) |
+| `WISPKEY_PROTECTOR` | Session protector backend: `auto` (default), `os`, or `file` |
+| `WISPKEY_PROTECTOR_TIMEOUT` | Remembered-protector lifetime in minutes (default 480; `0` means until `lock --forget`) |
 | `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import |
 | `WISPKEY_SIDELOAD_<SLUG>` | Env-sideload credential value for MCP/proxy use; never print the value |
 
@@ -260,3 +267,12 @@ When the proxy is running (`wispkey serve`):
 - Partitions: logical grouping (e.g. `infrastructure`, `cloud-services`, `ci-cd`)
 - Projects: team/project isolation (e.g. `client-alpha`, `internal-tools`)
 - Values starting with `-`: use `--value='-1abc...'` (equals syntax), though `--value-file` is preferred for secret material
+
+## Cursor Cloud specific instructions
+
+Single Rust crate (no services/DB to boot; SQLite is bundled via `rusqlite`). Standard dev commands live in `CONTRIBUTING.md` (`cargo build`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`) and the CI matrix in `.github/workflows/ci.yml`.
+
+- Toolchain: the base image's default Rust is too old to compile this crate (`edition = "2024"` needs Rust ≥ 1.85; the project targets 1.94+). The startup update script installs and defaults the `stable` toolchain (currently 1.98) with `clippy`/`rustfmt`, so just use `cargo`/`clippy`/`fmt` normally. If a session ever lands on old Rust, run `rustup default stable`.
+- `cargo test` compiles and boots real loopback TCP proxies; the full suite takes ~2-3 min. This is expected, not a hang.
+- Running the CLI/proxy non-interactively: set `WISPKEY_PASSWORD` to skip master-password prompts, and set `WISPKEY_VAULT_PATH` to a scratch dir (e.g. `/tmp/wk-demo`) so you never touch a real `~/.wispkey` vault.
+- `wispkey serve` is a long-running foreground process — run it in a tmux session (or `serve --daemon`). Forward-proxy (`HTTP_PROXY`) token swapping only works for plain HTTP; HTTPS requires reverse-proxy mode via the `X-Target-Url` header (see "HTTPS Proxy" above).
