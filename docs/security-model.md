@@ -40,6 +40,8 @@ The default unlocked session file is machine-bound and encrypted. WispKey derive
 
 This prevents a simple read of `~/.wispkey/session` from recovering the vault key. It is not a same-user security boundary. A same-user process with broad local file access or memory inspection can still recover or use unlocked credentials.
 
+`wispkey unlock --remember` stores the derived vault key (never the master password) in the platform credential store when available: macOS Keychain or Windows Credential Manager. Linux and other hosts fall back to a machine-bound `session-protector` file with its own timeout so WispKey stays free of D-Bus/libsecret build dependencies. `wispkey lock` revokes the short-lived session; `wispkey lock --forget` also deletes the protector. Headless callers should use `--password-file` rather than a CLI password argument. See [`docs/headless-unlock.md`](headless-unlock.md) for recovery and the Boring Computer smoke-test sequence.
+
 `WISPKEY_SESSION_PLAINTEXT=1` writes the legacy plaintext session format for explicit debugging or rollback. It is not the default and is reported as plaintext protection in `wispkey --format json status`.
 
 ## Exec, Run, And Inject Boundary

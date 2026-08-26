@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Safer headless unlock
+
+- Added `wispkey unlock --remember` to store the derived vault key (never the master password) in macOS Keychain or Windows Credential Manager, with a machine-bound `session-protector` file fallback on Linux and when the OS store is unavailable.
+- Added `wispkey lock [--forget]`, `--password-file` unlock input, protector/session timeouts, and fail-closed errors for locked, expired, and forgotten sessions.
+- Unlock, lock, remember, forget, and session-expiry paths emit audit events without passwords or raw credential values.
+- Documented host-side Boring Computer smoke-test authorization and recovery in `docs/headless-unlock.md`.
+
 ### Audit capability redaction
 
 - Audit records now store an HMAC-SHA-256 fingerprint for within-sink wisp-token correlation instead of the reusable token. Log, management API, export, and tail JSON use `token_fingerprint` and never return the capability or the fingerprint key.

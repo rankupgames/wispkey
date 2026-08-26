@@ -1,7 +1,10 @@
 use argon2::{Argon2, PasswordVerifier};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
-use super::session_store::{SessionStore, session_store};
+use crate::audit;
+
+use super::protector::{self, ProtectorBackend, ProtectorStatus};
+use super::session_store::{SessionStore, session_store, validate_timeout_minutes};
 use super::{Result, Vault, VaultError};
 
 impl Vault {
@@ -17,6 +20,9 @@ impl Vault {
         password: &str,
         timeout_minutes: Option<i64>,
     ) -> Result<()> {
+        if let Some(timeout_minutes) = timeout_minutes {
+            validate_timeout_minutes(timeout_minutes)?;
+        }
         let stored_hash: String = self.db.query_row(
             "SELECT value FROM vault_meta WHERE key = 'password_hash'",
             [],
@@ -44,6 +50,53 @@ impl Vault {
 
         tracing::info!("Vault unlocked");
         Ok(())
+    }
+
+    /// Reloads a valid session and optionally refreshes its timeout.
+    pub fn restore_or_refresh_session(&mut self, timeout_minutes: Option<i64>) -> Result<()> {
+        self.load_session()?;
+        if let Some(timeout_minutes) = timeout_minutes {
+            validate_timeout_minutes(timeout_minutes)?;
+            self.session_timeout_override = Some(timeout_minutes);
+            self.write_session()?;
+        }
+        Ok(())
+    }
+
+    /// Restores an unlocked session from a remembered OS or file protector.
+    pub fn unlock_from_protector(
+        &mut self,
+        timeout_minutes: Option<i64>,
+    ) -> Result<ProtectorBackend> {
+        if let Some(timeout_minutes) = timeout_minutes {
+            validate_timeout_minutes(timeout_minutes)?;
+        }
+        let record = protector::load_protector()?;
+        self.master_key = Some(record.key);
+        self.session_timeout_override = timeout_minutes;
+        self.write_session()?;
+        tracing::info!("Vault unlocked from {} protector", record.backend.label());
+        Ok(record.backend)
+    }
+
+    /// Stores the derived vault key in the preferred session protector. Never stores the password.
+    pub fn remember_protector(&self, timeout_minutes: Option<i64>) -> Result<ProtectorBackend> {
+        let key = self.ensure_unlocked()?;
+        let timeout = match timeout_minutes {
+            Some(timeout) => validate_timeout_minutes(timeout)?,
+            None => protector::default_protector_timeout_minutes(),
+        };
+        protector::save_protector(key, timeout)
+    }
+
+    /// Deletes the local unlocked session file without touching a remembered protector.
+    pub fn lock_session() -> Result<()> {
+        session_store().clear()
+    }
+
+    /// Deletes any remembered OS or file protector.
+    pub fn forget_protector() -> Result<()> {
+        protector::clear_protector()
     }
 
     /// Whether the derived master key is currently loaded in memory.
@@ -89,7 +142,26 @@ impl Vault {
 
     pub(super) fn load_session(&mut self) -> Result<()> {
         let store = session_store();
-        let record = store.load()?;
+        let record = match store.load() {
+            Ok(record) => record,
+            Err(VaultError::SessionExpired) => {
+                audit::log_event(
+                    &self.db,
+                    "SessionExpired",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    Some("session_expired"),
+                    None,
+                );
+                return Err(VaultError::SessionExpired);
+            }
+            Err(error) => return Err(error),
+        };
         self.master_key = Some(record.key);
         if store.should_upgrade(&record) {
             store.save(&record.key, record.issued_at, record.timeout_minutes)?;
@@ -101,5 +173,23 @@ impl Vault {
     #[must_use]
     pub fn session_protection_label() -> &'static str {
         session_store().protection_label()
+    }
+
+    /// Issued-at and timeout for the current session file, if it is still valid.
+    pub fn session_metadata() -> Result<(DateTime<Utc>, i64)> {
+        let record = session_store().load()?;
+        Ok((record.issued_at, record.timeout_minutes))
+    }
+
+    /// Status of a remembered OS or file protector, if any.
+    #[must_use]
+    pub fn protector_status() -> ProtectorStatus {
+        protector::protector_status()
+    }
+
+    /// Default remembered-protector lifetime in minutes (`WISPKEY_PROTECTOR_TIMEOUT`, else 480).
+    #[must_use]
+    pub fn protector_timeout_minutes() -> i64 {
+        protector::default_protector_timeout_minutes()
     }
 }
