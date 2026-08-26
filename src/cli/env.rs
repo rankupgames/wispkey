@@ -67,16 +67,16 @@ pub async fn handle_env_attach(
                 results.path, results.project, results.environment
             );
             for credential in &results.credentials {
-                println!(
-                    "  {} -> {} ({})",
-                    credential.env_key, credential.wisp_token, credential.credential
-                );
+                println!("  {} -> {}", credential.env_key, credential.credential);
             }
             println!();
             println!("  Imported:         {}", results.imported);
             println!("  Reused:           {}", results.reused);
             println!("  Already attached: {}", results.already_attached);
             println!("  Updated in file:  {}", results.updated);
+            println!();
+            println!("Next: wispkey project use {}", results.project);
+            println!("Warning: attached credentials have no inferred host restrictions.");
         }
         Err(error) => {
             eprintln!("Error attaching {path}: {error}");

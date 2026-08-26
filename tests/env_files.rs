@@ -2,6 +2,7 @@ mod common;
 
 use std::fs;
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use common::*;
 
@@ -18,6 +19,11 @@ fn env_list_discovers_attachable_files_without_generated_or_dependency_files() {
     )
     .expect("write nested env");
     fs::write(workspace.path().join(".env.example"), "EXAMPLE=value\n").expect("write example env");
+    fs::write(
+        workspace.path().join("apps/api/.env.production.template"),
+        "TEMPLATE=value\n",
+    )
+    .expect("write nested template env");
     fs::write(workspace.path().join(".env.wispkey"), "TOKEN=wk_example\n")
         .expect("write generated env");
     fs::write(
@@ -102,6 +108,26 @@ fn env_attach_creates_project_environment_and_only_tokenizes_selected_keys() {
         let token = credential["wisp_token"].as_str().expect("wisp token");
         assert!(rewritten.contains(token));
     }
+
+    let audit_log = run_wispkey_json(vault_dir.path(), &["log", "--format", "json"]);
+    let serialized_audit = serde_json::to_string(&audit_log).expect("serialize audit log");
+    assert!(!serialized_audit.contains(openai_secret));
+    assert!(!serialized_audit.contains(database_secret));
+    for credential in attached["credentials"]
+        .as_array()
+        .expect("attached credentials")
+    {
+        let token = credential["wisp_token"].as_str().expect("wisp token");
+        assert!(!serialized_audit.contains(token));
+    }
+    assert!(
+        audit_log["entries"]
+            .as_array()
+            .expect("audit entries")
+            .iter()
+            .filter(|entry| entry["event_type"] == "CredentialAdded")
+            .all(|entry| entry["token_fingerprint"].as_str().is_some())
+    );
 
     let listed = run_wispkey_json(
         vault_dir.path(),
@@ -251,4 +277,185 @@ fn env_attach_missing_key_does_not_create_project_or_modify_file() {
             .iter()
             .all(|project| project["name"] != "missing-key-app")
     );
+}
+
+#[test]
+fn env_attach_rejects_non_env_file_even_with_environment_override() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let config_path = workspace.path().join("config.txt");
+    let original = "API_TOKEN=secret\n";
+    fs::write(&config_path, original).expect("write config");
+    let output = run_wispkey(
+        vault_dir.path(),
+        &[
+            "env",
+            "attach",
+            config_path.to_str().expect("utf-8 config path"),
+            "--project",
+            "invalid-target",
+            "--environment",
+            "production",
+            "--key",
+            "API_TOKEN",
+        ],
+    );
+
+    assert!(!output.status.success());
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("read config"),
+        original
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("not an attachable .env file"));
+}
+
+#[test]
+fn env_attach_accepts_plaintext_that_only_starts_with_wk_prefix() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let env_path = workspace.path().join(".env");
+    fs::write(&env_path, "API_TOKEN=wk_customer-secret\n").expect("write env");
+    let attached = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "env",
+            "attach",
+            env_path.to_str().expect("utf-8 env path"),
+            "--project",
+            "wk-prefix-app",
+            "--key",
+            "API_TOKEN",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(attached["imported"], 1);
+    let rewritten = fs::read_to_string(&env_path).expect("read attached env");
+    assert!(!rewritten.contains("wk_customer-secret"));
+    assert!(rewritten.contains("wk_default_api_token_"));
+}
+
+#[cfg(unix)]
+#[test]
+fn env_attach_rehardens_an_unchanged_attached_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let env_path = workspace.path().join(".env");
+    fs::write(&env_path, "API_TOKEN=secret\n").expect("write env");
+    let args = [
+        "env",
+        "attach",
+        env_path.to_str().expect("utf-8 env path"),
+        "--project",
+        "permissions-app",
+        "--key",
+        "API_TOKEN",
+        "--format",
+        "json",
+    ];
+    run_wispkey_json(vault_dir.path(), &args);
+    fs::set_permissions(&env_path, fs::Permissions::from_mode(0o644)).expect("broaden mode");
+
+    let attached_again = run_wispkey_json(vault_dir.path(), &args);
+    assert_eq!(attached_again["updated"], 0);
+    assert_eq!(file_mode(&env_path), 0o600);
+}
+
+#[test]
+fn concurrent_env_attachments_preserve_both_tokens() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let env_path = workspace.path().join(".env");
+    fs::write(
+        &env_path,
+        "FIRST_TOKEN=first-secret\nSECOND_TOKEN=second-secret\n",
+    )
+    .expect("write env");
+    let env_path = env_path.to_str().expect("utf-8 env path");
+    let spawn_attach = |key: &str| {
+        wispkey_bin()
+            .args([
+                "env",
+                "attach",
+                env_path,
+                "--project",
+                "concurrent-app",
+                "--key",
+                key,
+                "--format",
+                "json",
+            ])
+            .env("WISPKEY_VAULT_PATH", vault_dir.path())
+            .env("WISPKEY_PASSWORD", "test-password")
+            .env("WISPKEY_PROTECTOR", "file")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn env attach")
+    };
+
+    let first = spawn_attach("FIRST_TOKEN");
+    let second = spawn_attach("SECOND_TOKEN");
+    for output in [
+        first.wait_with_output().expect("wait for first attach"),
+        second.wait_with_output().expect("wait for second attach"),
+    ] {
+        assert!(
+            output.status.success(),
+            "concurrent attach failed\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let rewritten = fs::read_to_string(env_path).expect("read concurrently attached env");
+    assert!(!rewritten.contains("first-secret"));
+    assert!(!rewritten.contains("second-secret"));
+    assert!(rewritten.contains("FIRST_TOKEN=wk_default_first_token_"));
+    assert!(rewritten.contains("SECOND_TOKEN=wk_default_second_token_"));
+}
+
+#[test]
+fn env_attach_text_output_does_not_repeat_token_capabilities() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let env_path = workspace.path().join(".env");
+    fs::write(&env_path, "API_TOKEN=secret\n").expect("write env");
+    let output = run_wispkey(
+        vault_dir.path(),
+        &[
+            "env",
+            "attach",
+            env_path.to_str().expect("utf-8 env path"),
+            "--project",
+            "text-output-app",
+            "--key",
+            "API_TOKEN",
+        ],
+    );
+    assert!(output.status.success());
+
+    let rewritten = fs::read_to_string(&env_path).expect("read attached env");
+    let token = rewritten
+        .trim()
+        .strip_prefix("API_TOKEN=")
+        .expect("attached token");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains(token));
+    assert!(stdout.contains("API_TOKEN -> default-api-token"));
+    assert!(stdout.contains("wispkey project use text-output-app"));
+    assert!(stdout.contains("no inferred host restrictions"));
 }

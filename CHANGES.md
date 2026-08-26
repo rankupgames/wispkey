@@ -8,6 +8,44 @@
 - Added `wispkey env attach <path> --project <project> --key <name>... [--environment <environment>]`. It imports only explicitly selected values, auto-creates the project and environment partition, preserves ordinary settings and comments, and atomically replaces selected plaintext values with `wk_*` tokens in the same file.
 - `.env` maps to the `default` environment and `.env.<name>` maps to `<name>`. Credential names receive the environment prefix so identical variable names can coexist across environment partitions despite project-wide credential-name uniqueness.
 - Attachment is idempotent for matching stored values and existing tokens. Missing keys, unknown tokens, cross-environment credentials, and value conflicts fail without rewriting the source file.
+- Attachment serializes concurrent rewrites with an owner-only sibling lock file, inserts each selected credential batch in one vault transaction, and does not repeat token capabilities in human-readable output.
+
+### Optional secure tray GUI
+
+- Added `wispkey lock` to clear the current session and drop the in-memory master key.
+- Added `wispkey tray [--ipc-only]` for authenticated, current-user-only owner IPC (Unix socket with same-UID `SO_PEERCRED`, Windows named pipe).
+- Added optional `wispkey-tray` desktop crate with tray-icon plus a Svelte 5 webview for single-credential and atomic OVH API template entry. Closing a dialog does not quit the tray.
+- `add_credential` now rejects empty names and values. Compound saves use `add_credentials_atomic` so a duplicate or invalid later row rolls back the whole batch.
+- Owner IPC responses and logs never include plaintext secret values or reusable wisp tokens; known secret fields are redacted before tracing.
+- Owner IPC uses a single-owner lifecycle lease, validates live discovery before the tray connects, and requires explicit destination confirmation for credential writes. Windows named pipes grant access only to the current user SID.
+- Default `cargo test` still skips the GUI crate. Documented the tray boundary in `docs/tray.md` and `docs/security-model.md`.
+
+### PKI-aware certificate issuance
+
+- Added the `wispkey_issue_cert` MCP tool so a CA private key can stay in the vault while agents request leaf identities. The tool either generates an EC P-256/P-384 or RSA 2048/4096 keypair or signs a PEM CSR. RSA generation uses rcgen's aws-lc-rs backend so WispKey does not depend on the unfixed `rsa` crate advisory.
+- The CA credential must be PEM. A bundled CA certificate is preferred; `ca_cert` supplies the issuer certificate when the credential is key-only. Issuance fails closed unless the certificate is a currently valid CA with certificate-signing key usage when that extension is present, and the requested leaf lifetime cannot extend past the CA expiration.
+- Returned material is the leaf certificate PEM and, for generated keys, the leaf private key PEM. The CA private key is never included in the MCP response, audit log, or error text.
+- Successful issuance writes a `CertificateIssued` audit event with the CA credential name, leaf CN, SAN/key/validity/serial metadata, and project. Audit rows do not store PEM or key material.
+- Leaf certificates are X.509 v3 end-entity certs with Digital Signature plus RSA Key Encipherment or EC Key Agreement, and Extended Key Usage for TLS server and client authentication.
+
+### Website login generation
+
+- Added `wispkey login generate` as the canonical generate-and-store path for unique website logins. Passwords come from the OS CSPRNG with a default policy of at least 128 bits of entropy and are stored with the username in encrypted credential material.
+- Added schema v11 `origin`, `lifecycle_state`, and `review_at` columns. Existing credentials migrate to `active` with an empty origin. Review dates never auto-delete; `login list --due` only reports them.
+- CLI and MCP (`wispkey_generate_login`) return metadata only. `wispkey add --type website_login` and `wispkey_set` refuse this type so agents cannot supply or retrieve the generated password.
+- Lifecycle commands `login archive`, `login restore`, and `login activate` are audited without secret values. Browser fill remains a follow-up slice.
+
+### Safer headless unlock
+
+- Added `wispkey unlock --remember` to store the derived vault key (never the master password) in macOS Keychain or Windows Credential Manager, with a machine-bound `session-protector` file fallback on Linux and when the OS store is unavailable.
+- Added `wispkey lock [--forget]`, `--password-file` unlock input, protector/session timeouts, and fail-closed errors for locked, expired, and forgotten sessions.
+- Unlock, lock, remember, forget, and session-expiry paths emit audit events without passwords or raw credential values.
+- Documented host-side Boring Computer smoke-test authorization and recovery in `docs/headless-unlock.md`.
+
+### Audit capability redaction
+
+- Audit records now store an HMAC-SHA-256 fingerprint for within-sink wisp-token correlation instead of the reusable token. Log, management API, export, and tail JSON use `token_fingerprint` and never return the capability or the fingerprint key.
+- Opening an existing vault converts legacy SQLite token fields to keyed fingerprints and redacts token copies from free-text audit fields. Legacy fallback JSONL token fields are omitted when read; existing fallback files created by older releases must still be handled as sensitive local data.
 
 ### Cross-machine and Firecracker instance access
 

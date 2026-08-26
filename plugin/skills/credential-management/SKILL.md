@@ -14,6 +14,17 @@ wispkey add "<name>" --type <type> --value-file <path|-> [--hosts "<hosts>"] [--
 
 Types: `bearer_token` (default), `api_key`, `basic_auth`, `custom_header`, `query_param`
 
+Website logins are not added with `wispkey add`. Generate them so the password never enters argv or the agent context:
+
+```bash
+wispkey login generate "acme-careers" \
+  --username user@example.com \
+  --url https://careers.example.com \
+  --project career-ops \
+  --partition job-applications \
+  --review-after 180d
+```
+
 `api_key` is the generic opaque-secret type. Use it for passwords, database URLs, SSH/private-key files, webhook secrets, OAuth tokens, service-account JSON, and other encrypted values that do not need a more specific proxy injection behavior.
 
 Prefer `--value-file <path>` for non-interactive secret input, or `--value-file -` to read from stdin. `--value` still works, but WispKey warns on stderr because the value can be exposed through shell history and process listings. Omitting both flags uses the hidden prompt.
@@ -89,7 +100,15 @@ The vault auto-locks after 30 minutes. Unlock with:
 wispkey unlock
 ```
 
-For non-interactive/CI usage:
+To avoid retyping the master password during a longer verification window, remember an OS-backed or local protector after the first unlock:
+```bash
+wispkey unlock --remember --password-file ~/.wispkey/master.pass
+wispkey lock
+wispkey unlock
+wispkey lock --forget
+```
+
+For non-interactive/CI usage, prefer `--password-file` or a remembered protector. `WISPKEY_PASSWORD` still works for trusted local automation:
 ```bash
 export WISPKEY_PASSWORD=<master-password>
 ```
@@ -101,3 +120,5 @@ wispkey mcp serve
 ```
 
 The MCP tool returns a deterministic `wk_env_openai` token and the env key name only. Start `wispkey serve` with the same `WISPKEY_SIDELOAD_OPENAI` variable when outbound requests need token substitution. Never print or log the raw sideload value.
+
+Store a CA private key as a normal `api_key` credential, preferably a PEM bundle of the CA certificate plus the PKCS#8 private key. Agents can then call `wispkey_issue_cert` with `ca_credential` to mint a leaf certificate without receiving the CA key. Pass `ca_cert` only when the stored credential is the key alone. Treat the returned leaf private key as a new secret.

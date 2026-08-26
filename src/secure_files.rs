@@ -33,20 +33,8 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     harden_file(path)
 }
 
-/// Writes a private file without changing permissions on its existing parent
-/// directory. Use this for sensitive files stored inside user-managed projects.
-pub(crate) fn write_private_in_existing_directory(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    if !parent.is_dir() {
-        return Err(VaultError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("parent directory does not exist: {}", parent.display()),
-        )));
-    }
-    write_private_file(path, bytes)?;
+/// Restricts an existing sensitive file to the current user.
+pub(crate) fn harden_existing_file(path: &Path) -> Result<()> {
     harden_file(path)
 }
 
@@ -60,6 +48,58 @@ pub(crate) fn append_private(path: &Path, bytes: &[u8]) -> Result<()> {
     }
     append_private_file(path, bytes)?;
     harden_file(path)
+}
+
+/// Creates a new owner-only file without replacing an existing file.
+/// Returns `false` when another process created the file first.
+pub(crate) fn create_private(path: &Path, bytes: &[u8]) -> Result<bool> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        ensure_private_directory(parent)?;
+    }
+    match create_private_file(path, bytes) {
+        Ok(()) => {
+            if let Err(error) = harden_file(path) {
+                let _ = fs::remove_file(path);
+                return Err(error);
+            }
+            Ok(true)
+        }
+        Err(VaultError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Creates a new private file without changing permissions on its existing
+/// parent directory. Returns `false` if the file already exists.
+pub(crate) fn create_private_in_existing_directory(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(VaultError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("parent directory does not exist: {}", parent.display()),
+        )));
+    }
+    match create_private_file(path, bytes) {
+        Ok(()) => {
+            if let Err(error) = harden_file(path) {
+                let _ = fs::remove_file(path);
+                return Err(error);
+            }
+            Ok(true)
+        }
+        Err(VaultError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Reads a small sensitive text file after rejecting obviously unsafe inputs
@@ -113,6 +153,21 @@ fn append_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn create_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
 #[cfg(not(unix))]
 fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::write(path, bytes)?;
@@ -125,6 +180,16 @@ fn append_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::io::Write;
 
     let mut file = OpenOptions::new().append(true).create(true).open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(bytes)?;
     Ok(())
 }
@@ -190,7 +255,7 @@ fn validate_private_file(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
 }
 
 #[cfg(windows)]
-mod windows_acl {
+pub(crate) mod windows_acl {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
@@ -311,7 +376,18 @@ mod windows_acl {
         }
     }
 
-    struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+    pub(crate) fn current_user_only_security_descriptor() -> Result<SecurityDescriptor> {
+        let sid = current_user_sid_string()?;
+        security_descriptor_from_sddl(&format!("D:P(A;;GA;;;{sid})"))
+    }
+
+    pub(crate) struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl SecurityDescriptor {
+        pub(crate) fn as_mut_ptr(&self) -> PSECURITY_DESCRIPTOR {
+            self.0
+        }
+    }
 
     impl Drop for SecurityDescriptor {
         fn drop(&mut self) {

@@ -270,6 +270,8 @@ The repository integration coverage verifies scoped injection, out-of-scope deni
 
 The boring-computers launcher records the one-time enrollment output and starts the microVM with `WISPKEY_INSTANCE_ID`, `WISPKEY_INSTANCE_SECRET`, and only the `wk_*` tokens it should use. Generic hypervisors that expose host AF_VSOCK directly can instead use `vsock://<cid>:<port>` on Linux builds compiled with `--features vsock`.
 
+Authorize the **host** vault before launching guests. Prefer `wispkey unlock --remember` (OS Keychain or a bounded local protector) or `wispkey unlock --password-file`; never pass the master password as a CLI argument or into the guest environment. `wispkey lock` ends the host session after cleanup. The full host-side sequence is in [`docs/headless-unlock.md`](headless-unlock.md).
+
 The invariant is that the guest receives no plaintext secrets. A compromised microVM can use credentials already in its WispKey scope, but out-of-scope credentials fail closed and require a host approval step before retry.
 
 Operationally, treat the instance secret as a bearer credential, rotate it with `instance rotate-secret`, prefer narrow selectors such as `--credential` or tenant tags, keep UDS paths short and host-owned, and keep using credential host restrictions and TOML policies. Instance scope is an additional gate, not a replacement for policy.

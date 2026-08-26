@@ -11,11 +11,12 @@
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::OnceLock;
 
+use fs2::FileExt;
 use regex::Regex;
 use serde::Serialize;
 use uuid::Uuid;
@@ -184,6 +185,11 @@ pub fn attach_env_file(
     environment_override: Option<&str>,
 ) -> crate::core::Result<AttachEnvResults> {
     let input_path = Path::new(path);
+    if project.trim().is_empty() {
+        return Err(VaultError::InvalidEnvFile(
+            "project name must not be empty".into(),
+        ));
+    }
     let input_metadata = fs::symlink_metadata(input_path)?;
     if input_metadata.file_type().is_symlink() || !input_metadata.is_file() {
         return Err(VaultError::InvalidEnvFile(format!(
@@ -200,6 +206,21 @@ pub fn attach_env_file(
     }
 
     let canonical_path = fs::canonicalize(input_path)?;
+    let _attachment_lock = lock_env_file(&canonical_path)?;
+    let locked_metadata = fs::symlink_metadata(&canonical_path)?;
+    if locked_metadata.file_type().is_symlink() || !locked_metadata.is_file() {
+        return Err(VaultError::InvalidEnvFile(format!(
+            "{} must remain a regular, non-symlink file",
+            canonical_path.display()
+        )));
+    }
+    if locked_metadata.len() > MAX_ATTACH_FILE_BYTES {
+        return Err(VaultError::InvalidEnvFile(format!(
+            "{} exceeds the {} byte size limit",
+            canonical_path.display(),
+            MAX_ATTACH_FILE_BYTES
+        )));
+    }
     let original = fs::read_to_string(&canonical_path)?;
     let entries = selected_env_entries(&original, keys)?;
     let environment = resolve_environment_name(&canonical_path, environment_override)?;
@@ -221,7 +242,7 @@ pub fn attach_env_file(
         Err(VaultError::ProjectNotFound(_)) => {
             if let Some((entry, _)) = named_entries
                 .iter()
-                .find(|(entry, _)| entry.value.starts_with("wk_"))
+                .find(|(entry, _)| is_wisp_token(&entry.value))
             {
                 return Err(VaultError::EnvCredentialConflict(format!(
                     "token for '{}' cannot be attached because project '{project}' does not exist",
@@ -240,7 +261,7 @@ pub fn attach_env_file(
         Err(VaultError::PartitionNotFound(_)) => {
             if let Some((entry, _)) = named_entries
                 .iter()
-                .find(|(entry, _)| entry.value.starts_with("wk_"))
+                .find(|(entry, _)| is_wisp_token(&entry.value))
             {
                 return Err(VaultError::EnvCredentialConflict(format!(
                     "token for '{}' cannot be attached because environment '{environment}' does not exist",
@@ -272,7 +293,7 @@ pub fn attach_env_file(
 
     let mut plans = Vec::with_capacity(named_entries.len());
     for (entry, credential_name) in named_entries {
-        let already_tokenized = entry.value.starts_with("wk_");
+        let already_tokenized = is_wisp_token(&entry.value);
         let credential = match vault.get_credential_in_project(project, &credential_name) {
             Ok(credential) => {
                 if credential.partition_id.as_deref() != Some(partition.id.as_str()) {
@@ -319,18 +340,35 @@ pub fn attach_env_file(
     let mut imported = 0;
     let mut reused = 0;
     let mut already_attached = 0;
+    let requests: Vec<_> = plans
+        .iter()
+        .filter(|plan| plan.credential.is_none())
+        .map(|plan| AddCredentialRequest {
+            name: &plan.credential_name,
+            credential_type: detect_credential_type(&plan.entry.value),
+            value: &plan.entry.value,
+            description: None,
+            hosts: None,
+            tags: Some("attached"),
+            partition: Some(&environment),
+            project: Some(project),
+            origin: None,
+            lifecycle_state: None,
+            review_at: None,
+        })
+        .collect();
+    let created = if requests.is_empty() {
+        Vec::new()
+    } else {
+        vault.add_credentials_atomic(&requests)?
+    };
+    drop(requests);
+    let mut created = created.into_iter();
     for plan in &mut plans {
         if plan.credential.is_none() {
-            let credential = vault.add_credential(AddCredentialRequest {
-                name: &plan.credential_name,
-                credential_type: detect_credential_type(&plan.entry.value),
-                value: &plan.entry.value,
-                description: None,
-                hosts: None,
-                tags: Some("attached"),
-                partition: Some(&environment),
-                project: Some(project),
-            })?;
+            let credential = created
+                .next()
+                .expect("atomic attachment insert must return one credential per request");
             audit::log_event(
                 vault.db(),
                 "CredentialAdded",
@@ -378,6 +416,7 @@ pub fn attach_env_file(
         }
         replace_env_file(&canonical_path, original.as_bytes(), attached.as_bytes())?;
     }
+    secure_files::harden_existing_file(&canonical_path)?;
 
     Ok(AttachEnvResults {
         path: canonical_path.to_string_lossy().into_owned(),
@@ -403,6 +442,10 @@ fn is_attachable_env_file(name: &OsStr) -> bool {
     let name = name.to_string_lossy();
     (name == ".env" || name.starts_with(".env."))
         && !name.ends_with(".previous")
+        && !name.ends_with(".example")
+        && !name.ends_with(".sample")
+        && !name.ends_with(".template")
+        && !name.ends_with(".wispkey.lock")
         && !RESERVED_ENV_FILES.contains(&name.as_ref())
 }
 
@@ -410,18 +453,19 @@ fn resolve_environment_name(
     path: &Path,
     environment_override: Option<&str>,
 ) -> crate::core::Result<String> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| VaultError::InvalidEnvFile("missing file name".into()))?;
+    if !is_attachable_env_file(file_name) {
+        return Err(VaultError::InvalidEnvFile(format!(
+            "{} is not an attachable .env file",
+            path.display()
+        )));
+    }
+
     let raw_name = if let Some(environment) = environment_override {
         environment.to_string()
     } else {
-        let file_name = path
-            .file_name()
-            .ok_or_else(|| VaultError::InvalidEnvFile("missing file name".into()))?;
-        if !is_attachable_env_file(file_name) {
-            return Err(VaultError::InvalidEnvFile(format!(
-                "{} is not an attachable .env file",
-                path.display()
-            )));
-        }
         let file_name = file_name.to_string_lossy();
         if file_name == ".env" {
             "default".to_string()
@@ -439,7 +483,46 @@ fn resolve_environment_name(
             "environment name must contain an ASCII letter or number".into(),
         ));
     }
+    if normalized != raw_name {
+        return Err(VaultError::InvalidEnvFile(format!(
+            "environment '{raw_name}' is not canonical; use '{normalized}'"
+        )));
+    }
     Ok(normalized)
+}
+
+fn is_wisp_token(value: &str) -> bool {
+    if let Some(slug) = value.strip_prefix("wk_env_") {
+        return !slug.is_empty()
+            && slug
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_');
+    }
+
+    let Some(body) = value.strip_prefix("wk_") else {
+        return false;
+    };
+    let Some((slug, random)) = body.rsplit_once('_') else {
+        return false;
+    };
+    !slug.is_empty()
+        && slug
+            .chars()
+            .all(|character| character.is_alphanumeric() || character == '_')
+        && random.len() == 8
+        && random
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+}
+
+fn lock_env_file(path: &Path) -> crate::core::Result<fs::File> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let lock_path = parent.join(format!("{file_name}.wispkey.lock"));
+    let _created = secure_files::create_private_in_existing_directory(&lock_path, b"")?;
+    let lock = OpenOptions::new().read(true).write(true).open(&lock_path)?;
+    lock.lock_exclusive()?;
+    Ok(lock)
 }
 
 fn normalize_scope_component(value: &str) -> String {
@@ -670,7 +753,15 @@ fn replace_env_file(path: &Path, original: &[u8], attached: &[u8]) -> crate::cor
     let parent = path.parent().unwrap_or(Path::new("."));
     let file_name = path.file_name().unwrap_or_default().to_string_lossy();
     let temp_path = parent.join(format!(".{file_name}.wispkey-{}.tmp", Uuid::new_v4()));
-    secure_files::write_private_in_existing_directory(&temp_path, attached)?;
+    if !secure_files::create_private_in_existing_directory(&temp_path, attached)? {
+        return Err(VaultError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "temporary attachment file already exists: {}",
+                temp_path.display()
+            ),
+        )));
+    }
     if let Err(error) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(VaultError::Io(error));
@@ -723,6 +814,9 @@ pub fn import_env_file(
             tags: Some("imported"),
             partition,
             project,
+            origin: None,
+            lifecycle_state: None,
+            review_at: None,
         }) {
             Ok(cred) => {
                 audit::log_event(
@@ -826,7 +920,6 @@ struct CredentialPatterns {
     slack_bot: Regex,
     slack_user: Regex,
     aws_access: Regex,
-    basic_auth: Regex,
     bearer: Regex,
 }
 
@@ -840,7 +933,6 @@ fn get_patterns() -> &'static CredentialPatterns {
         slack_bot: Regex::new(r"^xoxb-[0-9]+-[a-zA-Z0-9]+$").expect("static regex"),
         slack_user: Regex::new(r"^xoxp-[0-9]+-[a-zA-Z0-9]+$").expect("static regex"),
         aws_access: Regex::new(r"^AKIA[A-Z0-9]{16}$").expect("static regex"),
-        basic_auth: Regex::new(r"^Basic [A-Za-z0-9+/=]+$").expect("static regex"),
         bearer: Regex::new(r"^Bearer [a-zA-Z0-9._\-]+$").expect("static regex"),
     })
 }
@@ -893,10 +985,6 @@ fn detect_credential_type(value: &str) -> CredentialType {
 
     if patterns.aws_access.is_match(value) {
         return CredentialType::ApiKey;
-    }
-
-    if patterns.basic_auth.is_match(value) {
-        return CredentialType::BasicAuth;
     }
 
     CredentialType::BearerToken
@@ -973,10 +1061,10 @@ mod tests {
     }
 
     #[test]
-    fn detect_basic_auth() {
+    fn encoded_basic_auth_is_not_encoded_again() {
         assert_eq!(
             detect_credential_type("Basic dXNlcjpwYXNz").display_name(),
-            "basic_auth"
+            "bearer_token"
         );
     }
 
@@ -994,6 +1082,14 @@ mod tests {
             detect_credential_type("some-random-value-123").display_name(),
             "bearer_token"
         );
+    }
+
+    #[test]
+    fn recognizes_only_complete_wisp_token_shapes() {
+        assert!(is_wisp_token("wk_default_api_token_a1B2c3D4"));
+        assert!(is_wisp_token("wk_env_openai_api_key"));
+        assert!(!is_wisp_token("wk_customer-secret"));
+        assert!(!is_wisp_token("wk_default_api_token_short"));
     }
 
     #[test]

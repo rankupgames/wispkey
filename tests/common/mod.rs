@@ -28,6 +28,17 @@ pub fn run_wispkey(vault_dir: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .env("WISPKEY_VAULT_PATH", vault_dir)
         .env("WISPKEY_PASSWORD", "test-password")
+        .env("WISPKEY_PROTECTOR", "file")
+        .output()
+        .expect("failed to run wispkey")
+}
+
+pub fn run_wispkey_without_password(vault_dir: &Path, args: &[&str]) -> std::process::Output {
+    wispkey_bin()
+        .args(args)
+        .env("WISPKEY_VAULT_PATH", vault_dir)
+        .env_remove("WISPKEY_PASSWORD")
+        .env("WISPKEY_PROTECTOR", "file")
         .output()
         .expect("failed to run wispkey")
 }
@@ -46,6 +57,7 @@ pub fn run_wispkey_with_bundle_passphrase(
         .env("WISPKEY_VAULT_PATH", vault_dir)
         .env("WISPKEY_PASSWORD", "test-password")
         .env("WISPKEY_BUNDLE_PASSPHRASE", passphrase)
+        .env("WISPKEY_PROTECTOR", "file")
         .output()
         .expect("failed to run wispkey")
 }
@@ -75,6 +87,24 @@ pub fn output_json(args: &[&str], output: std::process::Output) -> Value {
             String::from_utf8_lossy(&output.stdout)
         )
     })
+}
+
+pub fn wait_for_owner_info(vault_dir: &Path) -> Value {
+    let owner_info_path = vault_dir.join("owner.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(&owner_info_path)
+            && let Ok(value) = serde_json::from_str::<Value>(&raw)
+            && value.get("endpoint").and_then(Value::as_str).is_some()
+        {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owner IPC did not write owner.json in time"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
 }
 
 pub fn wait_for_proxy_info(vault_dir: &Path) -> Value {
