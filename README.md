@@ -348,6 +348,7 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey partition create/list/delete/assign/export/import` | Manage partitions |
 | `wispkey project create/list/delete/use/current/export/import` | Manage projects and encrypted project bundles |
 | `wispkey credential export/import` | Export or import one encrypted credential bundle |
+| `wispkey backup create/inspect/verify/restore` | Encrypted full-vault backup, inspection, verification, and atomic restore |
 | `wispkey instance enroll <name> [--description D] [--partition P]... [--project P]... [--credential C]... [--tag T]...` | Enroll a host-managed instance identity |
 | `wispkey instance list/show/scope/revoke/requests/approve/deny` | List, inspect, scope, revoke, and approve or deny instance access requests |
 | `wispkey instance rotate-secret <name> [--if-older-than 30d] [--grace 10m]` | Schedule-safe instance-secret rotation with bounded overlap |
@@ -391,6 +392,20 @@ wispkey credential export "openai-key" --output openai-key.wkcred
 wispkey credential import openai-key.wkcred --project client-alpha --partition personal
 ```
 
+## Vault Backup
+
+Create an encrypted full-vault backup for disaster recovery. This is separate from project, partition, and credential sharing bundles:
+
+```bash
+wispkey backup create --output vault.wkbackup
+wispkey backup inspect vault.wkbackup
+wispkey backup verify vault.wkbackup
+wispkey backup restore vault.wkbackup --dry-run
+wispkey backup restore vault.wkbackup --target /tmp/wispkey-restore-test
+```
+
+The backup passphrase is separate from the vault master password (`WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file`). Credential blobs stay encrypted with the original master key. After restore, unlock with that master password. Session files, instance bearer secrets, and bootstrap token secrets are not restored; see [`docs/vault-backup.md`](docs/vault-backup.md) for the format, scope, and recovery limits.
+
 ## Non-Interactive Mode (CI / Agents)
 
 Do not pass the master password as a CLI argument. Prefer a remembered protector or an owner-only password file:
@@ -413,7 +428,7 @@ printf '%s' "$SECRET_VALUE" | wispkey add "key" --type api_key --value-file -
 
 For non-interactive secret input, prefer `wispkey add "key" --type api_key --value-file ./secret.txt` or pipe the value to `--value-file -`. Passing secrets with `--value` emits a warning because the value can be captured by shell history or process listings.
 
-`WISPKEY_PASSWORD` only unlocks or initializes the vault. It is intentionally not used for encrypted bundle export/import; use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file` for those commands.
+`WISPKEY_PASSWORD` only unlocks or initializes the vault. It is intentionally not used for encrypted bundle export/import or vault backup; use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file` for those commands.
 
 `wispkey mcp serve` does not require `WISPKEY_PASSWORD` when you only need env-sideloaded credentials. Set `WISPKEY_SIDELOAD_<SLUG>` in the MCP server environment and ask for credential name `<slug>` (case and separators are normalized).
 

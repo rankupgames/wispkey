@@ -4,13 +4,14 @@
  * Project: WispKey
  * Description: Library surface for vault operations and owner IPC.
  * Created: 2026-08-25
- * Last Modified: 2026-08-25
+ * Last Modified: 2026-08-26
  */
 
 #![deny(clippy::correctness)]
 #![warn(clippy::suspicious, clippy::style, clippy::perf, clippy::complexity)]
 
 pub mod audit;
+pub mod backup;
 pub mod bundle;
 pub mod cli;
 pub mod cloud;

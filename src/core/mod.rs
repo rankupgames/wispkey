@@ -4,7 +4,7 @@
  * Project: WispKey
  * Description: Vault engine -- encrypted credential storage and domain operations.
  * Created: 2026-04-07
- * Last Modified: 2026-08-25
+ * Last Modified: 2026-08-26
  */
 
 use std::collections::HashSet;
@@ -36,6 +36,9 @@ pub use instances::{
     AccessRequest, BootstrapJoinResult, BootstrapToken, CreateBootstrapTokenResult,
     EnrollInstanceResult, Instance, InstanceScopeInput, RotateInstanceSecretResult,
 };
+pub(crate) use instances::{
+    prepare_restored_instance_secrets, revoke_bootstrap_tokens_after_restore,
+};
 use rows::{credential_from_row, parse_csv, partition_from_row, project_from_row};
 #[cfg(test)]
 use rows::{parse_credential_type_column, parse_datetime_column};
@@ -47,7 +50,8 @@ pub use templates::{
 pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
-const CURRENT_SCHEMA_VERSION: &str = "11";
+/// Current on-disk SQLite schema version written to `vault_meta`.
+pub const CURRENT_SCHEMA_VERSION: &str = "11";
 
 /// Errors returned by vault operations (I/O, crypto, schema, and business rules).
 #[derive(Error, Debug)]
@@ -107,6 +111,8 @@ pub enum VaultError {
     CannotDeleteDefaultProject,
     #[error("invalid bundle: {0}")]
     InvalidBundle(String),
+    #[error("{0}")]
+    Backup(String),
     #[error("instance '{0}' already exists")]
     DuplicateInstance(String),
     #[error("instance '{0}' not found")]

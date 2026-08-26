@@ -5,7 +5,7 @@
  * Description: Shared encrypted bundle framing for partition, project, and
  *              credential exports.
  * Created: 2026-05-16
- * Last Modified: 2026-05-16
+ * Last Modified: 2026-08-26
  */
 
 use std::path::Path;
@@ -30,7 +30,23 @@ pub(crate) fn write_encrypted_payload<T: Serialize>(
     passphrase: &str,
     output_path: &str,
 ) -> Result<()> {
+    write_encrypted_payload_with_limit(magic, payload, passphrase, output_path, MAX_BUNDLE_BYTES)
+}
+
+/// Same as [`write_encrypted_payload`] with an explicit plaintext size cap.
+pub(crate) fn write_encrypted_payload_with_limit<T: Serialize>(
+    magic: &[u8; 4],
+    payload: &T,
+    passphrase: &str,
+    output_path: &str,
+    max_bytes: u64,
+) -> Result<()> {
     let json = serde_json::to_vec(payload).map_err(|e| VaultError::InvalidBundle(e.to_string()))?;
+    if json.len() as u64 > max_bytes {
+        return Err(VaultError::InvalidBundle(
+            "bundle exceeds size limit".into(),
+        ));
+    }
     let salt = random_bytes::<32>()?;
     let derived_key = derive_bundle_key(passphrase, &salt)?;
     let encrypted_payload = aes_gcm_encrypt(&derived_key, &json)?;
@@ -52,9 +68,19 @@ pub(crate) fn read_encrypted_payload<T: for<'de> Deserialize<'de>>(
     bundle_path: &str,
     passphrase: &str,
 ) -> Result<T> {
+    read_encrypted_payload_with_limit(magic, bundle_path, passphrase, MAX_BUNDLE_BYTES)
+}
+
+/// Same as [`read_encrypted_payload`] with an explicit on-disk size cap.
+pub(crate) fn read_encrypted_payload_with_limit<T: for<'de> Deserialize<'de>>(
+    magic: &[u8; 4],
+    bundle_path: &str,
+    passphrase: &str,
+    max_bytes: u64,
+) -> Result<T> {
     let path = Path::new(bundle_path);
     let metadata = std::fs::metadata(path).map_err(|e| VaultError::InvalidBundle(e.to_string()))?;
-    if metadata.len() > MAX_BUNDLE_BYTES {
+    if metadata.len() > max_bytes {
         return Err(VaultError::InvalidBundle(
             "bundle exceeds size limit".into(),
         ));
