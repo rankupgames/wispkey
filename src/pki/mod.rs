@@ -165,34 +165,36 @@ fn issue_from_csr(
 
     let resolved_cn = match common_name {
         Some(value) => normalize_common_name(value)?.to_string(),
-        None => csr_common_name(&csr.params).ok_or_else(|| {
+        None => normalize_common_name(&csr_common_name(&csr.params).ok_or_else(|| {
             PkiError::InvalidInput(
                 "CSR has no common name; pass common_name to set the leaf subject".into(),
             )
-        })?,
+        })?)?
+        .to_string(),
     };
 
     let sans = if san.is_empty() {
-        let existing = csr_sans(&csr.params);
+        let existing = csr_sans(&csr.params)?;
         if existing.is_empty() {
             resolve_sans(&resolved_cn, &[])?
         } else {
-            existing
+            resolve_sans(&resolved_cn, &existing)?
         }
     } else {
         resolve_sans(&resolved_cn, san)?
     };
 
     csr.params.distinguished_name = distinguished_name(&resolved_cn);
+    let leaf_key_type = detect_csr_leaf_key_type(&csr)?;
     apply_leaf_extensions(
         &mut csr.params,
         &sans,
         window.not_before,
         window.not_after,
-        None,
+        Some(leaf_key_type),
     )?;
 
-    let key_type = detect_csr_key_type(&csr);
+    let key_type = leaf_key_type.as_str().to_string();
     let cert = csr
         .signed_by(issuer)
         .map_err(|error| PkiError::IssueFailed(format!("failed to sign CSR: {error}")))?;
@@ -321,16 +323,29 @@ fn validate_ca_certificate(cert_pem: &str) -> Result<OffsetDateTime, PkiError> {
         }
     }
 
-    if let Ok(Some(extension)) = certificate.key_usage()
-        && !extension.value.key_cert_sign()
-    {
-        return Err(PkiError::InvalidCaMaterial(
-            "CA certificate Key Usage does not allow certificate signing".into(),
-        ));
+    match certificate.key_usage() {
+        Ok(Some(extension)) if !extension.value.key_cert_sign() => {
+            return Err(PkiError::InvalidCaMaterial(
+                "CA certificate Key Usage does not allow certificate signing".into(),
+            ));
+        }
+        Ok(_) => {}
+        Err(error) => {
+            return Err(PkiError::InvalidCaMaterial(format!(
+                "failed to parse CA Key Usage: {error}"
+            )));
+        }
     }
 
+    let not_before = certificate.validity().not_before.to_datetime();
     let not_after = certificate.validity().not_after.to_datetime();
-    if not_after <= OffsetDateTime::now_utc() {
+    let now = OffsetDateTime::now_utc();
+    if not_before > now {
+        return Err(PkiError::InvalidCaMaterial(
+            "CA certificate is not valid yet".into(),
+        ));
+    }
+    if not_after <= now {
         return Err(PkiError::InvalidCaMaterial(
             "CA certificate is expired".into(),
         ));
@@ -555,23 +570,17 @@ fn csr_common_name(params: &CertificateParams) -> Option<String> {
         .map(|(_, value)| dn_value_text(value))
 }
 
-fn csr_sans(params: &CertificateParams) -> Vec<String> {
-    params
-        .subject_alt_names
-        .iter()
-        .map(san_to_string)
-        .filter(|name| !name.is_empty())
-        .collect()
+fn csr_sans(params: &CertificateParams) -> Result<Vec<String>, PkiError> {
+    params.subject_alt_names.iter().map(san_to_string).collect()
 }
 
-fn san_to_string(san: &SanType) -> String {
+fn san_to_string(san: &SanType) -> Result<String, PkiError> {
     match san {
-        SanType::DnsName(name) => name.as_str().to_string(),
-        SanType::IpAddress(ip) => ip.to_string(),
-        SanType::Rfc822Name(name) => name.as_str().to_string(),
-        SanType::URI(uri) => uri.as_str().to_string(),
-        SanType::OtherName(_) => String::new(),
-        _ => String::new(),
+        SanType::DnsName(name) => Ok(name.as_str().to_string()),
+        SanType::IpAddress(ip) => Ok(ip.to_string()),
+        _ => Err(PkiError::InvalidInput(
+            "CSR SANs must contain only DNS names or IP addresses".into(),
+        )),
     }
 }
 
@@ -586,19 +595,23 @@ fn dn_value_text(value: &DnValue) -> String {
     }
 }
 
-fn detect_csr_key_type(csr: &CertificateSigningRequestParams) -> String {
+fn detect_csr_leaf_key_type(
+    csr: &CertificateSigningRequestParams,
+) -> Result<LeafKeyType, PkiError> {
     let alg = csr.public_key.algorithm();
     if alg == &rcgen::PKCS_ECDSA_P256_SHA256 {
-        "ec-p256".into()
+        Ok(LeafKeyType::EcP256)
     } else if alg == &rcgen::PKCS_ECDSA_P384_SHA384 {
-        "ec-p384".into()
+        Ok(LeafKeyType::EcP384)
     } else if alg == &rcgen::PKCS_RSA_SHA256
         || alg == &rcgen::PKCS_RSA_SHA384
         || alg == &rcgen::PKCS_RSA_SHA512
     {
-        "rsa".into()
+        Ok(LeafKeyType::Rsa2048)
     } else {
-        "unknown".into()
+        Err(PkiError::InvalidInput(
+            "CSR public key algorithm is not supported".into(),
+        ))
     }
 }
 
@@ -711,7 +724,10 @@ mod tests {
             params.key_usages.push(KeyUsagePurpose::CrlSign);
         }
         if let Some(not_after) = not_after {
-            params.not_before = not_after - Duration::days(2);
+            params.not_before = std::cmp::min(
+                OffsetDateTime::now_utc() - Duration::days(1),
+                not_after - Duration::days(2),
+            );
             params.not_after = not_after;
         }
         let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
@@ -943,7 +959,7 @@ mod tests {
         assert!(!issued.certificate_pem.contains(key_pem.trim()));
         assert_signed_by(&issued.certificate_pem, &cert_pem);
         assert_leaf_key_matches(&issued.certificate_pem, &leaf_key.serialize_pem());
-        assert_tls_leaf_profile(&issued.certificate_pem, true, true);
+        assert_tls_leaf_profile(&issued.certificate_pem, false, true);
     }
 
     #[test]
@@ -1179,7 +1195,7 @@ mod tests {
         assert!(issued.private_key_pem.is_none());
         assert_signed_by(&issued.certificate_pem, &cert_pem);
         assert_leaf_key_matches(&issued.certificate_pem, &leaf_key.serialize_pem());
-        assert_tls_leaf_profile(&issued.certificate_pem, true, true);
+        assert_tls_leaf_profile(&issued.certificate_pem, false, true);
     }
 
     #[test]

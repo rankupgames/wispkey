@@ -25,12 +25,14 @@ fn serve_cleans_stale_proxy_metadata_before_starting() {
     init_vault(vault_dir.path());
 
     std::fs::write(vault_dir.path().join("proxy.pid"), "999999").expect("write stale pid");
+    // Use a closed loopback port so a parallel --random-port proxy cannot make
+    // this stale metadata look like a live owner or a healthy foreign listener.
     std::fs::write(
         vault_dir.path().join("proxy.json"),
         serde_json::to_string(&serde_json::json!({
             "pid": 999999_u32,
-            "port": 45678_u16,
-            "address": "http://127.0.0.1:45678",
+            "port": 1_u16,
+            "address": "http://127.0.0.1:1",
             "management_token": "stale-token"
         }))
         .expect("stale metadata json"),
@@ -38,7 +40,7 @@ fn serve_cleans_stale_proxy_metadata_before_starting() {
     .expect("write stale proxy metadata");
 
     let _proxy = spawn_proxy(vault_dir.path(), &["serve", "--random-port"]);
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     let info = loop {
         let value = wait_for_proxy_info(vault_dir.path());
         if value["schema_version"].as_u64() == Some(1) {

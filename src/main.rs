@@ -59,6 +59,25 @@ enum Commands {
         /// Session timeout in minutes (default: 30, 0 = no expiry)
         #[arg(long)]
         timeout: Option<i64>,
+
+        /// Remember this unlock in the OS protector (Keychain/Credential Manager/Secret Service) or a local file protector
+        #[arg(long)]
+        remember: bool,
+
+        /// Remembered-protector timeout in minutes (default: 480, 0 = until `lock --forget`)
+        #[arg(long)]
+        protector_timeout: Option<i64>,
+
+        /// Read the master password from a file, or '-' for stdin. Never pass the password as a CLI argument.
+        #[arg(long)]
+        password_file: Option<String>,
+    },
+
+    /// Lock the current session and optionally forget a remembered unlock
+    Lock {
+        /// Also delete the OS or file protector so later unlocks require the master password
+        #[arg(long)]
+        forget: bool,
     },
 
     /// Add a credential to the vault
@@ -306,6 +325,12 @@ enum Commands {
         command: CredentialCommands,
     },
 
+    /// Generate and manage website logins without exposing passwords
+    Login {
+        #[command(subcommand)]
+        command: LoginCommands,
+    },
+
     /// Manage access policies
     Policy {
         #[command(subcommand)]
@@ -533,6 +558,66 @@ enum CredentialCommands {
 }
 
 #[derive(Subcommand)]
+enum LoginCommands {
+    /// Generate a unique website login and store it encrypted
+    Generate {
+        /// Credential name
+        name: String,
+        /// Username or email for the site
+        #[arg(long)]
+        username: String,
+        /// Website URL (https only; stored as an exact origin)
+        #[arg(long)]
+        url: String,
+        /// Project override (default: active project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Partition to add to (default: personal)
+        #[arg(long)]
+        partition: Option<String>,
+        /// Review interval such as 180d, or 'none'
+        #[arg(long, default_value = "180d")]
+        review_after: String,
+        /// Password length (must keep at least 128 bits of entropy)
+        #[arg(long)]
+        length: Option<usize>,
+        /// Omit symbols for site compatibility (length still must meet 128 bits)
+        #[arg(long)]
+        no_symbols: bool,
+    },
+    /// List website logins (metadata only)
+    List {
+        /// Filter by project (default: active project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Show logins across all projects
+        #[arg(long)]
+        all_projects: bool,
+        /// Show only logins whose review date is due (never deletes)
+        #[arg(long)]
+        due: bool,
+    },
+    /// Archive a website login without deleting it
+    Archive {
+        name: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Restore an archived website login to pending
+    Restore {
+        name: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Mark a pending website login as active
+    Activate {
+        name: String,
+        #[arg(long)]
+        project: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum PolicyCommands {
     /// List all policies
     List,
@@ -721,8 +806,16 @@ async fn main() {
         Commands::Init => {
             cli::handle_init().await;
         }
-        Commands::Unlock { timeout } => {
-            cli::handle_unlock(timeout).await;
+        Commands::Unlock {
+            timeout,
+            remember,
+            protector_timeout,
+            password_file,
+        } => {
+            cli::handle_unlock(timeout, remember, protector_timeout, password_file).await;
+        }
+        Commands::Lock { forget } => {
+            cli::handle_lock(forget).await;
         }
         Commands::Add {
             name,
@@ -983,6 +1076,44 @@ async fn main() {
                     bundle_passphrase_file.as_deref(),
                 )
                 .await
+            }
+        },
+        Commands::Login { command } => match command {
+            LoginCommands::Generate {
+                name,
+                username,
+                url,
+                project,
+                partition,
+                review_after,
+                length,
+                no_symbols,
+            } => {
+                cli::handle_generate(cli::GenerateLoginArgs {
+                    name: &name,
+                    username: &username,
+                    url: &url,
+                    project: project.as_deref(),
+                    partition: partition.as_deref(),
+                    review_after: Some(review_after.as_str()),
+                    length,
+                    no_symbols,
+                })
+                .await
+            }
+            LoginCommands::List {
+                project,
+                all_projects,
+                due,
+            } => cli::handle_login_list(project.as_deref(), all_projects, due).await,
+            LoginCommands::Archive { name, project } => {
+                cli::handle_archive(&name, project.as_deref()).await
+            }
+            LoginCommands::Restore { name, project } => {
+                cli::handle_restore(&name, project.as_deref()).await
+            }
+            LoginCommands::Activate { name, project } => {
+                cli::handle_activate(&name, project.as_deref()).await
             }
         },
         Commands::Policy { command } => match command {
