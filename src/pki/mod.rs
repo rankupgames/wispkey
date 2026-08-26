@@ -5,7 +5,7 @@
  * Description: In-vault CA signing -- issues X.509 leaf certificates from a
  *              CA private key held in the vault without ever returning that key.
  * Created: 2026-08-25
- * Last Modified: 2026-08-25
+ * Last Modified: 2026-08-26
  */
 
 use std::net::IpAddr;
@@ -722,6 +722,22 @@ mod tests {
         (bundle, cert_pem, key_pem)
     }
 
+    fn test_rsa_ca() -> (String, String, String) {
+        let mut params = CertificateParams::new(Vec::new()).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "WispKey RSA Test CA");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages.push(KeyUsagePurpose::DigitalSignature);
+        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        params.key_usages.push(KeyUsagePurpose::CrlSign);
+        let key = KeyPair::generate_rsa_for(&rcgen::PKCS_RSA_SHA256, RsaKeySize::_2048).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let key_pem = key.serialize_pem();
+        let cert_pem = cert.pem();
+        (format!("{cert_pem}{key_pem}"), cert_pem, key_pem)
+    }
+
     fn issue_ok(ca_pem: &str, cn: &str, san: &[&str], key_type: LeafKeyType) -> IssuedCertificate {
         issue_certificate(IssueCertRequest {
             ca_pem,
@@ -736,6 +752,119 @@ mod tests {
             csr_pem: None,
         })
         .unwrap()
+    }
+
+    fn assert_signed_by(leaf_pem: &str, ca_cert_pem: &str) {
+        let leaf_der = pem_der(leaf_pem, "CERTIFICATE").unwrap();
+        let ca_der = pem_der(ca_cert_pem, "CERTIFICATE").unwrap();
+        X509Certificate::from_der(&leaf_der)
+            .unwrap()
+            .1
+            .verify_signature(Some(
+                X509Certificate::from_der(&ca_der).unwrap().1.public_key(),
+            ))
+            .expect("leaf signature must verify against the CA");
+    }
+
+    fn assert_leaf_key_matches(leaf_pem: &str, key_pem: &str) {
+        let leaf_der = pem_der(leaf_pem, "CERTIFICATE").unwrap();
+        let leaf = X509Certificate::from_der(&leaf_der).unwrap().1;
+        let key = KeyPair::from_pem(key_pem).expect("leaf private key PEM");
+        assert_eq!(
+            leaf.public_key().subject_public_key.data.as_ref(),
+            key.public_key_raw(),
+            "leaf private key must match the issued certificate public key"
+        );
+    }
+
+    fn assert_tls_leaf_profile(leaf_pem: &str, expect_encipherment: bool, expect_agreement: bool) {
+        let leaf_der = pem_der(leaf_pem, "CERTIFICATE").unwrap();
+        let leaf = X509Certificate::from_der(&leaf_der).unwrap().1;
+
+        if let Some(extension) = leaf.basic_constraints().unwrap() {
+            assert!(
+                !extension.value.ca,
+                "issued leaf must not have Basic Constraints CA:TRUE"
+            );
+        }
+
+        let key_usage = leaf.key_usage().unwrap().expect("leaf Key Usage");
+        assert!(
+            key_usage.value.digital_signature(),
+            "leaf must include Digital Signature"
+        );
+        assert_eq!(
+            key_usage.value.key_encipherment(),
+            expect_encipherment,
+            "Key Encipherment mismatch"
+        );
+        assert_eq!(
+            key_usage.value.key_agreement(),
+            expect_agreement,
+            "Key Agreement mismatch"
+        );
+        assert!(
+            !key_usage.value.key_cert_sign(),
+            "leaf must not include KeyCertSign"
+        );
+
+        let eku = leaf
+            .extended_key_usage()
+            .unwrap()
+            .expect("leaf Extended Key Usage");
+        assert!(eku.value.server_auth, "leaf must include serverAuth EKU");
+        assert!(eku.value.client_auth, "leaf must include clientAuth EKU");
+    }
+
+    fn take_der_len(input: &[u8], cursor: &mut usize) -> usize {
+        let first = input[*cursor];
+        *cursor += 1;
+        if first < 0x80 {
+            return usize::from(first);
+        }
+        let nbytes = usize::from(first & 0x7f);
+        assert!((1..=4).contains(&nbytes), "unsupported DER length");
+        let mut len = 0usize;
+        for _ in 0..nbytes {
+            len = (len << 8) | usize::from(input[*cursor]);
+            *cursor += 1;
+        }
+        len
+    }
+
+    fn take_der_value<'a>(input: &'a [u8], cursor: &mut usize, expected_tag: u8) -> &'a [u8] {
+        assert_eq!(input[*cursor], expected_tag, "unexpected DER tag");
+        *cursor += 1;
+        let len = take_der_len(input, cursor);
+        let start = *cursor;
+        *cursor += len;
+        &input[start..*cursor]
+    }
+
+    fn pkcs8_inner_key(pkcs8_der: &[u8]) -> &[u8] {
+        let mut cursor = 0;
+        let seq = take_der_value(pkcs8_der, &mut cursor, 0x30);
+        let mut inner = 0;
+        let _version = take_der_value(seq, &mut inner, 0x02);
+        let _algorithm = take_der_value(seq, &mut inner, 0x30);
+        take_der_value(seq, &mut inner, 0x04)
+    }
+
+    fn pem_encode(label: &str, der: &[u8]) -> String {
+        use base64::Engine;
+        let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+        let mut pem = format!("-----BEGIN {label}-----\n");
+        for chunk in encoded.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(chunk).expect("base64 is ascii"));
+            pem.push('\n');
+        }
+        pem.push_str(&format!("-----END {label}-----\n"));
+        pem
+    }
+
+    fn traditional_key_pem(pkcs8_pem: &str, label: &str) -> String {
+        let der = pem_der(pkcs8_pem, "PRIVATE KEY").expect("PKCS#8 PEM");
+        pem_encode(label, pkcs8_inner_key(&der))
     }
 
     #[test]
@@ -759,11 +888,11 @@ mod tests {
         assert_eq!(issued.key_type, "ec-p256");
         assert!(!issued.serial_hex.is_empty());
 
+        assert_signed_by(&issued.certificate_pem, &cert_pem);
+        assert_leaf_key_matches(&issued.certificate_pem, &leaf_key);
+        assert_tls_leaf_profile(&issued.certificate_pem, false, true);
         let leaf_der = pem_der(&issued.certificate_pem, "CERTIFICATE").unwrap();
-        let ca_der = pem_der(&cert_pem, "CERTIFICATE").unwrap();
         let leaf = X509Certificate::from_der(&leaf_der).unwrap().1;
-        let ca = X509Certificate::from_der(&ca_der).unwrap().1;
-        leaf.verify_signature(Some(ca.public_key())).unwrap();
         assert_eq!(
             leaf.subject()
                 .iter_common_name()
@@ -780,20 +909,15 @@ mod tests {
         let (bundle, cert_pem, _) = test_ca(true, true);
         let issued = issue_ok(&bundle, "rsa-leaf.internal", &[], LeafKeyType::Rsa2048);
         assert_eq!(issued.key_type, "rsa-2048");
-        let leaf_der = pem_der(&issued.certificate_pem, "CERTIFICATE").unwrap();
-        let ca_der = pem_der(&cert_pem, "CERTIFICATE").unwrap();
-        X509Certificate::from_der(&leaf_der)
-            .unwrap()
-            .1
-            .verify_signature(Some(
-                X509Certificate::from_der(&ca_der).unwrap().1.public_key(),
-            ))
-            .unwrap();
+        let leaf_key = issued.private_key_pem.expect("generated key");
+        assert_signed_by(&issued.certificate_pem, &cert_pem);
+        assert_leaf_key_matches(&issued.certificate_pem, &leaf_key);
+        assert_tls_leaf_profile(&issued.certificate_pem, true, false);
     }
 
     #[test]
     fn signs_csr_without_returning_a_key() {
-        let (bundle, _, key_pem) = test_ca(true, true);
+        let (bundle, cert_pem, key_pem) = test_ca(true, true);
         let mut params = CertificateParams::new(vec!["csr.internal".into()]).unwrap();
         params
             .distinguished_name
@@ -817,6 +941,9 @@ mod tests {
         assert_eq!(issued.common_name, "csr-leaf");
         assert!(issued.san.contains(&"csr.internal".to_string()));
         assert!(!issued.certificate_pem.contains(key_pem.trim()));
+        assert_signed_by(&issued.certificate_pem, &cert_pem);
+        assert_leaf_key_matches(&issued.certificate_pem, &leaf_key.serialize_pem());
+        assert_tls_leaf_profile(&issued.certificate_pem, true, true);
     }
 
     #[test]
@@ -834,6 +961,9 @@ mod tests {
         .unwrap();
         assert_eq!(issued.common_name, "svc.internal");
         assert_eq!(issued.san, vec!["svc.internal".to_string()]);
+        let leaf_key = issued.private_key_pem.expect("generated key");
+        assert_signed_by(&issued.certificate_pem, &cert_pem);
+        assert_leaf_key_matches(&issued.certificate_pem, &leaf_key);
     }
 
     #[test]
@@ -902,9 +1032,17 @@ mod tests {
     fn parses_ip_sans() {
         let san = parse_san("127.0.0.1").unwrap();
         assert!(matches!(san, SanType::IpAddress(IpAddr::V4(_))));
-        let (bundle, _, _) = test_ca(true, true);
-        let issued = issue_ok(&bundle, "localhost", &["127.0.0.1"], LeafKeyType::EcP256);
-        assert_eq!(issued.san, vec!["127.0.0.1".to_string()]);
+        let v6 = parse_san("::1").unwrap();
+        assert!(matches!(v6, SanType::IpAddress(IpAddr::V6(_))));
+        let (bundle, cert_pem, _) = test_ca(true, true);
+        let issued = issue_ok(
+            &bundle,
+            "localhost",
+            &["127.0.0.1", "::1"],
+            LeafKeyType::EcP256,
+        );
+        assert_eq!(issued.san, vec!["127.0.0.1".to_string(), "::1".to_string()]);
+        assert_signed_by(&issued.certificate_pem, &cert_pem);
     }
 
     #[test]
@@ -936,5 +1074,152 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.to_string().contains("extends past the CA"), "{error}");
+    }
+
+    #[test]
+    fn issues_ec_p384_and_rsa_4096_leaves() {
+        let (bundle, cert_pem, _) = test_ca(true, true);
+
+        let p384 = issue_ok(&bundle, "p384.internal", &[], LeafKeyType::EcP384);
+        assert_eq!(p384.key_type, "ec-p384");
+        let p384_key = p384.private_key_pem.expect("p384 key");
+        assert_signed_by(&p384.certificate_pem, &cert_pem);
+        assert_leaf_key_matches(&p384.certificate_pem, &p384_key);
+        assert_tls_leaf_profile(&p384.certificate_pem, false, true);
+
+        let rsa4096 = issue_ok(&bundle, "rsa4096.internal", &[], LeafKeyType::Rsa4096);
+        assert_eq!(rsa4096.key_type, "rsa-4096");
+        let rsa_key = rsa4096.private_key_pem.expect("rsa4096 key");
+        assert_signed_by(&rsa4096.certificate_pem, &cert_pem);
+        assert_leaf_key_matches(&rsa4096.certificate_pem, &rsa_key);
+        assert_tls_leaf_profile(&rsa4096.certificate_pem, true, false);
+    }
+
+    #[test]
+    fn defaults_to_365_days_and_uses_cn_as_san() {
+        let (bundle, cert_pem, _) = test_ca(true, true);
+        let issued = issue_certificate(IssueCertRequest {
+            ca_pem: &bundle,
+            ca_cert_pem: None,
+            common_name: Some("svc.internal"),
+            san: &[],
+            validity_days: None,
+            key_type: None,
+            csr_pem: None,
+        })
+        .unwrap();
+
+        assert_eq!(issued.validity_days, 365);
+        assert_eq!(issued.san, vec!["svc.internal".to_string()]);
+        assert_eq!(issued.key_type, "ec-p256");
+        let leaf_key = issued.private_key_pem.expect("generated key");
+        assert_signed_by(&issued.certificate_pem, &cert_pem);
+        assert_leaf_key_matches(&issued.certificate_pem, &leaf_key);
+        assert_tls_leaf_profile(&issued.certificate_pem, false, true);
+
+        let leaf_der = pem_der(&issued.certificate_pem, "CERTIFICATE").unwrap();
+        let leaf = X509Certificate::from_der(&leaf_der).unwrap().1;
+        let span =
+            leaf.validity().not_after.to_datetime() - leaf.validity().not_before.to_datetime();
+        assert!(
+            (365..=366).contains(&span.whole_days()),
+            "expected ~365 day lifetime, got {} days",
+            span.whole_days()
+        );
+    }
+
+    #[test]
+    fn rejects_ca_without_key_cert_sign() {
+        let (bundle, _, _) = test_ca(true, false);
+        let error = issue_certificate(IssueCertRequest {
+            ca_pem: &bundle,
+            ca_cert_pem: None,
+            common_name: Some("svc.internal"),
+            san: &[],
+            validity_days: Some(7),
+            key_type: None,
+            csr_pem: None,
+        })
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not allow certificate signing"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn hostile_csr_cannot_mint_a_ca() {
+        let (bundle, cert_pem, _) = test_ca(true, true);
+        let mut params = CertificateParams::new(vec!["evil.internal".into()]).unwrap();
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "evil-ca");
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params.key_usages.push(KeyUsagePurpose::KeyCertSign);
+        params.key_usages.push(KeyUsagePurpose::CrlSign);
+        params
+            .extended_key_usages
+            .push(ExtendedKeyUsagePurpose::Any);
+        let leaf_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let csr = params.serialize_request(&leaf_key).unwrap();
+
+        let issued = issue_certificate(IssueCertRequest {
+            ca_pem: &bundle,
+            ca_cert_pem: None,
+            common_name: None,
+            san: &[],
+            validity_days: Some(14),
+            key_type: None,
+            csr_pem: Some(&csr.pem().unwrap()),
+        })
+        .unwrap();
+
+        assert!(issued.private_key_pem.is_none());
+        assert_signed_by(&issued.certificate_pem, &cert_pem);
+        assert_leaf_key_matches(&issued.certificate_pem, &leaf_key.serialize_pem());
+        assert_tls_leaf_profile(&issued.certificate_pem, true, true);
+    }
+
+    #[test]
+    fn accepts_pkcs1_and_sec1_ca_keys() {
+        let (_, rsa_cert, rsa_key) = test_rsa_ca();
+        let pkcs1 = traditional_key_pem(&rsa_key, "RSA PRIVATE KEY");
+        assert!(pkcs1.contains("BEGIN RSA PRIVATE KEY"));
+        let issued = issue_certificate(IssueCertRequest {
+            ca_pem: &pkcs1,
+            ca_cert_pem: Some(&rsa_cert),
+            common_name: Some("pkcs1.internal"),
+            san: &[],
+            validity_days: Some(7),
+            key_type: Some(LeafKeyType::EcP256),
+            csr_pem: None,
+        })
+        .unwrap();
+        assert_signed_by(&issued.certificate_pem, &rsa_cert);
+        assert_leaf_key_matches(
+            &issued.certificate_pem,
+            issued.private_key_pem.as_deref().expect("leaf key"),
+        );
+
+        let (_, ec_cert, ec_key) = test_ca(true, true);
+        let sec1 = traditional_key_pem(&ec_key, "EC PRIVATE KEY");
+        assert!(sec1.contains("BEGIN EC PRIVATE KEY"));
+        let issued = issue_certificate(IssueCertRequest {
+            ca_pem: &sec1,
+            ca_cert_pem: Some(&ec_cert),
+            common_name: Some("sec1.internal"),
+            san: &[],
+            validity_days: Some(7),
+            key_type: Some(LeafKeyType::EcP256),
+            csr_pem: None,
+        })
+        .unwrap();
+        assert_signed_by(&issued.certificate_pem, &ec_cert);
+        assert_leaf_key_matches(
+            &issued.certificate_pem,
+            issued.private_key_pem.as_deref().expect("leaf key"),
+        );
     }
 }
