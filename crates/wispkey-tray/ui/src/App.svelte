@@ -9,6 +9,7 @@
   let status = $state("");
   let credentials = $state([]);
   let startAtLogin = $state(false);
+  let destinationConfirmed = $state(false);
   let form = $state({
     name: "",
     type: "bearer_token",
@@ -70,6 +71,10 @@
   }
 
   async function save() {
+    if (!destinationConfirmed) {
+      status = "Confirm the destination before saving";
+      return;
+    }
     const response =
       mode === "ovh_api"
         ? await ipc({
@@ -84,6 +89,7 @@
               partition: form.partition,
               hosts: form.hosts,
               tags: form.tags,
+              destination_confirmed: true,
             },
           })
         : await ipc({
@@ -99,9 +105,11 @@
               partition: form.partition,
               header_name: form.headerName,
               param_name: form.paramName,
+              destination_confirmed: true,
             },
           });
     clearSecrets();
+    destinationConfirmed = false;
     if (response.ok) {
       status = "Saved";
     } else {
@@ -214,10 +222,14 @@
       <input bind:value={form.hosts} />
     </label>
     <label>Project
-      <input bind:value={form.project} />
+      <input bind:value={form.project} oninput={() => (destinationConfirmed = false)} />
     </label>
     <label>Partition
-      <input bind:value={form.partition} />
+      <input bind:value={form.partition} oninput={() => (destinationConfirmed = false)} />
+    </label>
+    <label class="destination-confirmation">
+      <input type="checkbox" bind:checked={destinationConfirmed} />
+      Confirm save to project <strong>{form.project || "active project"}</strong>, partition <strong>{form.partition || "personal"}</strong>
     </label>
     <button type="button" onclick={() => (reveal = !reveal)}>Reveal</button>
     <button type="button" onclick={save}>Save</button>

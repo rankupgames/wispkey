@@ -28,6 +28,17 @@ pub fn run_wispkey(vault_dir: &Path, args: &[&str]) -> std::process::Output {
         .args(args)
         .env("WISPKEY_VAULT_PATH", vault_dir)
         .env("WISPKEY_PASSWORD", "test-password")
+        .env("WISPKEY_PROTECTOR", "file")
+        .output()
+        .expect("failed to run wispkey")
+}
+
+pub fn run_wispkey_without_password(vault_dir: &Path, args: &[&str]) -> std::process::Output {
+    wispkey_bin()
+        .args(args)
+        .env("WISPKEY_VAULT_PATH", vault_dir)
+        .env_remove("WISPKEY_PASSWORD")
+        .env("WISPKEY_PROTECTOR", "file")
         .output()
         .expect("failed to run wispkey")
 }
@@ -46,6 +57,7 @@ pub fn run_wispkey_with_bundle_passphrase(
         .env("WISPKEY_VAULT_PATH", vault_dir)
         .env("WISPKEY_PASSWORD", "test-password")
         .env("WISPKEY_BUNDLE_PASSPHRASE", passphrase)
+        .env("WISPKEY_PROTECTOR", "file")
         .output()
         .expect("failed to run wispkey")
 }

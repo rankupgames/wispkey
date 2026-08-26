@@ -143,6 +143,9 @@ pub fn import_partition(
             tags,
             partition: Some(&payload.partition),
             project: Some(&project_name),
+            origin: None,
+            lifecycle_state: None,
+            review_at: None,
         }) {
             Ok(_) => imported += 1,
             Err(VaultError::DuplicateCredential(_)) => skipped += 1,

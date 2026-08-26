@@ -20,6 +20,7 @@ pub mod mcp;
 pub mod migrate;
 pub mod owner_ipc;
 pub mod partition;
+pub mod pki;
 pub mod policy;
 pub mod proxy;
 pub mod random;

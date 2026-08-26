@@ -55,14 +55,9 @@ fn main() {
         )
         .init();
 
-    if !wispkey::owner_ipc::metadata_path().exists() {
-        std::thread::spawn(|| {
-            let runtime = tokio::runtime::Runtime::new().expect("owner ipc runtime");
-            if let Err(error) = runtime.block_on(wispkey::owner_ipc::serve()) {
-                tracing::error!(error = %error, "owner ipc server stopped");
-            }
-        });
-        wait_for_owner_endpoint();
+    if !wait_for_owner_endpoint() {
+        eprintln!("Error: owner IPC is unavailable; start it with `wispkey tray`");
+        std::process::exit(1);
     }
 
     let menu = Menu::new();
@@ -170,12 +165,19 @@ fn main() {
     });
 }
 
-fn wait_for_owner_endpoint() {
+fn wait_for_owner_endpoint() -> bool {
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while !wispkey::owner_ipc::metadata_path().exists() {
-        if std::time::Instant::now() > deadline {
-            eprintln!("Error: owner IPC did not start");
-            std::process::exit(1);
+    loop {
+        let live = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("ipc runtime")
+            .block_on(wispkey::owner_ipc::is_live());
+        if live {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
         }
         std::thread::sleep(Duration::from_millis(50));
     }

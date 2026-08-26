@@ -9,6 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
+use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -34,6 +35,8 @@ const SECRET_FIELD_NAMES: &[&str] = &[
 /// Errors from serving or calling the owner IPC endpoint.
 #[derive(Debug, thiserror::Error)]
 pub enum OwnerIpcError {
+    #[error("owner IPC server is already running")]
+    AlreadyRunning,
     #[error("owner IPC is unauthorized")]
     Unauthorized,
     #[error("owner IPC I/O error: {0}")]
@@ -97,6 +100,14 @@ pub async fn serve() -> Result<(), OwnerIpcError> {
 
 /// Serves owner IPC on an explicit socket path (used by tests).
 pub async fn serve_at(path: &Path) -> Result<(), OwnerIpcError> {
+    let _lease = acquire_server_lease(path)?;
+    cleanup_endpoint(path);
+    let result = serve_platform(path).await;
+    cleanup_endpoint(path);
+    result
+}
+
+async fn serve_platform(path: &Path) -> Result<(), OwnerIpcError> {
     #[cfg(unix)]
     {
         unix::serve(path).await
@@ -105,6 +116,37 @@ pub async fn serve_at(path: &Path) -> Result<(), OwnerIpcError> {
     {
         windows::serve(path).await
     }
+}
+
+/// Verifies that discovery metadata identifies the server that answers the live endpoint.
+pub async fn is_live() -> bool {
+    is_live_at(&socket_path(), &metadata_path()).await
+}
+
+/// Verifies an explicit endpoint and metadata path (used by isolated clients and tests).
+pub async fn is_live_at(path: &Path, metadata_path: &Path) -> bool {
+    let metadata = match std::fs::read(metadata_path)
+        .ok()
+        .and_then(|raw| serde_json::from_slice::<OwnerEndpoint>(&raw).ok())
+    {
+        Some(metadata) => metadata,
+        None => return false,
+    };
+    if metadata.schema_version != PROTOCOL_VERSION || metadata.endpoint != endpoint_label(path) {
+        return false;
+    }
+    let response = match tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        call(path, json!({ "id": "liveness", "method": "status" })),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        _ => return false,
+    };
+    response["ok"] == true
+        && response["result"]["owner_pid"].as_u64() == Some(u64::from(metadata.pid))
+        && response["result"]["protocol_version"].as_u64() == Some(u64::from(PROTOCOL_VERSION))
 }
 
 /// Sends one JSON request to the owner endpoint and returns the response object.
@@ -129,12 +171,42 @@ fn write_metadata(path: &Path) -> Result<(), OwnerIpcError> {
     let endpoint = OwnerEndpoint {
         schema_version: PROTOCOL_VERSION,
         pid: std::process::id(),
-        endpoint: format!("unix:{}", path.display()),
+        endpoint: endpoint_label(path),
     };
     let encoded = serde_json::to_vec_pretty(&endpoint)
         .map_err(|error| OwnerIpcError::Protocol(error.to_string()))?;
     secure_files::write_private(&metadata_path(), &encoded)?;
     Ok(())
+}
+
+fn endpoint_label(path: &Path) -> String {
+    #[cfg(unix)]
+    {
+        format!("unix:{}", path.display())
+    }
+    #[cfg(windows)]
+    {
+        windows::pipe_name(path)
+    }
+}
+
+fn acquire_server_lease(path: &Path) -> Result<std::fs::File, OwnerIpcError> {
+    if let Some(parent) = path.parent() {
+        secure_files::ensure_private_directory(parent)?;
+    }
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))?;
+    match FileExt::try_lock_exclusive(&lease) {
+        Ok(()) => Ok(lease),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(OwnerIpcError::AlreadyRunning)
+        }
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn cleanup_endpoint(path: &Path) {
@@ -194,6 +266,8 @@ fn status_response() -> Result<Value, Value> {
             "vault_path": Vault::vault_dir().to_string_lossy(),
             "active_project": core::resolve_active_project(),
             "credential_count": 0,
+            "owner_pid": std::process::id(),
+            "protocol_version": PROTOCOL_VERSION,
         }));
     }
     let vault = Vault::open().map_err(vault_error)?;
@@ -206,6 +280,8 @@ fn status_response() -> Result<Value, Value> {
         "active_project": core::resolve_active_project(),
         "credential_count": vault.credential_count().unwrap_or(0),
         "created_at": vault.vault_created_at().ok(),
+        "owner_pid": std::process::id(),
+        "protocol_version": PROTOCOL_VERSION,
     }))
 }
 
@@ -300,6 +376,7 @@ fn list_partitions_response(params: &Value) -> Result<Value, Value> {
 }
 
 fn add_credential_response(params: &Value) -> Result<Value, Value> {
+    require_destination_confirmation(params)?;
     let vault = Vault::open_with_session().map_err(vault_error)?;
     let name = required_string(params, "name")?;
     let type_str = params
@@ -332,6 +409,9 @@ fn add_credential_response(params: &Value) -> Result<Value, Value> {
             tags: tags.as_deref(),
             partition: partition.as_deref(),
             project: project.as_deref(),
+            origin: None,
+            lifecycle_state: None,
+            review_at: None,
         })
         .map_err(vault_error)?;
     audit::log_event(
@@ -354,6 +434,7 @@ fn add_credential_response(params: &Value) -> Result<Value, Value> {
 }
 
 fn add_template_response(params: &Value) -> Result<Value, Value> {
+    require_destination_confirmation(params)?;
     let vault = Vault::open_with_session().map_err(vault_error)?;
     let template = required_string(params, "template")?;
     let name_prefix = required_string(params, "name_prefix")?;
@@ -422,13 +503,23 @@ fn credential_metadata(credential: &core::Credential) -> Value {
         "name": credential.name,
         "description": credential.description,
         "type": credential.credential_type.display_name(),
-        "wisp_token": credential.wisp_token,
         "hosts": credential.hosts,
         "tags": credential.tags,
         "partition_id": credential.partition_id,
         "created_at": credential.created_at.to_rfc3339(),
         "updated_at": credential.updated_at.to_rfc3339(),
     })
+}
+
+fn require_destination_confirmation(params: &Value) -> Result<(), Value> {
+    if params.get("destination_confirmed").and_then(Value::as_bool) == Some(true) {
+        Ok(())
+    } else {
+        Err(error_body(
+            "confirmation_required",
+            "confirm the destination project and partition before saving",
+        ))
+    }
 }
 
 fn required_string(params: &Value, key: &str) -> Result<String, Value> {
@@ -553,7 +644,6 @@ mod unix {
         if let Some(parent) = path.parent() {
             crate::secure_files::ensure_private_directory(parent)?;
         }
-        let _ = std::fs::remove_file(path);
         let listener = UnixListener::bind(path)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         write_metadata(path)?;
@@ -612,36 +702,55 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
+    use std::mem::size_of;
     use std::path::Path;
     use std::time::Duration;
 
     use serde_json::Value;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
     use super::{OwnerIpcError, cleanup_endpoint, handle_request, write_line, write_metadata};
 
-    fn pipe_name(path: &Path) -> String {
+    pub(super) fn pipe_name(path: &Path) -> String {
         let raw = path.to_string_lossy().replace(['\\', '/', ':', ' '], "_");
         format!(r"\\.\pipe\wispkey-owner-{raw}")
     }
 
+    fn create_server(
+        name: &str,
+        first: bool,
+    ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, OwnerIpcError> {
+        let descriptor = crate::secure_files::windows_acl::current_user_only_security_descriptor()?;
+        let mut attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.as_mut_ptr().cast(),
+            bInheritHandle: 0,
+        };
+        // SAFETY: attributes and its owned security descriptor remain valid for the create call.
+        let server = unsafe {
+            ServerOptions::new()
+                .first_pipe_instance(first)
+                .create_with_security_attributes_raw(name, &mut attributes)
+        }?;
+        Ok(server)
+    }
+
     pub(super) async fn serve(path: &Path) -> Result<(), OwnerIpcError> {
         let name = pipe_name(path);
+        let mut server = create_server(&name, true)?;
         write_metadata(path)?;
         tracing::info!(pipe = %name, "owner ipc listening");
-        let mut first = true;
         loop {
-            let server = ServerOptions::new()
-                .first_pipe_instance(first)
-                .create(&name)?;
-            first = false;
             server.connect().await?;
             let mut reader = BufReader::new(server);
             let mut line = String::new();
             line.clear();
             let read = reader.read_line(&mut line).await?;
             if read == 0 {
+                drop(reader);
+                server = create_server(&name, false)?;
                 continue;
             }
             let request = match serde_json::from_str::<Value>(line.trim()) {
@@ -655,6 +764,8 @@ mod windows {
                         }),
                     )
                     .await?;
+                    drop(reader);
+                    server = create_server(&name, false)?;
                     continue;
                 }
             };
@@ -665,6 +776,8 @@ mod windows {
                 cleanup_endpoint(path);
                 return Ok(());
             }
+            drop(reader);
+            server = create_server(&name, false)?;
         }
     }
 

@@ -43,6 +43,9 @@ impl OwnedAddCredentialRequest {
             tags: self.tags.as_deref(),
             partition: self.partition.as_deref(),
             project: self.project.as_deref(),
+            origin: None,
+            lifecycle_state: None,
+            review_at: None,
         }
     }
 }

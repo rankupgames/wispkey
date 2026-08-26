@@ -44,7 +44,8 @@ async fn owner_ipc_adds_one_credential_without_returning_secret() {
                 "value": "sk-live-never-log-this",
                 "description": "OpenAI",
                 "tags": "openai",
-                "hosts": "api.openai.com"
+                "hosts": "api.openai.com",
+                "destination_confirmed": true
             }
         }),
     )
@@ -52,6 +53,7 @@ async fn owner_ipc_adds_one_credential_without_returning_secret() {
     assert_eq!(response["ok"], true);
     let encoded = response.to_string();
     assert!(!encoded.contains("sk-live-never-log-this"));
+    assert!(!encoded.contains("wk_"));
     assert_eq!(response["result"]["credentials"][0]["name"], "openai-key");
 
     let listed = owner_call(
@@ -61,6 +63,11 @@ async fn owner_ipc_adds_one_credential_without_returning_secret() {
     .await;
     assert_eq!(listed["result"]["credentials"][0]["name"], "openai-key");
     assert!(!listed.to_string().contains("sk-live-never-log-this"));
+    assert!(
+        listed["result"]["credentials"][0]
+            .get("wisp_token")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -97,7 +104,8 @@ async fn owner_ipc_ovh_duplicate_rolls_back_all() {
                 "name_prefix": "ovh-prod",
                 "application_key": "ak-secret",
                 "application_secret": "as-secret",
-                "consumer_key": "ck-secret"
+                "consumer_key": "ck-secret",
+                "destination_confirmed": true
             }
         }),
     )
@@ -131,7 +139,8 @@ async fn owner_ipc_ovh_success_creates_three() {
                 "application_key": "ak-secret",
                 "application_secret": "as-secret",
                 "consumer_key": "ck-secret",
-                "hosts": "api.ovh.com"
+                "hosts": "api.ovh.com",
+                "destination_confirmed": true
             }
         }),
     )
@@ -170,7 +179,7 @@ async fn owner_ipc_locked_vault_fails_closed() {
         json!({
             "id": "1",
             "method": "add_credential",
-            "params": { "name": "x", "value": "y" }
+            "params": { "name": "x", "value": "y", "destination_confirmed": true }
         }),
     )
     .await;
@@ -188,7 +197,7 @@ async fn owner_ipc_empty_value_fails_closed() {
         json!({
             "id": "1",
             "method": "add_credential",
-            "params": { "name": "blank", "value": "   " }
+            "params": { "name": "blank", "value": "   ", "destination_confirmed": true }
         }),
     )
     .await;
@@ -206,7 +215,7 @@ async fn owner_ipc_duplicate_name_fails_closed() {
         json!({
             "id": "1",
             "method": "add_credential",
-            "params": { "name": "dup", "value": "one" }
+            "params": { "name": "dup", "value": "one", "destination_confirmed": true }
         }),
     )
     .await;
@@ -216,7 +225,7 @@ async fn owner_ipc_duplicate_name_fails_closed() {
         json!({
             "id": "2",
             "method": "add_credential",
-            "params": { "name": "dup", "value": "two" }
+            "params": { "name": "dup", "value": "two", "destination_confirmed": true }
         }),
     )
     .await;
@@ -234,7 +243,11 @@ async fn owner_ipc_redacts_secrets_from_logs() {
         json!({
             "id": "1",
             "method": "add_credential",
-            "params": { "name": "logged-key", "value": "super-secret-log-probe-value" }
+            "params": {
+                "name": "logged-key",
+                "value": "super-secret-log-probe-value",
+                "destination_confirmed": true
+            }
         }),
     )
     .await;
@@ -265,4 +278,50 @@ fn owner_socket_is_owner_only() {
 #[test]
 fn unauthorized_peer_uid_fails_closed() {
     assert!(!owner_ipc::authorize_peer_uid(Some(1), 99));
+}
+
+#[tokio::test]
+async fn owner_ipc_requires_explicit_destination_confirmation() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    init_vault(dir.path());
+    let _server = start_owner_ipc(dir.path());
+    let response = owner_call(
+        dir.path(),
+        json!({
+            "id": "1",
+            "method": "add_credential",
+            "params": { "name": "unconfirmed", "value": "secret" }
+        }),
+    )
+    .await;
+    assert_eq!(response["ok"], false);
+    assert_eq!(response["error"]["code"], "confirmation_required");
+}
+
+#[tokio::test]
+async fn second_owner_server_is_rejected_without_replacing_discovery() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    init_vault(dir.path());
+    let _server = start_owner_ipc(dir.path());
+    let original = std::fs::read(dir.path().join("owner.json")).expect("owner metadata");
+
+    let second = wispkey_bin()
+        .args(["tray", "--ipc-only"])
+        .env("WISPKEY_VAULT_PATH", dir.path())
+        .env("WISPKEY_PASSWORD", "test-password")
+        .output()
+        .expect("start second owner");
+
+    assert!(!second.status.success());
+    assert_eq!(
+        std::fs::read(dir.path().join("owner.json")).expect("owner metadata"),
+        original
+    );
+    assert!(
+        owner_ipc::is_live_at(
+            &dir.path().join("owner.sock"),
+            &dir.path().join("owner.json")
+        )
+        .await
+    );
 }

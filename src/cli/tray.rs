@@ -1,36 +1,8 @@
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use crate::core::{Vault, VaultError};
 use crate::owner_ipc;
-
-use super::shared::{json_output, print_json};
-
-/// Locks the vault by clearing the session file and in-memory key.
-pub async fn handle_lock() {
-    let mut vault = match Vault::open() {
-        Ok(vault) => vault,
-        Err(error) => {
-            eprintln!("Error: {}", error);
-            std::process::exit(1);
-        }
-    };
-    match vault.lock() {
-        Ok(()) => {
-            if json_output() {
-                print_json(serde_json::json!({
-                    "ok": true,
-                    "session_active": false,
-                }));
-                return;
-            }
-            println!("Vault locked.");
-        }
-        Err(error) => {
-            eprintln!("Error: {}", error);
-            std::process::exit(1);
-        }
-    }
-}
 
 /// Starts the owner IPC server, optionally spawning the tray UI binary.
 pub async fn handle_tray(ipc_only: bool) {
@@ -38,10 +10,30 @@ pub async fn handle_tray(ipc_only: bool) {
         eprintln!("Error: {}", VaultError::NotFound);
         std::process::exit(1);
     }
-    if !ipc_only {
+    if !ipc_only && owner_ipc::is_live().await {
         spawn_tray_ui();
+        return;
     }
-    if let Err(error) = owner_ipc::serve().await {
+
+    if ipc_only {
+        if let Err(error) = owner_ipc::serve().await {
+            eprintln!("Error: {}", error);
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    let server = tokio::spawn(owner_ipc::serve());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !owner_ipc::is_live().await {
+        if server.is_finished() || Instant::now() >= deadline {
+            eprintln!("Error: owner IPC did not start");
+            std::process::exit(1);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    spawn_tray_ui();
+    if let Err(error) = server.await.expect("owner IPC task panicked") {
         eprintln!("Error: {}", error);
         std::process::exit(1);
     }

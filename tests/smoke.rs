@@ -25,6 +25,8 @@ fn help_flag_shows_commands() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("init"));
+    assert!(stdout.contains("unlock"));
+    assert!(stdout.contains("lock"));
     assert!(stdout.contains("add"));
     assert!(stdout.contains("serve"));
     assert!(stdout.contains("import"));
