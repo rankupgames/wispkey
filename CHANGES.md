@@ -17,7 +17,7 @@
 - Added optional `wispkey-tray` desktop crate with tray-icon plus a Svelte 5 webview for single-credential and atomic OVH API template entry. Closing a dialog does not quit the tray.
 - `add_credential` now rejects empty names and values. Compound saves use `add_credentials_atomic` so a duplicate or invalid later row rolls back the whole batch.
 - Owner IPC responses and logs never include plaintext secret values or reusable wisp tokens; known secret fields are redacted before tracing.
-- Owner IPC uses a single-owner lifecycle lease, validates live discovery before the tray connects, and requires explicit destination confirmation for credential writes. Windows named pipes grant access only to the current user SID.
+- Owner IPC uses a single-owner lifecycle lease, validates live discovery before the tray connects, and requires explicit destination confirmation for credential writes. Windows named pipes grant access only to the current user SID and retry transient pipe replacement gaps.
 - Default `cargo test` still skips the GUI crate. Documented the tray boundary in `docs/tray.md` and `docs/security-model.md`.
 
 ### PKI-aware certificate issuance
