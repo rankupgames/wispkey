@@ -17,6 +17,7 @@ WispKey is a credential firewall for AI agents. Its main boundary is between a p
 - Owner-approved plaintext egress. `wispkey exec` records `CredentialExec` audit events when it injects a credential into a child process through stdin, a child-only environment variable, or askpass. `wispkey run` records `CredentialRun` events for manifest-based child environment injection, and `wispkey inject` records `CredentialInject` events for template rendering.
 - Accidental env-sideload disclosure. `WISPKEY_SIDELOAD_<SLUG>` values are exposed to agents as deterministic `wk_env_<slug>` tokens; the raw env value is not printed or logged.
 - Timing disclosure of proxy management tokens through direct string comparison. Management API tokens are compared in constant time.
+- Agent-visible website-login generation. `wispkey login generate` and `wispkey_generate_login` create a unique password with the OS CSPRNG, store username and password together in encrypted credential material, and return only non-secret metadata. CLI `add` and MCP `wispkey_set` cannot create `website_login` credentials.
 
 ## Explicit Limits
 
@@ -29,6 +30,7 @@ WispKey is a credential firewall for AI agents. Its main boundary is between a p
 - WispKey does not defend against a same-OS-user local process that can read all local WispKey files, read the device seed, reconstruct machine inputs, call local OS APIs available to that user, attach a debugger, or inspect process memory.
 - Root, Administrator, kernel-level compromise, malware with equivalent local privileges, or a malicious WispKey binary are out of scope.
 - Body substitution is limited to text-like content types such as JSON, text, form-urlencoded, and XML. Binary or opaque body rewriting is intentionally not supported.
+- Website-login browser fill and native-messaging handoff are not in this slice. Generated logins are saved before any fill attempt so a failed signup cannot strand an unknown password. Review dates never auto-delete credentials.
 - Secrets are no longer protected by WispKey after they are intentionally sent upstream. The upstream service, SDKs, logs, and process memory are outside WispKey's boundary.
 - `wispkey exec`, `wispkey run`, and `wispkey inject` are deliberate plaintext-egress paths for owner-run non-HTTP tools, similar in trust level to `op run` or `aws-vault exec`. A compromised owner shell can still run these commands or use the child process or rendered file to misuse the credential.
 - Plaintext secrets stored in external client configuration, shell startup files, or MCP `env` blocks are outside the vault. Prefer process environment forwarding or an OS credential manager when available.

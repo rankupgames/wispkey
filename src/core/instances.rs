@@ -784,7 +784,7 @@ impl Vault {
     fn get_credential_by_id(&self, credential_id: &str) -> Result<Credential> {
         self.db
             .query_row(
-                "SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials WHERE id = ?1",
+                "SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id, origin, lifecycle_state, review_at FROM credentials WHERE id = ?1",
                 params![credential_id],
                 super::rows::credential_from_row,
             )

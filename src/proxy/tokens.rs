@@ -69,6 +69,9 @@ fn credential_replacement_value(credential_type: &CredentialType, real_value: &s
         | CredentialType::ApiKey
         | CredentialType::CustomHeader { .. }
         | CredentialType::QueryParam { .. } => real_value.to_string(),
+        CredentialType::WebsiteLogin => {
+            unreachable!("website logins must be denied before generic token substitution")
+        }
         CredentialType::BasicAuth => {
             let encoded = BASE64.encode(real_value.as_bytes());
             format!("Basic {}", encoded)
@@ -247,6 +250,21 @@ fn try_resolve_exact_token_for_request(
 
     match vault.lookup_by_wisp_token(token) {
         Ok((cred, real_value)) => {
+            if cred.credential_type == CredentialType::WebsiteLogin {
+                let reason = "website login credentials require an approved local fill flow";
+                audit_denial(
+                    vault,
+                    "CredentialDenied",
+                    Some(&cred.name),
+                    token,
+                    context,
+                    reason,
+                );
+                return TokenResolution::Denied(Box::new(error_response(
+                    StatusCode::FORBIDDEN,
+                    reason,
+                )));
+            }
             if let Some(reason) = check_project_scope(vault, &cred, context.project_scope) {
                 audit_denial(
                     vault,

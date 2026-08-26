@@ -77,6 +77,9 @@ pub fn import_env_file(
             tags: Some("imported"),
             partition,
             project,
+            origin: None,
+            lifecycle_state: None,
+            review_at: None,
         }) {
             Ok(cred) => {
                 audit::log_event(

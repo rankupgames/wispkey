@@ -43,7 +43,7 @@ For repeated headless unlocks, prefer `wispkey unlock --remember --password-file
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v10 automatically.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v11 automatically.
 
 ```bash
 # Create a project
@@ -118,6 +118,8 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
 | `wispkey remove <name>` | Delete credential |
 | `wispkey rotate <name>` | Regenerate wisp token |
+| `wispkey login generate <name> --username U --url HTTPS [--project P] [--partition P] [--review-after 180d]` | Generate and store a unique website login (password never printed) |
+| `wispkey login list/archive/restore/activate` | Website-login metadata and lifecycle; review dates never auto-delete |
 | `wispkey exec --credential <name> [--project P] [--stdin] [--env VAR]... [--askpass] -- <command> [args...]` | Audited child-process secret injection |
 | `wispkey run [--manifest PATH] [--project P] -- <command> [args...]` | Manifest-defined child-only environment injection |
 | `wispkey inject -i <infile|-> [-o <outfile>] [--project P] [--stdout]` | Render `{{ cred:<name> }}` references to owner-only file output or explicit stdout |
@@ -143,6 +145,7 @@ wispkey inject -i .env.template -o .env.local
 | Basic Auth | `basic_auth` | `user:pass` format |
 | Custom Header | `custom_header` | Requires `--header-name` |
 | Query Param | `query_param` | Requires `--param-name` |
+| Website Login | `website_login` | Generated only via `wispkey login generate`; username+password encrypted together |
 
 WispKey stores arbitrary encrypted secret values, not only API keys. Use `api_key` as the generic opaque type for passwords, database URLs, SSH/private-key files via `--value-file`, webhook secrets, OAuth tokens, service-account JSON, and other secret material. The credential type controls proxy injection behavior, not what can be stored.
 
@@ -203,7 +206,8 @@ Available tools:
 - **`wispkey_get_token`** -- Get wisp token for a credential by `name`
 - **`wispkey_proxy_status`** -- Check vault/session/proxy state
 - **`wispkey_project_list`** -- List all projects with partition counts and active indicator
-- **`wispkey_set`** -- Create or update a credential (`name`, `value` required; `type`, `description`, `hosts`, `tags`, `project`, `header_name`, `param_name` optional). Refuses to overwrite unless `overwrite: true`. On update, the wisp token is preserved.
+- **`wispkey_set`** -- Create or update a credential (`name`, `value` required; `type`, `description`, `hosts`, `tags`, `project`, `header_name`, `param_name` optional). Refuses to overwrite unless `overwrite: true`. On update, the wisp token is preserved. Refuses `website_login`; use `wispkey_generate_login`.
+- **`wispkey_generate_login`** -- Generate a unique website login (`name`, `username`, `url` required). Returns origin, lifecycle, and username only—never the password.
 - **`wispkey_delete`** -- Delete a credential by `name` (optional `project` scope)
 
 ## HTTPS Proxy (Reverse Proxy Mode)

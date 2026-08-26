@@ -523,6 +523,10 @@ fn credential_type_parsing() {
     ));
     assert!(CredentialType::from_str_with_params("custom_header", None, None).is_err());
     assert!(CredentialType::from_str_with_params("bogus", None, None).is_err());
+    assert!(matches!(
+        CredentialType::from_str_with_params("website_login", None, None).unwrap(),
+        CredentialType::WebsiteLogin
+    ));
 }
 
 #[test]
@@ -1394,4 +1398,206 @@ fn revoke_during_instance_secret_verification_fails_closed() {
         vault.get_instance(&enrolled.instance.id).unwrap().status,
         "revoked"
     );
+}
+
+#[test]
+fn parse_https_origin_requires_https_and_strips_path() {
+    assert_eq!(
+        parse_https_origin("https://careers.example.com/jobs?id=1").unwrap(),
+        "https://careers.example.com"
+    );
+    assert_eq!(
+        parse_https_origin("https://Careers.Example.com:8443/path").unwrap(),
+        "https://careers.example.com:8443"
+    );
+    assert!(parse_https_origin("http://careers.example.com").is_err());
+    assert!(parse_https_origin("https://user:pass@careers.example.com").is_err());
+    assert!(parse_https_origin("https://*.example.com").is_err());
+    assert!(parse_https_origin("https://example..com").is_err());
+}
+
+#[test]
+fn generate_website_login_stores_encrypted_payload_without_sharing_password() {
+    let vault = test_vault("pw");
+    let first = vault
+        .generate_website_login(GenerateWebsiteLoginRequest {
+            name: "acme-careers",
+            username: "user@example.com",
+            url: "https://careers.example.com/apply",
+            project: Some("default"),
+            partition: None,
+            review_at: Some(Utc::now() + chrono::Duration::days(180)),
+            length: None,
+            symbols: true,
+        })
+        .unwrap();
+    let second = vault
+        .generate_website_login(GenerateWebsiteLoginRequest {
+            name: "other-careers",
+            username: "user@example.com",
+            url: "https://jobs.example.net",
+            project: Some("default"),
+            partition: None,
+            review_at: None,
+            length: None,
+            symbols: true,
+        })
+        .unwrap();
+
+    assert_eq!(first.credential_type, CredentialType::WebsiteLogin);
+    assert_eq!(first.origin, "https://careers.example.com");
+    assert_eq!(first.lifecycle_state, LIFECYCLE_PENDING);
+    assert_eq!(first.hosts, vec!["careers.example.com"]);
+    assert!(first.review_at.is_some());
+    assert!(first.description.is_empty());
+    assert!(first.tags.is_empty());
+
+    let first_payload: WebsiteLoginPayload =
+        serde_json::from_str(&vault.decrypt_credential_value("acme-careers").unwrap()).unwrap();
+    let second_payload: WebsiteLoginPayload =
+        serde_json::from_str(&vault.decrypt_credential_value("other-careers").unwrap()).unwrap();
+    assert_eq!(first_payload.username, "user@example.com");
+    assert_eq!(second_payload.username, "user@example.com");
+    assert_ne!(first_payload.password, second_payload.password);
+    assert_eq!(first_payload.password.len(), 24);
+    assert_ne!(first.wisp_token, second.wisp_token);
+}
+
+#[test]
+fn website_login_lifecycle_archive_restore_activate_never_auto_deletes() {
+    let vault = test_vault("pw");
+    vault
+        .generate_website_login(GenerateWebsiteLoginRequest {
+            name: "lifecycle-login",
+            username: "user@example.com",
+            url: "https://careers.example.com",
+            project: Some("default"),
+            partition: None,
+            review_at: Some(Utc::now() - chrono::Duration::days(1)),
+            length: None,
+            symbols: true,
+        })
+        .unwrap();
+
+    let due = vault.list_due_website_logins(Some("default")).unwrap();
+    assert_eq!(due.len(), 1);
+
+    vault
+        .set_credential_lifecycle("lifecycle-login", LIFECYCLE_ARCHIVED, Some("default"))
+        .unwrap();
+    let due_after_archive = vault.list_due_website_logins(Some("default")).unwrap();
+    assert!(due_after_archive.is_empty());
+    assert!(
+        vault
+            .get_credential("lifecycle-login")
+            .unwrap()
+            .lifecycle_state
+            == LIFECYCLE_ARCHIVED
+    );
+
+    vault
+        .set_credential_lifecycle("lifecycle-login", LIFECYCLE_PENDING, Some("default"))
+        .unwrap();
+    vault
+        .set_credential_lifecycle("lifecycle-login", LIFECYCLE_ACTIVE, Some("default"))
+        .unwrap();
+    assert_eq!(
+        vault
+            .get_credential("lifecycle-login")
+            .unwrap()
+            .lifecycle_state,
+        LIFECYCLE_ACTIVE
+    );
+    assert!(vault.get_credential("lifecycle-login").is_ok());
+}
+
+#[test]
+fn schema_v10_to_current_adds_website_login_columns_without_touching_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("vault.db");
+    let db = Connection::open(&db_path).unwrap();
+    let now = Utc::now().to_rfc3339();
+    db.execute_batch(
+        "CREATE TABLE vault_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE partitions (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(project_id, name)
+        );
+        CREATE TABLE credentials (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            credential_type TEXT NOT NULL,
+            encrypted_value TEXT NOT NULL,
+            wisp_token TEXT UNIQUE NOT NULL,
+            hosts TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            last_used_at TEXT,
+            partition_id TEXT REFERENCES partitions(id)
+        );",
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO vault_meta (key, value) VALUES ('version', '10')",
+        [],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO projects (id, name, description, created_at, updated_at) VALUES ('default', 'default', '', ?1, ?2)",
+        params![now, now],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO partitions (id, name, description, project_id, created_at, updated_at) VALUES ('personal', 'personal', '', 'default', ?1, ?2)",
+        params![now, now],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO credentials (id, name, description, credential_type, encrypted_value, wisp_token, hosts, tags, created_at, updated_at, partition_id) VALUES ('cred-1', 'kept', '', 'api_key', 'encrypted', 'wk_kept_12345678', '', '', ?1, ?2, 'personal')",
+        params![now, now],
+    )
+    .unwrap();
+
+    Vault::migrate_schema(&db).unwrap();
+    let version: String = db
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key = 'version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    let origin: String = db
+        .query_row(
+            "SELECT origin FROM credentials WHERE name = 'kept'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let lifecycle: String = db
+        .query_row(
+            "SELECT lifecycle_state FROM credentials WHERE name = 'kept'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(origin, "");
+    assert_eq!(lifecycle, "active");
 }

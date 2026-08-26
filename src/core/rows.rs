@@ -38,6 +38,9 @@ pub(super) fn credential_from_row(row: &Row<'_>) -> rusqlite::Result<Credential>
     let updated_str: String = row.get(8)?;
     let last_used_str: Option<String> = row.get(9)?;
     let partition_id: Option<String> = row.get(10)?;
+    let origin: String = row.get(11)?;
+    let lifecycle_state: String = row.get(12)?;
+    let review_at_str: Option<String> = row.get(13)?;
 
     Ok(Credential {
         id: row.get(0)?,
@@ -54,6 +57,12 @@ pub(super) fn credential_from_row(row: &Row<'_>) -> rusqlite::Result<Credential>
             .map(|value| parse_datetime_column(9, value))
             .transpose()?,
         partition_id,
+        origin,
+        lifecycle_state,
+        review_at: review_at_str
+            .as_deref()
+            .map(|value| parse_datetime_column(13, value))
+            .transpose()?,
     })
 }
 

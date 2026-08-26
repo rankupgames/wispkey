@@ -4,7 +4,7 @@
  * Project: WispKey
  * Description: Vault engine -- encrypted credential storage and domain operations.
  * Created: 2026-04-07
- * Last Modified: 2026-04-12
+ * Last Modified: 2026-08-25
  */
 
 use std::fs;
@@ -42,7 +42,7 @@ use rows::{parse_credential_type_column, parse_datetime_column};
 pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
-const CURRENT_SCHEMA_VERSION: &str = "10";
+const CURRENT_SCHEMA_VERSION: &str = "11";
 
 /// Errors returned by vault operations (I/O, crypto, schema, and business rules).
 #[derive(Error, Debug)]
@@ -114,6 +114,10 @@ pub enum VaultError {
     AccessRequestNotFound(String),
     #[error("access request '{0}' is already decided")]
     AccessRequestAlreadyDecided(String),
+    #[error("invalid website origin: {0}")]
+    InvalidOrigin(String),
+    #[error("invalid credential lifecycle state: {0}")]
+    InvalidLifecycle(String),
     #[error("invalid, expired, exhausted, or revoked bootstrap token")]
     InvalidBootstrapToken,
     #[error("bootstrap token '{0}' not found")]
@@ -132,7 +136,21 @@ pub enum CredentialType {
     BasicAuth,
     CustomHeader { header_name: String },
     QueryParam { param_name: String },
+    WebsiteLogin,
 }
+
+/// Encrypted website-login payload. Username and password stay inside
+/// encrypted credential material and are never stored in tags or descriptions.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebsiteLoginPayload {
+    pub username: String,
+    pub password: String,
+}
+
+/// Lifecycle for generated website logins. Review dates notify; they never auto-delete.
+pub const LIFECYCLE_PENDING: &str = "pending";
+pub const LIFECYCLE_ACTIVE: &str = "active";
+pub const LIFECYCLE_ARCHIVED: &str = "archived";
 
 impl CredentialType {
     /// Parses a wire/type string into a [`CredentialType`], using optional header or query param names when required.
@@ -161,6 +179,7 @@ impl CredentialType {
                     param_name: name.to_string(),
                 })
             }
+            "website_login" => Ok(Self::WebsiteLogin),
             other => Err(VaultError::InvalidCredentialType(other.to_string())),
         }
     }
@@ -174,6 +193,7 @@ impl CredentialType {
             Self::BasicAuth => "basic_auth",
             Self::CustomHeader { .. } => "custom_header",
             Self::QueryParam { .. } => "query_param",
+            Self::WebsiteLogin => "website_login",
         }
     }
 }
@@ -192,6 +212,9 @@ pub struct Credential {
     pub updated_at: DateTime<Utc>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub partition_id: Option<String>,
+    pub origin: String,
+    pub lifecycle_state: String,
+    pub review_at: Option<DateTime<Utc>>,
 }
 
 /// Parameters for creating a credential.
@@ -209,6 +232,22 @@ pub struct AddCredentialRequest<'a> {
     pub tags: Option<&'a str>,
     pub partition: Option<&'a str>,
     pub project: Option<&'a str>,
+    pub origin: Option<&'a str>,
+    pub lifecycle_state: Option<&'a str>,
+    pub review_at: Option<&'a str>,
+}
+
+/// Parameters for generating and storing a website login atomically.
+#[derive(Debug, Clone)]
+pub struct GenerateWebsiteLoginRequest<'a> {
+    pub name: &'a str,
+    pub username: &'a str,
+    pub url: &'a str,
+    pub project: Option<&'a str>,
+    pub partition: Option<&'a str>,
+    pub review_at: Option<DateTime<Utc>>,
+    pub length: Option<usize>,
+    pub symbols: bool,
 }
 
 #[cfg(test)]
@@ -224,6 +263,9 @@ impl<'a> AddCredentialRequest<'a> {
             tags: None,
             partition: None,
             project: None,
+            origin: None,
+            lifecycle_state: None,
+            review_at: None,
         }
     }
 
@@ -346,11 +388,15 @@ impl Vault {
         let desc = request.description.unwrap_or("");
         let hosts_csv = request.hosts.unwrap_or("");
         let tags_csv = request.tags.unwrap_or("");
+        let origin = request.origin.unwrap_or("");
+        let lifecycle_state = request.lifecycle_state.unwrap_or(LIFECYCLE_ACTIVE);
+        validate_lifecycle_state(lifecycle_state)?;
+        let review_at = request.review_at;
         let now = Utc::now().to_rfc3339();
 
         self.db.execute(
-			"INSERT INTO credentials (id, name, description, credential_type, encrypted_value, wisp_token, hosts, tags, created_at, updated_at, partition_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-			params![id, request.name, desc, type_json, BASE64.encode(&encrypted_value), wisp_token, hosts_csv, tags_csv, now, now, partition_id],
+			"INSERT INTO credentials (id, name, description, credential_type, encrypted_value, wisp_token, hosts, tags, created_at, updated_at, partition_id, origin, lifecycle_state, review_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+			params![id, request.name, desc, type_json, BASE64.encode(&encrypted_value), wisp_token, hosts_csv, tags_csv, now, now, partition_id, origin, lifecycle_state, review_at],
 		)?;
 
         Ok(Credential {
@@ -365,7 +411,107 @@ impl Vault {
             updated_at: Utc::now(),
             last_used_at: None,
             partition_id: Some(partition_id),
+            origin: origin.to_string(),
+            lifecycle_state: lifecycle_state.to_string(),
+            review_at: review_at.and_then(parse_optional_review_at),
         })
+    }
+
+    /// Generates a unique password, encrypts username+password together, and
+    /// stores the login before any fill attempt. Never returns the password.
+    pub fn generate_website_login(
+        &self,
+        request: GenerateWebsiteLoginRequest<'_>,
+    ) -> Result<Credential> {
+        let origin = parse_https_origin(request.url)?;
+        if request.username.trim().is_empty() {
+            return Err(VaultError::InvalidCredentialType(
+                "website login username must not be empty".into(),
+            ));
+        }
+        let mut policy = crate::random::PasswordPolicy::default_strong();
+        if let Some(length) = request.length {
+            policy.length = length;
+        }
+        policy.symbols = request.symbols;
+        let password = crate::random::generate_password(&policy)?;
+        let payload = WebsiteLoginPayload {
+            username: request.username.to_string(),
+            password,
+        };
+        let value = serde_json::to_string(&payload)
+            .map_err(|error| VaultError::Encryption(error.to_string()))?;
+        let host = origin_host(&origin);
+        let review_at = request.review_at.map(|value| value.to_rfc3339());
+        self.add_credential(AddCredentialRequest {
+            name: request.name,
+            credential_type: CredentialType::WebsiteLogin,
+            value: &value,
+            description: None,
+            hosts: Some(&host),
+            tags: None,
+            partition: request.partition,
+            project: request.project,
+            origin: Some(&origin),
+            lifecycle_state: Some(LIFECYCLE_PENDING),
+            review_at: review_at.as_deref(),
+        })
+    }
+
+    /// Archives, restores, or activates a credential lifecycle. Never deletes.
+    pub fn set_credential_lifecycle(
+        &self,
+        name: &str,
+        lifecycle_state: &str,
+        project: Option<&str>,
+    ) -> Result<Credential> {
+        let _ = self.ensure_unlocked()?;
+        validate_lifecycle_state(lifecycle_state)?;
+        let active = resolve_active_project();
+        let project_name = project.unwrap_or(&active);
+        let credential = self.get_credential_in_project(project_name, name)?;
+        if credential.credential_type != CredentialType::WebsiteLogin {
+            return Err(VaultError::InvalidCredentialType(
+                "lifecycle changes are only supported for website_login credentials".into(),
+            ));
+        }
+        match (credential.lifecycle_state.as_str(), lifecycle_state) {
+            (_, LIFECYCLE_ARCHIVED) => {}
+            (LIFECYCLE_ARCHIVED, LIFECYCLE_PENDING | LIFECYCLE_ACTIVE) => {}
+            (LIFECYCLE_PENDING, LIFECYCLE_ACTIVE) => {}
+            (current, next) if current == next => {}
+            (current, next) => {
+                return Err(VaultError::InvalidLifecycle(format!(
+                    "cannot change lifecycle from {current} to {next}"
+                )));
+            }
+        }
+        let now = Utc::now().to_rfc3339();
+        self.db.execute(
+            "UPDATE credentials SET lifecycle_state = ?1, updated_at = ?2 WHERE id = ?3",
+            params![lifecycle_state, now, credential.id],
+        )?;
+        self.get_credential_in_project(project_name, name)
+    }
+
+    /// Lists website logins whose review date is due. Never deletes them.
+    pub fn list_due_website_logins(&self, project: Option<&str>) -> Result<Vec<Credential>> {
+        let credentials = if let Some(project_name) = project {
+            self.list_credentials_in_project(project_name)?
+        } else {
+            self.list_credentials()?
+        };
+        let now = Utc::now();
+        Ok(credentials
+            .into_iter()
+            .filter(|credential| {
+                credential.credential_type == CredentialType::WebsiteLogin
+                    && credential.lifecycle_state != LIFECYCLE_ARCHIVED
+                    && credential
+                        .review_at
+                        .is_some_and(|review_at| review_at <= now)
+            })
+            .collect())
     }
 
     /// Updates an existing credential in place: re-encrypts with a new value and
@@ -376,12 +522,30 @@ impl Vault {
         let project_name = request.project.unwrap_or(&active);
         let project_id = self.resolve_project_id(project_name)?;
 
-        let (cred_id, partition_id, created_at_str, wisp_token): (String, String, String, String) = self
+        let (cred_id, partition_id, created_at_str, wisp_token, origin, lifecycle_state, review_at_str): (
+            String,
+            String,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        ) = self
             .db
             .query_row(
-                "SELECT c.id, c.partition_id, c.created_at, c.wisp_token FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
+                "SELECT c.id, c.partition_id, c.created_at, c.wisp_token, c.origin, c.lifecycle_state, c.review_at FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
                 params![project_id, request.name],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
             )
             .map_err(|_| VaultError::CredentialNotFound(request.name.to_string()))?;
 
@@ -413,6 +577,9 @@ impl Vault {
             updated_at: Utc::now(),
             last_used_at: None,
             partition_id: Some(partition_id),
+            origin,
+            lifecycle_state,
+            review_at: review_at_str.and_then(|value| parse_optional_review_at(&value)),
         })
     }
 
@@ -583,7 +750,7 @@ impl Vault {
         let partition_id =
             self.resolve_partition_id_for_insert(Some(partition_name), Some(project_name))?;
         let mut stmt = self.db.prepare(
-			"SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials WHERE partition_id = ?1 ORDER BY name",
+			"SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id, origin, lifecycle_state, review_at FROM credentials WHERE partition_id = ?1 ORDER BY name",
 		)?;
         let credentials = stmt
             .query_map(params![partition_id], credential_from_row)?
@@ -604,7 +771,7 @@ impl Vault {
     /// Lists every credential in the vault, sorted by name.
     pub fn list_credentials(&self) -> Result<Vec<Credential>> {
         let _ = self.ensure_unlocked()?;
-        let mut stmt = self.db.prepare("SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id FROM credentials ORDER BY name")?;
+        let mut stmt = self.db.prepare("SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id, origin, lifecycle_state, review_at FROM credentials ORDER BY name")?;
         let credentials = stmt
             .query_map([], credential_from_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -621,7 +788,7 @@ impl Vault {
         let _ = self.ensure_unlocked()?;
         let project_id = self.resolve_project_id(project_name)?;
         let mut stmt = self.db.prepare(
-			"SELECT c.id, c.name, c.description, c.credential_type, c.wisp_token, c.hosts, c.tags, c.created_at, c.updated_at, c.last_used_at, c.partition_id FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
+			"SELECT c.id, c.name, c.description, c.credential_type, c.wisp_token, c.hosts, c.tags, c.created_at, c.updated_at, c.last_used_at, c.partition_id, c.origin, c.lifecycle_state, c.review_at FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
 		)?;
         stmt.query_row(params![project_id, name], credential_from_row)
             .map_err(|_| VaultError::CredentialNotFound(name.to_string()))
@@ -706,10 +873,10 @@ impl Vault {
     pub fn lookup_by_wisp_token(&self, token: &str) -> Result<(Credential, String)> {
         let key = self.ensure_unlocked()?;
 
-        let mut stmt = self.db.prepare("SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id, encrypted_value FROM credentials WHERE wisp_token = ?1")?;
+        let mut stmt = self.db.prepare("SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id, origin, lifecycle_state, review_at, encrypted_value FROM credentials WHERE wisp_token = ?1")?;
         let (cred, encoded) = stmt
             .query_row(params![token], |row| {
-                let encrypted_value: String = row.get(11)?;
+                let encrypted_value: String = row.get(14)?;
                 let cred = credential_from_row(row)?;
                 Ok((cred, encrypted_value))
             })
@@ -875,7 +1042,7 @@ impl Vault {
         let _ = self.ensure_unlocked()?;
         let project_id = self.resolve_project_id(project_name)?;
         let mut stmt = self.db.prepare(
-			"SELECT c.id, c.name, c.description, c.credential_type, c.wisp_token, c.hosts, c.tags, c.created_at, c.updated_at, c.last_used_at, c.partition_id FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 ORDER BY c.name",
+			"SELECT c.id, c.name, c.description, c.credential_type, c.wisp_token, c.hosts, c.tags, c.created_at, c.updated_at, c.last_used_at, c.partition_id, c.origin, c.lifecycle_state, c.review_at FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 ORDER BY c.name",
 		)?;
         let credentials = stmt
             .query_map(params![project_id], credential_from_row)?
@@ -965,4 +1132,71 @@ pub fn set_active_project(name: &str) -> Result<()> {
     secure_files::ensure_private_directory(&vault_dir)?;
     fs::write(vault_dir.join("active_project"), name)?;
     Ok(())
+}
+
+/// Returns the exact HTTPS origin (`https://host[:port]`) for website-login policy binding.
+pub fn parse_https_origin(raw: &str) -> Result<String> {
+    let parsed = url::Url::parse(raw.trim()).map_err(|error| {
+        VaultError::InvalidOrigin(format!("invalid website login URL: {error}"))
+    })?;
+    if parsed.scheme() != "https" {
+        return Err(VaultError::InvalidOrigin(
+            "website login URL must use https".into(),
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(VaultError::InvalidOrigin(
+            "website login URL must not include userinfo".into(),
+        ));
+    }
+    let host = match parsed.host() {
+        Some(url::Host::Domain(domain)) => {
+            let valid = !domain.is_empty()
+                && domain.split('.').all(|label| {
+                    !label.is_empty()
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label
+                            .bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+                });
+            if !valid {
+                return Err(VaultError::InvalidOrigin(
+                    "website login URL host is invalid".into(),
+                ));
+            }
+            domain.to_string()
+        }
+        Some(url::Host::Ipv4(address)) => address.to_string(),
+        Some(url::Host::Ipv6(address)) => format!("[{address}]"),
+        None => {
+            return Err(VaultError::InvalidOrigin(
+                "website login URL is missing a host".into(),
+            ));
+        }
+    };
+    Ok(match parsed.port() {
+        Some(port) => format!("https://{host}:{port}"),
+        None => format!("https://{host}"),
+    })
+}
+
+fn origin_host(origin: &str) -> String {
+    origin
+        .strip_prefix("https://")
+        .unwrap_or(origin)
+        .to_string()
+}
+
+fn validate_lifecycle_state(state: &str) -> Result<()> {
+    match state {
+        LIFECYCLE_PENDING | LIFECYCLE_ACTIVE | LIFECYCLE_ARCHIVED => Ok(()),
+        other => Err(VaultError::InvalidLifecycle(other.to_string())),
+    }
+}
+
+fn parse_optional_review_at(value: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(value)
+        .ok()
+        .map(|datetime| datetime.with_timezone(&Utc))
 }
