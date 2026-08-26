@@ -219,7 +219,7 @@ fn validate_private_file(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
 }
 
 #[cfg(windows)]
-mod windows_acl {
+pub(crate) mod windows_acl {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
@@ -340,7 +340,18 @@ mod windows_acl {
         }
     }
 
-    struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+    pub(crate) fn current_user_only_security_descriptor() -> Result<SecurityDescriptor> {
+        let sid = current_user_sid_string()?;
+        security_descriptor_from_sddl(&format!("D:P(A;;GA;;;{sid})"))
+    }
+
+    pub(crate) struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
+
+    impl SecurityDescriptor {
+        pub(crate) fn as_mut_ptr(&self) -> PSECURITY_DESCRIPTOR {
+            self.0
+        }
+    }
 
     impl Drop for SecurityDescriptor {
         fn drop(&mut self) {

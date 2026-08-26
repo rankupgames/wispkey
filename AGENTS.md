@@ -113,6 +113,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey init` | Create vault + master password |
 | `wispkey unlock [--timeout N] [--remember] [--password-file PATH]` | Unlock vault (30 min session); `--remember` stores a password-free protector |
 | `wispkey lock [--forget]` | Revoke the current session; `--forget` also deletes the remembered protector |
+| `wispkey tray [--ipc-only]` | Start authenticated owner IPC; optionally spawn the tray GUI |
 | `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store credential |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials (names only) |
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
@@ -271,9 +272,10 @@ When the proxy is running (`wispkey serve`):
 
 ## Cursor Cloud specific instructions
 
-Single Rust crate (no services/DB to boot; SQLite is bundled via `rusqlite`). Standard dev commands live in `CONTRIBUTING.md` (`cargo build`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`) and the CI matrix in `.github/workflows/ci.yml`.
+Workspace crate with an optional `wispkey-tray` GUI member. Default `cargo test` / `cargo clippy` build the CLI only (`default-members = ["."]`). SQLite is bundled via `rusqlite`. Standard dev commands live in `CONTRIBUTING.md` (`cargo build`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`) and the CI matrix in `.github/workflows/ci.yml`.
 
 - Toolchain: the base image's default Rust is too old to compile this crate (`edition = "2024"` needs Rust ≥ 1.85; the project targets 1.94+). The startup update script installs and defaults the `stable` toolchain (currently 1.98) with `clippy`/`rustfmt`, so just use `cargo`/`clippy`/`fmt` normally. If a session ever lands on old Rust, run `rustup default stable`.
 - `cargo test` compiles and boots real loopback TCP proxies; the full suite takes ~2-3 min. This is expected, not a hang.
 - Running the CLI/proxy non-interactively: set `WISPKEY_PASSWORD` to skip master-password prompts, and set `WISPKEY_VAULT_PATH` to a scratch dir (e.g. `/tmp/wk-demo`) so you never touch a real `~/.wispkey` vault.
 - `wispkey serve` is a long-running foreground process — run it in a tmux session (or `serve --daemon`). Forward-proxy (`HTTP_PROXY`) token swapping only works for plain HTTP; HTTPS requires reverse-proxy mode via the `X-Target-Url` header (see "HTTPS Proxy" above).
+- `wispkey tray --ipc-only` is a long-running owner IPC server. The optional GUI crate needs extra system libraries (`libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev` on Debian/Ubuntu); see `docs/tray.md`.

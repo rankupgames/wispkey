@@ -89,6 +89,24 @@ pub fn output_json(args: &[&str], output: std::process::Output) -> Value {
     })
 }
 
+pub fn wait_for_owner_info(vault_dir: &Path) -> Value {
+    let owner_info_path = vault_dir.join("owner.json");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(raw) = std::fs::read_to_string(&owner_info_path)
+            && let Ok(value) = serde_json::from_str::<Value>(&raw)
+            && value.get("endpoint").and_then(Value::as_str).is_some()
+        {
+            return value;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "owner IPC did not write owner.json in time"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 pub fn wait_for_proxy_info(vault_dir: &Path) -> Value {
     let proxy_info_path = vault_dir.join("proxy.json");
     let deadline = Instant::now() + Duration::from_secs(5);

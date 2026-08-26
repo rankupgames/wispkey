@@ -175,6 +175,13 @@ impl Vault {
         session_store().protection_label()
     }
 
+    /// Clears the on-disk session and drops the in-memory master key.
+    pub fn lock(&mut self) -> Result<()> {
+        session_store().clear()?;
+        self.master_key = None;
+        Ok(())
+    }
+
     /// Issued-at and timeout for the current session file, if it is still valid.
     pub fn session_metadata() -> Result<(DateTime<Utc>, i64)> {
         let record = session_store().load()?;

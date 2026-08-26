@@ -10,25 +10,10 @@
 #![deny(clippy::correctness)]
 #![warn(clippy::suspicious, clippy::style, clippy::perf, clippy::complexity)]
 
-mod audit;
-mod bundle;
-mod cli;
-mod cloud;
-mod core;
-mod env_sideload;
-mod mcp;
-mod migrate;
-mod partition;
-mod pki;
-mod policy;
-mod proxy;
-mod random;
-mod secure_files;
-mod sharing;
-
 use std::io::Read;
 
 use clap::{Parser, Subcommand, ValueEnum};
+use wispkey::cli;
 
 #[derive(Parser)]
 #[command(name = "wispkey")]
@@ -78,6 +63,13 @@ enum Commands {
         /// Also delete the OS or file protector so later unlocks require the master password
         #[arg(long)]
         forget: bool,
+    },
+
+    /// Start the owner IPC server and optional tray UI
+    Tray {
+        /// Serve authenticated owner IPC without opening the tray UI
+        #[arg(long)]
+        ipc_only: bool,
     },
 
     /// Add a credential to the vault
@@ -816,6 +808,9 @@ async fn main() {
         }
         Commands::Lock { forget } => {
             cli::handle_lock(forget).await;
+        }
+        Commands::Tray { ipc_only } => {
+            cli::handle_tray(ipc_only).await;
         }
         Commands::Add {
             name,

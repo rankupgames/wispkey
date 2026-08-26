@@ -52,6 +52,7 @@ Four commands from zero to protected. The AI process never touches your real sec
 - **Multi-instance access** -- Enroll ephemeral VMs or worker instances with per-request identity, least-privilege credential scope, scoped bootstrap-token self-enrollment, cross-platform TCP, Unix, Linux AF_VSOCK, and Firecracker UDS-backed vsock listeners, plus host-approved access escalation
 - **Rotation-ready instance identities** -- Schedule due-aware 48-character CSPRNG secret rotation with a bounded rollout grace window; the previous secret is retired as soon as the new secret first authenticates
 - **.env importer** -- One-command migration with auto-detection of OpenAI, GitHub, Slack, AWS, and bearer token patterns
+- **Optional tray GUI** -- Background desktop tray for owner credential entry over authenticated local IPC, including an atomic OVH API template; see [`docs/tray.md`](docs/tray.md)
 
 ### Organization
 - **Projects** -- Top-level credential isolation by team or engagement (`project create`, `use`, `current`, `list`, `delete`)
@@ -327,6 +328,7 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey init` | Create vault and master password |
 | `wispkey unlock [--timeout N] [--remember] [--protector-timeout N] [--password-file PATH\|-]` | Unlock vault for the current session; `--remember` stores a password-free re-unlock protector |
 | `wispkey lock [--forget]` | Revoke the current session; `--forget` also deletes the remembered protector |
+| `wispkey tray [--ipc-only]` | Start authenticated owner IPC; optionally spawn the tray GUI |
 | `wispkey add <name> [--type TYPE] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store a credential |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials |
 | `wispkey get <name> [--show-token]` | Show credential metadata and wisp token |
@@ -352,6 +354,10 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey instance bootstrap create/list/revoke` | Manage scoped, atomic bootstrap tokens for fleet self-enrollment |
 | `wispkey instance join [<bootstrap-token>] [--token-file <path|->] --name <instance-name>` | Redeem a bootstrap token; prefer `--token-file -` to avoid argv exposure |
 | `wispkey mcp serve` | Start the MCP server over stdio |
+
+## Tray GUI
+
+The optional `wispkey-tray` binary is a desktop extension of the CLI. Start owner IPC with `wispkey tray` (or `wispkey tray --ipc-only` for tests), then add single credentials or the OVH API template from a native dialog. Secrets stay off argv and never pass through an unauthenticated localhost form. Closing a dialog leaves the tray running. See [`docs/tray.md`](docs/tray.md).
 
 ## Partition Bundles
 

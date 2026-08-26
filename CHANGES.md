@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Optional secure tray GUI
+
+- Added `wispkey lock` to clear the current session and drop the in-memory master key.
+- Added `wispkey tray [--ipc-only]` for authenticated, current-user-only owner IPC (Unix socket with same-UID `SO_PEERCRED`, Windows named pipe).
+- Added optional `wispkey-tray` desktop crate with tray-icon plus a Svelte 5 webview for single-credential and atomic OVH API template entry. Closing a dialog does not quit the tray.
+- `add_credential` now rejects empty names and values. Compound saves use `add_credentials_atomic` so a duplicate or invalid later row rolls back the whole batch.
+- Owner IPC responses and logs never include plaintext secret values or reusable wisp tokens; known secret fields are redacted before tracing.
+- Owner IPC uses a single-owner lifecycle lease, validates live discovery before the tray connects, and requires explicit destination confirmation for credential writes. Windows named pipes grant access only to the current user SID.
+- Default `cargo test` still skips the GUI crate. Documented the tray boundary in `docs/tray.md` and `docs/security-model.md`.
+
 ### PKI-aware certificate issuance
 
 - Added the `wispkey_issue_cert` MCP tool so a CA private key can stay in the vault while agents request leaf identities. The tool either generates an EC P-256/P-384 or RSA 2048/4096 keypair or signs a PEM CSR. RSA generation uses rcgen's aws-lc-rs backend so WispKey does not depend on the unfixed `rsa` crate advisory.
