@@ -7,10 +7,10 @@ Local-first, open-source credential firewall for AI agents that lets agents auth
 ## Quick Start
 
 ```bash
-# Install (once published)
-brew install wispkey
+# macOS / Linux
+brew install --formula https://github.com/rankupgames/wispkey/releases/latest/download/wispkey.rb
 # -- or --
-cargo install wispkey
+cargo install wispkey --locked
 
 # Create your vault
 wispkey init
@@ -22,7 +22,7 @@ wispkey import .env
 wispkey serve
 ```
 
-Four commands from zero to protected. The AI process never touches your real secrets.
+Four commands from zero to protected. The AI process never touches your real secrets. Signed GitHub Release archives, SHA-256 checksums, Sigstore signatures, and verification steps are in [`docs/install.md`](docs/install.md).
 
 ## How It Works
 

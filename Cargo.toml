@@ -6,7 +6,9 @@ authors = ["Miguel A. Lopez <miguel@rankupgames.com>"]
 description = "Local-first credential firewall for AI agents with wisp token proxy"
 license = "Apache-2.0"
 repository = "https://github.com/rankupgames/wispkey"
+homepage = "https://github.com/rankupgames/wispkey"
 readme = "README.md"
+rust-version = "1.94"
 keywords = ["credentials", "security", "ai-agents", "proxy", "mcp"]
 categories = ["authentication", "command-line-utilities"]
 
