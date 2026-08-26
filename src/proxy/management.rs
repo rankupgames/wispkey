@@ -438,7 +438,7 @@ fn logs_response(uri: &Uri) -> Response<Full<Bytes>> {
                 "timestamp": e.timestamp,
                 "event_type": e.event_type,
                 "credential_name": e.credential_name,
-                "wisp_token": e.wisp_token,
+                "token_fingerprint": e.token_fingerprint,
                 "target_host": e.target_host,
                 "target_path": e.target_path,
                 "http_method": e.http_method,

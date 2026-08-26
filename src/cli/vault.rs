@@ -120,7 +120,7 @@ pub async fn handle_unlock(
                     None,
                     None,
                     false,
-                    Some(backend.label()),
+                    None,
                     None,
                 );
                 remembered = Some(backend);
@@ -142,7 +142,7 @@ pub async fn handle_unlock(
         None,
         None,
         false,
-        Some(source),
+        None,
         None,
     );
 
@@ -209,7 +209,7 @@ pub async fn handle_lock(forget: bool) {
         None,
         None,
         false,
-        Some("session_revoked"),
+        None,
         None,
     );
 

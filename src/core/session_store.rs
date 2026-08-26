@@ -319,8 +319,7 @@ fn validate_session_record(
     record: SessionRecord,
     store: &SessionFileStore,
 ) -> Result<SessionRecord> {
-    let age = Utc::now() - record.issued_at;
-    if record.timeout_minutes > 0 && age.num_minutes() > record.timeout_minutes {
+    if is_timeout_expired(record.issued_at, record.timeout_minutes) {
         store.clear()?;
         return Err(VaultError::SessionExpired);
     }
@@ -328,11 +327,24 @@ fn validate_session_record(
 }
 
 pub(super) fn is_timeout_expired(issued_at: DateTime<Utc>, timeout_minutes: i64) -> bool {
-    timeout_minutes > 0 && (Utc::now() - issued_at).num_minutes() > timeout_minutes
+    is_timeout_expired_at(Utc::now(), issued_at, timeout_minutes)
+}
+
+fn is_timeout_expired_at(
+    now: DateTime<Utc>,
+    issued_at: DateTime<Utc>,
+    timeout_minutes: i64,
+) -> bool {
+    if timeout_minutes <= 0 {
+        return false;
+    }
+    chrono::Duration::try_minutes(timeout_minutes)
+        .and_then(|duration| issued_at.checked_add_signed(duration))
+        .is_none_or(|expires_at| now >= expires_at)
 }
 
 pub(super) fn validate_timeout_minutes(timeout_minutes: i64) -> Result<i64> {
-    if timeout_minutes < 0 {
+    if timeout_minutes < 0 || chrono::Duration::try_minutes(timeout_minutes).is_none() {
         return Err(VaultError::InvalidSessionTimeout);
     }
     Ok(timeout_minutes)
@@ -529,5 +541,18 @@ mod tests {
 
         assert!(matches!(store.load(), Err(VaultError::SessionExpired)));
         assert!(!store.session_path.exists());
+    }
+
+    #[test]
+    fn timeout_expires_at_the_exact_boundary() {
+        let issued_at = Utc::now();
+        let expires_at = issued_at + chrono::Duration::minutes(30);
+
+        assert!(!is_timeout_expired_at(
+            expires_at - chrono::Duration::milliseconds(1),
+            issued_at,
+            30
+        ));
+        assert!(is_timeout_expired_at(expires_at, issued_at, 30));
     }
 }

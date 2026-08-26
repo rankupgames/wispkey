@@ -100,7 +100,6 @@ pub(super) fn save_protector(key: &[u8; 32], timeout_minutes: i64) -> Result<Pro
     match ProtectorPreference::from_env() {
         ProtectorPreference::File => {
             save_file_protector(&payload)?;
-            clear_os_protector();
             Ok(ProtectorBackend::File)
         }
         ProtectorPreference::Os => match save_os_protector(&payload) {
@@ -146,9 +145,12 @@ pub(super) fn load_protector() -> Result<ProtectorRecord> {
 }
 
 pub(super) fn clear_protector() -> Result<()> {
-    clear_file_protector()?;
-    clear_os_protector();
-    Ok(())
+    let file_result = clear_file_protector();
+    let os_result = match ProtectorPreference::from_env() {
+        ProtectorPreference::File => Ok(()),
+        ProtectorPreference::Auto | ProtectorPreference::Os => clear_os_protector(),
+    };
+    file_result.and(os_result)
 }
 
 pub(super) fn protector_status() -> ProtectorStatus {
@@ -281,7 +283,7 @@ fn load_os_protector() -> Result<ProtectorRecord> {
     match decode_payload(&raw, ProtectorBackend::Os) {
         Ok(record) => Ok(record),
         Err(VaultError::ProtectorExpired) => {
-            clear_os_protector();
+            clear_os_protector()?;
             Err(VaultError::ProtectorExpired)
         }
         Err(error) => Err(error),
@@ -289,9 +291,10 @@ fn load_os_protector() -> Result<ProtectorRecord> {
 }
 
 #[cfg(any(target_os = "macos", windows))]
-fn clear_os_protector() {
-    if let Ok(entry) = os_entry() {
-        let _ = entry.delete_credential();
+fn clear_os_protector() -> Result<()> {
+    match os_entry()?.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(error) => Err(map_keyring_error(error)),
     }
 }
 
@@ -321,13 +324,16 @@ fn load_os_protector() -> Result<ProtectorRecord> {
 }
 
 #[cfg(not(any(target_os = "macos", windows)))]
-fn clear_os_protector() {}
+fn clear_os_protector() -> Result<()> {
+    Ok(())
+}
 
 fn expiry_timestamp(issued_at: DateTime<Utc>, timeout_minutes: i64) -> Option<DateTime<Utc>> {
     if timeout_minutes <= 0 {
         return None;
     }
-    issued_at.checked_add_signed(chrono::Duration::minutes(timeout_minutes))
+    chrono::Duration::try_minutes(timeout_minutes)
+        .and_then(|duration| issued_at.checked_add_signed(duration))
 }
 
 #[cfg(test)]

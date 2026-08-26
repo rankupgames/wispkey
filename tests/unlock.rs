@@ -137,6 +137,21 @@ fn unlock_and_lock_emit_audit_events_without_password() {
     assert!(stdout.contains("ProtectorRemembered"));
     assert!(stdout.contains("ProtectorForgotten"));
     assert!(!stdout.contains("test-password"));
+
+    let entries: serde_json::Value = serde_json::from_slice(&output.stdout).expect("audit JSON");
+    for entry in entries["entries"].as_array().expect("audit entry array") {
+        if [
+            "VaultUnlocked",
+            "VaultLocked",
+            "ProtectorRemembered",
+            "ProtectorForgotten",
+        ]
+        .contains(&entry["event_type"].as_str().unwrap_or_default())
+        {
+            assert_eq!(entry["denied"], false);
+            assert!(entry["deny_reason"].is_null());
+        }
+    }
 }
 
 #[test]

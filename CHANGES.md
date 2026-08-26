@@ -9,6 +9,11 @@
 - Unlock, lock, remember, forget, and session-expiry paths emit audit events without passwords or raw credential values.
 - Documented host-side Boring Computer smoke-test authorization and recovery in `docs/headless-unlock.md`.
 
+### Audit capability redaction
+
+- Audit records now store an HMAC-SHA-256 fingerprint for within-sink wisp-token correlation instead of the reusable token. Log, management API, export, and tail JSON use `token_fingerprint` and never return the capability or the fingerprint key.
+- Opening an existing vault converts legacy SQLite token fields to keyed fingerprints and redacts token copies from free-text audit fields. Legacy fallback JSONL token fields are omitted when read; existing fallback files created by older releases must still be handled as sensitive local data.
+
 ### Cross-machine and Firecracker instance access
 
 - Added `firecracker-vsock:/absolute/base.sock:<port>` listeners for Firecracker's actual guest-to-host transport. WispKey binds Firecracker's required `<base>_<port>` Unix socket while preserving the existing feature-gated `vsock://<cid>:<port>` listener for Linux environments that expose host AF_VSOCK directly.
