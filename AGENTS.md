@@ -37,11 +37,13 @@ printf '%s' "$SECRET_VALUE" | wispkey add "key" --type api_key --value-file -  #
 
 `wispkey add --value` still works, but warns on stderr because command-line arguments can be exposed through shell history and process listings. Prefer `--value-file <path>` or `--value-file -` for non-interactive secret input.
 
+For repeated headless unlocks, prefer `wispkey unlock --remember --password-file ~/.wispkey/master.pass` so later `wispkey unlock` calls can remint a bounded session without the password. `wispkey lock` revokes the session; `wispkey lock --forget` also drops the remembered protector. See `docs/headless-unlock.md`.
+
 ## Project Scoping
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v10 automatically.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v11 automatically.
 
 ```bash
 # Create a project
@@ -109,12 +111,16 @@ wispkey inject -i .env.template -o .env.local
 | Command | Purpose |
 |---------|---------|
 | `wispkey init` | Create vault + master password |
-| `wispkey unlock` | Unlock vault (30 min session) |
+| `wispkey unlock [--timeout N] [--remember] [--password-file PATH]` | Unlock vault (30 min session); `--remember` stores a password-free protector |
+| `wispkey lock [--forget]` | Revoke the current session; `--forget` also deletes the remembered protector |
+| `wispkey tray [--ipc-only]` | Start authenticated owner IPC; optionally spawn the tray GUI |
 | `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store credential |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials (names only) |
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
 | `wispkey remove <name>` | Delete credential |
 | `wispkey rotate <name>` | Regenerate wisp token |
+| `wispkey login generate <name> --username U --url HTTPS [--project P] [--partition P] [--review-after 180d]` | Generate and store a unique website login (password never printed) |
+| `wispkey login list/archive/restore/activate` | Website-login metadata and lifecycle; review dates never auto-delete |
 | `wispkey exec --credential <name> [--project P] [--stdin] [--env VAR]... [--askpass] -- <command> [args...]` | Audited child-process secret injection |
 | `wispkey run [--manifest PATH] [--project P] -- <command> [args...]` | Manifest-defined child-only environment injection |
 | `wispkey inject -i <infile|-> [-o <outfile>] [--project P] [--stdout]` | Render `{{ cred:<name> }}` references to owner-only file output or explicit stdout |
@@ -140,6 +146,7 @@ wispkey inject -i .env.template -o .env.local
 | Basic Auth | `basic_auth` | `user:pass` format |
 | Custom Header | `custom_header` | Requires `--header-name` |
 | Query Param | `query_param` | Requires `--param-name` |
+| Website Login | `website_login` | Generated only via `wispkey login generate`; username+password encrypted together |
 
 WispKey stores arbitrary encrypted secret values, not only API keys. Use `api_key` as the generic opaque type for passwords, database URLs, SSH/private-key files via `--value-file`, webhook secrets, OAuth tokens, service-account JSON, and other secret material. The credential type controls proxy injection behavior, not what can be stored.
 
@@ -200,6 +207,10 @@ Available tools:
 - **`wispkey_get_token`** -- Get wisp token for a credential by `name`
 - **`wispkey_proxy_status`** -- Check vault/session/proxy state
 - **`wispkey_project_list`** -- List all projects with partition counts and active indicator
+- **`wispkey_set`** -- Create or update a credential (`name`, `value` required; `type`, `description`, `hosts`, `tags`, `project`, `header_name`, `param_name` optional). Refuses to overwrite unless `overwrite: true`. On update, the wisp token is preserved. Refuses `website_login`; use `wispkey_generate_login`.
+- **`wispkey_generate_login`** -- Generate a unique website login (`name`, `username`, `url` required). Returns origin, lifecycle, and username only—never the password.
+- **`wispkey_delete`** -- Delete a credential by `name` (optional `project` scope)
+- **`wispkey_issue_cert`** -- Issue an X.509 leaf certificate with a CA private key held in the vault (`ca_credential` required). Generates an `ec-p256` keypair by default or signs a PEM `csr`. Returns the leaf certificate and, when generated, the leaf private key. The CA private key never leaves the vault. Optional: `common_name`, `san`, `validity_days` (default 365, max 3650), `key_type` (`ec-p256`, `ec-p384`, `rsa-2048`, `rsa-4096`), `ca_cert` when the credential is key-only, `project`.
 
 ## HTTPS Proxy (Reverse Proxy Mode)
 
@@ -237,12 +248,16 @@ When the proxy is running (`wispkey serve`):
 |------|---------|
 | `~/.wispkey/vault.db` | Encrypted credential database (owner-only permissions on Unix) |
 | `~/.wispkey/session` | Session key (30 min TTL; owner-only permissions on Unix, restricted ACL on Windows) |
+| `~/.wispkey/session-protector` | Optional machine-bound remembered unlock (used when the OS credential store is unavailable) |
 | `~/.wispkey/proxy.pid` | Proxy PID (written on `serve`) |
 | `~/.wispkey/proxy.json` | Proxy discovery file with management token (owner-only permissions/ACL) |
 | `~/.wispkey/active_project` | Persistent active project (set by `project use`) |
 | `.env.wispkey` | Generated import output with wisp tokens (owner-only permissions on Unix) |
 | `WISPKEY_VAULT_PATH` | Override vault directory |
 | `WISPKEY_PROJECT` | Override active project per-terminal |
+| `WISPKEY_SESSION_TIMEOUT` | Unlocked session lifetime in minutes (default 30; `0` means no expiry) |
+| `WISPKEY_PROTECTOR` | Session protector backend: `auto` (default), `os`, or `file` |
+| `WISPKEY_PROTECTOR_TIMEOUT` | Remembered-protector lifetime in minutes (default 480; `0` means until `lock --forget`) |
 | `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import |
 | `WISPKEY_SIDELOAD_<SLUG>` | Env-sideload credential value for MCP/proxy use; never print the value |
 
@@ -254,3 +269,13 @@ When the proxy is running (`wispkey serve`):
 - Partitions: logical grouping (e.g. `infrastructure`, `cloud-services`, `ci-cd`)
 - Projects: team/project isolation (e.g. `client-alpha`, `internal-tools`)
 - Values starting with `-`: use `--value='-1abc...'` (equals syntax), though `--value-file` is preferred for secret material
+
+## Cursor Cloud specific instructions
+
+Workspace crate with an optional `wispkey-tray` GUI member. Default `cargo test` / `cargo clippy` build the CLI only (`default-members = ["."]`). SQLite is bundled via `rusqlite`. Standard dev commands live in `CONTRIBUTING.md` (`cargo build`, `cargo fmt --check`, `cargo clippy -- -D warnings`, `cargo test`) and the CI matrix in `.github/workflows/ci.yml`.
+
+- Toolchain: the base image's default Rust is too old to compile this crate (`edition = "2024"` needs Rust ≥ 1.85; the project targets 1.94+). The startup update script installs and defaults the `stable` toolchain (currently 1.98) with `clippy`/`rustfmt`, so just use `cargo`/`clippy`/`fmt` normally. If a session ever lands on old Rust, run `rustup default stable`.
+- `cargo test` compiles and boots real loopback TCP proxies; the full suite takes ~2-3 min. This is expected, not a hang.
+- Running the CLI/proxy non-interactively: set `WISPKEY_PASSWORD` to skip master-password prompts, and set `WISPKEY_VAULT_PATH` to a scratch dir (e.g. `/tmp/wk-demo`) so you never touch a real `~/.wispkey` vault.
+- `wispkey serve` is a long-running foreground process — run it in a tmux session (or `serve --daemon`). Forward-proxy (`HTTP_PROXY`) token swapping only works for plain HTTP; HTTPS requires reverse-proxy mode via the `X-Target-Url` header (see "HTTPS Proxy" above).
+- `wispkey tray --ipc-only` is a long-running owner IPC server. The optional GUI crate needs extra system libraries (`libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev` on Debian/Ubuntu); see `docs/tray.md`.
