@@ -459,8 +459,44 @@ impl Vault {
             )?;
             db.execute(
                 "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                params!["10"],
+            )?;
+        }
+
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| "10".to_string());
+
+        if version.as_str() == "10" {
+            if !table_has_column(db, "credentials", "origin")? {
+                db.execute(
+                    "ALTER TABLE credentials ADD COLUMN origin TEXT NOT NULL DEFAULT ''",
+                    [],
+                )?;
+            }
+            if !table_has_column(db, "credentials", "lifecycle_state")? {
+                db.execute(
+                    "ALTER TABLE credentials ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'active'",
+                    [],
+                )?;
+            }
+            if !table_has_column(db, "credentials", "review_at")? {
+                db.execute("ALTER TABLE credentials ADD COLUMN review_at TEXT", [])?;
+            }
+            db.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
                 params![CURRENT_SCHEMA_VERSION],
             )?;
+        }
+
+        // Older releases stored reusable capability tokens in audit rows. Remove
+        // them on every open so databases do not retain credentials in history.
+        if table_has_column(db, "audit_log", "wisp_token")? {
+            crate::audit::redact_legacy_audit_tokens(db)?;
         }
 
         Ok(())
@@ -500,7 +536,10 @@ impl Vault {
 				created_at TEXT NOT NULL,
 				updated_at TEXT NOT NULL,
 				last_used_at TEXT,
-				partition_id TEXT REFERENCES partitions(id)
+				partition_id TEXT REFERENCES partitions(id),
+				origin TEXT NOT NULL DEFAULT '',
+				lifecycle_state TEXT NOT NULL DEFAULT 'active',
+				review_at TEXT
 			);
 			CREATE TABLE IF NOT EXISTS audit_log (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,

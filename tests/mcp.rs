@@ -45,16 +45,685 @@ fn get_token_suggests_hyphenated_name_for_underscore_lookup() {
     );
 }
 
-fn call_mcp_tool(vault_dir: &std::path::Path, request: Value) -> Value {
+#[test]
+fn set_creates_credential_and_returns_wisp_token() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+
+    let response = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_set",
+                "arguments": {
+                    "name": "test-api-key",
+                    "value": "sk-secret-12345",
+                    "type": "bearer_token",
+                    "description": "Test key",
+                    "hosts": "api.example.com"
+                }
+            }
+        }),
+    );
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("mcp text response");
+    let parsed: Value = serde_json::from_str(text).expect("parse inner json");
+    assert_eq!(parsed["action"], "created");
+    assert_eq!(parsed["name"], "test-api-key");
+    assert_eq!(parsed["type"], "bearer_token");
+    assert!(
+        parsed["wisp_token"]
+            .as_str()
+            .expect("wisp_token")
+            .starts_with("wk_"),
+        "wisp token should start with wk_"
+    );
+
+    let verify = run_wispkey_json(
+        vault_dir.path(),
+        &["--format", "json", "get", "test-api-key", "--show-token"],
+    );
+    assert_eq!(verify["credential"]["name"], "test-api-key");
+    assert_eq!(verify["credential"]["type"], "bearer_token");
+}
+
+#[test]
+fn set_refuses_overwrite_by_default() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+
+    call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_set",
+                "arguments": { "name": "dup-key", "value": "first-value" }
+            }
+        }),
+    );
+
+    let response = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_set",
+                "arguments": { "name": "dup-key", "value": "second-value" }
+            }
+        }),
+    );
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        text.contains("already exists"),
+        "expected duplicate error, got: {text}"
+    );
+    assert!(
+        response["result"]["isError"].as_bool().unwrap_or(false),
+        "expected isError flag"
+    );
+}
+
+#[test]
+fn set_overwrites_when_flag_is_true_and_preserves_wisp_token() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+
+    let create_resp = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_set",
+                "arguments": { "name": "rotate-me", "value": "old-secret", "description": "version 1" }
+            }
+        }),
+    );
+    let create_text = create_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("create text");
+    let created: Value = serde_json::from_str(create_text).expect("parse create json");
+    let original_token = created["wisp_token"].as_str().expect("original token");
+
+    let update_resp = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_set",
+                "arguments": {
+                    "name": "rotate-me",
+                    "value": "new-secret",
+                    "description": "version 2",
+                    "overwrite": true
+                }
+            }
+        }),
+    );
+    let update_text = update_resp["result"]["content"][0]["text"]
+        .as_str()
+        .expect("update text");
+    let updated: Value = serde_json::from_str(update_text).expect("parse update json");
+    assert_eq!(updated["action"], "updated");
+    assert_eq!(
+        updated["wisp_token"].as_str().expect("updated token"),
+        original_token,
+        "wisp token must be preserved on overwrite"
+    );
+}
+
+#[test]
+fn delete_removes_credential() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+
+    call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_set",
+                "arguments": { "name": "ephemeral-key", "value": "temp-secret" }
+            }
+        }),
+    );
+
+    let response = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_delete",
+                "arguments": { "name": "ephemeral-key" }
+            }
+        }),
+    );
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("delete text");
+    let parsed: Value = serde_json::from_str(text).expect("parse delete json");
+    assert_eq!(parsed["action"], "deleted");
+    assert_eq!(parsed["name"], "ephemeral-key");
+
+    let list = run_wispkey_json(vault_dir.path(), &["--format", "json", "list"]);
+    let names = credential_names(&list);
+    assert!(
+        !names.contains(&"ephemeral-key".to_string()),
+        "credential should be gone after delete"
+    );
+}
+
+#[test]
+fn delete_returns_error_for_missing_credential() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+
+    let response = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_delete",
+                "arguments": { "name": "nonexistent" }
+            }
+        }),
+    );
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        text.contains("not found"),
+        "expected not-found error, got: {text}"
+    );
+    assert!(
+        response["result"]["isError"].as_bool().unwrap_or(false),
+        "expected isError flag"
+    );
+}
+
+#[test]
+fn tools_list_includes_issue_cert() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+
+    let response = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list"
+        }),
+    );
+
+    let names = response["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name").to_string())
+        .collect::<Vec<_>>();
+    assert!(
+        names.contains(&"wispkey_issue_cert".to_string()),
+        "expected wispkey_issue_cert in {names:?}"
+    );
+}
+
+#[test]
+fn issue_cert_returns_leaf_and_never_ca_key() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let (bundle, ca_cert_pem, ca_key_pem) = test_ca_bundle();
+    add_ca_credential(vault_dir.path(), "lab-ca", &bundle);
+
+    let response = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_issue_cert",
+                "arguments": {
+                    "ca_credential": "lab-ca",
+                    "common_name": "blackbox-exporter",
+                    "san": ["blackbox.internal"],
+                    "validity_days": 30,
+                    "key_type": "ec-p256"
+                }
+            }
+        }),
+    );
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("mcp text response");
+    assert!(
+        !response["result"]["isError"].as_bool().unwrap_or(false),
+        "issue_cert failed: {text}"
+    );
+    let parsed: Value = serde_json::from_str(text).expect("parse inner json");
+    assert_eq!(parsed["action"], "issued");
+    assert_eq!(parsed["common_name"], "blackbox-exporter");
+    assert_eq!(parsed["source"], "generated");
+    let certificate_pem = parsed["certificate_pem"].as_str().expect("certificate_pem");
+    let private_key_pem = parsed["private_key_pem"].as_str().expect("private_key_pem");
+    assert!(certificate_pem.contains("BEGIN CERTIFICATE"));
+    assert!(private_key_pem.contains("BEGIN PRIVATE KEY"));
+    assert_mcp_leaf_valid(certificate_pem, Some(private_key_pem), &ca_cert_pem);
+    assert!(
+        !compact_text(text).contains(&ca_private_key_body(&ca_key_pem)),
+        "response leaked CA private key material"
+    );
+
+    let log = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "log",
+            "--last",
+            "20",
+            "--credential",
+            "lab-ca",
+        ],
+    );
+    let entries = log["entries"].as_array().expect("audit entries");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["event_type"] == "CertificateIssued"
+                && entry["credential_name"] == "lab-ca"
+                && entry["target_host"] == "blackbox-exporter"),
+        "expected CertificateIssued audit row, got {log}"
+    );
+    let serialized = serde_json::to_string(&log).expect("serialize audit");
+    assert!(!compact_text(&serialized).contains(&ca_private_key_body(&ca_key_pem)));
+    assert!(!serialized.contains("BEGIN PRIVATE KEY"));
+}
+
+#[test]
+fn issue_cert_signs_csr_without_leaf_key() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let (bundle, ca_cert_pem, ca_key_pem) = test_ca_bundle();
+    add_ca_credential(vault_dir.path(), "csr-ca", &bundle);
+
+    let mut params = rcgen::CertificateParams::new(vec!["csr.internal".into()]).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "csr-leaf");
+    let leaf_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let csr = params.serialize_request(&leaf_key).unwrap().pem().unwrap();
+
+    let response = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_issue_cert",
+                "arguments": {
+                    "ca_credential": "csr-ca",
+                    "csr": csr
+                }
+            }
+        }),
+    );
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("mcp text response");
+    let parsed: Value = serde_json::from_str(text).expect("parse inner json");
+    assert_eq!(parsed["action"], "issued");
+    assert_eq!(parsed["source"], "csr");
+    assert_eq!(parsed["common_name"], "csr-leaf");
+    assert!(parsed.get("private_key_pem").is_none());
+    let certificate_pem = parsed["certificate_pem"].as_str().expect("certificate_pem");
+    assert_mcp_leaf_valid(
+        certificate_pem,
+        Some(&leaf_key.serialize_pem()),
+        &ca_cert_pem,
+    );
+    assert!(!compact_text(text).contains(&ca_private_key_body(&ca_key_pem)));
+}
+
+#[test]
+fn issue_cert_rejects_missing_ca_and_does_not_use_sideload() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+
     let mut child = wispkey_bin()
         .args(["mcp", "serve"])
-        .env("WISPKEY_VAULT_PATH", vault_dir)
+        .env("WISPKEY_VAULT_PATH", vault_dir.path())
         .env("WISPKEY_PASSWORD", "test-password")
+        .env("WISPKEY_SIDELOAD_LAB_CA", "sideload-is-not-a-ca")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mcp server");
+    {
+        let stdin = child.stdin.as_mut().expect("mcp stdin");
+        writeln!(
+            stdin,
+            "{}",
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "wispkey_issue_cert",
+                    "arguments": {
+                        "ca_credential": "lab-ca",
+                        "common_name": "svc.internal"
+                    }
+                }
+            })
+        )
+        .expect("write mcp request");
+    }
+    drop(child.stdin.take());
+    let output = child.wait_with_output().expect("wait for mcp server");
+    let response: Value = serde_json::from_slice(&output.stdout).expect("mcp response json");
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        text.contains("not found"),
+        "expected missing CA credential, got: {text}"
+    );
+    assert!(response["result"]["isError"].as_bool().unwrap_or(false));
+}
+
+#[test]
+fn issue_cert_requires_common_name_or_csr() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let (bundle, _, _) = test_ca_bundle();
+    add_ca_credential(vault_dir.path(), "lab-ca", &bundle);
+
+    let response = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_issue_cert",
+                "arguments": { "ca_credential": "lab-ca" }
+            }
+        }),
+    );
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        text.contains("missing required argument: common_name"),
+        "expected common_name requirement, got: {text}"
+    );
+    assert!(response["result"]["isError"].as_bool().unwrap_or(false));
+}
+
+#[test]
+fn issue_cert_rejects_locked_vault() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let (bundle, _, _) = test_ca_bundle();
+    add_ca_credential(vault_dir.path(), "lab-ca", &bundle);
+    std::fs::remove_file(vault_dir.path().join("session")).expect("remove session");
+
+    let response = call_mcp_tool_without_password(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_issue_cert",
+                "arguments": {
+                    "ca_credential": "lab-ca",
+                    "common_name": "svc.internal"
+                }
+            }
+        }),
+    );
+
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        text.contains("locked") || text.contains("session"),
+        "expected locked vault error, got: {text}"
+    );
+    assert!(response["result"]["isError"].as_bool().unwrap_or(false));
+}
+
+#[test]
+fn issue_cert_scopes_ca_lookup_to_requested_project() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    run_wispkey_json(
+        vault_dir.path(),
+        &["--format", "json", "project", "create", "client-alpha"],
+    );
+    let (bundle, ca_cert_pem, _) = test_ca_bundle();
+    add_ca_in_project(vault_dir.path(), "lab-ca", &bundle, Some("client-alpha"));
+
+    let missing = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_issue_cert",
+                "arguments": {
+                    "ca_credential": "lab-ca",
+                    "common_name": "svc.internal"
+                }
+            }
+        }),
+    );
+    let missing_text = missing["result"]["content"][0]["text"]
+        .as_str()
+        .expect("error text");
+    assert!(
+        missing_text.contains("not found"),
+        "CA in another project must be out of scope, got: {missing_text}"
+    );
+    assert!(missing["result"]["isError"].as_bool().unwrap_or(false));
+
+    let response = call_mcp_tool(
+        vault_dir.path(),
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "wispkey_issue_cert",
+                "arguments": {
+                    "ca_credential": "lab-ca",
+                    "common_name": "svc.internal",
+                    "project": "client-alpha"
+                }
+            }
+        }),
+    );
+    let text = response["result"]["content"][0]["text"]
+        .as_str()
+        .expect("mcp text response");
+    assert!(
+        !response["result"]["isError"].as_bool().unwrap_or(false),
+        "issue_cert in scoped project failed: {text}"
+    );
+    let parsed: Value = serde_json::from_str(text).expect("parse inner json");
+    assert_eq!(parsed["action"], "issued");
+    assert_eq!(parsed["project"], "client-alpha");
+    assert_mcp_leaf_valid(
+        parsed["certificate_pem"].as_str().expect("certificate_pem"),
+        parsed["private_key_pem"].as_str(),
+        &ca_cert_pem,
+    );
+}
+
+fn add_ca_credential(vault_dir: &std::path::Path, name: &str, bundle: &str) {
+    add_ca_in_project(vault_dir, name, bundle, None);
+}
+
+fn add_ca_in_project(vault_dir: &std::path::Path, name: &str, bundle: &str, project: Option<&str>) {
+    let pem_path = vault_dir.join(format!("{name}.pem"));
+    write_private_test_file(&pem_path, bundle);
+    let pem = pem_path.to_str().expect("utf8 pem path");
+    match project {
+        Some(project) => {
+            run_wispkey_json(
+                vault_dir,
+                &[
+                    "--format",
+                    "json",
+                    "add",
+                    name,
+                    "--type",
+                    "api_key",
+                    "--value-file",
+                    pem,
+                    "--tags",
+                    "pki,ca",
+                    "--project",
+                    project,
+                ],
+            );
+        }
+        None => {
+            run_wispkey_json(
+                vault_dir,
+                &[
+                    "--format",
+                    "json",
+                    "add",
+                    name,
+                    "--type",
+                    "api_key",
+                    "--value-file",
+                    pem,
+                    "--tags",
+                    "pki,ca",
+                ],
+            );
+        }
+    }
+}
+
+fn test_ca_bundle() -> (String, String, String) {
+    let mut params = rcgen::CertificateParams::new(Vec::new()).unwrap();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "WispKey Test CA");
+    params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    params
+        .key_usages
+        .push(rcgen::KeyUsagePurpose::DigitalSignature);
+    params.key_usages.push(rcgen::KeyUsagePurpose::KeyCertSign);
+    params.key_usages.push(rcgen::KeyUsagePurpose::CrlSign);
+    let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+    let cert = params.self_signed(&key).unwrap();
+    let key_pem = key.serialize_pem();
+    let cert_pem = cert.pem();
+    (format!("{cert_pem}{key_pem}"), cert_pem, key_pem)
+}
+
+fn assert_mcp_leaf_valid(leaf_pem: &str, leaf_key_pem: Option<&str>, ca_cert_pem: &str) {
+    let (_, leaf_block) = x509_parser::pem::parse_x509_pem(leaf_pem.as_bytes()).expect("leaf PEM");
+    let leaf = leaf_block.parse_x509().expect("parse leaf cert");
+    let (_, ca_block) = x509_parser::pem::parse_x509_pem(ca_cert_pem.as_bytes()).expect("CA PEM");
+    let ca = ca_block.parse_x509().expect("parse CA cert");
+    leaf.verify_signature(Some(ca.public_key()))
+        .expect("MCP-issued leaf must verify against the vault CA");
+
+    if let Some(key_pem) = leaf_key_pem {
+        let key = rcgen::KeyPair::from_pem(key_pem).expect("leaf key PEM");
+        assert_eq!(
+            leaf.public_key().subject_public_key.data.as_ref(),
+            key.public_key_raw(),
+            "leaf private key must match the issued certificate"
+        );
+    }
+
+    if let Some(extension) = leaf.basic_constraints().unwrap() {
+        assert!(!extension.value.ca, "MCP leaf must not be a CA");
+    }
+    let key_usage = leaf.key_usage().unwrap().expect("leaf Key Usage");
+    assert!(key_usage.value.digital_signature());
+    assert!(!key_usage.value.key_cert_sign());
+    let eku = leaf
+        .extended_key_usage()
+        .unwrap()
+        .expect("leaf Extended Key Usage");
+    assert!(eku.value.server_auth);
+    assert!(eku.value.client_auth);
+}
+
+fn ca_private_key_body(key_pem: &str) -> String {
+    key_pem
+        .lines()
+        .filter(|line| !line.contains("-----"))
+        .collect::<String>()
+}
+
+fn compact_text(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_whitespace()).collect()
+}
+
+fn call_mcp_tool(vault_dir: &std::path::Path, request: Value) -> Value {
+    call_mcp_tool_with_password(vault_dir, request, Some("test-password"))
+}
+
+fn call_mcp_tool_without_password(vault_dir: &std::path::Path, request: Value) -> Value {
+    call_mcp_tool_with_password(vault_dir, request, None)
+}
+
+fn call_mcp_tool_with_password(
+    vault_dir: &std::path::Path,
+    request: Value,
+    password: Option<&str>,
+) -> Value {
+    let mut command = wispkey_bin();
+    command
+        .args(["mcp", "serve"])
+        .env("WISPKEY_VAULT_PATH", vault_dir)
+        .env_remove("WISPKEY_PASSWORD")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(password) = password {
+        command.env("WISPKEY_PASSWORD", password);
+    }
+    let mut child = command.spawn().expect("spawn mcp server");
 
     {
         let stdin = child.stdin.as_mut().expect("mcp stdin");

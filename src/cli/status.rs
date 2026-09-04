@@ -30,6 +30,24 @@ pub async fn handle_status() {
                 .vault_created_at()
                 .unwrap_or_else(|_| "unknown".to_string());
             let session_active = Vault::open_with_session().is_ok();
+            let (session_expires_at, session_timeout_minutes) = if session_active {
+                Vault::session_metadata()
+                    .ok()
+                    .map(|(issued_at, timeout)| {
+                        let expires_at = if timeout > 0 {
+                            issued_at
+                                .checked_add_signed(chrono::Duration::minutes(timeout))
+                                .map(|ts| ts.to_rfc3339())
+                        } else {
+                            None
+                        };
+                        (expires_at, Some(timeout))
+                    })
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+            let protector = Vault::protector_status();
             let proxy_status = lifecycle::read_status().await;
 
             if json_output() {
@@ -38,7 +56,14 @@ pub async fn handle_status() {
                     "created_at": created,
                     "credential_count": count,
                     "session_active": session_active,
+                    "session_timeout_minutes": session_timeout_minutes,
+                    "session_expires_at": session_expires_at,
                     "session_protection": Vault::session_protection_label(),
+                    "protector_available": protector.available,
+                    "protector_backend": protector.backend.map(|backend| backend.label()),
+                    "protector_preference": protector.preference,
+                    "protector_timeout_minutes": protector.timeout_minutes,
+                    "protector_expires_at": protector.expires_at.map(|ts| ts.to_rfc3339()),
                     "active_project": core::resolve_active_project(),
                     "proxy_running": proxy_status.running,
                     "proxy_status": proxy_status.state.as_str(),
@@ -56,6 +81,20 @@ pub async fn handle_status() {
                 if session_active { "active" } else { "locked" }
             );
             println!("Protection:  {}", Vault::session_protection_label());
+            if let Some(expires_at) = session_expires_at {
+                println!("Expires:     {}", expires_at);
+            }
+            println!(
+                "Protector:   {}",
+                if protector.available {
+                    protector
+                        .backend
+                        .map(|backend| backend.label())
+                        .unwrap_or("available")
+                } else {
+                    "none"
+                }
+            );
 
             if let Some(metadata) = &proxy_status.metadata {
                 let detail = proxy_status

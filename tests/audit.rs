@@ -10,7 +10,7 @@ fn audit_export_jsonl_outputs_matching_range_without_secret_values() {
     let vault_dir = tempfile::tempdir().expect("temp vault dir");
     init_vault(vault_dir.path());
 
-    run_wispkey_json(
+    let created = run_wispkey_json(
         vault_dir.path(),
         &[
             "--format",
@@ -23,6 +23,9 @@ fn audit_export_jsonl_outputs_matching_range_without_secret_values() {
             AUDIT_SECRET,
         ],
     );
+    let wisp_token = created["credential"]["wisp_token"]
+        .as_str()
+        .expect("wisp token");
 
     let output = run_wispkey(
         vault_dir.path(),
@@ -54,6 +57,8 @@ fn audit_export_jsonl_outputs_matching_range_without_secret_values() {
         assert_eq!(entry["credential_name"], "audit-key");
     }
     assert!(!stdout.contains(AUDIT_SECRET));
+    assert!(!stdout.contains(wisp_token));
+    assert!(lines.iter().all(|line| line.contains("token_fingerprint")));
 
     let empty = run_wispkey(
         vault_dir.path(),
@@ -83,7 +88,7 @@ fn audit_export_json_array_writes_output_file_and_tail_prints_jsonl() {
     let export_path_string = export_path.to_string_lossy().to_string();
     init_vault(vault_dir.path());
 
-    run_wispkey_json(
+    let created = run_wispkey_json(
         vault_dir.path(),
         &[
             "--format",
@@ -96,6 +101,9 @@ fn audit_export_json_array_writes_output_file_and_tail_prints_jsonl() {
             AUDIT_SECRET,
         ],
     );
+    let wisp_token = created["credential"]["wisp_token"]
+        .as_str()
+        .expect("wisp token");
 
     let export = run_wispkey(
         vault_dir.path(),
@@ -122,6 +130,7 @@ fn audit_export_json_array_writes_output_file_and_tail_prints_jsonl() {
         entry["event_type"] == "CredentialAdded" && entry["credential_name"] == "tail-key"
     }));
     assert!(!exported.contains(AUDIT_SECRET));
+    assert!(!exported.contains(wisp_token));
 
     let tail = run_wispkey(
         vault_dir.path(),
@@ -135,6 +144,7 @@ fn audit_export_json_array_writes_output_file_and_tail_prints_jsonl() {
     );
     let tail_stdout = String::from_utf8_lossy(&tail.stdout);
     assert!(!tail_stdout.contains(AUDIT_SECRET));
+    assert!(!tail_stdout.contains(wisp_token));
     let first_line = tail_stdout
         .lines()
         .find(|line| !line.trim().is_empty())

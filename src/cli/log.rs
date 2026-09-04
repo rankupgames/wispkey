@@ -24,7 +24,7 @@ pub async fn handle_log(last: usize, credential: Option<&str>, since: Option<&st
                     "timestamp": entry.timestamp,
                     "event_type": entry.event_type,
                     "credential_name": entry.credential_name,
-                    "wisp_token": entry.wisp_token,
+                    "token_fingerprint": entry.token_fingerprint,
                     "target_host": entry.target_host,
                     "target_path": entry.target_path,
                     "http_method": entry.http_method,

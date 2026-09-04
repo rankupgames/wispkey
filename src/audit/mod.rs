@@ -8,18 +8,195 @@
  * Last Modified: 2026-04-13
  */
 
+use std::fmt::Write as _;
+use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use regex::Regex;
+use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use crate::core::Vault;
 use crate::secure_files;
 
 pub const SIDELOAD_FALLBACK_AUDIT_FILE: &str = "sideload-audit.jsonl";
+const AUDIT_FINGERPRINT_KEY_FILE: &str = "audit-fingerprint.key";
+const AUDIT_FINGERPRINT_KEY_LEN: usize = 32;
+const AUDIT_REDACTION_MARKER: &str = "audit_tokens_redacted_v1";
+
+fn redact_capabilities(value: Option<&str>) -> Option<String> {
+    static WISP_TOKEN_PATTERN: OnceLock<Regex> = OnceLock::new();
+    let pattern = WISP_TOKEN_PATTERN.get_or_init(|| {
+        Regex::new(r"wk_[A-Za-z0-9_-]+").expect("static wisp token regex must compile")
+    });
+    value.map(|value| pattern.replace_all(value, "[wisp-token]").into_owned())
+}
+
+fn redact_required(value: &str) -> String {
+    redact_capabilities(Some(value)).unwrap_or_default()
+}
+
+fn token_fingerprint(token: &str, key_material: &[u8]) -> String {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, key_material);
+    let digest = hmac::sign(&key, token.as_bytes());
+    let mut fingerprint = String::with_capacity(12 + digest.as_ref().len() * 2);
+    fingerprint.push_str("hmac-sha256:");
+    for byte in digest.as_ref() {
+        let _ = write!(&mut fingerprint, "{byte:02x}");
+    }
+    fingerprint
+}
+
+fn stored_token_fingerprint(value: Option<String>) -> Option<String> {
+    value.filter(|value| value.starts_with("hmac-sha256:"))
+}
+
+fn database_fingerprint_key(db: &Connection) -> Option<String> {
+    db.query_row(
+        "SELECT value FROM vault_meta WHERE key = 'password_hash'",
+        [],
+        |row| row.get(0),
+    )
+    .ok()
+}
+
+fn fallback_fingerprint_key() -> Option<Vec<u8>> {
+    let path = Vault::vault_dir().join(AUDIT_FINGERPRINT_KEY_FILE);
+    match fs::read(&path) {
+        Ok(key) if key.len() == AUDIT_FINGERPRINT_KEY_LEN => return Some(key),
+        Ok(_) => {
+            tracing::error!("Invalid audit fingerprint key length");
+            return None;
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            tracing::error!("Failed to read audit fingerprint key: {error}");
+            return None;
+        }
+        Err(_) => {}
+    }
+
+    let mut key = vec![0u8; AUDIT_FINGERPRINT_KEY_LEN];
+    if let Err(error) = SystemRandom::new().fill(&mut key) {
+        tracing::error!("Failed to generate audit fingerprint key: {error}");
+        return None;
+    }
+    match secure_files::create_private(&path, &key) {
+        Ok(true) => Some(key),
+        Ok(false) => match fs::read(&path) {
+            Ok(winning_key) if winning_key.len() == AUDIT_FINGERPRINT_KEY_LEN => Some(winning_key),
+            Ok(_) => {
+                tracing::error!("Invalid concurrently-created audit fingerprint key length");
+                None
+            }
+            Err(error) => {
+                tracing::error!(
+                    "Failed to read concurrently-created audit fingerprint key: {error}"
+                );
+                None
+            }
+        },
+        Err(error) => {
+            tracing::error!("Failed to store audit fingerprint key: {error}");
+            None
+        }
+    }
+}
+
+pub(crate) fn redact_legacy_audit_tokens(db: &Connection) -> rusqlite::Result<()> {
+    let already_redacted = db
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key = ?1",
+            params![AUDIT_REDACTION_MARKER],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .is_some_and(|value| value == "1");
+    if already_redacted {
+        return Ok(());
+    }
+
+    let mut statement = db.prepare(
+        "SELECT id, wisp_token, event_type, credential_name, target_host, target_path,
+                http_method, deny_reason, project_name
+         FROM audit_log
+         WHERE wisp_token LIKE 'wk_%'
+            OR event_type LIKE '%wk_%'
+            OR credential_name LIKE '%wk_%'
+            OR target_host LIKE '%wk_%'
+            OR target_path LIKE '%wk_%'
+            OR http_method LIKE '%wk_%'
+            OR deny_reason LIKE '%wk_%'
+            OR project_name LIKE '%wk_%'
+         ORDER BY id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, Option<String>>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, Option<String>>(6)?,
+            row.get::<_, Option<String>>(7)?,
+            row.get::<_, Option<String>>(8)?,
+        ))
+    })?;
+    let legacy_tokens = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    drop(statement);
+
+    let key = database_fingerprint_key(db);
+    for (
+        id,
+        token,
+        event_type,
+        credential_name,
+        target_host,
+        target_path,
+        http_method,
+        deny_reason,
+        project_name,
+    ) in legacy_tokens
+    {
+        let fingerprint = token.as_deref().and_then(|token| {
+            if token.starts_with("wk_") {
+                key.as_deref()
+                    .map(|key| token_fingerprint(token, key.as_bytes()))
+            } else {
+                stored_token_fingerprint(Some(token.to_string()))
+            }
+        });
+        db.execute(
+            "UPDATE audit_log
+             SET wisp_token = ?1, event_type = ?2, credential_name = ?3, target_host = ?4,
+                 target_path = ?5, http_method = ?6, deny_reason = ?7, project_name = ?8
+             WHERE id = ?9",
+            params![
+                fingerprint,
+                redact_required(&event_type),
+                redact_capabilities(credential_name.as_deref()),
+                redact_capabilities(target_host.as_deref()),
+                redact_capabilities(target_path.as_deref()),
+                redact_capabilities(http_method.as_deref()),
+                redact_capabilities(deny_reason.as_deref()),
+                redact_capabilities(project_name.as_deref()),
+                id
+            ],
+        )?;
+    }
+    db.execute(
+        "INSERT INTO vault_meta (key, value) VALUES (?1, '1')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![AUDIT_REDACTION_MARKER],
+    )?;
+    Ok(())
+}
 
 /// Single row from the audit log.
 #[derive(Debug, Clone, Serialize)]
@@ -28,7 +205,7 @@ pub struct AuditEntry {
     pub timestamp: String,
     pub event_type: String,
     pub credential_name: Option<String>,
-    pub wisp_token: Option<String>,
+    pub token_fingerprint: Option<String>,
     pub target_host: Option<String>,
     pub target_path: Option<String>,
     pub http_method: Option<String>,
@@ -54,9 +231,20 @@ pub fn log_event(
     deny_reason: Option<&str>,
     project_name: Option<&str>,
 ) {
+    let key = database_fingerprint_key(db);
+    let token_fingerprint = wisp_token
+        .zip(key.as_deref())
+        .map(|(token, key)| token_fingerprint(token, key.as_bytes()));
+    let event_type = redact_required(event_type);
+    let credential_name = redact_capabilities(credential_name);
+    let target_host = redact_capabilities(target_host);
+    let target_path = redact_capabilities(target_path);
+    let http_method = redact_capabilities(http_method);
+    let deny_reason = redact_capabilities(deny_reason);
+    let project_name = redact_capabilities(project_name);
     let result = db.execute(
 		"INSERT INTO audit_log (timestamp, event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied, deny_reason, project_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-		params![Utc::now().to_rfc3339(), event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied as i32, deny_reason, project_name],
+		params![Utc::now().to_rfc3339(), event_type, credential_name, token_fingerprint, target_host, target_path, http_method, response_status, denied as i32, deny_reason, project_name],
 	);
     if let Err(e) = result {
         tracing::error!("Failed to write audit log: {}", e);
@@ -64,18 +252,18 @@ pub fn log_event(
 }
 
 #[derive(Debug, Serialize)]
-struct FallbackAuditEntry<'a> {
+struct FallbackAuditEntry {
     timestamp: String,
-    event_type: &'a str,
-    credential_name: Option<&'a str>,
-    wisp_token: Option<&'a str>,
-    target_host: Option<&'a str>,
-    target_path: Option<&'a str>,
-    http_method: Option<&'a str>,
+    event_type: String,
+    credential_name: Option<String>,
+    token_fingerprint: Option<String>,
+    target_host: Option<String>,
+    target_path: Option<String>,
+    http_method: Option<String>,
     response_status: Option<u16>,
     denied: bool,
-    deny_reason: Option<&'a str>,
-    project_name: Option<&'a str>,
+    deny_reason: Option<String>,
+    project_name: Option<String>,
     sink: &'static str,
 }
 
@@ -84,6 +272,9 @@ struct FallbackAuditLine {
     timestamp: String,
     event_type: String,
     credential_name: Option<String>,
+    #[serde(default)]
+    token_fingerprint: Option<String>,
+    #[serde(default)]
     wisp_token: Option<String>,
     target_host: Option<String>,
     target_path: Option<String>,
@@ -109,11 +300,21 @@ pub fn log_fallback_event(
     deny_reason: Option<&str>,
     project_name: Option<&str>,
 ) {
+    let key = fallback_fingerprint_key();
+    let event_type = redact_required(event_type);
+    let credential_name = redact_capabilities(credential_name);
+    let target_host = redact_capabilities(target_host);
+    let target_path = redact_capabilities(target_path);
+    let http_method = redact_capabilities(http_method);
+    let deny_reason = redact_capabilities(deny_reason);
+    let project_name = redact_capabilities(project_name);
     let entry = FallbackAuditEntry {
         timestamp: Utc::now().to_rfc3339(),
         event_type,
         credential_name,
-        wisp_token,
+        token_fingerprint: wisp_token
+            .zip(key.as_deref())
+            .map(|(token, key)| token_fingerprint(token, key)),
         target_host,
         target_path,
         http_method,
@@ -213,12 +414,12 @@ pub fn query_log(
         Ok(AuditEntry {
             id: row.get(0)?,
             timestamp: row.get(1)?,
-            event_type: row.get(2)?,
-            credential_name: row.get(3)?,
-            wisp_token: row.get(4)?,
-            target_host: row.get(5)?,
-            target_path: row.get(6)?,
-            http_method: row.get(7)?,
+            event_type: redact_required(&row.get::<_, String>(2)?),
+            credential_name: redact_capabilities(row.get::<_, Option<String>>(3)?.as_deref()),
+            token_fingerprint: stored_token_fingerprint(row.get(4)?),
+            target_host: redact_capabilities(row.get::<_, Option<String>>(5)?.as_deref()),
+            target_path: redact_capabilities(row.get::<_, Option<String>>(6)?.as_deref()),
+            http_method: redact_capabilities(row.get::<_, Option<String>>(7)?.as_deref()),
             response_status: row
                 .get::<_, Option<i64>>(8)?
                 .map(u16::try_from)
@@ -231,8 +432,8 @@ pub fn query_log(
                     )
                 })?,
             denied: row.get::<_, i32>(9)? != 0,
-            deny_reason: row.get(10)?,
-            project_name: row.get(11)?,
+            deny_reason: redact_capabilities(row.get::<_, Option<String>>(10)?.as_deref()),
+            project_name: redact_capabilities(row.get::<_, Option<String>>(11)?.as_deref()),
             source: "vault".to_string(),
         })
     }) {
@@ -388,22 +589,34 @@ fn query_fallback_log_from_path(
             continue;
         }
 
+        let token_fingerprint = if row.wisp_token.is_some() {
+            None
+        } else {
+            row.token_fingerprint
+                .filter(|value| value.starts_with("hmac-sha256:"))
+        };
+        let event_type = redact_required(&row.event_type);
+        let credential_name = redact_capabilities(row.credential_name.as_deref());
+        let target_host = redact_capabilities(row.target_host.as_deref());
+        let target_path = redact_capabilities(row.target_path.as_deref());
+        let http_method = redact_capabilities(row.http_method.as_deref());
+        let deny_reason = redact_capabilities(row.deny_reason.as_deref());
+        let project_name = redact_capabilities(row.project_name.as_deref());
+        let source = redact_required(row.sink.as_deref().unwrap_or("sideload-fallback-jsonl"));
         entries.push(AuditEntry {
             id: -((line_index as i64) + 1),
             timestamp: row.timestamp,
-            event_type: row.event_type,
-            credential_name: row.credential_name,
-            wisp_token: row.wisp_token,
-            target_host: row.target_host,
-            target_path: row.target_path,
-            http_method: row.http_method,
+            event_type,
+            credential_name,
+            token_fingerprint,
+            target_host,
+            target_path,
+            http_method,
             response_status: row.response_status,
             denied: row.denied,
-            deny_reason: row.deny_reason,
-            project_name: row.project_name,
-            source: row
-                .sink
-                .unwrap_or_else(|| "sideload-fallback-jsonl".to_string()),
+            deny_reason,
+            project_name,
+            source,
         });
     }
 
@@ -438,12 +651,12 @@ fn read_audit_rows(
         Ok(AuditEntry {
             id: row.get(0)?,
             timestamp: row.get(1)?,
-            event_type: row.get(2)?,
-            credential_name: row.get(3)?,
-            wisp_token: row.get(4)?,
-            target_host: row.get(5)?,
-            target_path: row.get(6)?,
-            http_method: row.get(7)?,
+            event_type: redact_required(&row.get::<_, String>(2)?),
+            credential_name: redact_capabilities(row.get::<_, Option<String>>(3)?.as_deref()),
+            token_fingerprint: stored_token_fingerprint(row.get(4)?),
+            target_host: redact_capabilities(row.get::<_, Option<String>>(5)?.as_deref()),
+            target_path: redact_capabilities(row.get::<_, Option<String>>(6)?.as_deref()),
+            http_method: redact_capabilities(row.get::<_, Option<String>>(7)?.as_deref()),
             response_status: row
                 .get::<_, Option<i64>>(8)?
                 .map(u16::try_from)
@@ -456,8 +669,8 @@ fn read_audit_rows(
                     )
                 })?,
             denied: row.get::<_, i32>(9)? != 0,
-            deny_reason: row.get(10)?,
-            project_name: row.get(11)?,
+            deny_reason: redact_capabilities(row.get::<_, Option<String>>(10)?.as_deref()),
+            project_name: redact_capabilities(row.get::<_, Option<String>>(11)?.as_deref()),
             source: "vault".to_string(),
         })
     }) {
@@ -568,7 +781,12 @@ mod tests {
                 denied INTEGER NOT NULL DEFAULT 0,
                 deny_reason TEXT,
                 project_name TEXT
-            );",
+            );
+            CREATE TABLE vault_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO vault_meta (key, value) VALUES ('password_hash', 'audit-test-key');",
         )
         .unwrap();
         db
@@ -594,6 +812,16 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].event_type, "credential_accessed");
         assert_eq!(entries[0].credential_name.as_deref(), Some("my-key"));
+        assert!(
+            entries[0]
+                .token_fingerprint
+                .as_deref()
+                .is_some_and(|value| value.starts_with("hmac-sha256:"))
+        );
+        let stored: String = db
+            .query_row("SELECT wisp_token FROM audit_log", [], |row| row.get(0))
+            .unwrap();
+        assert!(!stored.contains("wk_my_key_abc"));
         assert_eq!(entries[0].response_status, Some(200));
         assert!(!entries[0].denied);
     }
@@ -607,17 +835,24 @@ mod tests {
             Some("secret"),
             Some("wk_secret_xyz"),
             Some("evil.com"),
-            Some("/steal"),
+            Some("/steal/foowk_secret_xyz"),
             Some("POST"),
             None,
             true,
-            Some("host not allowed"),
+            Some("unknown token wk_secret_xyz"),
             None,
         );
         let entries = query_log(&db, 10, None, None);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].denied);
-        assert_eq!(entries[0].deny_reason.as_deref(), Some("host not allowed"));
+        assert_eq!(
+            entries[0].target_path.as_deref(),
+            Some("/steal/foo[wisp-token]")
+        );
+        assert_eq!(
+            entries[0].deny_reason.as_deref(),
+            Some("unknown token [wisp-token]")
+        );
     }
 
     #[test]
@@ -737,7 +972,7 @@ mod tests {
             "credential_name": "WISPKEY_SIDELOAD_OPENAI",
             "wisp_token": "wk_env_openai",
             "target_host": "api.example.com",
-            "target_path": "/v1/test",
+            "target_path": "/v1/foowk_env_openai",
             "http_method": "GET",
             "response_status": 200,
             "denied": false,
@@ -755,10 +990,15 @@ mod tests {
             entries[0].credential_name.as_deref(),
             Some("WISPKEY_SIDELOAD_OPENAI")
         );
-        assert_eq!(entries[0].wisp_token.as_deref(), Some("wk_env_openai"));
+        assert!(entries[0].token_fingerprint.is_none());
+        assert_eq!(
+            entries[0].target_path.as_deref(),
+            Some("/v1/foo[wisp-token]")
+        );
         assert_eq!(entries[0].source, "sideload-fallback-jsonl");
 
         let serialized = serde_json::to_string(&entries).unwrap();
+        assert!(!serialized.contains("wk_env_openai"));
         assert!(!serialized.contains("sideload-secret"));
     }
 }

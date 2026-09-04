@@ -28,6 +28,15 @@ cargo clippy -- -D warnings
 cargo test
 ```
 
+Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). The optional `wispkey-tray` GUI is a workspace member but is not required for CI. To build it locally on Debian/Ubuntu:
+
+```bash
+sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
+cargo build -p wispkey-tray
+```
+
+See [`docs/tray.md`](docs/tray.md) for owner IPC and tray usage.
+
 4. Open a PR against `main`
 
 ## What We're Looking For

@@ -21,6 +21,48 @@ fn start_proxy(vault_dir: &std::path::Path) -> (ChildGuard, u16) {
 }
 
 #[test]
+fn proxy_refuses_generic_website_login_token_substitution() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let generated = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "login",
+            "generate",
+            "blocked-login",
+            "--username",
+            "user@example.com",
+            "--url",
+            "https://example.com",
+        ],
+    );
+    let token = generated["credential"]["wisp_token"]
+        .as_str()
+        .expect("wisp token");
+    let (_guard, proxy_port) = start_proxy(vault_dir.path());
+    let request = format!(
+        "POST http://example.com/login HTTP/1.1\r\n\
+         Host: example.com\r\n\
+         Content-Type: text/plain\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        token.len(),
+        token
+    );
+    let mut stream = TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect to proxy");
+    stream
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = String::new();
+    stream.read_to_string(&mut response).expect("read response");
+
+    assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+    assert!(response.contains("approved local fill flow"), "{response}");
+}
+
+#[test]
 fn bundle_passphrase_file_roundtrips_multiline_secret_through_proxy() {
     let source_dir = tempfile::tempdir().expect("source vault dir");
     let destination_dir = tempfile::tempdir().expect("destination vault dir");

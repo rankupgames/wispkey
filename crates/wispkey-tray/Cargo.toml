@@ -1,0 +1,20 @@
+[package]
+name = "wispkey-tray"
+version = "0.4.0"
+edition = "2024"
+authors = ["Miguel A. Lopez <miguel@rankupgames.com>"]
+description = "Optional WispKey desktop tray UI for secure credential entry"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+wispkey = { path = "../.." }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+dirs = "6"
+tao = "0.32"
+tray-icon = "0.21"
+wry = "0.53"
