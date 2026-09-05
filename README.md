@@ -18,14 +18,14 @@ wispkey init
 
 # Find and attach selected secrets from an existing .env
 wispkey env list .
-wispkey env attach .env --project my-app --key OPENAI_API_KEY
+wispkey env attach .env --project my-app --key OPENAI_API_KEY --hosts api.openai.com
 wispkey project use my-app
 
 # Start the proxy
 wispkey serve
 ```
 
-The attached `.env` stays in place: selected secret values become `wk_*` tokens while ordinary settings remain unchanged. Tokens belong to the local vault and are not portable team secrets. They are placeholders, not plaintext environment injection. Requests must use a WispKey substitution path; for HTTPS, send them through reverse proxy mode with `X-Target-Url`. Use `wispkey run`, `exec`, or `inject` for non-HTTP consumers. Because attachment cannot infer target hosts, pre-provision matching host-restricted credentials or configure a policy before exposing attached tokens to an untrusted agent.
+The attached `.env` stays in place: selected secret values become `wk_*` tokens while ordinary settings remain unchanged. Tokens belong to the local vault and are not portable team secrets. They are placeholders, not plaintext environment injection. Requests must use a WispKey substitution path; for HTTPS, send them through reverse proxy mode with `X-Target-Url`. Use `wispkey run`, `exec`, or `inject` for non-HTTP consumers. Because attachment cannot infer target hosts, `--hosts` is required when it creates credentials. Use a specific hostname or bounded glob such as `*.example.com`; empty or wildcard-only scopes such as `*` are rejected. Existing matching credentials must already have a meaningful host allowlist, and attachment never broadens their stored restrictions.
 
 ## How It Works
 
@@ -313,7 +313,7 @@ Credential names are unique within a project, not across the whole vault. The sa
 
 For `.env` attachment, the WispKey project represents the source project and the filename maps to an environment partition: `.env` becomes `default`, while `.env.production` becomes `production`. Organization/account scope remains external to the local vault.
 
-`env attach` cannot infer the intended upstream host. Attached credentials have no host allowlist unless a matching environment-prefixed credential was pre-provisioned with `--hosts`; configure host restrictions or policies before treating a token as safe for an untrusted agent.
+`env attach` cannot infer the intended upstream host. New attached credentials require `--hosts` with a meaningful hostname or bounded glob. A matching environment-prefixed credential may be reused only when it already has a meaningful host allowlist; `env attach` preserves that stored allowlist and never widens it. Wildcard-only scopes such as `*` are rejected.
 
 ```bash
 wispkey project create "client-alpha" --description "Client Alpha credentials"
@@ -349,7 +349,7 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start the proxy; `SPEC` supports `tcp://host:port`, `unix:/path.sock`, feature-gated Linux `vsock://cid:port`, and `firecracker-vsock:/path.sock:port` |
 | `wispkey proxy status/stop/cleanup` | Inspect, stop, or clean up local proxy lifecycle state |
 | `wispkey env list [directory]` | Recursively list attachable `.env*` files without reading their contents; use `--format json` for automation |
-| `wispkey env attach <path> --project P --key NAME... [--environment E]` | Import selected secrets into a project/environment and replace their values with WispKey tokens in the same file |
+| `wispkey env attach <path> --project P --key NAME... [--environment E] [--hosts H]` | Import selected secrets into a project/environment with safe host scopes and replace their values with WispKey tokens in the same file |
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Legacy whole-file import that writes a sibling `.env.wispkey` file |
 | `wispkey login generate <name> --username U --url HTTPS [--project P] [--partition P] [--review-after 180d]` | Generate and store a unique website login without printing the password |
 | `wispkey login list [--due] [--project P] [--all-projects]` | List website-login metadata |

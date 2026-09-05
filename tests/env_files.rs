@@ -83,6 +83,8 @@ fn env_attach_creates_project_environment_and_only_tokenizes_selected_keys() {
         "OPENAI_API_KEY",
         "--key",
         "DATABASE_URL",
+        "--hosts",
+        "api.example.com",
         "--format",
         "json",
     ];
@@ -152,6 +154,13 @@ fn env_attach_creates_project_environment_and_only_tokenizes_selected_keys() {
             "production-openai-api-key".to_string(),
         ]
     );
+    assert!(
+        listed["credentials"]
+            .as_array()
+            .expect("credentials")
+            .iter()
+            .all(|credential| credential["hosts"] == serde_json::json!(["api.example.com"]))
+    );
 
     let attached_again = run_wispkey_json(vault_dir.path(), &args);
     assert_eq!(attached_again["imported"], 0);
@@ -160,6 +169,234 @@ fn env_attach_creates_project_environment_and_only_tokenizes_selected_keys() {
 
     #[cfg(unix)]
     assert_eq!(file_mode(&env_path), 0o600);
+}
+
+#[test]
+fn env_attach_requires_hosts_before_mutating_vault_or_file() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let env_path = workspace.path().join(".env");
+    let secret = "not-a-host-scoped-secret";
+    let original = format!("API_TOKEN={secret}\n");
+    fs::write(&env_path, &original).expect("write env");
+    let output = run_wispkey(
+        vault_dir.path(),
+        &[
+            "env",
+            "attach",
+            env_path.to_str().expect("utf-8 env path"),
+            "--project",
+            "missing-hosts-app",
+            "--key",
+            "API_TOKEN",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(fs::read_to_string(&env_path).expect("read env"), original);
+    let projects = run_wispkey_json(vault_dir.path(), &["project", "list", "--format", "json"]);
+    assert!(
+        projects["projects"]
+            .as_array()
+            .expect("projects")
+            .iter()
+            .all(|project| project["name"] != "missing-hosts-app")
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("requires --hosts"), "stderr: {stderr}");
+    assert!(!stderr.contains(secret));
+}
+
+#[test]
+fn env_attach_rejects_wildcard_only_hosts_before_mutating_vault_or_file() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let env_path = workspace.path().join(".env");
+    let secret = "wildcard-host-secret";
+    let original = format!("API_TOKEN={secret}\n");
+    fs::write(&env_path, &original).expect("write env");
+    let output = run_wispkey(
+        vault_dir.path(),
+        &[
+            "env",
+            "attach",
+            env_path.to_str().expect("utf-8 env path"),
+            "--project",
+            "wildcard-hosts-app",
+            "--key",
+            "API_TOKEN",
+            "--hosts",
+            "*",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(fs::read_to_string(&env_path).expect("read env"), original);
+    let projects = run_wispkey_json(vault_dir.path(), &["project", "list", "--format", "json"]);
+    assert!(
+        projects["projects"]
+            .as_array()
+            .expect("projects")
+            .iter()
+            .all(|project| project["name"] != "wildcard-hosts-app")
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("meaningful host restriction"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains(secret));
+}
+
+#[test]
+fn env_attach_reuses_restricted_credentials_without_broadening_hosts() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    let env_path = workspace.path().join(".env");
+    fs::write(&env_path, "API_TOKEN=stored-secret\n").expect("write env");
+    let first_args = [
+        "env",
+        "attach",
+        env_path.to_str().expect("utf-8 env path"),
+        "--project",
+        "restricted-app",
+        "--key",
+        "API_TOKEN",
+        "--hosts",
+        "api.example.com",
+        "--format",
+        "json",
+    ];
+    let initial = run_wispkey_json(vault_dir.path(), &first_args);
+    let token = initial["credentials"][0]["wisp_token"]
+        .as_str()
+        .expect("wisp token")
+        .to_string();
+
+    fs::write(&env_path, "API_TOKEN=stored-secret\n").expect("restore plaintext env");
+    let reused = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "env",
+            "attach",
+            env_path.to_str().expect("utf-8 env path"),
+            "--project",
+            "restricted-app",
+            "--key",
+            "API_TOKEN",
+            "--hosts",
+            "evil.example.com",
+            "--format",
+            "json",
+        ],
+    );
+
+    assert_eq!(reused["imported"], 0);
+    assert_eq!(reused["reused"], 1);
+    assert_eq!(reused["updated"], 1);
+    assert!(
+        fs::read_to_string(&env_path)
+            .expect("read attached env")
+            .contains(&token)
+    );
+
+    let listed = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "list",
+            "--project",
+            "restricted-app",
+            "--partition",
+            "default",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(listed["credentials"][0]["wisp_token"], token);
+    assert_eq!(
+        listed["credentials"][0]["hosts"],
+        serde_json::json!(["api.example.com"])
+    );
+}
+
+#[test]
+fn env_attach_rejects_unrestricted_or_wildcard_provisioned_credentials() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+
+    for (environment, hosts) in [("unrestricted", None), ("wildcard", Some("*"))] {
+        let project = format!("{environment}-app");
+        let credential_name = format!("{environment}-api-token");
+        assert!(
+            run_wispkey(vault_dir.path(), &["project", "create", &project])
+                .status
+                .success()
+        );
+        assert!(
+            run_wispkey(
+                vault_dir.path(),
+                &["partition", "create", environment, "--project", &project,],
+            )
+            .status
+            .success()
+        );
+
+        let mut add_args = vec![
+            "add",
+            &credential_name,
+            "--value",
+            "stored-secret",
+            "--project",
+            &project,
+            "--partition",
+            environment,
+        ];
+        if let Some(hosts) = hosts {
+            add_args.extend(["--hosts", hosts]);
+        }
+        assert!(run_wispkey(vault_dir.path(), &add_args).status.success());
+
+        let env_path = workspace.path().join(format!(".env.{environment}"));
+        let original = "API_TOKEN=stored-secret\n";
+        fs::write(&env_path, original).expect("write env");
+        let output = run_wispkey(
+            vault_dir.path(),
+            &[
+                "env",
+                "attach",
+                env_path.to_str().expect("utf-8 env path"),
+                "--project",
+                &project,
+                "--key",
+                "API_TOKEN",
+                "--format",
+                "json",
+            ],
+        );
+
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(fs::read_to_string(&env_path).expect("read env"), original);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("meaningful host restriction"),
+            "stderr: {stderr}"
+        );
+        assert!(!stderr.contains("stored-secret"));
+    }
 }
 
 #[test]
@@ -179,6 +416,8 @@ fn env_attach_conflict_leaves_file_unchanged() {
         "conflict-app",
         "--key",
         "API_TOKEN",
+        "--hosts",
+        "api.example.com",
         "--format",
         "json",
     ];
@@ -222,6 +461,8 @@ fn env_attach_scopes_the_same_key_to_separate_environment_partitions() {
                 "multi-env-app",
                 "--key",
                 "API_TOKEN",
+                "--hosts",
+                "api.example.com",
                 "--format",
                 "json",
             ],
@@ -333,6 +574,8 @@ fn env_attach_accepts_plaintext_that_only_starts_with_wk_prefix() {
             "wk-prefix-app",
             "--key",
             "API_TOKEN",
+            "--hosts",
+            "api.example.com",
             "--format",
             "json",
         ],
@@ -363,6 +606,8 @@ fn env_attach_rehardens_an_unchanged_attached_file() {
         "permissions-app",
         "--key",
         "API_TOKEN",
+        "--hosts",
+        "api.example.com",
         "--format",
         "json",
     ];
@@ -397,6 +642,8 @@ fn concurrent_env_attachments_preserve_both_tokens() {
                 "concurrent-app",
                 "--key",
                 key,
+                "--hosts",
+                "api.example.com",
                 "--format",
                 "json",
             ])
@@ -448,6 +695,8 @@ fn env_attach_text_output_does_not_repeat_token_capabilities() {
             "text-output-app",
             "--key",
             "API_TOKEN",
+            "--hosts",
+            "api.example.com",
         ],
     );
     assert!(output.status.success());
@@ -461,5 +710,4 @@ fn env_attach_text_output_does_not_repeat_token_capabilities() {
     assert!(!stdout.contains(token));
     assert!(stdout.contains("API_TOKEN -> default-api-token"));
     assert!(stdout.contains("wispkey project use text-output-app"));
-    assert!(stdout.contains("no inferred host restrictions"));
 }

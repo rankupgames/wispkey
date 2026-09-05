@@ -44,6 +44,7 @@ pub async fn handle_env_attach(
     keys: &[String],
     project: &str,
     environment: Option<&str>,
+    hosts: Option<&str>,
 ) {
     let vault = match Vault::open_with_session() {
         Ok(vault) => vault,
@@ -53,7 +54,7 @@ pub async fn handle_env_attach(
         }
     };
 
-    match migrate::attach_env_file(&vault, path, keys, project, environment) {
+    match migrate::attach_env_file(&vault, path, keys, project, environment, hosts) {
         Ok(results) => {
             if json_output() {
                 print_json(
@@ -76,7 +77,6 @@ pub async fn handle_env_attach(
             println!("  Updated in file:  {}", results.updated);
             println!();
             println!("Next: wispkey project use {}", results.project);
-            println!("Warning: attached credentials have no inferred host restrictions.");
         }
         Err(error) => {
             eprintln!("Error attaching {path}: {error}");

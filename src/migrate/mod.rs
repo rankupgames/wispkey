@@ -181,6 +181,7 @@ pub fn attach_env_file(
     keys: &[String],
     project: &str,
     environment_override: Option<&str>,
+    hosts: Option<&str>,
 ) -> crate::core::Result<AttachEnvResults> {
     let input_path = Path::new(path);
     if project.trim().is_empty() {
@@ -222,6 +223,14 @@ pub fn attach_env_file(
     let original = fs::read_to_string(&canonical_path)?;
     let entries = selected_env_entries(&original, keys)?;
     let environment = resolve_environment_name(&canonical_path, environment_override)?;
+    let host_patterns = hosts.map(parse_host_patterns);
+    if let Some(host_patterns) = host_patterns.as_ref()
+        && !has_meaningful_host_restriction(host_patterns)
+    {
+        return Err(VaultError::InvalidEnvFile(
+            "--hosts must contain a meaningful host restriction".into(),
+        ));
+    }
 
     let mut credential_names = HashSet::new();
     let mut named_entries = Vec::with_capacity(entries.len());
@@ -235,8 +244,8 @@ pub fn attach_env_file(
         named_entries.push((entry, credential_name));
     }
 
-    let project_created = match vault.get_project(project) {
-        Ok(_) => false,
+    let project_exists = match vault.get_project(project) {
+        Ok(_) => true,
         Err(VaultError::ProjectNotFound(_)) => {
             if let Some((entry, _)) = named_entries
                 .iter()
@@ -247,84 +256,86 @@ pub fn attach_env_file(
                     entry.key
                 )));
             }
-            vault.create_project(project, "")?;
-            true
+            false
         }
         Err(error) => return Err(error),
     };
-    let (partition, environment_created) = match vault
-        .get_partition_in_project(project, &environment)
-    {
-        Ok(partition) => (partition, false),
-        Err(VaultError::PartitionNotFound(_)) => {
-            if let Some((entry, _)) = named_entries
-                .iter()
-                .find(|(entry, _)| is_wisp_token(&entry.value))
-            {
-                return Err(VaultError::EnvCredentialConflict(format!(
-                    "token for '{}' cannot be attached because environment '{environment}' does not exist",
-                    entry.key
-                )));
-            }
-            for (_, credential_name) in &named_entries {
-                match vault.get_credential_in_project(project, credential_name) {
-                    Ok(_) => {
-                        return Err(VaultError::EnvCredentialConflict(format!(
-                            "credential '{credential_name}' belongs to a different environment"
-                        )));
-                    }
-                    Err(VaultError::CredentialNotFound(_)) => {}
-                    Err(error) => return Err(error),
+    let existing_partition = if project_exists {
+        match vault.get_partition_in_project(project, &environment) {
+            Ok(partition) => Some(partition),
+            Err(VaultError::PartitionNotFound(_)) => {
+                if let Some((entry, _)) = named_entries
+                    .iter()
+                    .find(|(entry, _)| is_wisp_token(&entry.value))
+                {
+                    return Err(VaultError::EnvCredentialConflict(format!(
+                        "token for '{}' cannot be attached because environment '{environment}' does not exist",
+                        entry.key
+                    )));
                 }
+                for (_, credential_name) in &named_entries {
+                    match vault.get_credential_in_project(project, credential_name) {
+                        Ok(_) => {
+                            return Err(VaultError::EnvCredentialConflict(format!(
+                                "credential '{credential_name}' belongs to a different environment"
+                            )));
+                        }
+                        Err(VaultError::CredentialNotFound(_)) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                None
             }
-            (
-                vault.create_partition(
-                    &environment,
-                    "Environment attached from a .env file",
-                    Some(project),
-                )?,
-                true,
-            )
+            Err(error) => return Err(error),
         }
-        Err(error) => return Err(error),
+    } else {
+        None
     };
 
     let mut plans = Vec::with_capacity(named_entries.len());
     for (entry, credential_name) in named_entries {
         let already_tokenized = is_wisp_token(&entry.value);
-        let credential = match vault.get_credential_in_project(project, &credential_name) {
-            Ok(credential) => {
-                if credential.partition_id.as_deref() != Some(partition.id.as_str()) {
+        let credential = if !project_exists {
+            None
+        } else {
+            match vault.get_credential_in_project(project, &credential_name) {
+                Ok(credential) => {
+                    if existing_partition
+                        .as_ref()
+                        .map(|partition| partition.id.as_str())
+                        != credential.partition_id.as_deref()
+                    {
+                        return Err(VaultError::EnvCredentialConflict(format!(
+                            "credential '{credential_name}' belongs to a different environment"
+                        )));
+                    }
+                    if already_tokenized {
+                        if credential.wisp_token != entry.value {
+                            return Err(VaultError::EnvCredentialConflict(format!(
+                                "token for '{}' does not match credential '{credential_name}'",
+                                entry.key
+                            )));
+                        }
+                    } else {
+                        let existing_value =
+                            vault.decrypt_credential_value_in_project(project, &credential_name)?;
+                        if existing_value != entry.value {
+                            return Err(VaultError::EnvCredentialConflict(format!(
+                                "credential '{credential_name}' already stores a different value"
+                            )));
+                        }
+                    }
+                    Some(credential)
+                }
+                Err(VaultError::CredentialNotFound(_)) if already_tokenized => {
                     return Err(VaultError::EnvCredentialConflict(format!(
-                        "credential '{credential_name}' belongs to a different environment"
+                        "token for '{}' is not attached to credential '{credential_name}'",
+                        entry.key
                     )));
                 }
-                if already_tokenized {
-                    if credential.wisp_token != entry.value {
-                        return Err(VaultError::EnvCredentialConflict(format!(
-                            "token for '{}' does not match credential '{credential_name}'",
-                            entry.key
-                        )));
-                    }
-                } else {
-                    let existing_value =
-                        vault.decrypt_credential_value_in_project(project, &credential_name)?;
-                    if existing_value != entry.value {
-                        return Err(VaultError::EnvCredentialConflict(format!(
-                            "credential '{credential_name}' already stores a different value"
-                        )));
-                    }
-                }
-                Some(credential)
+                Err(VaultError::CredentialNotFound(_)) => None,
+                Err(error) => return Err(error),
             }
-            Err(VaultError::CredentialNotFound(_)) if already_tokenized => {
-                return Err(VaultError::EnvCredentialConflict(format!(
-                    "token for '{}' is not attached to credential '{credential_name}'",
-                    entry.key
-                )));
-            }
-            Err(VaultError::CredentialNotFound(_)) => None,
-            Err(error) => return Err(error),
         };
 
         plans.push(AttachPlan {
@@ -334,6 +345,39 @@ pub fn attach_env_file(
             already_tokenized,
         });
     }
+
+    for plan in &plans {
+        if let Some(credential) = plan.credential.as_ref() {
+            if !has_meaningful_host_restriction(&credential.hosts) {
+                return Err(VaultError::EnvCredentialConflict(format!(
+                    "existing credential '{}' must have a meaningful host restriction",
+                    plan.credential_name
+                )));
+            }
+        } else if host_patterns.is_none() {
+            return Err(VaultError::EnvCredentialConflict(format!(
+                "new credential '{}' requires --hosts with a meaningful host restriction",
+                plan.credential_name
+            )));
+        }
+    }
+
+    let project_created = if project_exists {
+        false
+    } else {
+        vault.create_project(project, "")?;
+        true
+    };
+    let environment_created = if existing_partition.is_some() {
+        false
+    } else {
+        vault.create_partition(
+            &environment,
+            "Environment attached from a .env file",
+            Some(project),
+        )?;
+        true
+    };
 
     let mut imported = 0;
     let mut reused = 0;
@@ -346,7 +390,7 @@ pub fn attach_env_file(
             credential_type: detect_credential_type(&plan.entry.value),
             value: &plan.entry.value,
             description: None,
-            hosts: None,
+            hosts,
             tags: Some("attached"),
             partition: Some(&environment),
             project: Some(project),
@@ -511,6 +555,23 @@ fn is_wisp_token(value: &str) -> bool {
         && random
             .chars()
             .all(|character| character.is_ascii_alphanumeric())
+}
+
+fn parse_host_patterns(hosts: &str) -> Vec<String> {
+    hosts
+        .split(',')
+        .map(str::trim)
+        .filter(|pattern| !pattern.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn has_meaningful_host_restriction(hosts: &[String]) -> bool {
+    !hosts.iter().all(|pattern| pattern.trim().is_empty())
+        && hosts
+            .iter()
+            .filter(|pattern| !pattern.trim().is_empty())
+            .all(|pattern| pattern.chars().any(char::is_alphanumeric))
 }
 
 fn lock_env_file(path: &Path) -> crate::core::Result<fs::File> {

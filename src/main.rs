@@ -381,6 +381,9 @@ enum EnvCommands {
         /// Environment variable to attach; repeat for each secret
         #[arg(long, required = true)]
         key: Vec<String>,
+        /// Allowed target hosts for new credentials (comma-separated, glob patterns)
+        #[arg(long)]
+        hosts: Option<String>,
     },
 }
 
@@ -1004,7 +1007,17 @@ async fn main() {
                 project,
                 environment,
                 key,
-            } => cli::handle_env_attach(&path, &key, &project, environment.as_deref()).await,
+                hosts,
+            } => {
+                cli::handle_env_attach(
+                    &path,
+                    &key,
+                    &project,
+                    environment.as_deref(),
+                    hosts.as_deref(),
+                )
+                .await;
+            }
         },
         Commands::Status => {
             cli::handle_status().await;

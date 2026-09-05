@@ -84,7 +84,8 @@ wispkey env list . --format json
 # Only selected keys are imported and replaced; PORT and other settings stay intact.
 wispkey env attach .env.production \
   --project client-alpha \
-  --key OPENAI_API_KEY
+  --key OPENAI_API_KEY \
+  --hosts api.openai.com
 wispkey project use client-alpha
 ```
 
@@ -94,7 +95,7 @@ Attach only values consumed through a WispKey token-substitution request path. A
 
 The proxy and MCP default to the active project. After attaching to another project, run `wispkey project use <project>` before starting them, or start the proxy with `--all-projects` when cross-project token resolution is intentional.
 
-`env attach` cannot infer target hosts. It creates unrestricted credentials unless the matching environment-prefixed credential already exists with host restrictions. Configure `--hosts` during pre-provisioning or enforce a policy before giving attached tokens to an untrusted agent.
+`env attach` cannot infer target hosts. New credentials require `--hosts` with a meaningful hostname or bounded glob; empty or wildcard-only scopes such as `*` are rejected. A matching provisioned credential is reusable only when it already has a meaningful host restriction, and attachment never broadens that stored restriction.
 
 ## Multi-Instance Access
 
