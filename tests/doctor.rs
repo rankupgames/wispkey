@@ -62,7 +62,10 @@ fn doctor_passes_core_checks_on_an_unlocked_vault() {
     let (ok, report) = doctor_json(vault_dir.path());
     assert_eq!(check_ids(&report), STABLE_CHECK_IDS);
     assert_eq!(check_named(&report, "binary.version")["status"], "pass");
+    #[cfg(unix)]
     assert_eq!(check_named(&report, "vault.permissions")["status"], "pass");
+    #[cfg(not(unix))]
+    assert_eq!(check_named(&report, "vault.permissions")["status"], "skip");
     assert_eq!(check_named(&report, "session.state")["status"], "pass");
     assert_eq!(check_named(&report, "policy.validity")["status"], "pass");
     assert_eq!(check_named(&report, "audit.writability")["status"], "pass");
@@ -124,6 +127,63 @@ fn doctor_fails_invalid_policy_file() {
             .as_str()
             .expect("message")
             .contains("rate_limit")
+    );
+}
+
+#[test]
+fn doctor_does_not_echo_malformed_policy_values() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let secret = "doctor-policy-secret";
+    std::fs::write(
+        vault_dir.path().join("policies.toml"),
+        format!("credential = \"{secret}\n"),
+    )
+    .expect("write malformed policies");
+
+    let (_ok, report) = doctor_json(vault_dir.path());
+
+    assert_eq!(check_named(&report, "policy.validity")["status"], "fail");
+    assert!(!report.to_string().contains(secret));
+}
+
+#[test]
+fn doctor_fails_when_locked_fallback_audit_sink_cannot_be_written() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let lock = run_wispkey(vault_dir.path(), &["lock"]);
+    assert!(lock.status.success(), "lock failed");
+    std::fs::create_dir(vault_dir.path().join("sideload-audit.jsonl"))
+        .expect("create blocking fallback audit path");
+
+    let (ok, report) = doctor_json(vault_dir.path());
+    let audit = check_named(&report, "audit.writability");
+
+    assert!(!ok);
+    assert_eq!(audit["status"], "fail");
+    assert!(
+        audit["message"]
+            .as_str()
+            .expect("audit message")
+            .contains("could not write a fallback audit event")
+    );
+}
+
+#[cfg(not(unix))]
+#[test]
+fn doctor_skips_unverifiable_vault_permissions() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+
+    let (_ok, report) = doctor_json(vault_dir.path());
+    let permissions = check_named(&report, "vault.permissions");
+
+    assert_eq!(permissions["status"], "skip");
+    assert!(
+        permissions["message"]
+            .as_str()
+            .expect("permission message")
+            .contains("cannot be inspected")
     );
 }
 

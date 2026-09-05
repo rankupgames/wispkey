@@ -130,7 +130,7 @@ pub fn apply_to_path(client: IntegrateClient, path: &Path) -> Result<(bool, Valu
                 if changed {
                     write_text(path, &pretty_json(&merged)?)?;
                 }
-                Ok((changed, merged))
+                Ok((changed, desired))
             }
             ConfigKind::Toml => {
                 let (merged, changed) = merge_toml_file(&content)?;
@@ -211,8 +211,7 @@ fn toml_snippet_value() -> Value {
 }
 
 fn inspect_json(content: &str) -> Result<ExistingClientConfig, String> {
-    let value: Value =
-        serde_json::from_str(content).map_err(|error| format!("invalid JSON: {error}"))?;
+    let value: Value = serde_json::from_str(content).map_err(|_| "invalid JSON".to_string())?;
     let server = value
         .get("mcpServers")
         .and_then(Value::as_object)
@@ -221,8 +220,7 @@ fn inspect_json(content: &str) -> Result<ExistingClientConfig, String> {
 }
 
 fn inspect_toml(content: &str) -> Result<ExistingClientConfig, String> {
-    let value: toml::Value =
-        toml::from_str(content).map_err(|error| format!("invalid TOML: {error}"))?;
+    let value: toml::Value = toml::from_str(content).map_err(|_| "invalid TOML".to_string())?;
     let server = value
         .get("mcp_servers")
         .and_then(toml::Value::as_table)
@@ -252,19 +250,16 @@ fn merge_json_file(content: &str) -> Result<(Value, bool), String> {
     let mut root: Value = if content.trim().is_empty() {
         json!({})
     } else {
-        serde_json::from_str(content).map_err(|error| format!("invalid JSON: {error}"))?
+        serde_json::from_str(content).map_err(|_| "invalid JSON".to_string())?
     };
     let object = root
         .as_object_mut()
         .ok_or_else(|| "MCP JSON must be an object".to_string())?;
     let servers = object.entry("mcpServers").or_insert_with(|| json!({}));
-    if !servers.is_object() {
-        *servers = json!({});
-    }
     let changed = upsert_json_server(
         servers
             .as_object_mut()
-            .expect("mcpServers object after normalization"),
+            .ok_or_else(|| "mcpServers must be a JSON object".to_string())?,
     );
     Ok((root, changed))
 }
@@ -302,8 +297,7 @@ fn merge_toml_file(content: &str) -> Result<(String, bool), String> {
         return Ok((toml_snippet(), true));
     }
 
-    let mut value: toml::Value =
-        toml::from_str(content).map_err(|error| format!("invalid TOML: {error}"))?;
+    let mut value: toml::Value = toml::from_str(content).map_err(|_| "invalid TOML".to_string())?;
     let table = value
         .as_table_mut()
         .ok_or_else(|| "Codex config must be a TOML table".to_string())?;
@@ -430,6 +424,17 @@ mod tests {
     }
 
     #[test]
+    fn json_merge_rejects_non_object_mcp_servers() {
+        let secret = "json-config-secret";
+        let existing = format!(r#"{{"mcpServers": "keep", "secret": "{secret}"}}"#);
+
+        let error = merge_json_file(&existing).expect_err("non-object mcpServers must fail");
+
+        assert_eq!(error, "mcpServers must be a JSON object");
+        assert!(!error.contains(secret));
+    }
+
+    #[test]
     fn toml_merge_appends_and_then_is_idempotent() {
         let existing = "model = \"gpt-5\"\n";
         let (first, changed) = merge_toml_file(existing).expect("merge");
@@ -448,5 +453,17 @@ mod tests {
         assert!(IntegrateClient::ClaudeCode.requires_plaintext_env_warning());
         assert!(IntegrateClient::GenericMcp.requires_plaintext_env_warning());
         assert!(!IntegrateClient::Codex.requires_plaintext_env_warning());
+    }
+
+    #[test]
+    fn toml_parse_errors_do_not_echo_config_values() {
+        let secret = "toml-config-secret";
+        let content = format!("credential = \"{secret}\n");
+
+        let inspect_error = inspect_toml(&content).expect_err("invalid TOML must fail");
+        let merge_error = merge_toml_file(&content).expect_err("invalid TOML must fail");
+
+        assert!(!inspect_error.contains(secret));
+        assert!(!merge_error.contains(secret));
     }
 }

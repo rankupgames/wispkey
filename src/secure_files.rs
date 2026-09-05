@@ -84,6 +84,12 @@ pub(crate) fn inspect_private_file(path: &Path) -> std::result::Result<(), Strin
     inspect_private_metadata(path, &metadata, false)
 }
 
+/// Reports whether this platform can verify private-file metadata without
+/// adding a platform-specific ACL inspection implementation.
+pub(crate) fn private_metadata_inspection_supported() -> bool {
+    cfg!(unix)
+}
+
 #[cfg(unix)]
 fn inspect_private_metadata(
     path: &Path,
@@ -111,8 +117,10 @@ fn inspect_private_metadata(
     _metadata: &fs::Metadata,
     _is_directory: bool,
 ) -> std::result::Result<(), String> {
-    let _ = path;
-    Ok(())
+    Err(format!(
+        "{} owner-only permission inspection is unsupported on this platform",
+        path.display()
+    ))
 }
 
 /// Reads a small sensitive text file after rejecting obviously unsafe inputs

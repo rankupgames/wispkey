@@ -208,6 +208,13 @@ fn check_vault_permissions() -> Check {
         );
     }
 
+    if !secure_files::private_metadata_inspection_supported() {
+        return Check::skip(
+            "vault.permissions",
+            "owner-only vault file permissions cannot be inspected on this platform",
+        );
+    }
+
     let mut problems = Vec::new();
     let vault_dir = Vault::vault_dir();
     if let Err(error) = secure_files::inspect_private_directory(&vault_dir) {
@@ -365,9 +372,9 @@ fn check_policy_validity() -> Check {
                     format!("Fix {} or run `wispkey policy check`.", path.display()),
                 ),
             },
-            Err(error) => Check::fail(
+            Err(_error) => Check::fail(
                 "policy.validity",
-                format!("could not parse {}: {error}", path.display()),
+                format!("could not parse {}", path.display()),
                 format!(
                     "Fix the TOML in {} or run `wispkey policy init`.",
                     path.display()
@@ -392,7 +399,7 @@ fn check_audit_writability() -> Check {
     }
 
     if let Ok(vault) = Vault::open_with_session() {
-        audit::log_event(
+        return match audit::try_log_event(
             vault.db(),
             "DoctorCheck",
             None,
@@ -404,14 +411,20 @@ fn check_audit_writability() -> Check {
             false,
             None,
             None,
-        );
-        return Check::pass(
-            "audit.writability",
-            "wrote a DoctorCheck audit event to the vault database",
-        );
+        ) {
+            Ok(()) => Check::pass(
+                "audit.writability",
+                "wrote a DoctorCheck audit event to the vault database",
+            ),
+            Err(error) => Check::fail(
+                "audit.writability",
+                format!("could not write a vault audit event: {error}"),
+                "Check vault database permissions and re-run `wispkey doctor`.",
+            ),
+        };
     }
 
-    audit::log_fallback_event(
+    match audit::try_log_fallback_event(
         "DoctorCheck",
         None,
         None,
@@ -422,20 +435,17 @@ fn check_audit_writability() -> Check {
         false,
         None,
         None,
-    );
-    let fallback = Vault::vault_dir().join(audit::SIDELOAD_FALLBACK_AUDIT_FILE);
-    if fallback.exists() {
-        Check::warn(
+    ) {
+        Ok(()) => Check::warn(
             "audit.writability",
             "vault is locked; wrote a fallback sideload audit event",
             "Run `wispkey unlock` to write vault-backed audit events.",
-        )
-    } else {
-        Check::fail(
+        ),
+        Err(error) => Check::fail(
             "audit.writability",
-            "could not write a fallback audit event while the vault is locked",
+            format!("could not write a fallback audit event while the vault is locked: {error}"),
             "Check permissions on the vault directory, then run `wispkey unlock`.",
-        )
+        ),
     }
 }
 

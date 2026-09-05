@@ -160,6 +160,92 @@ fn integrate_replaces_user_specific_command_path() {
 }
 
 #[test]
+fn integrate_rejects_non_object_mcp_servers_without_overwriting() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let config_path = vault_dir.path().join("invalid-shape.json");
+    let secret = "json-config-secret";
+    let original = format!(r#"{{"mcpServers": "keep", "secret": "{secret}"}}"#);
+    std::fs::write(&config_path, &original).expect("write existing config");
+    let path = config_path.to_string_lossy().to_string();
+
+    let output = run_wispkey(
+        vault_dir.path(),
+        &["integrate", "generic-mcp", "--path", &path],
+    );
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("mcpServers must be a JSON object"));
+    assert!(!stderr.contains(secret));
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config"),
+        original
+    );
+}
+
+#[test]
+fn integrate_does_not_echo_malformed_toml_values() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let config_path = vault_dir.path().join("invalid.toml");
+    let secret = "integrate-toml-secret";
+    let original = format!("credential = \"{secret}\n");
+    std::fs::write(&config_path, &original).expect("write malformed config");
+    let path = config_path.to_string_lossy().to_string();
+
+    let output = run_wispkey(vault_dir.path(), &["integrate", "codex", "--path", &path]);
+
+    assert!(!output.status.success());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+    assert_eq!(
+        std::fs::read_to_string(&config_path).expect("read config"),
+        original
+    );
+}
+
+#[test]
+fn integrate_json_output_does_not_expose_existing_config_secrets() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    let config_path = vault_dir.path().join("mcp.json");
+    let secret = "existing-client-secret";
+    let existing = serde_json::json!({
+        "mcpServers": {
+            "other": {"command": "other", "env": {"API_KEY": secret}},
+            "wispkey": {"env": {"WISPKEY_SIDELOAD_TEST": secret}}
+        }
+    });
+    std::fs::write(&config_path, existing.to_string()).expect("write config");
+    for _ in 0..2 {
+        let output = run_wispkey(
+            vault_dir.path(),
+            &[
+                "integrate",
+                "generic-mcp",
+                "--path",
+                config_path.to_str().unwrap(),
+                "--format",
+                "json",
+            ],
+        );
+        assert!(output.status.success());
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+                .unwrap();
+        assert_eq!(
+            saved["mcpServers"]["other"],
+            existing["mcpServers"]["other"]
+        );
+        assert_eq!(
+            saved["mcpServers"]["wispkey"]["env"],
+            existing["mcpServers"]["wispkey"]["env"]
+        );
+    }
+}
+
+#[test]
 fn integrate_codex_appends_without_dropping_unrelated_keys() {
     let vault_dir = tempfile::tempdir().expect("temp vault dir");
     init_vault(vault_dir.path());
