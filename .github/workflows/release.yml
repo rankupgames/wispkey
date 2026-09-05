@@ -275,9 +275,15 @@ jobs:
             --sha-aarch64-unknown-linux-gnu "$digest" \
             --sha-x86_64-unknown-linux-gnu "$digest"
 
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula dist/wispkey.rb
+          tap_name="local/wispkey-release-smoke"
+          brew tap-new --no-git "$tap_name"
+          tap_dir="$(brew --repository "$tap_name")"
+          cp dist/wispkey.rb "$tap_dir/Formula/wispkey.rb"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "$tap_name/wispkey"
           wispkey --version | grep -F "wispkey ${VERSION}"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew test wispkey
           brew uninstall wispkey
+          brew untap "$tap_name"
 
   provenance:
     name: Checksums, SBOM, signatures, provenance
@@ -376,9 +382,28 @@ jobs:
             dist/wispkey.cyclonedx.json
           if-no-files-found: error
 
+  publication-preflight:
+    name: Publication preflight
+    needs: [verify, provenance]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require Cargo registry token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_REGISTRY_TOKEN}" ]]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is required before release publication"
+            exit 1
+          fi
+
   publish-github:
     name: GitHub Release
-    needs: [verify, provenance]
+    needs: [verify, provenance, publication-preflight]
     if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -431,14 +456,23 @@ jobs:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          tap_name="local/wispkey-release-smoke-$$"
           formula_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/wispkey.rb"
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "$formula_url"
+          brew tap-new --no-git "$tap_name"
+          tap_dir="$(brew --repository "$tap_name")"
+          curl --fail --location --silent --show-error "$formula_url" --output "$tmp_dir/wispkey.rb"
+          cp "$tmp_dir/wispkey.rb" "$tap_dir/Formula/wispkey.rb"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "$tap_name/wispkey"
           wispkey --version | grep -F "wispkey ${VERSION}"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew test wispkey
           brew uninstall wispkey
+          brew untap "$tap_name"
+          rm -rf "$tmp_dir"
 
   publish-crates:
     name: crates.io
-    needs: [verify, homebrew-release]
+    needs: [verify, homebrew-release, publication-preflight]
     if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -458,8 +492,35 @@ jobs:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: |
           set -euo pipefail
-          if [[ -z "${CARGO_REGISTRY_TOKEN}" ]]; then
-            echo "::error::CARGO_REGISTRY_TOKEN is required to publish to crates.io"
-            exit 1
-          fi
           cargo publish --locked --token "${CARGO_REGISTRY_TOKEN}"
+
+  cargo-install:
+    name: Cargo registry install acceptance
+    needs: [verify, publish-crates]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+
+      - name: Install published crate from crates.io
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          install_root="$(mktemp -d)"
+          cargo_home="$(mktemp -d)"
+          trap 'rm -rf "$install_root" "$cargo_home"' EXIT
+
+          CARGO_HOME="$cargo_home" cargo install wispkey \
+            --version "${VERSION}" \
+            --locked \
+            --root "$install_root"
+          output="$("$install_root/bin/wispkey" --version)"
+          echo "$output"
+          echo "$output" | grep -F "wispkey ${VERSION}"

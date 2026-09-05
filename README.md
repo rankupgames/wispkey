@@ -7,8 +7,7 @@ Local-first, open-source credential firewall for AI agents that lets agents auth
 ## Quick Start
 
 ```bash
-# macOS / Linux
-brew install --formula https://github.com/rankupgames/wispkey/releases/latest/download/wispkey.rb
+# macOS / Linux: see docs/install.md for the Homebrew temporary-tap flow
 # -- or --
 cargo install wispkey --locked
 

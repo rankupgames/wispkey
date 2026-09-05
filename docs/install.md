@@ -7,10 +7,24 @@ WispKey ships signed, checksummed binaries for Linux, macOS, and Windows. Prefer
 ### Homebrew (macOS and Linux)
 
 ```bash
-brew install --formula https://github.com/rankupgames/wispkey/releases/latest/download/wispkey.rb
+tmp_dir="$(mktemp -d)"
+tap_name="local/wispkey-install-$$"
+cleanup() {
+  brew untap "$tap_name" >/dev/null 2>&1 || true
+  rm -rf "$tmp_dir"
+}
+trap cleanup EXIT
+
+formula_url="https://github.com/rankupgames/wispkey/releases/latest/download/wispkey.rb"
+brew tap-new --no-git "$tap_name"
+tap_dir="$(brew --repository "$tap_name")"
+curl --fail --location --silent --show-error "$formula_url" --output "$tmp_dir/wispkey.rb"
+cp "$tmp_dir/wispkey.rb" "$tap_dir/Formula/wispkey.rb"
+HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "$tap_name/wispkey"
+wispkey --version
 ```
 
-This formula installs the platform-matching signed archive from GitHub Releases and checks its SHA-256 digest before extracting.
+Homebrew's current formula loader does not accept arbitrary remote formula URLs. This temporary-tap flow installs the platform-matching signed archive from GitHub Releases and checks its SHA-256 digest before extracting.
 
 ### Cargo (all supported targets)
 
@@ -18,7 +32,7 @@ This formula installs the platform-matching signed archive from GitHub Releases 
 cargo install wispkey --locked
 ```
 
-crates.io publication runs only after release tests, clippy, `cargo audit`, packaging, Sigstore signing, provenance, and a binary smoke test succeed.
+For a non-dry-run tag operation, the release workflow checks `CARGO_REGISTRY_TOKEN` before any external publication, then verifies this path with a fresh `cargo install` from crates.io after publication.
 
 ### GitHub Release archives
 
@@ -42,8 +56,15 @@ Download `SHA256SUMS.txt` from the same release, then verify the archive you fet
 # GNU coreutils
 sha256sum -c SHA256SUMS.txt --ignore-missing
 
-# macOS
-shasum -a 256 -c SHA256SUMS.txt
+# macOS: set this to the archive you downloaded.
+archive="wispkey-aarch64-apple-darwin.tar.gz"
+entry="$(
+  awk -v file="$archive" '$2 == file { print; count++ } END { if (count != 1) exit 1 }' SHA256SUMS.txt
+)" || {
+  echo "missing or duplicate checksum entry for $archive" >&2
+  exit 1
+}
+printf '%s\n' "$entry" | shasum -a 256 -c -
 ```
 
 Verification must report `OK` for the file you downloaded. Do not install an archive whose digest is missing or mismatched.
@@ -89,12 +110,14 @@ gh attestation verify wispkey.cyclonedx.json --repo rankupgames/wispkey
 
 ## Fail-closed publication
 
-A version tag does not publish unless every gate succeeds:
+For a non-dry-run tag operation, the Cargo registry token preflight and every pre-publication gate must succeed before external publication starts:
 
 - `cargo fmt --check`, clippy, tests, `cargo audit`, and `cargo publish --dry-run`
 - native builds for Linux x64/ARM64, macOS x64/ARM64, and Windows x64
 - archive smoke tests of the downloaded binary on each of those platforms
-- Homebrew formula install of the macOS archive
+- Homebrew formula install and formula test of the macOS archive
 - SHA-256 checksums, CycloneDX SBOM, Sigstore checksum signatures, and build provenance
 
-If testing, audit, packaging, signing, or provenance generation fails, GitHub Releases and crates.io are not updated.
+If a pre-publication gate or the token preflight fails, GitHub Releases, the Homebrew formula, and crates.io are not updated.
+
+External publication is sequential, not atomic: the workflow publishes the GitHub Release, tests the published Homebrew formula, publishes to crates.io, and then runs the crates.io install acceptance check. A later failure can leave an earlier destination updated. For recovery, inspect the existing release and crates.io version before retrying, then use GitHub Actions' `Re-run failed jobs` after fixing the failed step. Do not try to republish a version that is already present on crates.io; crate versions are immutable.

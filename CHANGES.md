@@ -6,8 +6,8 @@
 
 - Version tags now build native Linux x64/ARM64, macOS x64/ARM64, and Windows x64 archives that include `LICENSE`, `README.md`, and a `VERSION` file.
 - Release assets are checksummed (`SHA256SUMS.txt`), signed with Sigstore, attested with GitHub build provenance, and accompanied by a CycloneDX SBOM.
-- Publication is fail-closed: tests, clippy, `cargo audit`, `cargo publish --dry-run`, downloaded-binary smoke tests, and Homebrew formula install must succeed before GitHub Releases and crates.io are updated.
-- Documented Homebrew (`brew install --formula …/wispkey.rb`) and `cargo install wispkey --locked` paths, including checksum and signature verification, in `docs/install.md`.
+- Publication is fail-closed through the pre-publication gates and `CARGO_REGISTRY_TOKEN` preflight; external publication remains sequential, with partial-publication recovery documented.
+- Documented the Homebrew temporary-tap install flow and `cargo install wispkey --locked` paths, including checksum, signature, and registry-install verification, in `docs/install.md`.
 
 ### Optional secure tray GUI
 
