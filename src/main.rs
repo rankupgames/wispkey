@@ -346,6 +346,12 @@ enum Commands {
         #[command(subcommand)]
         command: McpCommands,
     },
+
+    /// Run native plugin guards
+    Guard {
+        #[command(subcommand)]
+        command: GuardCommands,
+    },
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -770,6 +776,12 @@ enum ProxyCommands {
 enum McpCommands {
     /// Start MCP server (stdio transport)
     Serve,
+}
+
+#[derive(Subcommand)]
+enum GuardCommands {
+    /// Inspect a beforeShellExecution hook payload from stdin
+    Shell,
 }
 
 #[tokio::main]
@@ -1225,6 +1237,9 @@ async fn main() {
             McpCommands::Serve => {
                 cli::handle_mcp_serve().await;
             }
+        },
+        Commands::Guard { command } => match command {
+            GuardCommands::Shell => cli::handle_guard_shell().await,
         },
     }
 }
