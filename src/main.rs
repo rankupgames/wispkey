@@ -12,7 +12,7 @@
 
 use std::io::Read;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use wispkey::cli;
 
 #[derive(Parser)]
@@ -609,6 +609,29 @@ enum LoginCommands {
     },
 }
 
+#[derive(Args)]
+struct PolicyRequestOptions {
+    /// Credential name or glob target to evaluate
+    #[arg(long)]
+    credential: Option<String>,
+
+    /// Target host name
+    #[arg(long)]
+    host: Option<String>,
+
+    /// Target request path
+    #[arg(long)]
+    path: Option<String>,
+
+    /// HTTP method
+    #[arg(long)]
+    method: Option<String>,
+
+    /// Agent label used only as untrusted what-if input
+    #[arg(long)]
+    agent: Option<String>,
+}
+
 #[derive(Subcommand)]
 enum PolicyCommands {
     /// List all policies
@@ -617,6 +640,31 @@ enum PolicyCommands {
     Init,
     /// Validate the policies file
     Check,
+    /// Evaluate one request or a versioned JSON fixture
+    Test {
+        #[command(flatten)]
+        request: PolicyRequestOptions,
+        /// Evaluate a candidate TOML file instead of the installed policy file; use '-' for stdin
+        #[arg(long)]
+        policy_file: Option<String>,
+        /// RFC3339 timestamp used for local time-window evaluation
+        #[arg(long)]
+        at: Option<String>,
+        /// Versioned JSON fixture path; use '-' for stdin
+        #[arg(long)]
+        cases: Option<String>,
+    },
+    /// Explain one request against the installed or candidate policy file
+    Explain {
+        #[command(flatten)]
+        request: PolicyRequestOptions,
+        /// Evaluate a candidate TOML file instead of the installed policy file; use '-' for stdin
+        #[arg(long)]
+        policy_file: Option<String>,
+        /// RFC3339 timestamp used for local time-window evaluation
+        #[arg(long)]
+        at: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1115,6 +1163,41 @@ async fn main() {
             PolicyCommands::List => cli::handle_policy_list().await,
             PolicyCommands::Init => cli::handle_policy_init().await,
             PolicyCommands::Check => cli::handle_policy_check().await,
+            PolicyCommands::Test {
+                request,
+                policy_file,
+                at,
+                cases,
+            } => {
+                cli::handle_policy_test(cli::PolicyTestArgs {
+                    credential: request.credential.as_deref(),
+                    host: request.host.as_deref(),
+                    path: request.path.as_deref(),
+                    method: request.method.as_deref(),
+                    agent: request.agent.as_deref(),
+                    policy_file: policy_file.as_deref(),
+                    at: at.as_deref(),
+                    cases: cases.as_deref(),
+                })
+                .await
+            }
+            PolicyCommands::Explain {
+                request,
+                policy_file,
+                at,
+            } => {
+                cli::handle_policy_explain(cli::PolicyTestArgs {
+                    credential: request.credential.as_deref(),
+                    host: request.host.as_deref(),
+                    path: request.path.as_deref(),
+                    method: request.method.as_deref(),
+                    agent: request.agent.as_deref(),
+                    policy_file: policy_file.as_deref(),
+                    at: at.as_deref(),
+                    cases: None,
+                })
+                .await
+            }
         },
         Commands::Instance { command } => match command {
             InstanceCommands::Enroll {

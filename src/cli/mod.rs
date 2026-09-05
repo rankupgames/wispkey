@@ -56,7 +56,10 @@ pub use partitions::{
     handle_partition_assign, handle_partition_create, handle_partition_delete,
     handle_partition_export, handle_partition_import, handle_partition_list,
 };
-pub use policy::{handle_policy_check, handle_policy_init, handle_policy_list};
+pub use policy::{
+    PolicyTestArgs, handle_policy_check, handle_policy_explain, handle_policy_init,
+    handle_policy_list, handle_policy_test,
+};
 pub use projects::{
     handle_project_create, handle_project_current, handle_project_delete, handle_project_export,
     handle_project_import, handle_project_list, handle_project_use,
