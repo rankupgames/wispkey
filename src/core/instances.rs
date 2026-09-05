@@ -900,22 +900,26 @@ impl Vault {
     }
 }
 
-/// Invalidates restored instance bearer secrets and marks the instances for
-/// re-enrollment. Only Argon2id hashes exist in the vault, so a backup cannot
-/// restore a usable instance secret.
-pub(crate) fn prepare_restored_instance_secrets(db: &rusqlite::Connection) -> Result<Vec<String>> {
+/// Invalidates the selected restored instance bearer secrets and marks those
+/// instances for re-enrollment. Only Argon2id hashes exist in the vault, so a
+/// backup cannot restore a usable instance secret.
+pub(crate) fn prepare_restored_instance_secrets(
+    db: &rusqlite::Connection,
+    instance_ids: &[String],
+) -> Result<Vec<String>> {
     let now = Utc::now().to_rfc3339();
-    let mut statement =
-        db.prepare("SELECT id, name FROM instances WHERE status = ?1 ORDER BY name, id")?;
-    let rows = statement
-        .query_map(params![INSTANCE_STATUS_ACTIVE], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    drop(statement);
-
-    let mut names = Vec::with_capacity(rows.len());
-    for (id, name) in rows {
+    let mut names = Vec::new();
+    for id in instance_ids {
+        let name = db
+            .query_row(
+                "SELECT name FROM instances WHERE id = ?1 AND status = ?2",
+                params![id, INSTANCE_STATUS_ACTIVE],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(name) = name else {
+            continue;
+        };
         let discarded_secret = crate::random::alphanumeric(48, false)?;
         let secret_hash = hash_instance_secret(&discarded_secret)?;
         db.execute(
@@ -934,15 +938,23 @@ pub(crate) fn prepare_restored_instance_secrets(db: &rusqlite::Connection) -> Re
     Ok(names)
 }
 
-/// Revokes restored bootstrap tokens because plaintext tokens are never stored.
-pub(crate) fn revoke_bootstrap_tokens_after_restore(db: &rusqlite::Connection) -> Result<usize> {
-    let changed = db.execute(
-        "UPDATE bootstrap_tokens SET status = ?1 WHERE status = ?2",
-        params![
-            BOOTSTRAP_TOKEN_STATUS_REVOKED,
-            BOOTSTRAP_TOKEN_STATUS_ACTIVE
-        ],
-    )?;
+/// Revokes selected restored bootstrap tokens because plaintext tokens are
+/// never stored.
+pub(crate) fn revoke_bootstrap_tokens_after_restore(
+    db: &rusqlite::Connection,
+    token_ids: &[String],
+) -> Result<usize> {
+    let mut changed = 0;
+    for token_id in token_ids {
+        changed += db.execute(
+            "UPDATE bootstrap_tokens SET status = ?1 WHERE id = ?2 AND status = ?3",
+            params![
+                BOOTSTRAP_TOKEN_STATUS_REVOKED,
+                token_id,
+                BOOTSTRAP_TOKEN_STATUS_ACTIVE
+            ],
+        )?;
+    }
     Ok(changed)
 }
 

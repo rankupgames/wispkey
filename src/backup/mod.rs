@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -50,6 +50,24 @@ const SIDECAR_CLOUD: &str = "cloud.json";
 const SIDECAR_CLOUD_MANIFESTS: &str = "cloud-manifests.json";
 const SIDECAR_ACTIVE_PROJECT: &str = "active_project";
 const SIDECAR_AUDIT_FINGERPRINT: &str = "audit-fingerprint.key";
+const PROTECTED_VAULT_OUTPUT_NAMES: &[&str] = &[
+    "vault.db",
+    "vault.db-wal",
+    "vault.db-shm",
+    "vault.db-journal",
+    "session",
+    "session-device-seed",
+    "session-protector",
+    "proxy.pid",
+    "proxy.json",
+    "owner.sock",
+    "owner.json",
+    SIDECAR_POLICIES,
+    SIDECAR_CLOUD,
+    SIDECAR_CLOUD_MANIFESTS,
+    SIDECAR_ACTIVE_PROJECT,
+    SIDECAR_AUDIT_FINGERPRINT,
+];
 
 /// Explicit include/exclude flags recorded in every vault backup.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -281,17 +299,9 @@ pub fn create_backup(
     output_path: &str,
     scope: &BackupScope,
 ) -> Result<BackupCreateSummary> {
+    reject_protected_backup_output(vault_dir, output_path)?;
     let db = vault.db();
-    let source_schema_version = schema_version_from_db(db)?;
-    let source_vault_created_at = db
-        .query_row(
-            "SELECT value FROM vault_meta WHERE key = 'created_at'",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-
-    let contents = dump_contents(db, scope)?;
+    let (source_schema_version, source_vault_created_at, contents) = snapshot_database(db, scope)?;
     let sidecars = dump_sidecars(vault_dir, scope)?;
     let warnings = backup_warnings(scope);
     let mut payload = VaultBackupPayload {
@@ -307,7 +317,7 @@ pub fn create_backup(
     };
     payload.integrity = compute_integrity(&payload)?;
 
-    bundle::write_encrypted_payload_with_limit(
+    bundle::write_encrypted_payload_with_limit_no_clobber(
         VAULT_BACKUP_MAGIC,
         &payload,
         passphrase,
@@ -344,6 +354,9 @@ pub(crate) fn recovery_limits() -> Vec<String> {
         "Session files and remembered protectors are machine-bound and are never restored. Unlock the restored vault with the original master password.".into(),
         "A corrupt vault.db can be replaced by restoring onto an empty --target path or with --replace.".into(),
         "A partial backup cannot recreate omitted tables or sidecars. Inspect the recorded scope before restore.".into(),
+        "Database rows are snapshotted in one SQLite read transaction, but sidecars are read separately; stop WispKey and quiesce the vault for a cross-file-consistent backup.".into(),
+        "Restore can roll back ordinary process I/O failures, but SQLite and multiple sidecar renames are not power-loss atomic; verify after a crash or interrupted restore.".into(),
+        "Replace refuses stale sessions, remembered protectors, SQLite WAL/journal files, live IPC state, and omitted target sidecars instead of claiming those files were restored.".into(),
         "Instance bearer secrets and bootstrap tokens are never stored at rest. Restored instances are marked needs_reenrollment; run `wispkey instance rotate-secret` to mint a new secret.".into(),
         "Env-sideload secrets live in process environment only and are not part of a vault backup.".into(),
     ]
@@ -525,6 +538,39 @@ fn dump_contents(db: &Connection, scope: &BackupScope) -> Result<BackupContents>
     })
 }
 
+fn snapshot_database(
+    db: &Connection,
+    scope: &BackupScope,
+) -> Result<(String, Option<String>, BackupContents)> {
+    db.execute_batch("BEGIN DEFERRED TRANSACTION")?;
+    let snapshot = (|| {
+        let source_schema_version = schema_version_from_db(db)?;
+        let source_vault_created_at = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key = 'created_at'",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        let contents = dump_contents(db, scope)?;
+        Ok((source_schema_version, source_vault_created_at, contents))
+    })();
+    match snapshot {
+        Ok(snapshot) => {
+            if let Err(error) = db.execute_batch("COMMIT") {
+                let _ = db.execute_batch("ROLLBACK");
+                Err(error.into())
+            } else {
+                Ok(snapshot)
+            }
+        }
+        Err(error) => {
+            let _ = db.execute_batch("ROLLBACK");
+            Err(error)
+        }
+    }
+}
+
 fn dump_sidecars(vault_dir: &Path, scope: &BackupScope) -> Result<BackupSidecars> {
     Ok(BackupSidecars {
         policies_toml: if scope.policies {
@@ -652,6 +698,7 @@ fn backup_warnings(scope: &BackupScope) -> Vec<String> {
     let mut warnings = vec![
         "session, protector, proxy, and owner IPC files are excluded".to_string(),
         "env-sideload secrets are not stored in the vault and are not backed up".to_string(),
+        "database rows are captured in one SQLite read transaction; sidecars are read separately, so stop WispKey and quiesce the vault for cross-file consistency".to_string(),
     ];
     if scope.instances {
         warnings.push(
@@ -755,6 +802,51 @@ fn read_optional_bytes_b64(path: &Path) -> Result<Option<String>> {
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
     }
+}
+
+fn reject_protected_backup_output(vault_dir: &Path, output_path: &str) -> Result<()> {
+    let output = Path::new(output_path);
+    let output = normalize_path(if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(output)
+    });
+    let vault_dir = normalize_path(fs::canonicalize(vault_dir)?);
+    let Some(parent) = output.parent() else {
+        return Ok(());
+    };
+    let Some(name) = output.file_name().and_then(|name| name.to_str()) else {
+        return Ok(());
+    };
+    let lexical_match = normalize_path(parent) == vault_dir;
+    let symlink_match = match fs::canonicalize(parent) {
+        Ok(parent) => normalize_path(&parent) == vault_dir,
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => return Err(error.into()),
+    };
+    if (lexical_match || symlink_match) && PROTECTED_VAULT_OUTPUT_NAMES.contains(&name) {
+        return Err(VaultError::Backup(format!(
+            "backup output '{}' is a protected active-vault file",
+            output.display()
+        )));
+    }
+    Ok(())
+}
+
+fn normalize_path(path: impl AsRef<Path>) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.as_ref().components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 fn write_optional_text(path: &Path, contents: Option<&str>) -> Result<()> {

@@ -9,9 +9,11 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use uuid::Uuid;
@@ -106,13 +108,20 @@ fn restore_replace(
     payload: &VaultBackupPayload,
     options: RestoreOptions<'_>,
 ) -> Result<RestoreReport> {
+    validate_replace_target(options.target_dir, payload)?;
     let inspect = inspect_payload(payload);
     let instance_names: Vec<String> = inspect
         .instances
         .iter()
+        .filter(|row| row.status == "active")
         .map(|row| row.name.clone())
         .collect();
-    let bootstrap_count = payload.contents.bootstrap_tokens.len();
+    let bootstrap_count = payload
+        .contents
+        .bootstrap_tokens
+        .iter()
+        .filter(|row| string_field(row, "status").as_deref() == Some("active"))
+        .count();
     let report = RestoreReport {
         dry_run: options.dry_run,
         mode: "replace".into(),
@@ -135,24 +144,30 @@ fn restore_replace(
         .join(format!(".wk-restore-{}", Uuid::new_v4()));
     let restore_result = restore_replace_into_staging(payload, &staging)
         .and_then(|()| commit_restored_files(&staging, options.target_dir));
-    let _ = fs::remove_dir_all(&staging);
-    restore_result?;
-    Ok(report)
+    match restore_result {
+        Ok(()) => {
+            let _ = fs::remove_dir_all(&staging);
+            Ok(report)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn restore_replace_into_staging(payload: &VaultBackupPayload, staging: &Path) -> Result<()> {
     secure_files::ensure_private_directory(staging)?;
     let db_path = staging.join("vault.db");
     let db = Vault::initialize_database_file(&db_path)?;
-    db.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
+    db.execute_batch("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE TRANSACTION")?;
+    let instance_ids = row_ids(&payload.contents.instances);
+    let bootstrap_ids = row_ids(&payload.contents.bootstrap_tokens);
     let insert_result = insert_payload_tables(&db, payload, &SkipSet::default());
     match insert_result {
         Ok(()) => {
             if payload.scope.instances {
-                prepare_restored_instance_secrets(&db)?;
+                prepare_restored_instance_secrets(&db, &instance_ids)?;
             }
             if payload.scope.bootstrap {
-                revoke_bootstrap_tokens_after_restore(&db)?;
+                revoke_bootstrap_tokens_after_restore(&db, &bootstrap_ids)?;
             }
             db.execute_batch("COMMIT")?;
         }
@@ -170,45 +185,100 @@ fn restore_merge(
     options: RestoreOptions<'_>,
 ) -> Result<RestoreReport> {
     let db_path = options.target_dir.join("vault.db");
-    let db = Connection::open(&db_path)?;
-    Vault::migrate_schema(&db)?;
-    let plan = plan_merge(&db, payload)?;
-    if options.on_conflict == ConflictPolicy::Fail && !plan.conflicts.is_empty() && !options.dry_run
-    {
-        return Err(VaultError::Backup(format!(
-            "{} restore conflict(s); pass --on-conflict skip, choose --replace, or restore to an empty --target. First conflict: {} {}",
-            plan.conflicts.len(),
-            plan.conflicts[0].entity,
-            plan.conflicts[0].identity
-        )));
+    if options.dry_run {
+        let planning_db = open_merge_planning_db(&db_path)?;
+        let plan = plan_merge(&planning_db, options.target_dir, payload)?;
+        return Ok(merge_report(payload, &options, &plan));
     }
 
-    let mut instance_names = Vec::new();
-    if payload.scope.instances {
-        instance_names = payload
+    let staging = options
+        .target_dir
+        .join(format!(".wk-restore-{}", Uuid::new_v4()));
+    stage_merge_sidecars(&staging, payload)?;
+
+    let db = Connection::open(&db_path)?;
+    db.execute_batch("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE TRANSACTION")?;
+    let mut created_sidecars = Vec::new();
+    let result = (|| {
+        Vault::migrate_schema(&db)?;
+        let plan = plan_merge(&db, options.target_dir, payload)?;
+        if options.on_conflict == ConflictPolicy::Fail && !plan.conflicts.is_empty() {
+            return Err(VaultError::Backup(format!(
+                "{} restore conflict(s); pass --on-conflict skip, choose --replace, or restore to an empty --target. First conflict: {} {}",
+                plan.conflicts.len(),
+                plan.conflicts[0].entity,
+                plan.conflicts[0].identity
+            )));
+        }
+
+        let report = merge_report(payload, &options, &plan);
+        let instance_ids = inserted_row_ids(&payload.contents.instances, &plan.skip.instances);
+        let bootstrap_ids =
+            inserted_row_ids(&payload.contents.bootstrap_tokens, &plan.skip.bootstrap);
+        insert_payload_tables(&db, payload, &plan.skip)?;
+        apply_staged_sidecars(
+            options.target_dir,
+            &staging,
+            options.on_conflict,
+            &mut created_sidecars,
+        )?;
+        if payload.scope.instances {
+            prepare_restored_instance_secrets(&db, &instance_ids)?;
+        }
+        if payload.scope.bootstrap {
+            revoke_bootstrap_tokens_after_restore(&db, &bootstrap_ids)?;
+        }
+        db.execute_batch("COMMIT")?;
+        Ok(report)
+    })();
+
+    match result {
+        Ok(report) => {
+            let _ = fs::remove_dir_all(&staging);
+            Ok(report)
+        }
+        Err(error) => {
+            let db_rollback = db.execute_batch("ROLLBACK");
+            let sidecar_rollback = remove_created_sidecars(&created_sidecars);
+            if db_rollback.is_err() || sidecar_rollback.is_err() {
+                return Err(VaultError::Backup(format!(
+                    "merge failed and rollback was incomplete; recovery files retained at {}",
+                    staging.display()
+                )));
+            }
+            Err(error)
+        }
+    }
+}
+
+fn merge_report(
+    payload: &VaultBackupPayload,
+    options: &RestoreOptions<'_>,
+    plan: &MergePlan,
+) -> RestoreReport {
+    let instance_names = if payload.scope.instances {
+        payload
             .contents
             .instances
             .iter()
             .filter(|row| {
-                string_field(row, "id").is_none_or(|id| !plan.skip.instances.contains(&id))
+                string_field(row, "status").as_deref() == Some("active")
+                    && string_field(row, "id").is_some_and(|id| !plan.skip.instances.contains(&id))
             })
             .filter_map(|row| string_field(row, "name"))
-            .collect();
-    }
+            .collect()
+    } else {
+        Vec::new()
+    };
     let bootstrap_revoked = payload
         .contents
         .bootstrap_tokens
         .iter()
-        .filter(|row| {
-            !plan
-                .skip
-                .bootstrap
-                .iter()
-                .any(|row_id| row_id_is(row, row_id))
-        })
+        .filter(|row| string_field(row, "status").as_deref() == Some("active"))
+        .filter(|row| string_field(row, "id").is_some_and(|id| !plan.skip.bootstrap.contains(&id)))
         .count();
 
-    let report = RestoreReport {
+    RestoreReport {
         dry_run: options.dry_run,
         mode: "merge".into(),
         target: options.target_dir.display().to_string(),
@@ -219,31 +289,7 @@ fn restore_merge(
         bootstrap_tokens_revoked: bootstrap_revoked,
         warnings: payload.warnings.clone(),
         recovery_limits: recovery_limits(),
-    };
-    if options.dry_run {
-        return Ok(report);
     }
-
-    db.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
-    let result = insert_payload_tables(&db, payload, &plan.skip).and_then(|()| {
-        if payload.scope.instances {
-            prepare_restored_instance_secrets(&db)?;
-        }
-        if payload.scope.bootstrap {
-            revoke_bootstrap_tokens_after_restore(&db)?;
-        }
-        Ok(())
-    });
-    match result {
-        Ok(()) => db.execute_batch("COMMIT")?,
-        Err(error) => {
-            let _ = db.execute_batch("ROLLBACK");
-            return Err(error);
-        }
-    }
-
-    merge_sidecars(options.target_dir, payload, options.on_conflict)?;
-    Ok(report)
 }
 
 #[derive(Default)]
@@ -266,7 +312,8 @@ struct MergePlan {
     skip: SkipSet,
 }
 
-fn plan_merge(db: &Connection, payload: &VaultBackupPayload) -> Result<MergePlan> {
+fn plan_merge(db: &Connection, target: &Path, payload: &VaultBackupPayload) -> Result<MergePlan> {
+    validate_payload_graph(payload)?;
     let dest_projects = load_table_index(db, TABLE_PROJECTS, "id")?;
     let dest_project_names = load_table_index(db, TABLE_PROJECTS, "name")?;
     let dest_partitions = load_table_index(db, TABLE_PARTITIONS, "id")?;
@@ -297,6 +344,8 @@ fn plan_merge(db: &Connection, payload: &VaultBackupPayload) -> Result<MergePlan
                 skipped.vault_meta += 1;
             }
             Some(_) if key == "password_hash" => {
+                skip.vault_meta.insert(key.clone());
+                skipped.vault_meta += 1;
                 conflicts.push(RestoreConflict {
                     entity: "vault_meta".into(),
                     identity: key,
@@ -331,26 +380,59 @@ fn plan_merge(db: &Connection, payload: &VaultBackupPayload) -> Result<MergePlan
         &mut skipped.projects,
         &mut conflicts,
     );
+    let available_projects =
+        available_reference_ids(&payload.contents.projects, &dest_projects, &skip.projects);
     classify_partition_rows(
         &payload.contents.partitions,
         &dest_partitions,
         &dest_partition_names,
+        &available_projects,
         &mut skip,
         &mut imported.partitions,
         &mut skipped.partitions,
         &mut conflicts,
     );
+    let mut available_partitions = available_reference_ids(
+        &payload.contents.partitions,
+        &dest_partitions,
+        &skip.partitions,
+    );
+    for row in &payload.contents.partitions {
+        let Some(id) = string_field(row, "id") else {
+            continue;
+        };
+        let project_id = string_field(row, "project_id").unwrap_or_default();
+        if !available_projects.contains(&project_id) {
+            available_partitions.remove(&id);
+        }
+    }
     classify_credential_rows(
         &payload.contents.credentials,
         &dest_credentials,
         &dest_tokens,
         &dest_credential_names,
         &payload.contents.partitions,
+        &dest_partitions,
+        &available_partitions,
         &mut skip,
         &mut imported.credentials,
         &mut skipped.credentials,
         &mut conflicts,
     );
+    let mut available_credentials = available_reference_ids(
+        &payload.contents.credentials,
+        &dest_credentials,
+        &skip.credentials,
+    );
+    for row in &payload.contents.credentials {
+        let Some(id) = string_field(row, "id") else {
+            continue;
+        };
+        let partition_id = string_field(row, "partition_id").unwrap_or_default();
+        if !available_partitions.contains(&partition_id) {
+            available_credentials.remove(&id);
+        }
+    }
     classify_rows(
         &payload.contents.instances,
         "id",
@@ -361,6 +443,11 @@ fn plan_merge(db: &Connection, payload: &VaultBackupPayload) -> Result<MergePlan
         &mut imported.instances,
         &mut skipped.instances,
         &mut conflicts,
+    );
+    let available_instances = available_reference_ids(
+        &payload.contents.instances,
+        &dest_instances,
+        &skip.instances,
     );
     classify_rows(
         &payload.contents.instance_scopes,
@@ -382,6 +469,16 @@ fn plan_merge(db: &Connection, payload: &VaultBackupPayload) -> Result<MergePlan
         &mut skip.access_requests,
         &mut imported.access_requests,
         &mut skipped.access_requests,
+        &mut conflicts,
+    );
+    propagate_instance_dependencies(
+        &payload.contents.instance_scopes,
+        &payload.contents.access_requests,
+        &available_instances,
+        &available_credentials,
+        &mut skip,
+        &mut imported,
+        &mut skipped,
         &mut conflicts,
     );
     classify_rows(
@@ -406,6 +503,8 @@ fn plan_merge(db: &Connection, payload: &VaultBackupPayload) -> Result<MergePlan
         &mut skipped.audits,
         &mut conflicts,
     );
+
+    append_sidecar_conflicts(target, payload, &mut conflicts)?;
 
     Ok(MergePlan {
         imported,
@@ -465,10 +564,12 @@ fn classify_rows(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn classify_partition_rows(
     rows: &[Map<String, Value>],
     dest_by_id: &HashMap<String, Map<String, Value>>,
     dest_by_project_name: &HashMap<(String, String), Map<String, Value>>,
+    available_projects: &HashSet<String>,
     skip: &mut SkipSet,
     imported: &mut usize,
     skipped_count: &mut usize,
@@ -495,6 +596,17 @@ fn classify_partition_rows(
         }
         let project_id = string_field(row, "project_id").unwrap_or_default();
         let name = string_field(row, "name").unwrap_or_default();
+        if !available_projects.contains(&project_id) {
+            skip_with_dependency_conflict(
+                id,
+                "partition",
+                format!("referenced project '{project_id}' was not available"),
+                &mut skip.partitions,
+                skipped_count,
+                conflicts,
+            );
+            continue;
+        }
         if dest_by_project_name.contains_key(&(project_id.clone(), name.clone())) {
             skip.partitions.insert(id);
             *skipped_count += 1;
@@ -516,6 +628,8 @@ fn classify_credential_rows(
     dest_by_token: &HashMap<String, Map<String, Value>>,
     dest_by_project_name: &HashMap<(String, String), Map<String, Value>>,
     partitions: &[Map<String, Value>],
+    dest_partitions: &HashMap<String, Map<String, Value>>,
+    available_partitions: &HashSet<String>,
     skip: &mut SkipSet,
     imported: &mut usize,
     skipped_count: &mut usize,
@@ -557,9 +671,25 @@ fn classify_credential_rows(
             continue;
         }
         let partition_id = string_field(row, "partition_id").unwrap_or_default();
+        if !available_partitions.contains(&partition_id) {
+            skip_with_dependency_conflict(
+                id,
+                "credential",
+                format!("referenced partition '{partition_id}' was not available"),
+                &mut skip.credentials,
+                skipped_count,
+                conflicts,
+            );
+            continue;
+        }
         let project_id = partitions_by_id
             .get(&partition_id)
             .and_then(|partition| string_field(partition, "project_id"))
+            .or_else(|| {
+                dest_partitions
+                    .get(&partition_id)
+                    .and_then(|partition| string_field(partition, "project_id"))
+            })
             .unwrap_or_default();
         let name = string_field(row, "name").unwrap_or_default();
         if dest_by_project_name.contains_key(&(project_id.clone(), name.clone())) {
@@ -574,6 +704,257 @@ fn classify_credential_rows(
         }
         *imported += 1;
     }
+}
+
+fn available_reference_ids(
+    rows: &[Map<String, Value>],
+    dest_by_id: &RowIndex,
+    skipped: &HashSet<String>,
+) -> HashSet<String> {
+    let mut available = dest_by_id.keys().cloned().collect::<HashSet<_>>();
+    for row in rows {
+        let Some(id) = string_field(row, "id") else {
+            continue;
+        };
+        if skipped.contains(&id) {
+            if dest_by_id
+                .get(&id)
+                .is_some_and(|existing| rows_equivalent(existing, row))
+            {
+                available.insert(id);
+            } else {
+                available.remove(&id);
+            }
+        } else {
+            available.insert(id);
+        }
+    }
+    available
+}
+
+fn skip_with_dependency_conflict(
+    id: String,
+    entity: &str,
+    reason: String,
+    skip: &mut HashSet<String>,
+    skipped_count: &mut usize,
+    conflicts: &mut Vec<RestoreConflict>,
+) -> bool {
+    if skip.insert(id.clone()) {
+        *skipped_count += 1;
+        conflicts.push(RestoreConflict {
+            entity: entity.into(),
+            identity: id,
+            reason,
+        });
+        true
+    } else {
+        false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn propagate_instance_dependencies(
+    scopes: &[Map<String, Value>],
+    requests: &[Map<String, Value>],
+    available_instances: &HashSet<String>,
+    available_credentials: &HashSet<String>,
+    skip: &mut SkipSet,
+    imported: &mut BackupCounts,
+    skipped: &mut BackupCounts,
+    conflicts: &mut Vec<RestoreConflict>,
+) {
+    for row in scopes {
+        let Some(id) = string_field(row, "id") else {
+            continue;
+        };
+        if skip.scopes.contains(&id) {
+            continue;
+        }
+        let instance_id = string_field(row, "instance_id").unwrap_or_default();
+        if !available_instances.contains(&instance_id) {
+            if skip_with_dependency_conflict(
+                id,
+                "instance_scope",
+                format!("referenced instance '{instance_id}' was not available"),
+                &mut skip.scopes,
+                &mut skipped.scopes,
+                conflicts,
+            ) {
+                imported.scopes -= 1;
+            }
+            continue;
+        }
+        if string_field(row, "scope_type").as_deref() == Some("credential") {
+            let Some(credential_id) = string_field(row, "credential_id") else {
+                if skip_with_dependency_conflict(
+                    id,
+                    "instance_scope",
+                    "credential scope has no stable credential id".into(),
+                    &mut skip.scopes,
+                    &mut skipped.scopes,
+                    conflicts,
+                ) {
+                    imported.scopes -= 1;
+                }
+                continue;
+            };
+            if !available_credentials.contains(&credential_id)
+                && skip_with_dependency_conflict(
+                    id,
+                    "instance_scope",
+                    format!("referenced credential '{credential_id}' was not available"),
+                    &mut skip.scopes,
+                    &mut skipped.scopes,
+                    conflicts,
+                )
+            {
+                imported.scopes -= 1;
+            }
+        }
+    }
+
+    for row in requests {
+        let Some(id) = string_field(row, "id") else {
+            continue;
+        };
+        if skip.access_requests.contains(&id) {
+            continue;
+        }
+        let instance_id = string_field(row, "instance_id").unwrap_or_default();
+        if !available_instances.contains(&instance_id) {
+            if skip_with_dependency_conflict(
+                id,
+                "access_request",
+                format!("referenced instance '{instance_id}' was not available"),
+                &mut skip.access_requests,
+                &mut skipped.access_requests,
+                conflicts,
+            ) {
+                imported.access_requests -= 1;
+            }
+            continue;
+        }
+        let Some(credential_id) = string_field(row, "credential_id") else {
+            if skip_with_dependency_conflict(
+                id,
+                "access_request",
+                "access request has no stable credential id".into(),
+                &mut skip.access_requests,
+                &mut skipped.access_requests,
+                conflicts,
+            ) {
+                imported.access_requests -= 1;
+            }
+            continue;
+        };
+        if !available_credentials.contains(&credential_id)
+            && skip_with_dependency_conflict(
+                id,
+                "access_request",
+                format!("referenced credential '{credential_id}' was not available"),
+                &mut skip.access_requests,
+                &mut skipped.access_requests,
+                conflicts,
+            )
+        {
+            imported.access_requests -= 1;
+        }
+    }
+}
+
+fn validate_payload_graph(payload: &VaultBackupPayload) -> Result<()> {
+    validate_unique_ids(&payload.contents.projects, TABLE_PROJECTS)?;
+    validate_unique_ids(&payload.contents.partitions, TABLE_PARTITIONS)?;
+    validate_unique_ids(&payload.contents.credentials, TABLE_CREDENTIALS)?;
+    validate_unique_ids(&payload.contents.instances, TABLE_INSTANCES)?;
+    validate_unique_ids(&payload.contents.instance_scopes, TABLE_INSTANCE_SCOPES)?;
+    validate_unique_ids(&payload.contents.access_requests, TABLE_ACCESS_REQUESTS)?;
+    validate_unique_ids(&payload.contents.bootstrap_tokens, TABLE_BOOTSTRAP_TOKENS)?;
+    validate_unique_ids(&payload.contents.audit_log, TABLE_AUDIT_LOG)?;
+
+    for (table, rows, required) in [
+        (
+            TABLE_PROJECTS,
+            &payload.contents.projects,
+            ["id"].as_slice(),
+        ),
+        (
+            TABLE_PARTITIONS,
+            &payload.contents.partitions,
+            ["id", "project_id"].as_slice(),
+        ),
+        (
+            TABLE_CREDENTIALS,
+            &payload.contents.credentials,
+            ["id", "partition_id"].as_slice(),
+        ),
+        (
+            TABLE_INSTANCES,
+            &payload.contents.instances,
+            ["id"].as_slice(),
+        ),
+        (
+            TABLE_INSTANCE_SCOPES,
+            &payload.contents.instance_scopes,
+            ["id", "instance_id"].as_slice(),
+        ),
+        (
+            TABLE_ACCESS_REQUESTS,
+            &payload.contents.access_requests,
+            ["id", "instance_id"].as_slice(),
+        ),
+        (
+            TABLE_BOOTSTRAP_TOKENS,
+            &payload.contents.bootstrap_tokens,
+            ["id"].as_slice(),
+        ),
+        (
+            TABLE_AUDIT_LOG,
+            &payload.contents.audit_log,
+            ["id"].as_slice(),
+        ),
+    ] {
+        for row in rows {
+            if required.iter().any(|key| string_field(row, key).is_none()) {
+                return Err(VaultError::Backup(format!(
+                    "backup reference graph is invalid: {table} row is missing a required identity"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_unique_ids(rows: &[Map<String, Value>], table: &str) -> Result<()> {
+    let mut ids = HashSet::new();
+    for row in rows {
+        if let Some(id) = string_field(row, "id")
+            && !ids.insert(id.clone())
+        {
+            return Err(VaultError::Backup(format!(
+                "backup reference graph is invalid: duplicate {table} id '{id}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn append_sidecar_conflicts(
+    target: &Path,
+    payload: &VaultBackupPayload,
+    conflicts: &mut Vec<RestoreConflict>,
+) -> Result<()> {
+    for (included, name, contents) in merge_sidecar_candidates(payload) {
+        if included && contents.is_some() && path_entry_exists(&target.join(name))? {
+            conflicts.push(RestoreConflict {
+                entity: "sidecar".into(),
+                identity: name.into(),
+                reason: "sidecar already exists".into(),
+            });
+        }
+    }
+    Ok(())
 }
 
 fn insert_payload_tables(
@@ -694,66 +1075,169 @@ fn write_sidecars(dir: &Path, scope: &BackupScope, sidecars: &super::BackupSidec
     Ok(())
 }
 
-fn merge_sidecars(
-    target: &Path,
+fn merge_sidecar_candidates(
     payload: &VaultBackupPayload,
-    policy: ConflictPolicy,
-) -> Result<()> {
-    let candidates = [
+) -> [(bool, &'static str, Option<&str>); 5] {
+    [
         (
             payload.scope.policies,
             SIDECAR_POLICIES,
             payload.sidecars.policies_toml.as_deref(),
-            false,
         ),
         (
             payload.scope.cloud,
             SIDECAR_CLOUD,
             payload.sidecars.cloud_json.as_deref(),
-            false,
         ),
         (
             payload.scope.cloud,
             SIDECAR_CLOUD_MANIFESTS,
             payload.sidecars.cloud_manifests_json.as_deref(),
-            false,
         ),
         (
             payload.scope.active_project,
             SIDECAR_ACTIVE_PROJECT,
             payload.sidecars.active_project.as_deref(),
-            false,
         ),
         (
             payload.scope.audits,
             SIDECAR_AUDIT_FINGERPRINT,
             payload.sidecars.audit_fingerprint_key_b64.as_deref(),
-            true,
         ),
-    ];
-    for (included, name, contents, b64) in candidates {
-        if !included {
+    ]
+}
+
+fn stage_merge_sidecars(staging: &Path, payload: &VaultBackupPayload) -> Result<()> {
+    secure_files::ensure_private_directory(staging)?;
+    write_sidecars(staging, &payload.scope, &payload.sidecars)
+}
+
+fn apply_staged_sidecars(
+    target: &Path,
+    staging: &Path,
+    policy: ConflictPolicy,
+    created: &mut Vec<PathBuf>,
+) -> Result<()> {
+    for path in restore_sidecar_paths(staging) {
+        if !path_entry_exists(&path)? {
             continue;
         }
-        let Some(contents) = contents else {
-            continue;
-        };
+        let name = path
+            .file_name()
+            .ok_or_else(|| VaultError::Backup("invalid staged sidecar name".into()))?;
         let dest = target.join(name);
-        if dest.exists() {
+        if path_entry_exists(&dest)? {
             if policy == ConflictPolicy::Fail {
                 return Err(VaultError::Backup(format!(
-                    "sidecar '{name}' already exists; pass --on-conflict skip or --replace"
+                    "sidecar '{}' appeared during merge; no files were replaced",
+                    name.to_string_lossy()
                 )));
             }
             continue;
         }
-        if b64 {
-            write_optional_b64(&dest, Some(contents))?;
-        } else {
-            write_optional_text(&dest, Some(contents))?;
+        let contents = fs::read(&path)?;
+        match secure_files::create_private(&dest, &contents) {
+            Ok(true) => created.push(dest.clone()),
+            Ok(false) if policy == ConflictPolicy::Skip => {}
+            Ok(false) => {
+                return Err(VaultError::Backup(format!(
+                    "sidecar '{}' appeared during merge; no files were replaced",
+                    name.to_string_lossy()
+                )));
+            }
+            Err(error) => {
+                if path_entry_exists(&dest)? {
+                    created.push(dest);
+                }
+                return Err(error);
+            }
         }
     }
     Ok(())
+}
+
+fn remove_created_sidecars(created: &[PathBuf]) -> Result<()> {
+    let mut failures = Vec::new();
+    for path in created.iter().rev() {
+        if let Err(error) = fs::remove_file(path)
+            && error.kind() != ErrorKind::NotFound
+        {
+            failures.push(format!("{}: {error}", path.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(VaultError::Backup(format!(
+            "sidecar rollback failed: {}",
+            failures.join(", ")
+        )))
+    }
+}
+
+fn open_merge_planning_db(path: &Path) -> Result<Connection> {
+    let source = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    let mut planning = Connection::open_in_memory()?;
+    {
+        let backup = rusqlite::backup::Backup::new(&source, &mut planning)?;
+        backup.run_to_completion(100, Duration::from_millis(0), None)?;
+    }
+    Vault::migrate_schema(&planning)?;
+    Ok(planning)
+}
+
+fn validate_replace_target(target: &Path, payload: &VaultBackupPayload) -> Result<()> {
+    for name in [
+        "session",
+        "session-protector",
+        "vault.db-wal",
+        "vault.db-shm",
+        "vault.db-journal",
+        "proxy.pid",
+        "proxy.json",
+        "owner.sock",
+        "owner.json",
+    ] {
+        if path_entry_exists(&target.join(name))? {
+            return Err(VaultError::Backup(format!(
+                "replace refused while target contains live or journal file '{name}'; stop WispKey and remove stale excluded state first"
+            )));
+        }
+    }
+    if target == Vault::vault_dir() && Vault::protector_status().available {
+        return Err(VaultError::Backup(
+            "replace refused while a remembered unlock protector is available for the target; run `wispkey lock --forget` first".into(),
+        ));
+    }
+    for (included, name, contents) in merge_sidecar_candidates(payload) {
+        if (!included || contents.is_none()) && path_entry_exists(&target.join(name))? {
+            return Err(VaultError::Backup(format!(
+                "replace refused because backup does not contain target sidecar '{name}'; use a full backup or remove the stale sidecar first"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn row_ids(rows: &[Map<String, Value>]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|row| string_field(row, "id"))
+        .collect()
+}
+
+fn inserted_row_ids(rows: &[Map<String, Value>], skipped: &HashSet<String>) -> Vec<String> {
+    rows.iter()
+        .filter_map(|row| string_field(row, "id"))
+        .filter(|id| !skipped.contains(id))
+        .collect()
 }
 
 fn commit_restored_files(staging: &Path, target: &Path) -> Result<()> {
@@ -762,46 +1246,74 @@ fn commit_restored_files(staging: &Path, target: &Path) -> Result<()> {
     fs::create_dir_all(&backup_dir)?;
     let mut swapped: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     for path in restore_sidecar_paths(staging) {
-        if !path.exists() {
-            continue;
+        let result = (|| {
+            if !path_entry_exists(&path)? {
+                return Ok(());
+            }
+            let name = path
+                .file_name()
+                .ok_or_else(|| VaultError::Backup("invalid restored file name".into()))?;
+            let dest = target.join(name);
+            let replaced = if path_entry_exists(&dest)? {
+                let backup = backup_dir.join(name);
+                fs::rename(&dest, &backup)?;
+                Some(backup)
+            } else {
+                None
+            };
+            swapped.push((dest.clone(), replaced));
+            fs::rename(&path, &dest)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            return rollback_commit_error(error, staging, &swapped);
         }
-        let name = path
-            .file_name()
-            .ok_or_else(|| VaultError::Backup("invalid restored file name".into()))?;
-        let dest = target.join(name);
-        let replaced = if dest.exists() {
-            let backup = backup_dir.join(name);
-            fs::rename(&dest, &backup)?;
-            Some(backup)
-        } else {
-            None
-        };
-        if let Err(error) = fs::rename(&path, &dest) {
-            rollback_swaps(target, &swapped);
-            return Err(error.into());
-        }
-        swapped.push((dest, replaced));
     }
     Ok(())
 }
 
-fn rollback_swaps(target: &Path, swapped: &[(PathBuf, Option<PathBuf>)]) {
+fn rollback_commit_error(
+    error: VaultError,
+    staging: &Path,
+    swapped: &[(PathBuf, Option<PathBuf>)],
+) -> Result<()> {
+    if let Err(rollback_error) = rollback_swaps(swapped) {
+        return Err(VaultError::Backup(format!(
+            "restore commit failed: {error}; rollback failed: {rollback_error}; recovery files retained at {}",
+            staging.display()
+        )));
+    }
+    Err(error)
+}
+
+fn rollback_swaps(swapped: &[(PathBuf, Option<PathBuf>)]) -> Result<()> {
+    let mut failures = Vec::new();
     for (dest, replaced) in swapped.iter().rev() {
-        let failed = target.join(format!(
-            ".wk-restore-failed-{}",
-            dest.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("file")
-        ));
-        let _ = fs::rename(dest, &failed);
-        if let Some(backup) = replaced {
-            let _ = fs::rename(backup, dest);
+        if let Err(error) = fs::remove_file(dest)
+            && error.kind() != ErrorKind::NotFound
+        {
+            failures.push(format!("{}: {error}", dest.display()));
+            continue;
         }
+        if let Some(backup) = replaced
+            && let Err(error) = fs::rename(backup, dest)
+        {
+            failures.push(format!("{}: {error}", dest.display()));
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(VaultError::Backup(format!(
+            "restore rollback failed; replacement backups were retained: {}",
+            failures.join(", ")
+        )))
     }
 }
 
 fn password_hash_mismatch(target: &Path, payload: &VaultBackupPayload) -> Result<bool> {
-    let db = Connection::open(target.join("vault.db"))?;
+    let db =
+        Connection::open_with_flags(target.join("vault.db"), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
     let dest_hash: Option<String> = db
         .query_row(
             "SELECT value FROM vault_meta WHERE key = 'password_hash'",
@@ -891,10 +1403,6 @@ fn meta_values_equal(left: &Map<String, Value>, right: &Map<String, Value>) -> b
     string_field(left, "value") == string_field(right, "value")
 }
 
-fn row_id_is(row: &Map<String, Value>, id: &str) -> bool {
-    string_field(row, "id").as_deref() == Some(id)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -933,5 +1441,62 @@ mod tests {
         {
             let _ = (policies_dest, commit_restored_files);
         }
+    }
+
+    #[test]
+    fn rollback_restores_current_swap_and_retains_backup_on_failure() {
+        let target = tempfile::tempdir().expect("target");
+        let staging = tempfile::tempdir().expect("staging");
+        let destination = target.path().join("vault.db");
+        let backup = staging.path().join("replaced").join("vault.db");
+        fs::create_dir_all(backup.parent().expect("backup parent")).expect("backup directory");
+        fs::write(&destination, b"NEW").expect("new destination");
+        fs::write(&backup, b"OLD").expect("old backup");
+
+        rollback_swaps(&[(destination.clone(), Some(backup.clone()))]).expect("rollback");
+        assert_eq!(
+            fs::read(&destination).expect("restored destination"),
+            b"OLD"
+        );
+        assert!(!backup.exists());
+
+        let failed_target = target.path().join("blocked");
+        let failed_backup = staging.path().join("replaced").join("blocked");
+        fs::create_dir_all(&failed_target).expect("blocked destination");
+        fs::write(&failed_backup, b"RECOVERY").expect("recovery backup");
+        let rollback = rollback_swaps(&[(failed_target, Some(failed_backup.clone()))]);
+        assert!(rollback.is_err());
+        assert!(
+            failed_backup.exists(),
+            "failed rollback must retain its backup"
+        );
+    }
+
+    #[test]
+    fn failed_second_destination_backup_move_rolls_back_previous_swap() {
+        let target = tempfile::tempdir().expect("target");
+        let staging = tempfile::tempdir().expect("staging");
+        fs::write(target.path().join("vault.db"), b"OLD VAULT").expect("old vault");
+        fs::write(target.path().join(SIDECAR_POLICIES), b"OLD POLICIES").expect("old policies");
+        fs::write(staging.path().join("vault.db"), b"NEW VAULT").expect("new vault");
+        fs::write(staging.path().join(SIDECAR_POLICIES), b"NEW POLICIES").expect("new policies");
+        let blocked_backup = staging.path().join("replaced").join(SIDECAR_POLICIES);
+        fs::create_dir_all(&blocked_backup).expect("blocked backup directory");
+
+        let result = commit_restored_files(staging.path(), target.path());
+
+        assert!(result.is_err(), "second destination backup move must fail");
+        assert_eq!(
+            fs::read(target.path().join("vault.db")).expect("restored vault"),
+            b"OLD VAULT"
+        );
+        assert_eq!(
+            fs::read(target.path().join(SIDECAR_POLICIES)).expect("original policies"),
+            b"OLD POLICIES"
+        );
+        assert!(
+            blocked_backup.is_dir(),
+            "failed backup move must retain recovery state"
+        );
     }
 }

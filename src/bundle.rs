@@ -41,6 +41,36 @@ pub(crate) fn write_encrypted_payload_with_limit<T: Serialize>(
     output_path: &str,
     max_bytes: u64,
 ) -> Result<()> {
+    let file_bytes = encrypted_payload_bytes(magic, payload, passphrase, max_bytes)?;
+
+    secure_files::write_private(Path::new(output_path), &file_bytes)?;
+    Ok(())
+}
+
+/// Same as [`write_encrypted_payload_with_limit`] but refuses to replace an
+/// existing output file. This is reserved for destructive-recovery artifacts;
+/// sharing bundles retain their historical overwrite behavior.
+pub(crate) fn write_encrypted_payload_with_limit_no_clobber<T: Serialize>(
+    magic: &[u8; 4],
+    payload: &T,
+    passphrase: &str,
+    output_path: &str,
+    max_bytes: u64,
+) -> Result<()> {
+    let file_bytes = encrypted_payload_bytes(magic, payload, passphrase, max_bytes)?;
+    let output = Path::new(output_path);
+    if !secure_files::create_private(output, &file_bytes)? {
+        return Err(VaultError::AlreadyExists(output.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn encrypted_payload_bytes<T: Serialize>(
+    magic: &[u8; 4],
+    payload: &T,
+    passphrase: &str,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
     let json = serde_json::to_vec(payload).map_err(|e| VaultError::InvalidBundle(e.to_string()))?;
     if json.len() as u64 > max_bytes {
         return Err(VaultError::InvalidBundle(
@@ -56,9 +86,7 @@ pub(crate) fn write_encrypted_payload_with_limit<T: Serialize>(
     file_bytes.push(BUNDLE_VERSION);
     file_bytes.extend_from_slice(&salt);
     file_bytes.extend_from_slice(&encrypted_payload);
-
-    secure_files::write_private(Path::new(output_path), &file_bytes)?;
-    Ok(())
+    Ok(file_bytes)
 }
 
 /// Reads and decrypts a typed bundle payload after validating the expected

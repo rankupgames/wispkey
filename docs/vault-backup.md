@@ -13,6 +13,8 @@ wispkey backup restore vault.wkbackup --replace
 
 The backup passphrase is separate from the vault master password. Use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file`. New backups require a 12+ character passphrase. Share the archive and passphrase through different channels.
 
+Backup creation never replaces an existing output. It also refuses active vault paths such as `vault.db`, SQLite WAL/journal files, session/protector files, IPC files, and supported sidecars. Sharing bundle commands keep their existing output behavior.
+
 ## Format
 
 The on-disk frame is the shared WispKey bundle frame used by `.wkbundle` and `.wkcred` files:
@@ -59,11 +61,11 @@ Use `--exclude` to omit groups. Parent excludes cascade: `projects` also drops p
 
 `verify` checks magic/version, AES-GCM authentication, the inner SHA-256 integrity hash, row counts, and schema compatibility. It does not modify the destination.
 
-`restore --dry-run` reports the restore mode (`replace` or `merge`), row counts, conflicts, instances that would be marked for re-enrollment, and recovery limits.
+`restore --dry-run` reports the restore mode (`replace` or `merge`), row counts, database and sidecar conflicts, instances that would be marked for re-enrollment, and recovery limits. Merge planning opens the destination read-only, copies it into an in-memory SQLite database, and migrates only that copy. The destination is not changed by planning.
 
 ## Restore
 
-Restore validates integrity and schema compatibility before writing. Writes go to a staging directory, then files are renamed into the destination. A failed commit rolls the destination `vault.db` back when possible. Leftover `.wk-restore-*` directories can be deleted.
+Restore validates integrity and schema compatibility before writing. Replace writes go to a staging directory, then files are renamed into the destination. Merge sidecars are staged and created before the SQLite transaction commits; ordinary process I/O failures roll back both the database transaction and newly created sidecars. Failed operations retain `.wk-restore-*` staging when recovery is incomplete. SQLite and multiple file renames are not power-loss atomic.
 
 | Destination | Behavior |
 |-------------|----------|
@@ -73,7 +75,7 @@ Restore validates integrity and schema compatibility before writing. Writes go t
 
 Encrypted credential blobs stay wrapped with the original vault master key. Merge into a vault with a different `password_hash` is rejected; restore to an empty `--target` or pass `--replace`. After restore, unlock with the **original master password**. Session and protector files are not restored.
 
-Conflicts (same id with different data, or unique name/token collisions) require `--on-conflict skip` or `--replace`. Identical rows are treated as already present.
+Conflicts (same id with different data, unique name/token collisions, sidecar collisions, or unavailable parent identities) require `--on-conflict skip` or `--replace`. Identical rows are treated as already present. With `--on-conflict skip`, dependent partitions, credentials, scopes, and access requests are skipped when their exact referenced parent ID is unavailable. WispKey never remaps a security relationship by matching a different ID with the same name.
 
 ### Instance re-enrollment
 
@@ -83,7 +85,7 @@ Restored instances keep their ids and scopes but cannot authenticate. Active ins
 wispkey instance rotate-secret worker-acme-001
 ```
 
-Restored bootstrap tokens are revoked. Mint new tokens with `wispkey instance bootstrap create`.
+Restored bootstrap tokens are revoked. During a merge, only tokens inserted from the backup are revoked; existing destination tokens are not changed. Mint new tokens with `wispkey instance bootstrap create`.
 
 ## Recovery Limits
 
@@ -92,6 +94,9 @@ Restored bootstrap tokens are revoked. Mint new tokens with `wispkey instance bo
 - **Lost or reset device.** Copied `session` or `session-protector` files will not unlock on another machine. Restore the backup, then `wispkey unlock` with the master password.
 - **Corrupt `vault.db`.** Restore onto an empty `--target` or use `--replace`. Verify the archive first.
 - **Partial backup.** Excluded tables and sidecars are not recreated. Inspect the recorded scope before restore.
+- **Cross-file consistency.** Database rows are read in one SQLite transaction. Sidecars are read separately, so stop WispKey and quiesce vault-sidecar writers for a consistent backup.
+- **Replace preflight.** Replace refuses stale `session`/protector files, SQLite `-wal`/`-shm`/journal files, live IPC files, and target sidecars omitted from the backup. Clear the stale state or use a complete backup; no live replacement promise is made for excluded files.
+- **Interrupted restore.** Ordinary process failures are rolled back when possible. Power loss can occur between SQLite commit and filesystem durability, so verify the vault after an interruption. This feature does not promise crash-safe atomicity across SQLite and multiple files.
 - **Instance and bootstrap secrets.** Never stored at rest. Restored workers must receive newly minted secrets.
 - **Env sideloads.** `WISPKEY_SIDELOAD_*` values are not in the vault and are not in the backup.
 
