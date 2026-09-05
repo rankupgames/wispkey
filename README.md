@@ -164,6 +164,16 @@ wispkey inject -i config.template --stdout
 
 Configure in Cursor, Claude Code, or any MCP-compatible tool. Keep the command as `wispkey` so the client uses the normal installed binary from `PATH`; do not hardcode a user-specific absolute path. Vault-backed credentials use the current WispKey session; run `wispkey unlock` before starting the client, or set `WISPKEY_PASSWORD` only for trusted automation.
 
+```bash
+wispkey doctor
+wispkey integrate cursor --print
+wispkey integrate codex --print
+wispkey integrate claude-code --print
+wispkey integrate generic-mcp --print
+```
+
+`integrate` writes the matching client config by default and is idempotent: it updates only the WispKey MCP entry and leaves unrelated servers and settings in place. `--print` shows the snippet without writing. JSON clients warn that `env` blocks are plaintext; Codex uses `env_vars` instead of storing secret values.
+
 ```json
 {
   "mcpServers": {
@@ -342,6 +352,8 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey login list [--due] [--project P] [--all-projects]` | List website-login metadata |
 | `wispkey login archive/restore/activate <name>` | Lifecycle changes; archive never deletes |
 | `wispkey status` | Show vault, session, and proxy status |
+| `wispkey doctor` | Run secret-safe diagnostics (version, permissions, session, proxy, policy, audit, MCP, substitution) |
+| `wispkey integrate <client> [--print] [--path FILE]` | Generate or write MCP client config (`cursor`, `codex`, `claude-code`, `generic-mcp`) |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Query audit events |
 | `wispkey audit export [--since TS] [--until TS] [--credential C] [--encoding jsonl|json] [-o FILE]` | Export matching audit events for SIEM ingestion |
 | `wispkey audit tail [--follow] [--credential C]` | Stream newest audit events as JSONL; `--follow` uses a forward `(timestamp,id)` cursor |

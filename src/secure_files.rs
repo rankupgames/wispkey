@@ -66,6 +66,63 @@ pub(crate) fn create_private(path: &Path, bytes: &[u8]) -> Result<bool> {
     }
 }
 
+/// Reports whether a directory uses owner-only protection, without changing it.
+pub(crate) fn inspect_private_directory(path: &Path) -> std::result::Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    inspect_private_metadata(path, &metadata, true)
+}
+
+/// Reports whether a file uses owner-only protection, without changing it.
+pub(crate) fn inspect_private_file(path: &Path) -> std::result::Result<(), String> {
+    let metadata = fs::metadata(path).map_err(|error| format!("{}: {error}", path.display()))?;
+    if !metadata.is_file() {
+        return Err(format!("{} is not a regular file", path.display()));
+    }
+    inspect_private_metadata(path, &metadata, false)
+}
+
+/// Reports whether this platform can verify private-file metadata without
+/// adding a platform-specific ACL inspection implementation.
+pub(crate) fn private_metadata_inspection_supported() -> bool {
+    cfg!(unix)
+}
+
+#[cfg(unix)]
+fn inspect_private_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    is_directory: bool,
+) -> std::result::Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode() & 0o777;
+    let expected = if is_directory { 0o700 } else { 0o600 };
+    if mode & 0o077 != 0 {
+        return Err(format!(
+            "{} has permissions {:04o}; expected owner-only ({:04o})",
+            path.display(),
+            mode,
+            expected
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn inspect_private_metadata(
+    path: &Path,
+    _metadata: &fs::Metadata,
+    _is_directory: bool,
+) -> std::result::Result<(), String> {
+    Err(format!(
+        "{} owner-only permission inspection is unsupported on this platform",
+        path.display()
+    ))
+}
+
 /// Reads a small sensitive text file after rejecting obviously unsafe inputs
 /// such as directories, oversized files, and broad Unix permissions.
 pub(crate) fn read_private_string(path: &Path, max_bytes: u64) -> Result<String> {

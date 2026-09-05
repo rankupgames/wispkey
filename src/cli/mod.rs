@@ -4,16 +4,18 @@
  * Project: WispKey
  * Description: CLI command handlers -- grouped by command family.
  * Created: 2026-04-07
- * Last Modified: 2026-04-12
+ * Last Modified: 2026-08-26
  */
 
 mod audit;
 mod cloud;
 mod credential_sharing;
 mod credentials;
+mod doctor;
 mod exec;
 mod inject;
 mod instances;
+mod integrate;
 mod log;
 mod login;
 mod mcp;
@@ -37,6 +39,7 @@ pub use credentials::{
     AddCredentialArgs, handle_add, handle_get, handle_import, handle_list, handle_remove,
     handle_rotate,
 };
+pub use doctor::handle_doctor;
 pub use exec::{ExecArgs, askpass_mode_enabled, handle_askpass, handle_exec};
 pub use inject::{InjectArgs, handle_inject};
 pub use instances::{
@@ -46,6 +49,7 @@ pub use instances::{
     handle_instance_rotate_secret, handle_instance_scope_add, handle_instance_scope_remove,
     handle_instance_show,
 };
+pub use integrate::handle_integrate;
 pub use log::handle_log;
 pub use login::{
     GenerateLoginArgs, handle_activate, handle_archive, handle_generate,

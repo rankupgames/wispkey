@@ -4,7 +4,7 @@
  * Project: WispKey
  * Description: Entry point -- CLI argument parsing and subcommand dispatch.
  * Created: 2026-04-07
- * Last Modified: 2026-04-19
+ * Last Modified: 2026-08-26
  */
 
 #![deny(clippy::correctness)]
@@ -271,6 +271,23 @@ enum Commands {
 
     /// Show vault and proxy status
     Status,
+
+    /// Run secret-safe diagnostics
+    Doctor,
+
+    /// Generate or write MCP client configuration
+    Integrate {
+        /// Target client: cursor, codex, claude-code, or generic-mcp
+        client: IntegrateClient,
+
+        /// Print the generated config without writing
+        #[arg(long)]
+        print: bool,
+
+        /// Override the destination config path
+        #[arg(long)]
+        path: Option<String>,
+    },
 
     /// Manage the local WispKey proxy control plane
     Proxy {
@@ -766,6 +783,27 @@ enum ProxyCommands {
     Cleanup,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum IntegrateClient {
+    Cursor,
+    Codex,
+    #[value(name = "claude-code")]
+    ClaudeCode,
+    #[value(name = "generic-mcp")]
+    GenericMcp,
+}
+
+impl From<IntegrateClient> for wispkey::integrate::IntegrateClient {
+    fn from(value: IntegrateClient) -> Self {
+        match value {
+            IntegrateClient::Cursor => Self::Cursor,
+            IntegrateClient::Codex => Self::Codex,
+            IntegrateClient::ClaudeCode => Self::ClaudeCode,
+            IntegrateClient::GenericMcp => Self::GenericMcp,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum McpCommands {
     /// Start MCP server (stdio transport)
@@ -969,6 +1007,16 @@ async fn main() {
         }
         Commands::Status => {
             cli::handle_status().await;
+        }
+        Commands::Doctor => {
+            cli::handle_doctor().await;
+        }
+        Commands::Integrate {
+            client,
+            print,
+            path,
+        } => {
+            cli::handle_integrate(client.into(), print, path).await;
         }
         Commands::Proxy { command } => match command {
             ProxyCommands::Status => cli::handle_proxy_status().await,
