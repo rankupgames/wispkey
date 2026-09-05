@@ -1,15 +1,21 @@
+#[cfg(unix)]
 use std::fs;
+#[cfg(unix)]
 use std::path::PathBuf;
+#[cfg(unix)]
 use std::process::Command;
 
+#[cfg(unix)]
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
+#[cfg(unix)]
 fn script(name: &str) -> PathBuf {
     repo_root().join("scripts").join(name)
 }
 
+#[cfg(unix)]
 fn run_script(name: &str, args: &[&str]) -> std::process::Output {
     Command::new("bash")
         .arg(script(name))
@@ -18,6 +24,7 @@ fn run_script(name: &str, args: &[&str]) -> std::process::Output {
         .unwrap_or_else(|error| panic!("failed to run {name}: {error}"))
 }
 
+#[cfg(unix)]
 fn assert_success(name: &str, output: &std::process::Output) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -70,48 +77,51 @@ fn release_and_ci_workflows_pin_actions_to_commit_shas() {
 
 #[test]
 fn release_publication_has_preflight_and_registry_install_acceptance() {
-    let release = include_str!("../.github/workflows/release.yml");
-    let preflight = release
-        .find("  publication-preflight:\n")
-        .expect("publication preflight job");
-    let publish_github = release
-        .find("  publish-github:\n")
-        .expect("GitHub publication job");
-    assert!(preflight < publish_github);
+    let source = include_str!("../.github/workflows/release.yml").replace("\r\n", "\n");
+    for line_endings in [&source, &source.replace('\n', "\r\n")] {
+        let release = line_endings.replace("\r\n", "\n");
+        let preflight = release
+            .find("  publication-preflight:\n")
+            .expect("publication preflight job");
+        let publish_github = release
+            .find("  publish-github:\n")
+            .expect("GitHub publication job");
+        assert!(preflight < publish_github);
 
-    let preflight_block = &release[preflight..publish_github];
-    assert!(preflight_block.contains("needs: [verify, provenance]"));
-    assert!(preflight_block.contains(
+        let preflight_block = &release[preflight..publish_github];
+        assert!(preflight_block.contains("needs: [verify, provenance]"));
+        assert!(preflight_block.contains(
         "startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false)"
     ));
-    assert!(
-        preflight_block.contains("CARGO_REGISTRY_TOKEN is required before release publication")
-    );
-    assert!(release.contains("needs: [verify, provenance, publication-preflight]"));
-    assert!(release.contains("needs: [verify, homebrew-release, publication-preflight]"));
-    assert!(release.contains("brew tap-new --no-git \"$tap_name\""));
-    assert!(release.contains("tap_dir=\"$(brew --repository \"$tap_name\")\""));
-    assert!(release.contains("brew install --formula \"$tap_name/wispkey\""));
-    assert!(release.contains("brew untap \"$tap_name\""));
-    assert!(release.contains("curl --fail --location --silent --show-error \"$formula_url\""));
-    assert!(!release.contains("brew install --formula \"$formula_url\""));
+        assert!(
+            preflight_block.contains("CARGO_REGISTRY_TOKEN is required before release publication")
+        );
+        assert!(release.contains("needs: [verify, provenance, publication-preflight]"));
+        assert!(release.contains("needs: [verify, homebrew-release, publication-preflight]"));
+        assert!(release.contains("brew tap-new --no-git \"$tap_name\""));
+        assert!(release.contains("tap_dir=\"$(brew --repository \"$tap_name\")\""));
+        assert!(release.contains("brew install --formula \"$tap_name/wispkey\""));
+        assert!(release.contains("brew untap \"$tap_name\""));
+        assert!(release.contains("curl --fail --location --silent --show-error \"$formula_url\""));
+        assert!(!release.contains("brew install --formula \"$formula_url\""));
 
-    let cargo_install = release
-        .find("  cargo-install:\n")
-        .expect("Cargo registry install acceptance job");
-    let publish_crates = release
-        .find("  publish-crates:\n")
-        .expect("crates.io publication job");
-    assert!(publish_crates < cargo_install);
-    let publish_crates_block = &release[publish_crates..cargo_install];
-    assert!(!publish_crates_block.contains("is required to publish to crates.io"));
-    let cargo_install_block = &release[cargo_install..];
-    assert!(cargo_install_block.contains("needs: [verify, publish-crates]"));
-    assert!(cargo_install_block.contains("cargo install wispkey"));
-    assert!(cargo_install_block.contains("--version \"${VERSION}\""));
-    assert!(cargo_install_block.contains("--locked"));
-    assert!(cargo_install_block.contains("--root \"$install_root\""));
-    assert_eq!(release.matches("brew test wispkey").count(), 2);
+        let cargo_install = release
+            .find("  cargo-install:\n")
+            .expect("Cargo registry install acceptance job");
+        let publish_crates = release
+            .find("  publish-crates:\n")
+            .expect("crates.io publication job");
+        assert!(publish_crates < cargo_install);
+        let publish_crates_block = &release[publish_crates..cargo_install];
+        assert!(!publish_crates_block.contains("is required to publish to crates.io"));
+        let cargo_install_block = &release[cargo_install..];
+        assert!(cargo_install_block.contains("needs: [verify, publish-crates]"));
+        assert!(cargo_install_block.contains("cargo install wispkey"));
+        assert!(cargo_install_block.contains("--version \"${VERSION}\""));
+        assert!(cargo_install_block.contains("--locked"));
+        assert!(cargo_install_block.contains("--root \"$install_root\""));
+        assert_eq!(release.matches("brew test wispkey").count(), 2);
+    }
 }
 
 #[test]
