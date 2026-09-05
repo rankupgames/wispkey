@@ -31,6 +31,7 @@ fn help_flag_shows_commands() {
     assert!(stdout.contains("serve"));
     assert!(stdout.contains("import"));
     assert!(stdout.contains("cloud"));
+    assert!(stdout.contains("backup"));
     assert!(stdout.contains("mcp"));
 }
 

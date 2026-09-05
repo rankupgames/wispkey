@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+### Encrypted full-vault backup
+
+- Added `wispkey backup create/inspect/verify/restore` for a versioned, authenticated AES-256-GCM vault archive (`.wkbackup`, magic `WKVB`). The backup passphrase is separate from the master password.
+- Backups record an explicit include/exclude scope covering credentials, projects, partitions, policies, audits, instances, scopes, access requests, bootstrap state, and cloud sidecars. Session, protector, proxy, and owner IPC files are excluded.
+- Inspect, verify, and `restore --dry-run` decrypt the archive without printing secret values. Restore validates integrity and schema compatibility before writing, stages files, and commits with rollback of `vault.db` on failure.
+- Restore to an empty `--target` path or `--replace` is a full replace. Merge into an existing vault never overwrites; conflicts require `--on-conflict skip` or `--replace`.
+- Restored instances are marked `needs_reenrollment` because bearer secrets are never stored. `instance rotate-secret` mints a new secret and returns the instance to `active`. Restored bootstrap tokens are revoked.
+- Documented recovery limits for lost passwords, lost device material, corrupt databases, and partial backups in `docs/vault-backup.md`.
+
 ### Optional secure tray GUI
 
 - Added `wispkey lock` to clear the current session and drop the in-memory master key.

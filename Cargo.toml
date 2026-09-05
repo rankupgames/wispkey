@@ -41,7 +41,7 @@ ring = "0.17"
 argon2 = { version = "0.5", features = ["std"] }
 
 # Database
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

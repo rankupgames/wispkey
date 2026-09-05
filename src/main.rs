@@ -4,7 +4,7 @@
  * Project: WispKey
  * Description: Entry point -- CLI argument parsing and subcommand dispatch.
  * Created: 2026-04-07
- * Last Modified: 2026-04-19
+ * Last Modified: 2026-08-26
  */
 
 #![deny(clippy::correctness)]
@@ -299,6 +299,12 @@ enum Commands {
         command: AuditCommands,
     },
 
+    /// Create, inspect, verify, or restore an encrypted full-vault backup
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommands,
+    },
+
     /// Manage key partitions
     Partition {
         #[command(subcommand)]
@@ -431,6 +437,58 @@ enum AuditCommands {
         /// Filter by credential name
         #[arg(long)]
         credential: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCommands {
+    /// Write an encrypted full-vault backup
+    Create {
+        /// Output file path
+        #[arg(long, short)]
+        output: String,
+        /// Comma-separated items to omit: credentials,projects,partitions,policies,audits,instances,scopes,access-requests,bootstrap,cloud,active-project
+        #[arg(long)]
+        exclude: Option<String>,
+        /// Read the backup passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Show backup metadata without secret values
+    Inspect {
+        /// Path to a .wkbackup file
+        path: String,
+        /// Read the backup passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Check backup integrity and schema compatibility
+    Verify {
+        /// Path to a .wkbackup file
+        path: String,
+        /// Read the backup passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Restore a vault backup, optionally as a dry run
+    Restore {
+        /// Path to a .wkbackup file
+        path: String,
+        /// Plan the restore without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Restore into this vault directory instead of WISPKEY_VAULT_PATH
+        #[arg(long)]
+        target: Option<String>,
+        /// Replace an existing destination vault atomically
+        #[arg(long)]
+        replace: bool,
+        /// Conflict handling for merge restores: fail or skip
+        #[arg(long, default_value = "fail")]
+        on_conflict: String,
+        /// Read the backup passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
     },
 }
 
@@ -1001,6 +1059,46 @@ async fn main() {
             }
             AuditCommands::Tail { follow, credential } => {
                 cli::handle_audit_tail(follow, credential.as_deref()).await
+            }
+        },
+        Commands::Backup { command } => match command {
+            BackupCommands::Create {
+                output,
+                exclude,
+                bundle_passphrase_file,
+            } => {
+                cli::handle_backup_create(
+                    &output,
+                    exclude.as_deref(),
+                    bundle_passphrase_file.as_deref(),
+                )
+                .await
+            }
+            BackupCommands::Inspect {
+                path,
+                bundle_passphrase_file,
+            } => cli::handle_backup_inspect(&path, bundle_passphrase_file.as_deref()).await,
+            BackupCommands::Verify {
+                path,
+                bundle_passphrase_file,
+            } => cli::handle_backup_verify(&path, bundle_passphrase_file.as_deref()).await,
+            BackupCommands::Restore {
+                path,
+                dry_run,
+                target,
+                replace,
+                on_conflict,
+                bundle_passphrase_file,
+            } => {
+                cli::handle_backup_restore(
+                    &path,
+                    dry_run,
+                    target.as_deref(),
+                    replace,
+                    &on_conflict,
+                    bundle_passphrase_file.as_deref(),
+                )
+                .await
             }
         },
         Commands::Partition { command } => match command {

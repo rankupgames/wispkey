@@ -133,6 +133,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey partition create/list/delete/assign/export/import` | Partition management |
 | `wispkey project create/list/delete/use/current/export/import` | Project management and encrypted project bundles |
 | `wispkey credential export/import` | Encrypted single-credential sharing bundles |
+| `wispkey backup create/inspect/verify/restore` | Encrypted full-vault backup, inspection, verification, and atomic restore |
 | `wispkey instance enroll/list/show/scope/bootstrap/join/revoke/requests/approve/deny` | Manage instance identities, bootstrap self-enrollment, scopes, and access requests |
 | `wispkey instance rotate-secret <name> [--if-older-than AGE] [--grace AGE]` | Due-aware instance-secret rotation for protected automation |
 | `wispkey mcp serve` | Start MCP server (stdio) |
@@ -173,6 +174,20 @@ wispkey credential import openai-key.wkcred \
 ```
 
 New exports require a 12+ character bundle passphrase. Share the encrypted bundle and passphrase through different channels.
+
+## Vault Backup
+
+Full-vault backups are a different format from sharing bundles. They include credentials, projects, partitions, policies, audits, instances, scopes, access requests, bootstrap metadata, and cloud sidecars. Credential blobs stay encrypted with the original master key.
+
+```bash
+wispkey backup create --output vault.wkbackup
+wispkey backup inspect vault.wkbackup
+wispkey backup verify vault.wkbackup
+wispkey backup restore vault.wkbackup --dry-run
+wispkey backup restore vault.wkbackup --target /tmp/wispkey-restore-test
+```
+
+Use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file`. After restore, unlock with the original master password. Instance secrets cannot be restored; restored instances are marked `needs_reenrollment`. See `docs/vault-backup.md`.
 
 ## MCP Tools (for IDE agents)
 
@@ -258,7 +273,7 @@ When the proxy is running (`wispkey serve`):
 | `WISPKEY_SESSION_TIMEOUT` | Unlocked session lifetime in minutes (default 30; `0` means no expiry) |
 | `WISPKEY_PROTECTOR` | Session protector backend: `auto` (default), `os`, or `file` |
 | `WISPKEY_PROTECTOR_TIMEOUT` | Remembered-protector lifetime in minutes (default 480; `0` means until `lock --forget`) |
-| `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import |
+| `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import and vault backup |
 | `WISPKEY_SIDELOAD_<SLUG>` | Env-sideload credential value for MCP/proxy use; never print the value |
 
 ## Conventions

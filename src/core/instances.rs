@@ -8,10 +8,11 @@ use uuid::Uuid;
 use super::rows::parse_datetime_column;
 use super::{Credential, Result, Vault, VaultError};
 
-const INSTANCE_STATUS_ACTIVE: &str = "active";
-const INSTANCE_STATUS_REVOKED: &str = "revoked";
+pub(crate) const INSTANCE_STATUS_ACTIVE: &str = "active";
+pub(crate) const INSTANCE_STATUS_REVOKED: &str = "revoked";
+pub(crate) const INSTANCE_STATUS_NEEDS_REENROLLMENT: &str = "needs_reenrollment";
 const BOOTSTRAP_TOKEN_STATUS_ACTIVE: &str = "active";
-const BOOTSTRAP_TOKEN_STATUS_REVOKED: &str = "revoked";
+pub(crate) const BOOTSTRAP_TOKEN_STATUS_REVOKED: &str = "revoked";
 const REQUEST_STATUS_PENDING: &str = "pending";
 const REQUEST_STATUS_APPROVED: &str = "approved";
 const REQUEST_STATUS_DENIED: &str = "denied";
@@ -452,14 +453,17 @@ impl Vault {
                 params![instance.id],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )?;
-        if stored_status != INSTANCE_STATUS_ACTIVE {
+        if stored_status != INSTANCE_STATUS_ACTIVE
+            && stored_status != INSTANCE_STATUS_NEEDS_REENROLLMENT
+        {
             return Err(VaultError::InstanceNotActive(identifier.to_string()));
         }
 
         let now = Utc::now();
         let stored_rotated_at_parsed = parse_datetime_column(2, &stored_rotated_at)?;
-        if if_older_than
-            .is_some_and(|age| now.signed_duration_since(stored_rotated_at_parsed) < age)
+        if stored_status == INSTANCE_STATUS_ACTIVE
+            && if_older_than
+                .is_some_and(|age| now.signed_duration_since(stored_rotated_at_parsed) < age)
         {
             return Ok(RotateInstanceSecretResult {
                 instance: self.get_instance(&instance.id)?,
@@ -468,7 +472,8 @@ impl Vault {
             });
         }
 
-        let previous_secret_expires_at = if grace > Duration::zero() {
+        let retain_previous = stored_status == INSTANCE_STATUS_ACTIVE && grace > Duration::zero();
+        let previous_secret_expires_at = if retain_previous {
             Some(
                 now.checked_add_signed(grace)
                     .ok_or(VaultError::InvalidInstanceSecretRotation)?
@@ -490,17 +495,19 @@ impl Vault {
                  previous_secret_expires_at = ?1,
                  secret_hash = ?2,
                  secret_rotated_at = ?3,
-                 updated_at = ?3
-             WHERE id = ?4
-               AND status = ?5
-               AND secret_hash = ?6
-               AND secret_rotated_at = ?7",
+                 updated_at = ?3,
+                 status = ?4
+             WHERE id = ?5
+               AND status = ?6
+               AND secret_hash = ?7
+               AND secret_rotated_at = ?8",
             params![
                 previous_secret_expires_at,
                 secret_hash,
                 rotated_at,
-                instance.id,
                 INSTANCE_STATUS_ACTIVE,
+                instance.id,
+                stored_status,
                 stored_hash,
                 stored_rotated_at
             ],
@@ -891,6 +898,64 @@ impl Vault {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(requests)
     }
+}
+
+/// Invalidates the selected restored instance bearer secrets and marks those
+/// instances for re-enrollment. Only Argon2id hashes exist in the vault, so a
+/// backup cannot restore a usable instance secret.
+pub(crate) fn prepare_restored_instance_secrets(
+    db: &rusqlite::Connection,
+    instance_ids: &[String],
+) -> Result<Vec<String>> {
+    let now = Utc::now().to_rfc3339();
+    let mut names = Vec::new();
+    for id in instance_ids {
+        let name = db
+            .query_row(
+                "SELECT name FROM instances WHERE id = ?1 AND status = ?2",
+                params![id, INSTANCE_STATUS_ACTIVE],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        let Some(name) = name else {
+            continue;
+        };
+        let discarded_secret = crate::random::alphanumeric(48, false)?;
+        let secret_hash = hash_instance_secret(&discarded_secret)?;
+        db.execute(
+            "UPDATE instances
+             SET status = ?1,
+                 secret_hash = ?2,
+                 previous_secret_hash = NULL,
+                 previous_secret_expires_at = NULL,
+                 secret_rotated_at = ?3,
+                 updated_at = ?3
+             WHERE id = ?4",
+            params![INSTANCE_STATUS_NEEDS_REENROLLMENT, secret_hash, now, id],
+        )?;
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// Revokes selected restored bootstrap tokens because plaintext tokens are
+/// never stored.
+pub(crate) fn revoke_bootstrap_tokens_after_restore(
+    db: &rusqlite::Connection,
+    token_ids: &[String],
+) -> Result<usize> {
+    let mut changed = 0;
+    for token_id in token_ids {
+        changed += db.execute(
+            "UPDATE bootstrap_tokens SET status = ?1 WHERE id = ?2 AND status = ?3",
+            params![
+                BOOTSTRAP_TOKEN_STATUS_REVOKED,
+                token_id,
+                BOOTSTRAP_TOKEN_STATUS_ACTIVE
+            ],
+        )?;
+    }
+    Ok(changed)
 }
 
 fn hash_instance_secret(secret: &str) -> Result<String> {
