@@ -3,81 +3,524 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build, test, sign, and package without publishing"
+        type: boolean
+        default: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
 
 jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Read version and require tag match
+        id: meta
+        run: |
+          set -euo pipefail
+          version="$(awk '/^\[package\]/{p=1} p&&/^version = /{gsub(/"/,"",$3); print $3; exit}' Cargo.toml)"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
+            echo "::error::Could not read a valid version from Cargo.toml"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            tag="${GITHUB_REF_NAME}"
+            if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
+              echo "::error::Tag must be vMAJOR.MINOR.PATCH, got ${tag}"
+              exit 1
+            fi
+            if [[ "${tag#v}" != "$version" ]]; then
+              echo "::error::Tag ${tag} does not match Cargo.toml version ${version}"
+              exit 1
+            fi
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+          components: clippy, rustfmt
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          shared-key: release-verify
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings -W clippy::suspicious -W clippy::style -W clippy::perf -W clippy::complexity
+
+      - name: Tests
+        run: cargo test
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: Dependency audit
+        run: cargo audit
+
+      - name: cargo publish --dry-run
+        run: cargo publish --dry-run --locked
+
+      - name: Generate CycloneDX SBOM
+        run: |
+          set -euo pipefail
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+          cargo cyclonedx --format json --spec-version 1.5 --all --override-filename wispkey
+          if [[ -f wispkey.cdx.json ]]; then
+            mv wispkey.cdx.json wispkey.cyclonedx.json
+          elif [[ -f wispkey.json ]]; then
+            mv wispkey.json wispkey.cyclonedx.json
+          else
+            echo "::error::CycloneDX SBOM was not produced at the crate root"
+            ls -la
+            exit 1
+          fi
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          data = json.loads(Path("wispkey.cyclonedx.json").read_text())
+          bom_format = data.get("bomFormat") or data.get("bom_format")
+          if bom_format != "CycloneDX":
+              raise SystemExit(f"unexpected SBOM format: {bom_format!r}")
+          spec = str(data.get("specVersion") or data.get("spec_version") or "")
+          if not spec.startswith("1."):
+              raise SystemExit(f"unexpected CycloneDX spec version: {spec!r}")
+          PY
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: sbom
+          path: wispkey.cyclonedx.json
+          if-no-files-found: error
+
   build:
     name: Build ${{ matrix.target }}
+    needs: verify
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            artifact: wispkey
+            binary: wispkey
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
-            artifact: wispkey
+            os: ubuntu-24.04-arm
+            binary: wispkey
           - target: x86_64-apple-darwin
-            os: macos-latest
-            artifact: wispkey
+            os: macos-15-intel
+            binary: wispkey
           - target: aarch64-apple-darwin
             os: macos-latest
-            artifact: wispkey
+            binary: wispkey
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            artifact: wispkey.exe
-
+            binary: wispkey.exe
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
-      - name: Install cross-compilation tools
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
-          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> $GITHUB_ENV
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+        with:
+          shared-key: release-${{ matrix.target }}
 
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
-      - name: Package (unix)
-        if: runner.os != 'Windows'
+      - name: Package archive
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../wispkey-${{ matrix.target }}.tar.gz ${{ matrix.artifact }}
+          set -euo pipefail
+          bash scripts/package-release-asset.sh \
+            --target "${{ matrix.target }}" \
+            --binary "target/${{ matrix.target }}/release/${{ matrix.binary }}" \
+            --version "${VERSION}" \
+            --commit "${GITHUB_SHA}" \
+            --license LICENSE \
+            --readme README.md \
+            --out-dir dist
 
-      - name: Package (windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../wispkey-${{ matrix.target }}.zip ${{ matrix.artifact }}
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload archive
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: wispkey-${{ matrix.target }}
-          path: wispkey-${{ matrix.target }}.*
+          path: dist/wispkey-${{ matrix.target }}.*
+          if-no-files-found: error
 
-  release:
-    name: Release
-    needs: build
-    runs-on: ubuntu-latest
+  smoke:
+    name: Smoke ${{ matrix.target }}
+    needs: [verify, build]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            binary: wispkey
+            archive: wispkey-x86_64-unknown-linux-gnu.tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            binary: wispkey
+            archive: wispkey-aarch64-unknown-linux-gnu.tar.gz
+          - target: x86_64-apple-darwin
+            os: macos-15-intel
+            binary: wispkey
+            archive: wispkey-x86_64-apple-darwin.tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            binary: wispkey
+            archive: wispkey-aarch64-apple-darwin.tar.gz
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            binary: wispkey.exe
+            archive: wispkey-x86_64-pc-windows-msvc.zip
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
+      - name: Download packaged archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          path: artifacts
+          name: wispkey-${{ matrix.target }}
+          path: dist
+
+      - name: Run downloaded binary
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          cd dist
+          tar -xf "${{ matrix.archive }}"
+          test -f LICENSE
+          test -f README.md
+          test -f VERSION
+          test -f "${{ matrix.binary }}"
+          grep -F "version: ${VERSION}" VERSION
+          grep -F "commit: ${GITHUB_SHA}" VERSION
+          grep -F "license: Apache-2.0" VERSION
+          output="$("./${{ matrix.binary }}" --version)"
+          echo "$output"
+          echo "$output" | grep -F "wispkey ${VERSION}"
+
+  homebrew-local:
+    name: Homebrew formula smoke
+    needs: [verify, smoke]
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download macOS ARM64 archive
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: wispkey-aarch64-apple-darwin
+          path: dist
+
+      - name: Install formula from local archive
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          archive="dist/wispkey-aarch64-apple-darwin.tar.gz"
+          test -f "$archive"
+          digest="$(shasum -a 256 "$archive" | awk '{print $1}')"
+          dist_url="file://$(cd dist && pwd)"
+          bash scripts/generate-homebrew-formula.sh \
+            --version "${VERSION}" \
+            --base-url "${dist_url}" \
+            --out dist/wispkey.rb \
+            --sha-aarch64-apple-darwin "$digest" \
+            --sha-x86_64-apple-darwin "$digest" \
+            --sha-aarch64-unknown-linux-gnu "$digest" \
+            --sha-x86_64-unknown-linux-gnu "$digest"
+
+          tap_name="local/wispkey-release-smoke"
+          brew tap-new --no-git "$tap_name"
+          tap_dir="$(brew --repository "$tap_name")"
+          cp dist/wispkey.rb "$tap_dir/Formula/wispkey.rb"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "$tap_name/wispkey"
+          wispkey --version | grep -F "wispkey ${VERSION}"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew test wispkey
+          brew uninstall wispkey
+          brew untap "$tap_name"
+
+  provenance:
+    name: Checksums, SBOM, signatures, provenance
+    needs: [verify, smoke, homebrew-local]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: wispkey-*
+          path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+
+      - name: Download SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          files: artifacts/*
+          name: sbom
+          path: dist
+
+      - name: Generate Homebrew formula and checksums
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          required = [
+              "wispkey-x86_64-unknown-linux-gnu.tar.gz",
+              "wispkey-aarch64-unknown-linux-gnu.tar.gz",
+              "wispkey-x86_64-apple-darwin.tar.gz",
+              "wispkey-aarch64-apple-darwin.tar.gz",
+              "wispkey-x86_64-pc-windows-msvc.zip",
+              "wispkey.cyclonedx.json",
+          ]
+          missing = [name for name in required if not (Path("dist") / name).is_file()]
+          if missing:
+              raise SystemExit(f"missing release assets: {missing}")
+          PY
+
+          digest() {
+            sha256sum -- "$1" | awk '{print $1}'
+          }
+
+          bash scripts/generate-homebrew-formula.sh \
+            --version "${VERSION}" \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}" \
+            --out dist/wispkey.rb \
+            --sha-aarch64-apple-darwin "$(digest dist/wispkey-aarch64-apple-darwin.tar.gz)" \
+            --sha-x86_64-apple-darwin "$(digest dist/wispkey-x86_64-apple-darwin.tar.gz)" \
+            --sha-aarch64-unknown-linux-gnu "$(digest dist/wispkey-aarch64-unknown-linux-gnu.tar.gz)" \
+            --sha-x86_64-unknown-linux-gnu "$(digest dist/wispkey-x86_64-unknown-linux-gnu.tar.gz)"
+
+          bash scripts/sha256sums.sh --dir dist --out dist/SHA256SUMS.txt
+          grep -F "wispkey.rb" dist/SHA256SUMS.txt
+          grep -F "wispkey.cyclonedx.json" dist/SHA256SUMS.txt
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@3454372f43399081ed03b604cb2d021dabca52bb # v3.8.2
+
+      - name: Sign checksums with Sigstore
+        run: |
+          set -euo pipefail
+          cosign sign-blob --yes \
+            --bundle dist/SHA256SUMS.txt.sigstore.json \
+            dist/SHA256SUMS.txt
+          test -s dist/SHA256SUMS.txt.sigstore.json
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-checksums: dist/SHA256SUMS.txt
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@bd218ad0dbcb3e146bd073d1d9c6d78e08aa8a0b # v2.4.0
+        with:
+          subject-checksums: dist/SHA256SUMS.txt
+          sbom-path: dist/wispkey.cyclonedx.json
+
+      - name: Upload signed release metadata
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-metadata
+          path: |
+            dist/SHA256SUMS.txt
+            dist/SHA256SUMS.txt.sigstore.json
+            dist/wispkey.rb
+            dist/wispkey.cyclonedx.json
+          if-no-files-found: error
+
+  publication-preflight:
+    name: Publication preflight
+    needs: [verify, provenance]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Require Cargo registry token
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${CARGO_REGISTRY_TOKEN}" ]]; then
+            echo "::error::CARGO_REGISTRY_TOKEN is required before release publication"
+            exit 1
+          fi
+
+  publish-github:
+    name: GitHub Release
+    needs: [verify, provenance, publication-preflight]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Download archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: wispkey-*
+          path: dist
+          merge-multiple: true
+
+      - name: Download signed metadata
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-metadata
+          path: dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
+        with:
+          files: dist/*
           generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Signed WispKey ${{ needs.verify.outputs.version }} release.
+
+            Verify archives with `SHA256SUMS.txt` and `SHA256SUMS.txt.sigstore.json`, then confirm provenance:
+
+            ```bash
+            sha256sum -c SHA256SUMS.txt --ignore-missing
+            gh attestation verify <archive> --repo ${{ github.repository }}
+            ```
+
+            Installation and verification steps: https://github.com/${{ github.repository }}/blob/${{ github.sha }}/docs/install.md
+
+  homebrew-release:
+    name: Homebrew release install
+    needs: [verify, publish-github]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install from the published formula
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          tmp_dir="$(mktemp -d)"
+          tap_name="local/wispkey-release-smoke-$$"
+          formula_url="https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/wispkey.rb"
+          brew tap-new --no-git "$tap_name"
+          tap_dir="$(brew --repository "$tap_name")"
+          curl --fail --location --silent --show-error "$formula_url" --output "$tmp_dir/wispkey.rb"
+          cp "$tmp_dir/wispkey.rb" "$tap_dir/Formula/wispkey.rb"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install --formula "$tap_name/wispkey"
+          wispkey --version | grep -F "wispkey ${VERSION}"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew test wispkey
+          brew uninstall wispkey
+          brew untap "$tap_name"
+          rm -rf "$tmp_dir"
+
+  publish-crates:
+    name: crates.io
+    needs: [verify, homebrew-release, publication-preflight]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+
+      - name: Publish to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          set -euo pipefail
+          cargo publish --locked --token "${CARGO_REGISTRY_TOKEN}"
+
+  cargo-install:
+    name: Cargo registry install acceptance
+    needs: [verify, publish-crates]
+    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+
+      - name: Install published crate from crates.io
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          install_root="$(mktemp -d)"
+          cargo_home="$(mktemp -d)"
+          trap 'rm -rf "$install_root" "$cargo_home"' EXIT
+
+          CARGO_HOME="$cargo_home" cargo install wispkey \
+            --version "${VERSION}" \
+            --locked \
+            --root "$install_root"
+          output="$("$install_root/bin/wispkey" --version)"
+          echo "$output"
+          echo "$output" | grep -F "wispkey ${VERSION}"
