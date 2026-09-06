@@ -266,7 +266,7 @@ Configure the Firecracker VM with the same base socket path and a unique guest C
 
 WispKey binds `/run/wispkey/bc-acme-build-001.vsock_7700`. Inside the guest, connect AF_VSOCK to host CID `2`, port `7700`. Firecracker bridges that connection to WispKey's Unix socket. Use a unique base path and instance identity per microVM.
 
-This path was verified on a real Firecracker guest on RUG-DEV-1 on 2026-07-09 with scoped injection, out-of-scope denial, host approval and retry, and revocation. The verification used a disposable vault and synthetic credentials.
+The repository integration coverage verifies scoped injection, out-of-scope denial, host approval and retry, revocation, and Firecracker socket naming with disposable vaults and synthetic credentials. A production deployment should still validate its own Firecracker, filesystem-permission, and network configuration.
 
 The boring-computers launcher records the one-time enrollment output and starts the microVM with `WISPKEY_INSTANCE_ID`, `WISPKEY_INSTANCE_SECRET`, and only the `wk_*` tokens it should use. Generic hypervisors that expose host AF_VSOCK directly can instead use `vsock://<cid>:<port>` on Linux builds compiled with `--features vsock`.
 
