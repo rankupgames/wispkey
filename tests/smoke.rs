@@ -110,6 +110,7 @@ fn format_flag_is_global_after_subcommands() {
         vec!["status", "--format", "json"],
         vec!["instance", "list", "--format", "json"],
         vec!["audit", "export", "--format", "jsonl"],
+        vec!["guard", "shell", "--format", "json"],
     ] {
         let output = wispkey_bin()
             .args(&args)

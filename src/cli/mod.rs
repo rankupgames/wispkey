@@ -13,6 +13,7 @@ mod credential_sharing;
 mod credentials;
 mod env;
 mod exec;
+mod guard;
 mod inject;
 mod instances;
 mod log;
@@ -40,6 +41,7 @@ pub use credentials::{
 };
 pub use env::{handle_env_attach, handle_env_list};
 pub use exec::{ExecArgs, askpass_mode_enabled, handle_askpass, handle_exec};
+pub use guard::handle_guard_shell;
 pub use inject::{InjectArgs, handle_inject};
 pub use instances::{
     handle_instance_approve, handle_instance_bootstrap_create, handle_instance_bootstrap_list,

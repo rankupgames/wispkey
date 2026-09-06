@@ -70,6 +70,7 @@ The attached `.env` stays in place: selected secret values become `wk_*` tokens 
 - **Host restrictions** -- Glob-pattern allowlists per credential (e.g. `api.openai.com` or `*.amazonaws.com`)
 - **Cross-OS local file protection** -- Vault directories, attached `.env` files, generated `.env.wispkey` files, and other sensitive outputs are owner-only on Linux/macOS and restricted with Windows ACLs where supported
 - **Management API token checks** -- The proxy compares management tokens in constant time
+- **Native shell leak guard** -- the Cursor plugin calls `wispkey guard shell` through `PATH` to check `beforeShellExecution` payloads for known plaintext secret patterns and unsafe secret-environment-variable use on every supported OS
 - **Secret injection for subprocesses and templates** -- `wispkey exec`, `wispkey run`, and `wispkey inject` are audited, owner-only plaintext-egress tools that resolve credentials in-process without placing plaintext in argv, parent env, WispKey stdout except explicit `inject --stdout`, or audit logs
 - **Security model** -- The current boundary and intentional limits are documented in [`docs/security-model.md`](docs/security-model.md)
 
@@ -164,6 +165,12 @@ wispkey inject -i config.template --stdout
 ```
 
 `--stdout` is an explicit plaintext disclosure to the caller. The safer default is `-o <outfile>`, which uses WispKey's owner-only file writer. `inject` writes a `CredentialInject` audit event with the credential names, output destination, and project.
+
+## Native Shell Leak Guard
+
+The Cursor plugin's `beforeShellExecution` hooks invoke `wispkey guard shell` through `PATH`. The command reads the hook JSON from stdin and returns the existing `{"permission":"allow"}` or `{"permission":"deny",...}` contract. It does not open the vault or require a password. One native implementation performs both checks: known plaintext secret signatures and commands that print or directly export protected environment variables. Structurally valid lowercase `wk_*` tokens are treated as placeholders, but a command that also contains a plaintext secret is denied.
+
+This is a bounded, best-effort pattern detector, not a shell parser or a general command sandbox. It cannot identify every secret, shell transformation, indirect disclosure, or process behavior. Invalid, empty, oversized, or unrecognized hook input fails closed. Keep `wispkey` available on the plugin process `PATH`.
 
 ## MCP Integration
 
