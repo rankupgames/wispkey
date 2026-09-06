@@ -269,6 +269,12 @@ enum Commands {
         project: Option<String>,
     },
 
+    /// Discover and attach .env files to WispKey projects and environments
+    Env {
+        #[command(subcommand)]
+        command: EnvCommands,
+    },
+
     /// Show vault and proxy status
     Status,
 
@@ -358,6 +364,33 @@ enum Commands {
 enum AuditOutputFormat {
     Jsonl,
     Json,
+}
+
+#[derive(Subcommand)]
+enum EnvCommands {
+    /// Recursively list attachable .env files without reading their contents
+    List {
+        /// Directory to scan (default: current directory)
+        #[arg(default_value = ".")]
+        directory: String,
+    },
+    /// Import selected secrets and replace them with WispKey tokens in-place
+    Attach {
+        /// Path to the .env file
+        path: String,
+        /// WispKey project to create or use
+        #[arg(long)]
+        project: String,
+        /// Environment/partition name (default: derived from the file name)
+        #[arg(long)]
+        environment: Option<String>,
+        /// Environment variable to attach; repeat for each secret
+        #[arg(long, required = true)]
+        key: Vec<String>,
+        /// Allowed target hosts for new credentials (comma-separated, glob patterns)
+        #[arg(long)]
+        hosts: Option<String>,
+    },
 }
 
 impl From<AuditOutputFormat> for cli::AuditExportFormat {
@@ -979,6 +1012,25 @@ async fn main() {
             )
             .await;
         }
+        Commands::Env { command } => match command {
+            EnvCommands::List { directory } => cli::handle_env_list(&directory).await,
+            EnvCommands::Attach {
+                path,
+                project,
+                environment,
+                key,
+                hosts,
+            } => {
+                cli::handle_env_attach(
+                    &path,
+                    &key,
+                    &project,
+                    environment.as_deref(),
+                    hosts.as_deref(),
+                )
+                .await;
+            }
+        },
         Commands::Status => {
             cli::handle_status().await;
         }

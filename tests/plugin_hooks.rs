@@ -344,3 +344,21 @@ fn plugin_uses_one_unconditional_path_resolved_guard() {
     assert_eq!(hook_list[0]["command"], "wispkey guard shell");
     assert!(hook_list[0].get("matcher").is_none());
 }
+
+#[test]
+fn shell_guard_preserves_command_only_hook_payloads() {
+    for (command, expected) in [
+        ("echo hello", "allow"),
+        ("export OPENAI_API_KEY=wk_openai_test", "allow"),
+        ("printf \"%s\" \"$OPENAI_API_KEY\"", "deny"),
+        (
+            "export OPENAI_API_KEY=raw_value; export NOTE=wk_dummy",
+            "deny",
+        ),
+    ] {
+        let payload = serde_json::json!({"command": command}).to_string();
+        let output = run_guard_with_args(&["guard", "shell"], payload.as_bytes());
+        assert_eq!(permission(&output), expected);
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(command));
+    }
+}
