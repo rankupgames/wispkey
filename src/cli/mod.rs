@@ -11,6 +11,7 @@ mod audit;
 mod cloud;
 mod credential_sharing;
 mod credentials;
+mod env;
 mod exec;
 mod inject;
 mod instances;
@@ -37,6 +38,7 @@ pub use credentials::{
     AddCredentialArgs, handle_add, handle_get, handle_import, handle_list, handle_remove,
     handle_rotate,
 };
+pub use env::{handle_env_attach, handle_env_list};
 pub use exec::{ExecArgs, askpass_mode_enabled, handle_askpass, handle_exec};
 pub use inject::{InjectArgs, handle_inject};
 pub use instances::{

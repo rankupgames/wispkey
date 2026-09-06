@@ -709,6 +709,7 @@ mod windows {
     use serde_json::Value;
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
     use super::{OwnerIpcError, cleanup_endpoint, handle_request, write_line, write_metadata};
@@ -787,7 +788,21 @@ mod windows {
 
     pub(super) async fn call(path: &Path, request: Value) -> Result<Value, OwnerIpcError> {
         let name = pipe_name(path);
-        let mut client = ClientOptions::new().open(&name)?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        // The server replaces its one-shot pipe instance after each response.
+        let mut client = loop {
+            match ClientOptions::new().open(&name) {
+                Ok(client) => break client,
+                Err(error)
+                    if (error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32))
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        };
         write_line(&mut client, &request).await?;
         let mut reader = BufReader::new(client);
         let mut line = String::new();

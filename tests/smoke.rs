@@ -30,6 +30,7 @@ fn help_flag_shows_commands() {
     assert!(stdout.contains("add"));
     assert!(stdout.contains("serve"));
     assert!(stdout.contains("import"));
+    assert!(stdout.contains("env"));
     assert!(stdout.contains("cloud"));
     assert!(stdout.contains("mcp"));
 }
