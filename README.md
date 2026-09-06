@@ -65,7 +65,7 @@ The attached `.env` stays in place: selected secret values become `wk_*` tokens 
 - **Environments** -- `env attach` maps `.env` to a `default` partition and `.env.<name>` to a `<name>` partition; organization/account scope remains external to the local vault
 
 ### Security
-- **Policy engine** -- TOML-defined rules with per-credential, per-host, per-path, per-method restrictions, deny rules, time windows, and sliding-window rate limiting
+- **Policy engine** -- TOML-defined rules with per-credential, per-host, per-path, per-method restrictions, deny rules, time windows, and sliding-window rate limiting; deterministic offline checks are documented in [`docs/policy-testing.md`](docs/policy-testing.md)
 - **Audit log** -- Every credential use and denial logged with timestamp, target host/path, method, and status; vault-backed events are queryable by credential and date range, bulk export supports JSONL/JSON for SIEM egress, `audit tail --follow` streams without skipping same-timestamp events, and vault-less env sideload use writes a local fallback JSONL audit file
 - **Host restrictions** -- Glob-pattern allowlists per credential (e.g. `api.openai.com` or `*.amazonaws.com`)
 - **Cross-OS local file protection** -- Vault directories, attached `.env` files, generated `.env.wispkey` files, and other sensitive outputs are owner-only on Linux/macOS and restricted with Windows ACLs where supported
