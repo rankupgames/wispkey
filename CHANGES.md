@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Native .env discovery and attachment
+
+- Added `wispkey env list [directory]` to recursively discover attachable `.env*` files without opening them. Global `--format json` output returns absolute paths and explicit traversal warnings for agent automation.
+- Added `wispkey env attach <path> --project <project> --key <name>... [--environment <environment>]`. It imports only explicitly selected values, auto-creates the project and environment partition, preserves ordinary settings and comments, and atomically replaces selected plaintext values with `wk_*` tokens in the same file.
+- `.env` maps to the `default` environment and `.env.<name>` maps to `<name>`. Credential names receive the environment prefix so identical variable names can coexist across environment partitions despite project-wide credential-name uniqueness.
+- Attachment is idempotent for matching stored values and existing tokens. Missing keys, unknown tokens, cross-environment credentials, and value conflicts fail without rewriting the source file.
+- Attachment serializes concurrent rewrites with an owner-only sibling lock file, inserts each selected credential batch in one vault transaction, and does not repeat token capabilities in human-readable output.
+
 ### Optional secure tray GUI
 
 - Added `wispkey lock` to clear the current session and drop the in-memory master key.
@@ -9,7 +17,7 @@
 - Added optional `wispkey-tray` desktop crate with tray-icon plus a Svelte 5 webview for single-credential and atomic OVH API template entry. Closing a dialog does not quit the tray.
 - `add_credential` now rejects empty names and values. Compound saves use `add_credentials_atomic` so a duplicate or invalid later row rolls back the whole batch.
 - Owner IPC responses and logs never include plaintext secret values or reusable wisp tokens; known secret fields are redacted before tracing.
-- Owner IPC uses a single-owner lifecycle lease, validates live discovery before the tray connects, and requires explicit destination confirmation for credential writes. Windows named pipes grant access only to the current user SID.
+- Owner IPC uses a single-owner lifecycle lease, validates live discovery before the tray connects, and requires explicit destination confirmation for credential writes. Windows named pipes grant access only to the current user SID and retry transient pipe replacement gaps.
 - Default `cargo test` still skips the GUI crate. Documented the tray boundary in `docs/tray.md` and `docs/security-model.md`.
 
 ### PKI-aware certificate issuance
