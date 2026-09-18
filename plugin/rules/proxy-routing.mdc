@@ -8,7 +8,7 @@ globs: "*.sh,*.ts,*.js,*.py,*.rs,*.env*,Makefile,docker-compose*"
 When constructing HTTP requests that use wisp tokens (`wk_*`), always route through the WispKey proxy.
 
 ## Proxy Address
-`http://localhost:7700` (default). Set via `HTTP_PROXY` env var or pass directly.
+`http://localhost:7700` (default). Use `HTTP_PROXY` for inspectable plaintext HTTP or call the address directly in reverse proxy mode for HTTPS token substitution.
 
 ## curl
 ```bash
@@ -44,8 +44,8 @@ environment:
 ```
 
 ## Important
-- The proxy only listens on `localhost` -- requests from other machines will not work
+- The default listener is loopback-only; explicit non-loopback, Unix socket, Linux AF_VSOCK, and Firecracker listeners are available for identity-authenticated instances
 - `HTTPS_PROXY`/CONNECT tunneling is blind and cannot substitute `wk_*` tokens inside TLS
 - For HTTPS token substitution, use reverse proxy mode with `X-Target-Url`
 - Host restrictions are enforced per-credential (e.g. `openai-api` only works against `api.openai.com`)
-- Every proxied request is logged in the audit trail: `wispkey log`
+- Credential uses and denials are recorded in the audit trail: `wispkey log`
