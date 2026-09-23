@@ -231,6 +231,38 @@ pub fn log_event(
     deny_reason: Option<&str>,
     project_name: Option<&str>,
 ) {
+    if let Err(e) = try_log_event(
+        db,
+        event_type,
+        credential_name,
+        wisp_token,
+        target_host,
+        target_path,
+        http_method,
+        response_status,
+        denied,
+        deny_reason,
+        project_name,
+    ) {
+        tracing::error!("Failed to write audit log: {}", e);
+    }
+}
+
+/// Attempts to write an audit event and returns database failures to the caller.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_log_event(
+    db: &Connection,
+    event_type: &str,
+    credential_name: Option<&str>,
+    wisp_token: Option<&str>,
+    target_host: Option<&str>,
+    target_path: Option<&str>,
+    http_method: Option<&str>,
+    response_status: Option<u16>,
+    denied: bool,
+    deny_reason: Option<&str>,
+    project_name: Option<&str>,
+) -> rusqlite::Result<()> {
     let key = database_fingerprint_key(db);
     let token_fingerprint = wisp_token
         .zip(key.as_deref())
@@ -242,13 +274,11 @@ pub fn log_event(
     let http_method = redact_capabilities(http_method);
     let deny_reason = redact_capabilities(deny_reason);
     let project_name = redact_capabilities(project_name);
-    let result = db.execute(
+    db.execute(
 		"INSERT INTO audit_log (timestamp, event_type, credential_name, wisp_token, target_host, target_path, http_method, response_status, denied, deny_reason, project_name) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
 		params![Utc::now().to_rfc3339(), event_type, credential_name, token_fingerprint, target_host, target_path, http_method, response_status, denied as i32, deny_reason, project_name],
-	);
-    if let Err(e) = result {
-        tracing::error!("Failed to write audit log: {}", e);
-    }
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -300,6 +330,36 @@ pub fn log_fallback_event(
     deny_reason: Option<&str>,
     project_name: Option<&str>,
 ) {
+    if let Err(e) = try_log_fallback_event(
+        event_type,
+        credential_name,
+        wisp_token,
+        target_host,
+        target_path,
+        http_method,
+        response_status,
+        denied,
+        deny_reason,
+        project_name,
+    ) {
+        tracing::error!("Failed to write fallback audit log: {}", e);
+    }
+}
+
+/// Attempts to write a fallback audit event and returns sink failures.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_log_fallback_event(
+    event_type: &str,
+    credential_name: Option<&str>,
+    wisp_token: Option<&str>,
+    target_host: Option<&str>,
+    target_path: Option<&str>,
+    http_method: Option<&str>,
+    response_status: Option<u16>,
+    denied: bool,
+    deny_reason: Option<&str>,
+    project_name: Option<&str>,
+) -> std::result::Result<(), String> {
     let key = fallback_fingerprint_key();
     let event_type = redact_required(event_type);
     let credential_name = redact_capabilities(credential_name);
@@ -327,17 +387,13 @@ pub fn log_fallback_event(
 
     let mut line = match serde_json::to_vec(&entry) {
         Ok(line) => line,
-        Err(e) => {
-            tracing::error!("Failed to encode fallback audit log: {}", e);
-            return;
-        }
+        Err(e) => return Err(format!("failed to encode fallback audit log: {e}")),
     };
     line.push(b'\n');
 
     let path = Vault::vault_dir().join(SIDELOAD_FALLBACK_AUDIT_FILE);
-    if let Err(e) = secure_files::append_private(&path, &line) {
-        tracing::error!("Failed to write fallback audit log: {}", e);
-    }
+    secure_files::append_private(&path, &line)
+        .map_err(|error| format!("failed to write fallback audit log: {error}"))
 }
 
 /// Queries both the vault-backed audit DB and the sideload fallback JSONL sink.
@@ -824,6 +880,28 @@ mod tests {
         assert!(!stored.contains("wk_my_key_abc"));
         assert_eq!(entries[0].response_status, Some(200));
         assert!(!entries[0].denied);
+    }
+
+    #[test]
+    fn try_log_event_returns_database_failures() {
+        let db = test_db();
+        db.execute("DROP TABLE audit_log", []).unwrap();
+
+        let result = try_log_event(
+            &db,
+            "credential_accessed",
+            Some("my-key"),
+            Some("wk_my_key_abc"),
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
+
+        assert!(result.is_err());
     }
 
     #[test]

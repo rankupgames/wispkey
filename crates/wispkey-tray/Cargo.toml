@@ -13,7 +13,7 @@ tokio = { version = "1", features = ["full"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 dirs = "6"
 tao = "0.32"
 tray-icon = "0.21"

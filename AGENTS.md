@@ -156,6 +156,8 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey env attach <path> --project P --key NAME... [--environment E]` | Attach selected secrets to a project/environment and tokenize them in-place |
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Legacy whole-file import that writes `.env.wispkey` |
 | `wispkey status` | Vault + session + proxy status |
+| `wispkey doctor` | Secret-safe diagnostics (version, permissions, session, proxy, policy, audit, MCP, substitution) |
+| `wispkey integrate <client> [--print] [--path FILE]` | Generate or write MCP client config (`cursor`, `codex`, `claude-code`, `generic-mcp`) |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Audit log |
 | `wispkey audit export [--since TS] [--until TS] [--credential C] [--encoding jsonl|json] [-o FILE]` | Export matching audit events |
 | `wispkey audit tail [--follow] [--credential C]` | Stream newest audit events with a forward cursor when following |

@@ -6,13 +6,24 @@ WispKey is a local-first, open-source credential firewall for AI agents. Agents 
 
 ## Quick Start
 
+Install with Cargo, or follow the [Homebrew instructions](docs/install.md) on macOS and Linux:
+
 ```bash
-# Build from source
+cargo install wispkey --locked
+```
+
+You can also build from source:
+
+```bash
 git clone https://github.com/rankupgames/wispkey.git
 cd wispkey
 cargo build --release
 export PATH="$PWD/target/release:$PATH"
+```
 
+Then create a vault and attach a selected secret:
+
+```bash
 # Create your vault
 wispkey init
 
@@ -24,6 +35,8 @@ wispkey project use my-app
 # Start the proxy
 wispkey serve
 ```
+
+The AI process never touches your real secrets. Signed GitHub Release archives, SHA-256 checksums, Sigstore signatures, and verification steps are in [`docs/install.md`](docs/install.md).
 
 The attached `.env` stays in place: selected secret values become `wk_*` tokens while ordinary settings remain unchanged. Tokens belong to the local vault and are not portable team secrets. They are placeholders, not plaintext environment injection. Requests must use a WispKey substitution path; for HTTPS, send them through reverse proxy mode with `X-Target-Url`. Use `wispkey run`, `exec`, or `inject` for non-HTTP consumers. Because attachment cannot infer target hosts, `--hosts` is required when it creates credentials. Use a specific hostname or bounded glob such as `*.example.com`; empty or wildcard-only scopes such as `*` are rejected. Existing matching credentials must already have a meaningful host allowlist, and attachment never broadens their stored restrictions.
 
@@ -175,6 +188,16 @@ This is a bounded, best-effort pattern detector, not a shell parser or a general
 ## MCP Integration
 
 Configure in Cursor, Claude Code, or any MCP-compatible tool. Keep the command as `wispkey` so the client uses the normal installed binary from `PATH`; do not hardcode a user-specific absolute path. Vault-backed credentials use the current WispKey session; run `wispkey unlock` before starting the client, or set `WISPKEY_PASSWORD` only for trusted automation.
+
+```bash
+wispkey doctor
+wispkey integrate cursor --print
+wispkey integrate codex --print
+wispkey integrate claude-code --print
+wispkey integrate generic-mcp --print
+```
+
+`integrate` writes the matching client config by default and is idempotent: it updates only the WispKey MCP entry and leaves unrelated servers and settings in place. `--print` shows the snippet without writing. JSON clients warn that `env` blocks are plaintext; Codex uses `env_vars` instead of storing secret values.
 
 ```json
 {
@@ -362,6 +385,8 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey login list [--due] [--project P] [--all-projects]` | List website-login metadata |
 | `wispkey login archive/restore/activate <name>` | Lifecycle changes; archive never deletes |
 | `wispkey status` | Show vault, session, and proxy status |
+| `wispkey doctor` | Run secret-safe diagnostics (version, permissions, session, proxy, policy, audit, MCP, substitution) |
+| `wispkey integrate <client> [--print] [--path FILE]` | Generate or write MCP client config (`cursor`, `codex`, `claude-code`, `generic-mcp`) |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Query audit events |
 | `wispkey audit export [--since TS] [--until TS] [--credential C] [--encoding jsonl|json] [-o FILE]` | Export matching audit events for SIEM ingestion |
 | `wispkey audit tail [--follow] [--credential C]` | Stream newest audit events as JSONL; `--follow` uses a forward `(timestamp,id)` cursor |

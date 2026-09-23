@@ -10,6 +10,20 @@
 - Restore to an empty `--target` path or `--replace` is a full replace. Merge into an existing vault never overwrites; conflicts require `--on-conflict skip` or `--replace`.
 - Restored instances are marked `needs_reenrollment` because bearer secrets are never stored. `instance rotate-secret` mints a new secret and returns the instance to `active`. Restored bootstrap tokens are revoked.
 - Documented recovery limits for lost passwords, lost device material, corrupt databases, and partial backups in `docs/vault-backup.md`.
+
+### Doctor checks and MCP client setup
+
+- Added `wispkey doctor` and `wispkey doctor --format json` for secret-safe diagnostics with stable check IDs and remediation text.
+- Doctor verifies binary version, vault permissions, session state, proxy ownership/readiness, policy validity, audit writability, MCP stdio initialization, supported transport, and a synthetic token-substitution probe that uses generated test material rather than a vault credential.
+- Added `wispkey integrate cursor|codex|claude-code|generic-mcp [--print] [--path FILE]`. Generated commands use `wispkey` from PATH, contain no secret values, warn before JSON formats that need plaintext `env` blocks, and merge idempotently without dropping unrelated client settings.
+
+### Signed multi-platform releases
+
+- Version tags now build native Linux x64/ARM64, macOS x64/ARM64, and Windows x64 archives that include `LICENSE`, `README.md`, and a `VERSION` file.
+- Release assets are checksummed (`SHA256SUMS.txt`), signed with Sigstore, attested with GitHub build provenance, and accompanied by a CycloneDX SBOM.
+- Publication is fail-closed through the pre-publication gates and `CARGO_REGISTRY_TOKEN` preflight; external publication remains sequential, with partial-publication recovery documented.
+- Documented the Homebrew temporary-tap install flow and `cargo install wispkey --locked` paths, including checksum, signature, and registry-install verification, in `docs/install.md`.
+
 ### Native .env discovery and attachment
 
 - Added `wispkey env list [directory]` to recursively discover attachable `.env*` files without opening them. Global `--format json` output returns absolute paths and explicit traversal warnings for agent automation.

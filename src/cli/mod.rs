@@ -12,11 +12,13 @@ mod backup;
 mod cloud;
 mod credential_sharing;
 mod credentials;
+mod doctor;
 mod env;
 mod exec;
 mod guard;
 mod inject;
 mod instances;
+mod integrate;
 mod log;
 mod login;
 mod mcp;
@@ -43,6 +45,7 @@ pub use credentials::{
     AddCredentialArgs, handle_add, handle_get, handle_import, handle_list, handle_remove,
     handle_rotate,
 };
+pub use doctor::handle_doctor;
 pub use env::{handle_env_attach, handle_env_list};
 pub use exec::{ExecArgs, askpass_mode_enabled, handle_askpass, handle_exec};
 pub use guard::handle_guard_shell;
@@ -54,6 +57,7 @@ pub use instances::{
     handle_instance_rotate_secret, handle_instance_scope_add, handle_instance_scope_remove,
     handle_instance_show,
 };
+pub use integrate::handle_integrate;
 pub use log::handle_log;
 pub use login::{
     GenerateLoginArgs, handle_activate, handle_archive, handle_generate,

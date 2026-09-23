@@ -6,7 +6,9 @@ authors = ["Miguel A. Lopez <miguel@rankupgames.com>"]
 description = "Local-first credential firewall for AI agents with wisp token proxy"
 license = "Apache-2.0"
 repository = "https://github.com/rankupgames/wispkey"
+homepage = "https://github.com/rankupgames/wispkey"
 readme = "README.md"
+rust-version = "1.94"
 keywords = ["credentials", "security", "ai-agents", "proxy", "mcp"]
 categories = ["authentication", "command-line-utilities"]
 
@@ -52,7 +54,7 @@ toml = "0.8"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # TLS provider (explicit dep so we can install the process-wide CryptoProvider at startup)
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
 
 # PKI (CA-held leaf issuance). aws-lc-rs is required for RSA key generation;
 # rcgen's ring backend cannot generate RSA keys.
