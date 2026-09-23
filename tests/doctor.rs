@@ -208,3 +208,54 @@ fn doctor_fails_world_writable_vault_dir() {
             .contains("permissions")
     );
 }
+
+#[tokio::test]
+async fn proxy_version_requires_authentication_and_remains_available_when_locked() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let child = wispkey_bin()
+        .args(["serve", "--random-port"])
+        .env("WISPKEY_VAULT_PATH", vault_dir.path())
+        .env_remove("WISPKEY_PASSWORD")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn proxy");
+    let _proxy = ChildGuard(child);
+    let info = wait_for_proxy_info(vault_dir.path());
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .unwrap();
+    let url = format!("http://127.0.0.1:{}/api/version", info["port"]);
+    assert_eq!(client.get(&url).send().await.unwrap().status(), 401);
+    let lock = run_wispkey(vault_dir.path(), &["lock"]);
+    assert!(lock.status.success());
+    let response = client
+        .get(&url)
+        .header(
+            "x-wispkey-management-token",
+            info["management_token"].as_str().unwrap(),
+        )
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let version: Value = response.json().await.unwrap();
+    assert_eq!(
+        version,
+        serde_json::json!({
+            "name": "wispkey", "version": env!("CARGO_PKG_VERSION"), "pid": info["pid"]
+        })
+    );
+    let (_, report) = doctor_json(vault_dir.path());
+    assert_eq!(check_named(&report, "proxy.version")["status"], "pass");
+    assert!(
+        !report
+            .to_string()
+            .contains(info["management_token"].as_str().unwrap())
+    );
+    assert!(!report.to_string().contains("test-password"));
+}

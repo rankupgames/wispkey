@@ -215,6 +215,7 @@ fn cleanup_endpoint(path: &Path) {
 }
 
 fn handle_request(request: Value) -> Value {
+    let started = std::time::Instant::now();
     let id = request
         .get("id")
         .and_then(Value::as_str)
@@ -251,6 +252,12 @@ fn handle_request(request: Value) -> Value {
         )),
     };
 
+    tracing::info!(
+        phase = "request_handling",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        succeeded = result.is_ok(),
+        "owner ipc request completed"
+    );
     match result {
         Ok(value) => json!({ "id": id, "ok": true, "result": value }),
         Err(error) => json!({ "id": id, "ok": false, "error": error }),
@@ -788,27 +795,40 @@ mod windows {
 
     pub(super) async fn call(path: &Path, request: Value) -> Result<Value, OwnerIpcError> {
         let name = pipe_name(path);
+        let started = tokio::time::Instant::now();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         // The server replaces its one-shot pipe instance after each response.
         let mut client = loop {
             match ClientOptions::new().open(&name) {
                 Ok(client) => break client,
                 Err(error)
-                    if (error.kind() == std::io::ErrorKind::NotFound
-                        || error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32))
-                        && tokio::time::Instant::now() < deadline =>
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) =>
                 {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(OwnerIpcError::Protocol(
+                            "connection phase timed out after 5000 ms".into(),
+                        ));
+                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 Err(error) => return Err(error.into()),
             }
         };
-        write_line(&mut client, &request).await?;
+        let connected_ms = started.elapsed().as_millis();
+        tokio::time::timeout(Duration::from_secs(5), write_line(&mut client, &request))
+            .await
+            .map_err(|_| {
+                OwnerIpcError::Protocol(format!(
+                    "request_write phase timed out after 5000 ms (connection: {connected_ms} ms)"
+                ))
+            })??;
+        let written_ms = started.elapsed().as_millis();
         let mut reader = BufReader::new(client);
         let mut line = String::new();
         tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
             .await
-            .map_err(|_| OwnerIpcError::Protocol("timed out waiting for owner IPC".into()))??;
+            .map_err(|_| OwnerIpcError::Protocol(format!("response_read phase timed out after 5000 ms (connection: {connected_ms} ms; request write: {} ms)", written_ms - connected_ms)))??;
         serde_json::from_str(line.trim())
             .map_err(|error| OwnerIpcError::Protocol(error.to_string()))
     }

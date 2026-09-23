@@ -197,6 +197,8 @@ wispkey integrate claude-code --print
 wispkey integrate generic-mcp --print
 ```
 
+Doctor reports `binary.path` when the first executable or shell shim on the current `PATH` differs from the running CLI. It inspects paths without running the other installation; shell aliases and another client's environment are outside the check. `proxy.version` compares the CLI package version with an authenticated response from the owned proxy, including when the vault is locked. Older proxies without version diagnostics report an unknown version. These checks never edit PATH, install software, unlock the vault, or restart a service. Different builds with the same package version are not distinguished.
+
 `integrate` writes the matching client config by default and is idempotent: it updates only the WispKey MCP entry and leaves unrelated servers and settings in place. `--print` shows the snippet without writing. JSON clients warn that `env` blocks are plaintext; Codex uses `env_vars` instead of storing secret values.
 
 ```json

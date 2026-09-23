@@ -23,12 +23,16 @@ use crate::proxy::lifecycle::{self, ProxyState};
 use crate::proxy::prove_synthetic_token_substitution;
 use crate::secure_files;
 
+mod versions;
+
 pub const STABLE_CHECK_IDS: &[&str] = &[
     "binary.version",
+    "binary.path",
     "vault.permissions",
     "session.state",
     "proxy.ownership",
     "proxy.readiness",
+    "proxy.version",
     "policy.validity",
     "audit.writability",
     "mcp.initialization",
@@ -140,6 +144,7 @@ fn count_status(checks: &[Check], status: CheckStatus) -> usize {
 pub async fn run_doctor() -> DoctorReport {
     let mut checks = vec![
         check_binary_version(),
+        versions::check_binary_path(),
         check_vault_permissions(),
         check_session_state(),
     ];
@@ -147,6 +152,7 @@ pub async fn run_doctor() -> DoctorReport {
     let proxy_status = lifecycle::read_status().await;
     checks.push(check_proxy_ownership(&proxy_status));
     checks.push(check_proxy_readiness(&proxy_status));
+    checks.push(versions::check_proxy_version(&proxy_status).await);
     checks.push(check_policy_validity());
     checks.push(check_audit_writability());
     checks.push(check_mcp_initialization());
