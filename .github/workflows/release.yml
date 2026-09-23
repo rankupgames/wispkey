@@ -90,7 +90,7 @@ jobs:
         run: |
           set -euo pipefail
           cargo install cargo-cyclonedx --version 0.5.9 --locked
-          cargo cyclonedx --format json --spec-version 1.5 --all --override-filename wispkey
+          cargo cyclonedx --format json --spec-version 1.5 --all --target all --override-filename wispkey
           if [[ -f wispkey.cdx.json ]]; then
             mv wispkey.cdx.json wispkey.cyclonedx.json
           elif [[ -f wispkey.json ]]; then
@@ -108,7 +108,7 @@ jobs:
           if bom_format != "CycloneDX":
               raise SystemExit(f"unexpected SBOM format: {bom_format!r}")
           spec = str(data.get("specVersion") or data.get("spec_version") or "")
-          if not spec.startswith("1."):
+          if spec != "1.5":
               raise SystemExit(f"unexpected CycloneDX spec version: {spec!r}")
           PY
 

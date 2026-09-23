@@ -6,17 +6,24 @@ WispKey is a local-first, open-source credential firewall for AI agents. Agents 
 
 ## Quick Start
 
-```bash
-# macOS / Linux: see docs/install.md for the Homebrew temporary-tap flow
-# -- or --
-cargo install wispkey --locked
+Install with Cargo, or follow the [Homebrew instructions](docs/install.md) on macOS and Linux:
 
-# Or build from source instead of installing from crates.io
+```bash
+cargo install wispkey --locked
+```
+
+You can also build from source:
+
+```bash
 git clone https://github.com/rankupgames/wispkey.git
 cd wispkey
 cargo build --release
 export PATH="$PWD/target/release:$PATH"
+```
 
+Then create a vault and attach a selected secret:
+
+```bash
 # Create your vault
 wispkey init
 
