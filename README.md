@@ -6,13 +6,24 @@ WispKey is a local-first, open-source credential firewall for AI agents. Agents 
 
 ## Quick Start
 
+Install with Cargo, or follow the [Homebrew instructions](docs/install.md) on macOS and Linux:
+
 ```bash
-# Build from source
+cargo install wispkey --locked
+```
+
+You can also build from source:
+
+```bash
 git clone https://github.com/rankupgames/wispkey.git
 cd wispkey
 cargo build --release
 export PATH="$PWD/target/release:$PATH"
+```
 
+Then create a vault and attach a selected secret:
+
+```bash
 # Create your vault
 wispkey init
 
@@ -24,6 +35,8 @@ wispkey project use my-app
 # Start the proxy
 wispkey serve
 ```
+
+The AI process never touches your real secrets. Signed GitHub Release archives, SHA-256 checksums, Sigstore signatures, and verification steps are in [`docs/install.md`](docs/install.md).
 
 The attached `.env` stays in place: selected secret values become `wk_*` tokens while ordinary settings remain unchanged. Tokens belong to the local vault and are not portable team secrets. They are placeholders, not plaintext environment injection. Requests must use a WispKey substitution path; for HTTPS, send them through reverse proxy mode with `X-Target-Url`. Use `wispkey run`, `exec`, or `inject` for non-HTTP consumers. Because attachment cannot infer target hosts, `--hosts` is required when it creates credentials. Use a specific hostname or bounded glob such as `*.example.com`; empty or wildcard-only scopes such as `*` are rejected. Existing matching credentials must already have a meaningful host allowlist, and attachment never broadens their stored restrictions.
 
