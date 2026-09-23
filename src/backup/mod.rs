@@ -114,6 +114,7 @@ impl BackupScope {
                     self.projects = false;
                     self.partitions = false;
                     self.credentials = false;
+                    self.active_project = false;
                 }
                 "partitions" => {
                     self.partitions = false;
@@ -137,6 +138,12 @@ impl BackupScope {
                     )));
                 }
             }
+        }
+        // Credential-bound scopes and access requests cannot be restored when
+        // their referenced credential rows were omitted from the archive.
+        if !self.credentials {
+            self.scopes = false;
+            self.access_requests = false;
         }
         Ok(())
     }
@@ -939,6 +946,20 @@ fn restore_sidecar_paths(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn excluded_projects_drop_dependent_scope() {
+        let mut scope = BackupScope::all_included();
+        scope
+            .exclude_names(&["projects".into()])
+            .expect("exclude projects");
+        assert!(!scope.projects);
+        assert!(!scope.partitions);
+        assert!(!scope.credentials);
+        assert!(!scope.scopes);
+        assert!(!scope.access_requests);
+        assert!(!scope.active_project);
+    }
 
     #[test]
     fn inspect_payload_omits_secret_fields() {

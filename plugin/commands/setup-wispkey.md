@@ -1,6 +1,6 @@
 ---
 name: setup-wispkey
-description: Initialize WispKey vault, import existing .env secrets, and start the proxy. Use when the user says "setup wispkey", "init wispkey", or "secure my secrets".
+description: Initialize WispKey, attach selected .env secrets, and start the proxy. Use when the user says "setup wispkey", "init wispkey", or "secure my secrets".
 ---
 
 # Setup WispKey
@@ -14,30 +14,31 @@ Quick setup for a new project.
    wispkey init
    ```
 
-2. **Import existing .env file** (if present):
+2. **Discover existing `.env` files** without reading their contents:
    ```bash
-   wispkey import .env
+   wispkey env list .
    ```
 
-3. **Start the proxy**:
+3. **Attach only secret keys that will use WispKey's HTTP substitution path**:
+   ```bash
+   wispkey env attach .env --project my-app --key OPENAI_API_KEY
+   wispkey project use my-app
+   ```
+
+   This keeps the same file, preserves unselected settings, and replaces selected values with `wk_*` tokens. Do not attach ports, paths, database URLs, or other non-HTTP values; use `wispkey run`, `exec`, or `inject` for those. Before exposing tokens to an untrusted agent, pre-provision matching host-restricted credentials or configure a restrictive policy.
+
+4. **Start the proxy**:
    ```bash
    wispkey serve
    ```
 
-4. **Add `.env` to `.gitignore`** and commit `.env.wispkey`:
-   ```bash
-   echo '.env' >> .gitignore
-   ```
-
-   `wispkey import` writes `.env.wispkey` with owner-only permissions. It contains wisp tokens rather than raw secrets, but review it before committing.
-
 5. **Verify**:
    ```bash
    wispkey status
-   wispkey list
+   wispkey list --project my-app --partition default
    ```
 
-6. **Configure MCP** (add to Cursor settings). Keep `command` as `wispkey` so the client uses the normal installed binary from `PATH`:
+6. **Configure MCP**. Keep `command` as `wispkey` so the client uses the normal installed binary from `PATH`:
    ```json
    {
      "mcpServers": {
@@ -57,6 +58,6 @@ Quick setup for a new project.
    env_vars = ["WISPKEY_SIDELOAD_OPENAI"]
    ```
 
-   The MCP server returns `wk_env_openai` and the env key name, never the raw env value. Start `wispkey serve` with the same `WISPKEY_SIDELOAD_OPENAI` variable when the proxy needs to substitute that token.
+   The MCP server returns `wk_env_openai` and the env key name, never the raw env value. For sideload-only setup, launch the proxy with the same variable: `WISPKEY_SIDELOAD_OPENAI="$OPENAI_API_KEY" wispkey serve`.
 
-After setup, HTTP requests routed through `HTTP_PROXY=http://localhost:7700` will have wisp tokens swapped for real credentials. For HTTPS token substitution, use reverse proxy mode with `X-Target-Url`.
+After setup, inspectable HTTP requests can use `HTTP_PROXY=http://localhost:7700`. `HTTPS_PROXY` is a blind CONNECT tunnel and cannot substitute tokens; HTTPS requests containing `wk_*` values must use reverse proxy mode with `X-Target-Url`.

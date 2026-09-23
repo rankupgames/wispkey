@@ -42,7 +42,7 @@ Payload `format_version` is `1`. `source_schema_version` records the vault schem
 | `active_project` | Last `project use` selection |
 | `audit-fingerprint.key` | Local audit HMAC key when present |
 
-Use `--exclude` to omit groups. Parent excludes cascade: `projects` also drops partitions and credentials; `instances` also drops scopes and access requests. The recorded scope is part of inspect output.
+Use `--exclude` to omit groups. Parent excludes cascade: `projects` also drops partitions, credentials, and the active-project sidecar; `credentials` also drops scopes and access requests that could reference omitted credentials; `instances` also drops scopes and access requests. The recorded scope is part of inspect output.
 
 ### Excluded
 

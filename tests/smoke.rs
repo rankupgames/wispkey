@@ -30,6 +30,7 @@ fn help_flag_shows_commands() {
     assert!(stdout.contains("add"));
     assert!(stdout.contains("serve"));
     assert!(stdout.contains("import"));
+    assert!(stdout.contains("env"));
     assert!(stdout.contains("cloud"));
     assert!(stdout.contains("backup"));
     assert!(stdout.contains("mcp"));
@@ -110,6 +111,7 @@ fn format_flag_is_global_after_subcommands() {
         vec!["status", "--format", "json"],
         vec!["instance", "list", "--format", "json"],
         vec!["audit", "export", "--format", "jsonl"],
+        vec!["guard", "shell", "--format", "json"],
     ] {
         let output = wispkey_bin()
             .args(&args)

@@ -841,3 +841,55 @@ fn backup_exclude_omits_audits_from_scope() {
     assert_eq!(inspect["scope"]["audits"], false);
     assert_eq!(inspect["counts"]["audits"], 0);
 }
+
+#[test]
+fn backup_excluding_credentials_omits_dependent_instance_rows() {
+    let source = tempfile::tempdir().expect("source");
+    let dest = tempfile::tempdir().expect("dest");
+    let bundle_dir = tempfile::tempdir().expect("bundle");
+    let backup_path = bundle_dir.path().join("vault.wkbackup");
+    let backup = backup_path.to_string_lossy().to_string();
+    let dest_path = dest.path().to_string_lossy().to_string();
+
+    init_vault(source.path());
+    add_named_secret(source.path(), "backup-key", "backup-secret-value");
+    run_wispkey_json(
+        source.path(),
+        &[
+            "--format",
+            "json",
+            "instance",
+            "enroll",
+            "worker-one",
+            "--credential",
+            "backup-key",
+        ],
+    );
+    let created = run_wispkey_bundle_json(
+        source.path(),
+        &[
+            "--format",
+            "json",
+            "backup",
+            "create",
+            "--output",
+            &backup,
+            "--exclude",
+            "credentials",
+        ],
+    );
+    assert_eq!(created["scope"]["credentials"], false);
+    assert_eq!(created["scope"]["scopes"], false);
+    assert_eq!(created["scope"]["access_requests"], false);
+    assert_eq!(created["counts"]["scopes"], 0);
+
+    run_wispkey_bundle_json(
+        source.path(),
+        &[
+            "--format", "json", "backup", "restore", &backup, "--target", &dest_path,
+        ],
+    );
+    unlock_vault(dest.path());
+    let listed = run_wispkey_json(dest.path(), &["--format", "json", "instance", "list"]);
+    assert_eq!(listed["instances"][0]["status"], "needs_reenrollment");
+}
