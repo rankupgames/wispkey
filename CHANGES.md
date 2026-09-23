@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Signed multi-platform releases
+
+- Version tags now build native Linux x64/ARM64, macOS x64/ARM64, and Windows x64 archives that include `LICENSE`, `README.md`, and a `VERSION` file.
+- Release assets are checksummed (`SHA256SUMS.txt`), signed with Sigstore, attested with GitHub build provenance, and accompanied by a CycloneDX SBOM.
+- Publication is fail-closed through the pre-publication gates and `CARGO_REGISTRY_TOKEN` preflight; external publication remains sequential, with partial-publication recovery documented.
+- Documented the Homebrew temporary-tap install flow and `cargo install wispkey --locked` paths, including checksum, signature, and registry-install verification, in `docs/install.md`.
+
 ### Native .env discovery and attachment
 
 - Added `wispkey env list [directory]` to recursively discover attachable `.env*` files without opening them. Global `--format json` output returns absolute paths and explicit traversal warnings for agent automation.

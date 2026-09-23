@@ -39,6 +39,20 @@ See [`docs/tray.md`](docs/tray.md) for owner IPC and tray usage.
 
 4. Open a PR against `main`
 
+## Cutting a Release
+
+Releases are tag-driven. `.github/workflows/release.yml` fails closed before publication: GitHub Release assets and `cargo publish` do not run unless tests, clippy, `cargo audit`, `cargo publish --dry-run`, native packaging, downloaded-binary smoke tests, Homebrew formula install/test, checksums, Sigstore signatures, provenance, and the Cargo registry token preflight all succeed.
+
+1. Set `version` in the root `Cargo.toml` (and keep `crates/wispkey-tray` in lockstep if it changed).
+2. Update [`CHANGES.md`](CHANGES.md) and [`docs/install.md`](docs/install.md) if the install path changed.
+3. Push an annotated tag that matches the crate version, for example `v0.4.0`.
+4. Configure the `CARGO_REGISTRY_TOKEN` repository secret before the first crates.io publish. The non-dry-run tag path checks it before any external publication.
+5. After the workflow finishes, verify a downloaded archive with the instructions in [`docs/install.md`](docs/install.md).
+
+External publication is sequential rather than atomic. If a post-publication job fails, inspect the existing GitHub Release and crates.io version before using `Re-run failed jobs`; do not republish a version already present on crates.io.
+
+Third-party GitHub Actions in CI and release workflows are pinned to commit SHAs. When bumping an Action, update the pin and the version comment on the same line.
+
 ## What We're Looking For
 
 - Bug fixes with a test that reproduces the issue
