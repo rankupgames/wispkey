@@ -1,6 +1,7 @@
 [package]
 name = "wispkey"
 version = "0.4.0"
+default-run = "wispkey"
 edition = "2024"
 authors = ["Miguel A. Lopez <miguel@rankupgames.com>"]
 description = "Local-first credential firewall for AI agents with wisp token proxy"
@@ -90,6 +91,8 @@ keyring = { version = "3", default-features = false, features = ["apple-native"]
 
 [target.'cfg(windows)'.dependencies]
 keyring = { version = "3", default-features = false, features = ["windows-native"] }
+windows = { version = "0.62.2", features = ["Foundation", "Security_Credentials_UI", "Win32_System_WinRT", "Win32_UI_WindowsAndMessaging"] }
+windows-future = "0.3.2"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Security",

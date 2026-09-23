@@ -62,12 +62,14 @@ fn main() {
 
     let menu = Menu::new();
     let add_item = MenuItem::new("Add credential", true, None);
+    let login_item = MenuItem::new("Generate website login", true, None);
     let list_item = MenuItem::new("List credentials", true, None);
     let unlock_item = MenuItem::new("Unlock vault", true, None);
     let lock_item = MenuItem::new("Lock vault", true, None);
     let settings_item = MenuItem::new("Open settings", true, None);
     let quit_item = MenuItem::new("Quit", true, None);
     menu.append(&add_item).expect("add menu item");
+    menu.append(&login_item).expect("login menu item");
     menu.append(&list_item).expect("list menu item");
     menu.append(&unlock_item).expect("unlock menu item");
     menu.append(&lock_item).expect("lock menu item");
@@ -89,6 +91,7 @@ fn main() {
         .expect("tray icon");
 
     let add_id = add_item.id().clone();
+    let login_id = login_item.id().clone();
     let list_id = list_item.id().clone();
     let unlock_id = unlock_item.id().clone();
     let lock_id = lock_item.id().clone();
@@ -114,6 +117,8 @@ fn main() {
             Event::UserEvent(UserEvent::Menu(menu_id)) => {
                 if menu_id == add_id {
                     open_dialog(&dialogs, event_loop, &proxy, "add");
+                } else if menu_id == login_id {
+                    open_dialog(&dialogs, event_loop, &proxy, "login");
                 } else if menu_id == list_id {
                     open_dialog(&dialogs, event_loop, &proxy, "list");
                 } else if menu_id == unlock_id {
@@ -227,6 +232,7 @@ fn sanitize_view(view: &str) -> &'static str {
         "list" => "list",
         "settings" => "settings",
         "unlock" => "unlock",
+        "login" => "login",
         _ => "add",
     }
 }

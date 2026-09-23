@@ -489,6 +489,19 @@ impl Vault {
             }
             db.execute(
                 "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                params!["11"],
+            )?;
+        }
+
+        let version: String = db.query_row(
+            "SELECT value FROM vault_meta WHERE key = 'version'",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == "11" {
+            super::browser::create_schema(db)?;
+            db.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
                 params![CURRENT_SCHEMA_VERSION],
             )?;
         }
@@ -569,6 +582,7 @@ impl Vault {
         )?;
         create_instance_tables(db)?;
         create_bootstrap_token_table(db)?;
+        super::browser::create_schema(db)?;
         Ok(())
     }
 }

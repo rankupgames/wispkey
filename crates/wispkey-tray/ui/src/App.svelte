@@ -4,7 +4,7 @@
   const initialView =
     typeof window !== "undefined" && window.__WISPKEY_VIEW ? window.__WISPKEY_VIEW : "add";
   let view = $state(initialView);
-  let mode = $state("single");
+  let mode = $state(initialView === "login" ? "website_login" : "single");
   let reveal = $state(false);
   let status = $state("");
   let credentials = $state([]);
@@ -26,6 +26,8 @@
     applicationSecret: "",
     consumerKey: "",
     password: "",
+    username: "",
+    url: "",
   });
 
   window.__wispkeyPending = window.__wispkeyPending || {};
@@ -76,7 +78,15 @@
       return;
     }
     const response =
-      mode === "ovh_api"
+      mode === "website_login"
+        ? await ipc({
+            method: "generate_login",
+            params: {
+              name: form.name, username: form.username, url: form.url,
+              project: form.project, partition: form.partition, destination_confirmed: true,
+            },
+          })
+        : mode === "ovh_api"
         ? await ipc({
             method: "add_template",
             params: {
@@ -111,7 +121,9 @@
     clearSecrets();
     destinationConfirmed = false;
     if (response.ok) {
-      status = "Saved";
+      status = mode === "website_login"
+        ? `Login saved for ${response.result.origin}. Pending until you activate it; review in 180 days. Fill from the extension in your human-controlled browser profile.`
+        : "Saved";
     } else {
       status = (response.error && response.error.message) || "Save failed";
     }
@@ -161,14 +173,27 @@
 
 <main>
   <h1>WispKey</h1>
-  {#if view === "add"}
+  {#if view === "add" || view === "login"}
     <label>Mode
       <select bind:value={mode}>
         <option value="single">Single credential</option>
         <option value="ovh_api">OVH API template</option>
+        <option value="website_login">Generate website login</option>
       </select>
     </label>
-    {#if mode === "ovh_api"}
+    {#if mode === "website_login"}
+      <p>Generate and save a unique password. The password stays out of this window.</p>
+      <button type="button" onclick={() => {
+        form.project = "career-ops";
+        form.partition = "job-applications";
+        destinationConfirmed = false;
+      }}>Use job application preset</button>
+      <label>Name <input bind:value={form.name} /></label>
+      <label>Username or email <input bind:value={form.username} autocomplete="off" /></label>
+      <label>Website URL (HTTPS) <input type="url" bind:value={form.url} placeholder="https://careers.example.com" /></label>
+      <p>Saved logins start as pending, with a review reminder after 180 days. Review dates never delete a login.</p>
+      <p>The confirmed project and partition will be created if they do not exist.</p>
+    {:else if mode === "ovh_api"}
       <label>Name prefix
         <input bind:value={form.namePrefix} />
       </label>
@@ -215,12 +240,14 @@
         <input bind:value={form.description} />
       </label>
     {/if}
+    {#if mode !== "website_login"}
     <label>Tags
       <input bind:value={form.tags} />
     </label>
     <label>Hosts
       <input bind:value={form.hosts} />
     </label>
+    {/if}
     <label>Project
       <input bind:value={form.project} oninput={() => (destinationConfirmed = false)} />
     </label>
@@ -231,8 +258,10 @@
       <input type="checkbox" bind:checked={destinationConfirmed} />
       Confirm save to project <strong>{form.project || "active project"}</strong>, partition <strong>{form.partition || "personal"}</strong>
     </label>
-    <button type="button" onclick={() => (reveal = !reveal)}>Reveal</button>
-    <button type="button" onclick={save}>Save</button>
+    {#if mode !== "website_login"}
+      <button type="button" onclick={() => (reveal = !reveal)}>Reveal</button>
+    {/if}
+    <button type="button" onclick={save}>{mode === "website_login" ? "Generate and save" : "Save"}</button>
     <button type="button" onclick={() => { clearSecrets(); window.close(); }}>Cancel</button>
   {:else if view === "list"}
     <button type="button" onclick={loadList}>Refresh</button>

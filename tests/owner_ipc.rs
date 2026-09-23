@@ -88,6 +88,33 @@ async fn owner_call(vault_dir: &std::path::Path, request: serde_json::Value) -> 
 }
 
 #[tokio::test]
+async fn generated_website_login_requires_destination_and_returns_only_metadata() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    init_vault(dir.path());
+    let mut server = start_owner_ipc(dir.path());
+    let mut request = json!({ "id":"generate", "method":"generate_login", "params": {
+        "name":"careers", "username":"synthetic@example.com", "url":"https://careers.example.com/login",
+        "project":"career-ops", "partition":"job-applications"
+    }});
+    assert_eq!(owner_call(dir.path(), request.clone()).await["ok"], false);
+    request["params"]["destination_confirmed"] = json!(true);
+    let response = owner_call(dir.path(), request).await;
+    assert_eq!(response["ok"], true, "{response}");
+    assert_eq!(response["result"]["origin"], "https://careers.example.com");
+    assert_eq!(response["result"]["lifecycle_state"], "pending");
+    for forbidden in ["password", "wisp_token", "encrypted_value"] {
+        assert!(!response.to_string().contains(forbidden));
+    }
+    // No owner IPC fill/reveal method accompanies the metadata-only generator.
+    assert_eq!(
+        owner_call(dir.path(), json!({"id":"reveal","method":"browser_fill"})).await["ok"],
+        false
+    );
+    let logs = server.captured_logs();
+    assert!(!logs.contains("encrypted_value"));
+}
+
+#[tokio::test]
 async fn repeated_owner_requests_do_not_block_on_test_logging() {
     let dir = tempfile::tempdir().expect("vault dir");
     init_vault(dir.path());

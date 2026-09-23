@@ -173,6 +173,30 @@ async fn handle_jsonrpc(request: &Value) -> Option<Value> {
                             }
                         },
                         {
+                            "name": "wispkey_request_browser_fill",
+                            "description": "Queue a five-minute, one-use website login fill request. Returns a request ID only. The user must open the exact HTTPS site in their separate human-controlled browser profile and approve through the WispKey extension and Windows Hello. Never returns a password or fills an agent browser.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": {
+                                    "name": { "type": "string" },
+                                    "project": { "type": "string" },
+                                    "origin": { "type": "string", "description": "Exact HTTPS website origin" },
+                                    "requester": { "type": "string", "description": "Unverified agent label, at most 64 bytes" },
+                                    "reason": { "type": "string", "description": "Reason shown to the user, at most 160 bytes" }
+                                },
+                                "required": ["name", "origin", "requester", "reason"]
+                            }
+                        },
+                        {
+                            "name": "wispkey_browser_fill_status",
+                            "description": "Read metadata-only browser request status: pending, approved, denied, completed or failed. Completed means fields were filled, not that a form was submitted or an account was created.",
+                            "inputSchema": {
+                                "type": "object",
+                                "properties": { "request_id": { "type": "string" } },
+                                "required": ["request_id"]
+                            }
+                        },
+                        {
                             "name": "wispkey_delete",
                             "description": "Delete a credential from the vault by name. Returns confirmation on success or an error if the credential does not exist.",
                             "inputSchema": {
@@ -218,6 +242,8 @@ async fn handle_jsonrpc(request: &Value) -> Option<Value> {
                 "wispkey_project_list" => handle_tool_project_list(),
                 "wispkey_set" => handle_tool_set(&arguments),
                 "wispkey_generate_login" => handle_tool_generate_login(&arguments),
+                "wispkey_request_browser_fill" => handle_browser_request(&arguments, false),
+                "wispkey_browser_fill_status" => handle_browser_request(&arguments, true),
                 "wispkey_delete" => handle_tool_delete(&arguments),
                 "wispkey_issue_cert" => handle_tool_issue_cert(&arguments),
                 _ => tool_error(&format!("unknown tool: {}", tool_name)),
@@ -687,6 +713,44 @@ fn handle_tool_set(arguments: &Value) -> Value {
             }
             Err(e) => tool_error(&format!("failed to add credential: {}", e)),
         }
+    }
+}
+
+fn handle_browser_request(arguments: &Value, status_only: bool) -> Value {
+    let result = (|| -> core::browser::Result<Value> {
+        let vault = Vault::open_with_session()
+            .map_err(|_| "unlock WispKey before requesting browser fill")?;
+        let field = |key: &str| {
+            arguments
+                .get(key)
+                .and_then(Value::as_str)
+                .ok_or("missing required browser argument")
+        };
+        if status_only {
+            let request = core::browser::status(&vault, field("request_id")?)?;
+            Ok(
+                json!({ "request_id": request.request_id, "status": request.status, "expires_at": request.expires_at }),
+            )
+        } else {
+            let active = core::resolve_active_project();
+            let project = arguments
+                .get("project")
+                .and_then(Value::as_str)
+                .unwrap_or(&active);
+            let request = core::browser::request(
+                &vault,
+                field("name")?,
+                project,
+                field("origin")?,
+                field("requester")?,
+                field("reason")?,
+            )?;
+            Ok(json!({ "request_id": request.request_id }))
+        }
+    })();
+    match result {
+        Ok(value) => json!({ "content": [{ "type": "text", "text": value.to_string() }] }),
+        Err(error) => tool_error(error),
     }
 }
 
