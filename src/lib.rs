@@ -11,6 +11,7 @@
 #![warn(clippy::suspicious, clippy::style, clippy::perf, clippy::complexity)]
 
 pub mod audit;
+pub mod backup;
 pub mod bundle;
 pub mod cli;
 pub mod cloud;

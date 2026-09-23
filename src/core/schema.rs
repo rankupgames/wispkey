@@ -120,7 +120,7 @@ impl Vault {
         Ok(vault)
     }
 
-    pub(super) fn migrate_schema(db: &Connection) -> Result<()> {
+    pub(crate) fn migrate_schema(db: &Connection) -> Result<()> {
         let version: String = db
             .query_row(
                 "SELECT value FROM vault_meta WHERE key = 'version'",
@@ -502,7 +502,18 @@ impl Vault {
         Ok(())
     }
 
-    pub(super) fn create_schema(db: &Connection) -> Result<()> {
+    /// Creates an empty vault database file with the current schema and owner-only permissions.
+    pub(crate) fn initialize_database_file(path: &Path) -> Result<Connection> {
+        if let Some(parent) = path.parent() {
+            secure_files::ensure_private_directory(parent)?;
+        }
+        let db = Connection::open(path)?;
+        harden_db_file(path)?;
+        Self::create_schema(&db)?;
+        Ok(db)
+    }
+
+    pub(crate) fn create_schema(db: &Connection) -> Result<()> {
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS vault_meta (
 				key TEXT PRIMARY KEY,

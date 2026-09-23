@@ -11,11 +11,11 @@ WispKey is the local-first credential firewall for AI agents. WispKey Cloud is a
 
 The open-source CLI works fully offline and does not require an account. This repository contains local Cloud session and tier groundwork, not a working data-sync client.
 
-Cloud data transfer and conflict handling are not implemented in this CLI. Credentials stay on the machine where the vault was created unless you use encrypted bundles (`wispkey partition export` / `import`, `wispkey project export` / `import`) or your own secure transfer process.
+Cloud data transfer and conflict handling are not implemented in this CLI. Credentials stay on the machine where the vault was created unless you use a full vault backup (`wispkey backup create` / `restore`), encrypted bundles (`wispkey partition export` / `import`, `wispkey project export` / `import`), or your own secure transfer process.
 
 The public CLI exposes `cloud push`, `pull`, and `sync` as reserved commands, but they currently return `coming soon` and do not transfer vault data.
 
-Partition bundles are encrypted and passphrase-protected. The bundle passphrase is separate from the vault password; for automation use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file`.
+Partition and project bundles are encrypted and passphrase-protected for sharing selected credentials. `wispkey backup` is the complete local disaster-recovery path (policies, audits, instances, and sidecars included). The bundle passphrase is separate from the vault password; for automation use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file`. See `docs/vault-backup.md`.
 
 ## Planned Pricing
 
@@ -40,4 +40,4 @@ Use precise wording when advising users:
 2. **Name credentials consistently** -- clear names and tags make shared and synced vaults easier to audit.
 3. **Avoid duplicate secrets** -- one canonical credential per logical secret reduces merge and rotation pain when sync arrives.
 
-For current sharing workflows until client sync and recipient flows ship, use **partition export/import** or **project export/import** instead of raw secret copies.
+For current sharing workflows until client sync and recipient flows ship, use **vault backup** for complete recovery or **partition/project export/import** for selected sharing instead of raw secret copies.
