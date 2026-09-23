@@ -33,6 +33,8 @@ fn help_flag_shows_commands() {
     assert!(stdout.contains("env"));
     assert!(stdout.contains("cloud"));
     assert!(stdout.contains("mcp"));
+    assert!(stdout.contains("doctor"));
+    assert!(stdout.contains("integrate"));
 }
 
 #[test]
