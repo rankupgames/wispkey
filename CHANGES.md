@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Local diagnostics and owner IPC reliability
+
+- Doctor now reports PATH shadowing with `binary.path` and compares the running proxy's authenticated package version with `proxy.version`. It reports older or unavailable version endpoints as unknown, without executing another installation or restarting services.
+- Added authenticated `GET /api/version` diagnostics that remain available while the vault is locked. Checks bound response size and duration, reject redirects, and verify the responding process ID.
+- Owner IPC integration tests continuously drain bounded server-log captures so a full stderr pipe cannot stall requests. Regression coverage includes log pressure and concurrent clients; Windows timeout errors identify connection, request-write, and response-read phases without payloads.
+
 ### Encrypted full-vault backup
 
 - Added `wispkey backup create/inspect/verify/restore` for a versioned, authenticated AES-256-GCM vault archive (`.wkbackup`, magic `WKVB`). The backup passphrase is separate from the master password.

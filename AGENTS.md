@@ -282,6 +282,7 @@ When the proxy is running (`wispkey serve`):
 | Endpoint | Returns |
 |----------|---------|
 | `GET /api/status` | Vault info, credential count, session state |
+| `GET /api/version` | Authenticated running proxy name, package version, and PID; available while locked |
 | `GET /api/credentials` | All credentials with tokens (no plaintext values); honors `?project=` |
 | `GET /api/credentials/{name}` | Single credential by name; honors `?project=` |
 | `DELETE /api/credentials/{name}` | Delete credential by name; honors `?project=` |

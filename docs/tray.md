@@ -60,3 +60,7 @@ cargo build -p wispkey-tray
 ```
 
 Default `cargo test` does not build the GUI crate.
+
+## IPC troubleshooting
+
+Windows owner IPC calls bound connection, request-write, and response-read phases to five seconds each. Timeout messages identify the phase and prior phase durations without request contents. Server logs include request-handling duration and success status. If a launcher captures stderr, it must continuously drain the pipe; an unread log pipe can stall request handling. The integration harness drains logs while retaining at most 256 KiB, and tests log pressure and concurrent clients without automatic retries.

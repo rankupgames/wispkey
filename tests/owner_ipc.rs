@@ -4,28 +4,130 @@ use common::*;
 use serde_json::json;
 use std::io::Read;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use wispkey::owner_ipc;
 
-fn start_owner_ipc(vault_dir: &std::path::Path) -> ChildGuard {
-    let child = wispkey_bin()
-        .args(["tray", "--ipc-only"])
-        .env("WISPKEY_VAULT_PATH", vault_dir)
-        .env("WISPKEY_PASSWORD", "test-password")
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn owner ipc");
+struct OwnerServer {
+    child: ChildGuard,
+    logs: Arc<Mutex<Vec<u8>>>,
+    reader: Option<thread::JoinHandle<()>>,
+}
+
+impl OwnerServer {
+    fn stop(&mut self) {
+        let _ = self.child.0.kill();
+        let _ = self.child.0.wait();
+        if let Some(reader) = self.reader.take() {
+            reader.join().expect("server log reader");
+        }
+    }
+
+    fn captured_logs(&mut self) -> String {
+        self.stop();
+        String::from_utf8_lossy(&self.logs.lock().unwrap()).into_owned()
+    }
+}
+
+impl Drop for OwnerServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+fn start_owner_ipc(vault_dir: &std::path::Path) -> OwnerServer {
+    let started = Instant::now();
+    let mut child = ChildGuard(
+        wispkey_bin()
+            .args(["tray", "--ipc-only"])
+            .env("WISPKEY_VAULT_PATH", vault_dir)
+            .env("WISPKEY_PASSWORD", "test-password")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn owner ipc"),
+    );
+    let mut stderr = child.0.stderr.take().expect("server stderr");
+    let logs = Arc::new(Mutex::new(Vec::new()));
+    let captured = Arc::clone(&logs);
+    let reader = thread::spawn(move || {
+        let mut buffer = [0; 4096];
+        while let Ok(size) = stderr.read(&mut buffer) {
+            if size == 0 {
+                break;
+            }
+            // Keep draining even after reaching the capture limit. An unread
+            // pipe can block tracing before the server handles a request.
+            let mut logs = captured.lock().unwrap();
+            let keep = size.min(262_144_usize.saturating_sub(logs.len()));
+            logs.extend_from_slice(&buffer[..keep]);
+        }
+    });
+    let server = OwnerServer {
+        child,
+        logs,
+        reader: Some(reader),
+    };
     wait_for_owner_info(vault_dir);
-    ChildGuard(child)
+    eprintln!("owner IPC readiness: {} ms", started.elapsed().as_millis());
+    server
 }
 
 async fn owner_call(vault_dir: &std::path::Path, request: serde_json::Value) -> serde_json::Value {
     let path = vault_dir.join("owner.sock");
+    let started = Instant::now();
     owner_ipc::call(&path, request)
         .await
-        .expect("owner ipc call")
+        .unwrap_or_else(|error| {
+            panic!(
+                "owner IPC request failed after {} ms: {error}",
+                started.elapsed().as_millis()
+            )
+        })
+}
+
+#[tokio::test]
+async fn repeated_owner_requests_do_not_block_on_test_logging() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    init_vault(dir.path());
+    let _server = start_owner_ipc(dir.path());
+    // Exceed a pipe buffer with synthetic, non-secret log fields.
+    let request_id = "logging-load-".repeat(512);
+    for _ in 0..40 {
+        let response = tokio::time::timeout(
+            Duration::from_secs(6),
+            owner_call(dir.path(), json!({"id": request_id, "method": "status"})),
+        )
+        .await
+        .expect("owner request stalled while collecting server logs");
+        assert_eq!(response["ok"], true);
+    }
+}
+
+#[tokio::test]
+async fn concurrent_owner_clients_complete_against_one_server() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    init_vault(dir.path());
+    let _server = start_owner_ipc(dir.path());
+    let mut clients = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let path = dir.path().to_path_buf();
+        clients.spawn(async move {
+            for _ in 0..8 {
+                let response =
+                    owner_call(&path, json!({"id": "concurrency", "method": "status"})).await;
+                assert_eq!(response["ok"], true);
+            }
+        });
+    }
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while let Some(result) = clients.join_next().await {
+            result.expect("client task");
+        }
+    })
+    .await
+    .expect("concurrent owner requests stalled");
 }
 
 #[tokio::test]
@@ -252,11 +354,11 @@ async fn owner_ipc_redacts_secrets_from_logs() {
     )
     .await;
     let _ = owner_call(dir.path(), json!({ "id": "2", "method": "shutdown" })).await;
-    thread::sleep(Duration::from_millis(200));
-    let mut stderr = String::new();
-    if let Some(mut pipe) = server.0.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
-    }
+    let stderr = server.captured_logs();
+    assert!(
+        stderr.contains("owner ipc request completed"),
+        "server log capture was empty"
+    );
     assert!(
         !stderr.contains("super-secret-log-probe-value"),
         "secret leaked in stderr: {stderr}"
