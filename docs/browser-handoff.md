@@ -23,7 +23,12 @@ From the repository root:
 ```powershell
 cargo build --release --bin wispkey --bin wispkey-browser-host
 npm --prefix browser-extension run build
+$env:PATH = (Resolve-Path ./target/release).Path + [IO.Path]::PathSeparator + $env:PATH
 ```
+
+Restart MCP clients with the updated CLI on their `PATH`; an already-running
+server keeps its old tools. Keep the MCP command as `wispkey`, as in the normal
+setup. The `PATH` change above applies only to this terminal and its child processes.
 
 Chrome/Edge: enable developer mode at `chrome://extensions` or `edge://extensions`,
 choose **Load unpacked**, and select `browser-extension/dist/chromium`. Copy its
