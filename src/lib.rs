@@ -12,6 +12,7 @@
 
 pub mod audit;
 pub mod backup;
+pub mod browser_host;
 pub mod bundle;
 pub mod cli;
 pub mod cloud;

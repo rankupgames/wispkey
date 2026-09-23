@@ -51,7 +51,9 @@ pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
 /// Current on-disk SQLite schema version written to `vault_meta`.
-pub const CURRENT_SCHEMA_VERSION: &str = "11";
+pub const CURRENT_SCHEMA_VERSION: &str = "12";
+
+pub mod browser;
 
 /// Errors returned by vault operations (I/O, crypto, schema, and business rules).
 #[derive(Error, Debug)]

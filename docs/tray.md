@@ -18,6 +18,7 @@ Closing a dialog does not quit the tray. Use **Quit** in the tray menu.
 Tray menu:
 
 - Add credential
+- Generate website login
 - List credentials
 - Unlock vault
 - Lock vault
@@ -34,11 +35,19 @@ Newline-delimited JSON methods:
 
 - `status`, `unlock`, `lock`
 - `list_credentials`, `list_projects`, `list_partitions`
-- `add_credential`, `add_template`
+- `add_credential`, `add_template`, `generate_login`
 - `get_settings`, `set_settings`
 - `shutdown`
 
 Responses include names and metadata only. They never include plaintext secret values. Known secret fields are redacted from logs.
+
+`generate_login` accepts `name`, `username`, an HTTPS `url`, optional `project` /
+`partition`, and `destination_confirmed: true`. It saves a strong unique password
+without displaying it, sets lifecycle `pending`, and schedules a review in 180
+days. The job application preset uses `career-ops` / `job-applications`; the
+confirmed project and partition are created if needed. Use the
+[browser handoff preview](browser-handoff.md) to approve a fill separately; owner
+IPC has no browser-fill or password-reveal endpoint.
 
 ## OVH API template
 

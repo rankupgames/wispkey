@@ -45,7 +45,7 @@ For repeated headless unlocks, prefer `wispkey unlock --remember --password-file
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v11 automatically.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v12 automatically. Browser fill requests are short-lived metadata, omitted from encrypted backups.
 
 ```bash
 # Create a project
@@ -258,6 +258,8 @@ Available tools:
 - **`wispkey_project_list`** -- List all projects with partition counts and active indicator
 - **`wispkey_set`** -- Create or update a credential (`name`, `value` required; `type`, `description`, `hosts`, `tags`, `project`, `header_name`, `param_name` optional). Refuses to overwrite unless `overwrite: true`. On update, the wisp token is preserved. Refuses `website_login`; use `wispkey_generate_login`.
 - **`wispkey_generate_login`** -- Generate a unique website login (`name`, `username`, `url` required). Returns origin, lifecycle, and username only—never the password.
+- **`wispkey_request_browser_fill`** -- Queue a five-minute one-use request (`name`, `origin`, `requester`, `reason`; optional `project`). Returns only a request ID. Requires human approval in a separate browser profile and Windows Hello; see `docs/browser-handoff.md`.
+- **`wispkey_browser_fill_status`** -- Read request status by `request_id`; metadata only. Completed means fields were filled, not submitted.
 - **`wispkey_delete`** -- Delete a credential by `name` (optional `project` scope)
 - **`wispkey_issue_cert`** -- Issue an X.509 leaf certificate with a CA private key held in the vault (`ca_credential` required). Generates an `ec-p256` keypair by default or signs a PEM `csr`. Returns the leaf certificate and, when generated, the leaf private key. The CA private key never leaves the vault. Optional: `common_name`, `san`, `validity_days` (default 365, max 3650), `key_type` (`ec-p256`, `ec-p384`, `rsa-2048`, `rsa-4096`), `ca_cert` when the credential is key-only, `project`.
 

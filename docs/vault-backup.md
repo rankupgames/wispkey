@@ -26,7 +26,7 @@ The on-disk frame is the shared WispKey bundle frame used by `.wkbundle` and `.w
 
 The passphrase is stretched with Argon2id (`m=65536`, `t=3`, `p=4`) to a 256-bit key. Authentication is provided by AES-GCM. A SHA-256 integrity hash of the canonical JSON payload is stored inside the ciphertext and checked by `backup verify`.
 
-Payload `format_version` is `1`. `source_schema_version` records the vault schema at export time (currently `11`). Restores from schema 6 through the current version insert known columns and apply SQLite defaults for newer columns. A backup from a newer WispKey is rejected.
+Payload `format_version` is `1`. `source_schema_version` records the vault schema at export time (currently `12`). Restores from schema 6 through the current version insert known columns and apply SQLite defaults for newer columns. A backup from a newer WispKey is rejected. Short-lived browser fill requests are not exported or restored; request fresh approval after restoring a vault.
 
 ### Included
 

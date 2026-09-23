@@ -624,6 +624,20 @@ fn concurrent_env_attachments_preserve_both_tokens() {
     let vault_dir = tempfile::tempdir().expect("temp vault");
     let workspace = tempfile::tempdir().expect("temp workspace");
     init_vault(vault_dir.path());
+    let db = rusqlite::Connection::open_with_flags(
+        vault_dir.path().join("vault.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("read fresh vault");
+    let redacted: String = db
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key='audit_tokens_redacted_v1'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("fresh vault must not defer an audit write to concurrent first opens");
+    assert_eq!(redacted, "1");
+    drop(db);
 
     let env_path = workspace.path().join(".env");
     fs::write(
