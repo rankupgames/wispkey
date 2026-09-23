@@ -316,9 +316,11 @@ fn merge_toml_file(content: &str) -> Result<(String, bool), String> {
                 .get("args")
                 .and_then(toml::Value::as_array)
                 .is_some_and(|args| {
-                    args.iter()
-                        .filter_map(toml::Value::as_str)
-                        .eq(WISPKEY_MCP_ARGS)
+                    args.len() == WISPKEY_MCP_ARGS.len()
+                        && args
+                            .iter()
+                            .zip(WISPKEY_MCP_ARGS)
+                            .all(|(value, expected)| value.as_str() == Some(expected))
                 });
             if command_ok && args_ok {
                 return Ok((content.to_string(), false));
@@ -445,6 +447,22 @@ mod tests {
         let (second, changed_again) = merge_toml_file(&first).expect("second merge");
         assert!(!changed_again);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn toml_merge_repairs_mixed_type_arguments() {
+        let existing =
+            "[mcp_servers.wispkey]\ncommand = \"wispkey\"\nargs = [\"mcp\", 1, \"serve\"]\n";
+        let (merged, changed) = merge_toml_file(existing).expect("merge");
+        assert!(changed);
+        let value: toml::Value = toml::from_str(&merged).expect("valid TOML");
+        assert_eq!(
+            value["mcp_servers"]["wispkey"]["args"].as_array().unwrap(),
+            &vec![
+                toml::Value::String("mcp".into()),
+                toml::Value::String("serve".into())
+            ]
+        );
     }
 
     #[test]

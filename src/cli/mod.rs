@@ -12,7 +12,9 @@ mod cloud;
 mod credential_sharing;
 mod credentials;
 mod doctor;
+mod env;
 mod exec;
+mod guard;
 mod inject;
 mod instances;
 mod integrate;
@@ -40,7 +42,9 @@ pub use credentials::{
     handle_rotate,
 };
 pub use doctor::handle_doctor;
+pub use env::{handle_env_attach, handle_env_list};
 pub use exec::{ExecArgs, askpass_mode_enabled, handle_askpass, handle_exec};
+pub use guard::handle_guard_shell;
 pub use inject::{InjectArgs, handle_inject};
 pub use instances::{
     handle_instance_approve, handle_instance_bootstrap_create, handle_instance_bootstrap_list,
@@ -60,7 +64,10 @@ pub use partitions::{
     handle_partition_assign, handle_partition_create, handle_partition_delete,
     handle_partition_export, handle_partition_import, handle_partition_list,
 };
-pub use policy::{handle_policy_check, handle_policy_init, handle_policy_list};
+pub use policy::{
+    PolicyTestArgs, handle_policy_check, handle_policy_explain, handle_policy_init,
+    handle_policy_list, handle_policy_test,
+};
 pub use projects::{
     handle_project_create, handle_project_current, handle_project_delete, handle_project_export,
     handle_project_import, handle_project_list, handle_project_use,

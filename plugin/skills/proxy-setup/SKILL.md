@@ -10,6 +10,7 @@ description: Set up the WispKey proxy for a project. Use when the user wants to 
 1. WispKey installed normally (`cargo install --path . --locked`, package manager, or binary in PATH)
 2. Vault initialized with `wispkey init` for vault-backed credentials, or `WISPKEY_SIDELOAD_<SLUG>` set for sideload-only use
 3. At least one vault credential stored with `wispkey add ...`, or one sideload env var available to both MCP and proxy
+4. The credential's project selected with `wispkey project use <project>`, unless `serve --all-projects` is intentional
 
 ## Start the Proxy
 
@@ -26,7 +27,7 @@ wispkey serve \
   --listen unix:/run/wispkey/proxy.sock
 ```
 
-Unix domain socket and feature-gated Linux vsock listeners require per-request instance identity by default. TCP listeners keep the trusted-local default unless `--require-identity` is set.
+Unix domain socket, feature-gated Linux vsock, Firecracker UDS-backed vsock, and non-loopback TCP listeners require per-request instance identity by default. Loopback TCP keeps the trusted-local default unless `--require-identity` is set.
 
 For sideload-only proxy use, launch with the same sideload env var that the MCP server uses:
 ```bash

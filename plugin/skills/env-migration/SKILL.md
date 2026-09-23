@@ -5,58 +5,78 @@ description: Migrate .env files to WispKey wisp tokens. Use when the user wants 
 
 # WispKey .env Migration
 
-## Quick Migration
+## Discover And Attach
 
-Import an entire `.env` file in one command:
+Find existing environment files without reading their contents:
 ```bash
-wispkey import .env
+wispkey env list .
+wispkey env list . --format json
+```
+
+Attach only the secret-bearing keys. The project and environment partition are created when missing:
+```bash
+wispkey env attach .env.production \
+  --project my-app \
+  --key OPENAI_API_KEY \
+  --key GITHUB_TOKEN
+wispkey project use my-app
 ```
 
 This will:
-1. Parse every `KEY=VALUE` pair
-2. Auto-detect credential types (OpenAI, GitHub, AWS, Slack, Stripe, etc.)
-3. Encrypt and store each credential in the vault
-4. Generate `.env.wispkey` with wisp tokens replacing real values
-
-The generated `.env.wispkey` file is written with owner-only permissions. It contains only wisp tokens, but still treat it as project configuration and review it before committing.
+1. Import only the explicitly selected `--key` values
+2. Store them under project `my-app` and environment partition `production`
+3. Preserve unselected settings, comments, quoting, and the existing file path
+4. Atomically replace selected plaintext values with wisp tokens
+5. Restrict the attached file to owner-only permissions
 
 ## Output
 
-Original `.env`:
+Original `.env.production`:
 ```
 OPENAI_API_KEY=sk-abc123...
 GITHUB_TOKEN=ghp_xyz789...
 ```
 
-Generated `.env.wispkey`:
+Attached `.env.production`:
 ```
-OPENAI_API_KEY=wk_openai_api_key_f3k2m1x8
-GITHUB_TOKEN=wk_github_token_p9q7r5s3
+OPENAI_API_KEY=wk_production_openai_api_key_f3k2m1x8
+GITHUB_TOKEN=wk_production_github_token_p9q7r5s3
 ```
 
-## Using the Migrated File
+## Scope Mapping
 
-1. Replace `.env` with `.env.wispkey` in your project
-2. Start the proxy: `wispkey serve`
-3. Set `HTTP_PROXY=http://localhost:7700` in your runtime environment
-4. Requests containing wisp tokens are automatically resolved
+Organization/account scope remains external to the local vault:
 
-## Prefix Option
-
-Namespace imported credentials:
-```bash
-wispkey import .env --prefix "myapp-"
+```text
+Organization > WispKey Project > Environment Partition > Credential
 ```
-Creates credentials like `myapp-openai-api-key` instead of `openai-api-key`.
+
+`.env` maps to environment `default`; `.env.production` maps to `production`. Use `--environment <name>` to override this. Credential names are environment-prefixed, such as `production-openai-api-key`.
+
+## Using The Attached File
+
+1. Start the proxy: `wispkey serve`
+2. Load the same `.env` path as before
+3. Route inspectable HTTP through `HTTP_PROXY=http://localhost:7700`
+4. Send HTTPS requests containing tokens through reverse proxy mode with `X-Target-Url`; CONNECT cannot substitute inside TLS
+
+Attached tokens are not automatically converted when a process reads its environment. Attach only values used through an HTTP substitution path. Use `wispkey run`, `exec`, or `inject` for database URLs, ports, paths, and other non-HTTP values.
+
+The proxy and MCP use the active project by default. Run `wispkey project use <project>` after attaching, or use `wispkey serve --all-projects` only when resolving tokens across projects is intended. Attached tokens are specific to that local vault and should not be treated as portable team configuration.
+
+Attachment cannot infer target hosts. Configure restrictive policies, or pre-provision the matching environment-prefixed credentials with `--hosts`, before exposing attached tokens to an untrusted agent.
 
 ## Handling Duplicates
 
-Already-imported credentials are skipped with a notice. Safe to re-run.
+Matching stored values and existing tokens are safe to re-attach. A different stored value, unknown token, or cross-environment credential fails without changing the file.
+
+## Whole-File Import
+
+`wispkey import .env` remains available when a separate `.env.wispkey` output file is desired. Prefer `env attach` when the existing file should stay in place and only selected secrets should become tokens.
 
 ## Post-Migration Checklist
 
-1. Verify all credentials imported: `wispkey list`
-2. Add `.env` to `.gitignore` (if not already)
-3. Commit `.env.wispkey` if appropriate for the project (it contains only wisp tokens and is written owner-only locally)
-4. Update project README with proxy setup instructions
-5. Delete the original `.env` once confirmed
+1. Verify the environment: `wispkey list --project my-app --partition production`
+2. Confirm ordinary local settings are unchanged
+3. Keep `.env` ignored when it contains machine-vault-specific tokens; do not present those tokens as portable team configuration
+4. Start the proxy before local testing

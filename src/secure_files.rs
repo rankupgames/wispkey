@@ -33,6 +33,11 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
     harden_file(path)
 }
 
+/// Restricts an existing sensitive file to the current user.
+pub(crate) fn harden_existing_file(path: &Path) -> Result<()> {
+    harden_file(path)
+}
+
 /// Appends sensitive bytes to disk and then applies owner-only protection.
 pub(crate) fn append_private(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path
@@ -54,9 +59,28 @@ pub(crate) fn create_private(path: &Path, bytes: &[u8]) -> Result<bool> {
     {
         ensure_private_directory(parent)?;
     }
+    create_private_in_existing_directory(path, bytes)
+}
+
+/// Creates a new private file without changing permissions on its existing
+/// parent directory. Returns `false` if the file already exists.
+pub(crate) fn create_private_in_existing_directory(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(VaultError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("parent directory does not exist: {}", parent.display()),
+        )));
+    }
     match create_private_file(path, bytes) {
         Ok(()) => {
-            harden_file(path)?;
+            if let Err(error) = harden_file(path) {
+                let _ = fs::remove_file(path);
+                return Err(error);
+            }
             Ok(true)
         }
         Err(VaultError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {

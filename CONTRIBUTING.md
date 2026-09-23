@@ -13,7 +13,7 @@ cargo test
 
 ### Prerequisites
 
-- **Rust 1.94+** via [rustup](https://rustup.rs)
+- Current stable **Rust** via [rustup](https://rustup.rs)
 - That's it -- SQLite is bundled via `rusqlite`
 
 ## Development Workflow
@@ -23,9 +23,9 @@ cargo test
 3. Run the full check suite:
 
 ```bash
-cargo fmt --check
-cargo clippy -- -D warnings
-cargo test
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
 ```
 
 Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). The optional `wispkey-tray` GUI is a workspace member but is not required for CI. To build it locally on Debian/Ubuntu:
@@ -56,11 +56,27 @@ See [`docs/tray.md`](docs/tray.md) for owner IPC and tray usage.
 
 ## Reporting Issues
 
-Open a GitHub issue with:
-- What you expected
-- What happened instead
-- Steps to reproduce
-- OS and Rust version (`rustc --version`)
+Use the repository's GitHub issue forms. Keep one concern per issue and search
+existing issues and pull requests before submitting a new report.
+
+Feature requests use this structure:
+
+- **Problem:** the concrete limitation, risk, or unsupported workflow.
+- **Goal:** the observable outcome, separate from implementation details.
+- **Scope:** the behavior and surfaces included in the request.
+- **Proposed interface:** a CLI, MCP, API, UI, or data-contract sketch when useful.
+- **Acceptance criteria:** testable checklist items, including fail-closed and
+  secret-redaction behavior where relevant.
+- **Evidence:** current code, documentation, or sanitized behavior that proves
+  the gap exists.
+- **Non-goals and overlap:** exclusions and related issues or pull requests.
+
+Bug reports must include expected behavior, minimal reproduction steps, WispKey
+version, OS and architecture, Rust version when building from source, the
+affected interface, sanitized evidence, and acceptance criteria for the fix.
+
+Never include credentials, tokens, private keys, passwords, vault contents, or
+unredacted logs in an issue.
 
 ## Security Vulnerabilities
 

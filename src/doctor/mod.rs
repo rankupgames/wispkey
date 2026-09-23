@@ -7,9 +7,10 @@
  * Last Modified: 2026-08-26
  */
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -547,9 +548,27 @@ fn handshake_mcp_initialize() -> Result<String, String> {
         .env("WISPKEY_VAULT_PATH", Vault::vault_dir())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|error| format!("could not start MCP server: {error}"))?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "MCP stdout was not piped".to_string())?;
+    let reader = std::thread::spawn(move || {
+        let mut stdout = stdout;
+        let mut captured = Vec::new();
+        let mut buffer = [0_u8; 4096];
+        while let Ok(size) = stdout.read(&mut buffer) {
+            if size == 0 {
+                break;
+            }
+            let remaining = 65_536_usize.saturating_sub(captured.len());
+            captured.extend_from_slice(&buffer[..size.min(remaining)]);
+        }
+        captured
+    });
 
     let write_result = (|| {
         let stdin = child
@@ -563,21 +582,48 @@ fn handshake_mcp_initialize() -> Result<String, String> {
     if let Err(error) = write_result {
         let _ = child.kill();
         let _ = child.wait();
+        let _ = reader.join();
         return Err(error);
     }
 
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err("MCP initialize timed out".to_string());
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                return Err("could not check MCP server exit status".to_string());
+            }
+        }
+    }
+    let status = match child.wait() {
+        Ok(status) => status,
         Err(error) => return Err(format!("waiting for MCP server: {error}")),
     };
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stdout = reader
+        .join()
+        .map_err(|_| "could not read MCP initialize output".to_string())?;
+    if !status.success() {
+        return Err("MCP server exited unsuccessfully during initialize".to_string());
+    }
+    parse_mcp_initialize_output(&stdout)
+}
+
+fn parse_mcp_initialize_output(stdout: &[u8]) -> Result<String, String> {
+    let stdout = String::from_utf8_lossy(stdout);
     let response: Value = stdout
         .lines()
         .find_map(|line| serde_json::from_str(line).ok())
-        .ok_or_else(|| {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            format!("MCP initialize did not return JSON-RPC ({stderr})")
-        })?;
+        .ok_or_else(|| "MCP initialize did not return JSON-RPC".to_string())?;
 
     let protocol = response
         .pointer("/result/protocolVersion")
@@ -647,5 +693,13 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         assert_eq!(ids.len(), STABLE_CHECK_IDS.len());
+    }
+
+    #[test]
+    fn invalid_mcp_response_does_not_echo_output() {
+        let secret = "child-output-secret";
+        let output = format!("not JSON: {secret}\n");
+        let error = parse_mcp_initialize_output(output.as_bytes()).expect_err("invalid response");
+        assert!(!error.contains(secret));
     }
 }

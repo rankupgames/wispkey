@@ -5,19 +5,23 @@ description: Organize WispKey credentials into partitions, assign secrets to gro
 
 # WispKey Partition Management
 
-Partitions group credentials inside the vault. Use them to separate projects, environments, or teams without mixing unrelated secrets in one flat list.
+Partitions group credentials inside a WispKey project. Use projects for repositories, products, or engagements; use partitions for environments or other sub-scopes inside that project.
 
 ## Creating a Partition
 
 ```bash
-wispkey partition create "<name>" --description "Human-readable purpose"
+wispkey partition create "<name>" --description "Human-readable purpose" [--project "<project>"]
 ```
 
 Example:
 
 ```bash
-wispkey partition create "acme-api" --description "ACME customer integration keys"
+wispkey project create "acme-api" --description "ACME API credentials"
+wispkey project use "acme-api"
+wispkey partition create "production" --description "Production credentials"
 ```
+
+Most partition operations use the active project. Select it with `wispkey project use <project>` before assigning, deleting, exporting, or importing by partition name.
 
 ## Listing Partitions
 
@@ -90,9 +94,9 @@ Credential names are unique per project, so duplicate detection happens inside t
 
 ## Use Cases
 
-### Organizing by Project
+### Organizing Environments
 
-Create a partition per product or repo, assign only the credentials that belong there, and use `wispkey list --partition "<name>"` during day-to-day work to stay scoped.
+Create a WispKey project per product or repo, then create partitions such as `development`, `staging`, and `production`. Use `wispkey list --project "<project>" --partition "<environment>"` to stay scoped.
 
 ### Team Sharing
 
@@ -106,4 +110,4 @@ Prepare a standard partition (for example `new-hire-dev`) with non-production ke
 
 - `wispkey add` with `--partition` when creating credentials inside a partition
 - `wispkey list --partition "<name>"` to list credentials in one partition
-- Cloud sync (future): see the cloud-sync skill for planned multi-user and org workflows
+- Cloud sync commands are reserved but currently return `coming soon`; use encrypted project, partition, or credential bundles today

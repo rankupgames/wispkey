@@ -67,6 +67,10 @@ pub enum VaultError {
     CredentialNotFound(String),
     #[error("invalid credential type: {0}")]
     InvalidCredentialType(String),
+    #[error("invalid .env file: {0}")]
+    InvalidEnvFile(String),
+    #[error(".env credential conflict: {0}")]
+    EnvCredentialConflict(String),
     #[error("credential name must not be empty")]
     EmptyCredentialName,
     #[error("credential value must not be empty")]
