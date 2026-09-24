@@ -945,6 +945,17 @@ pub(crate) mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+        // Elevated Windows runners may create files owned by Administrators.
+        // The private reader requires the process account as the actual owner.
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/setowner", &format!("*{sid}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert!(super::super::identity::read_private_catalog(path).is_ok());
     }
 
     #[test]
