@@ -23,6 +23,8 @@ use crate::secure_files;
 
 mod crypto;
 mod instances;
+pub(crate) mod operation_grants;
+mod operation_session;
 mod protector;
 mod rows;
 mod schema;
@@ -51,7 +53,7 @@ pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
 /// Current on-disk SQLite schema version written to `vault_meta`.
-pub const CURRENT_SCHEMA_VERSION: &str = "12";
+pub const CURRENT_SCHEMA_VERSION: &str = "13";
 
 pub mod browser;
 

@@ -390,7 +390,7 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey login archive/restore/activate <name>` | Lifecycle changes; archive never deletes |
 | `wispkey status` | Show vault, session, and proxy status |
 | `wispkey doctor` | Run secret-safe diagnostics (version, permissions, session, proxy, policy, audit, MCP, substitution) |
-| `wispkey operation identity/check` | Inspect the local OS principal and validate a private operation catalog; [preflight only](docs/operation-preflight.md) |
+| `wispkey operation identity/check/authorize/execute/status/cancel/reconcile/audit` | Owner-approved one-use SSH, Kubernetes Secret and PostgreSQL operations; [runtime guide](docs/operation-runtime.md) |
 | `wispkey integrate <client> [--print] [--path FILE]` | Generate or write MCP client config (`cursor`, `codex`, `claude-code`, `generic-mcp`) |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Query audit events |
 | `wispkey audit export [--since TS] [--until TS] [--credential C] [--encoding jsonl|json] [-o FILE]` | Export matching audit events for SIEM ingestion |

@@ -23,6 +23,7 @@ pub mod integrate;
 pub mod mcp;
 pub mod migrate;
 pub(crate) mod operations;
+pub use operations::helper::run as run_operation_helper;
 pub mod owner_ipc;
 pub mod partition;
 pub mod pki;

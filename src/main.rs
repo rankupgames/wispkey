@@ -397,6 +397,45 @@ enum AuditOutputFormat {
 
 #[derive(Subcommand)]
 enum OperationCommands {
+    /// Approve one instance-bound operation with fresh interactive owner confirmation
+    Authorize {
+        operation: String,
+        #[arg(long, default_value_t = 300)]
+        seconds: u32,
+    },
+    /// Execute an existing grant through the authenticated requester API
+    Execute {
+        #[arg(long)]
+        grant: String,
+        #[arg(long)]
+        identity_file: std::path::PathBuf,
+        #[arg(long)]
+        proxy: Option<String>,
+    },
+    /// Inspect one grant or attempt as the local owner
+    Status {
+        #[arg(long, conflicts_with = "attempt", required_unless_present = "attempt")]
+        grant: Option<String>,
+        #[arg(long)]
+        attempt: Option<String>,
+    },
+    /// Cancel a pending grant or request cancellation of an active attempt
+    Cancel {
+        #[arg(long, conflicts_with = "attempt", required_unless_present = "attempt")]
+        grant: Option<String>,
+        #[arg(long)]
+        attempt: Option<String>,
+    },
+    /// Mark an expired interrupted attempt uncertain after checking the remote target
+    Reconcile {
+        #[arg(long)]
+        attempt: String,
+    },
+    /// Read the eight-field operation audit as the local owner
+    Audit {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
     /// Show the current OS account principal (not an agent identity or authorization)
     Identity,
     /// Read-only validation; does not contact targets, unlock a vault, or authorize execution
@@ -988,11 +1027,32 @@ async fn main() {
         .install_default()
         .expect("Failed to install rustls ring CryptoProvider");
 
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("wispkey=info".parse().expect("static directive must parse")),
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::from_default_env().add_directive(
+                        "wispkey=info".parse().expect("static directive must parse"),
+                    ),
+                )
+                .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                    // Transport dependencies can debug-print channels, headers or payloads.
+                    // This filter is independent of user RUST_LOG specificity.
+                    ![
+                        "russh",
+                        "ssh_key",
+                        "reqwest",
+                        "hyper",
+                        "h2",
+                        "rustls",
+                        "tokio_postgres",
+                        "postgres_protocol",
+                    ]
+                    .iter()
+                    .any(|prefix| metadata.target().starts_with(prefix))
+                })),
         )
         .init();
 
@@ -1020,7 +1080,7 @@ async fn main() {
             cli::handle_lock(forget).await;
         }
         Commands::Tray { ipc_only } => {
-            cli::handle_tray(ipc_only).await;
+            Box::pin(cli::handle_tray(ipc_only)).await;
         }
         Commands::Add {
             name,
@@ -1115,6 +1175,29 @@ async fn main() {
             .await;
         }
         Commands::Operation { command } => match command {
+            OperationCommands::Authorize { operation, seconds } => {
+                cli::handle_operation_authorize(&operation, seconds)
+            }
+            OperationCommands::Execute {
+                grant,
+                identity_file,
+                proxy,
+            } => {
+                Box::pin(cli::handle_operation_execute(
+                    &grant,
+                    &identity_file,
+                    proxy.as_deref(),
+                ))
+                .await
+            }
+            OperationCommands::Status { grant, attempt } => {
+                cli::handle_operation_status(grant.as_deref(), attempt.as_deref())
+            }
+            OperationCommands::Cancel { grant, attempt } => {
+                cli::handle_operation_cancel(grant.as_deref(), attempt.as_deref())
+            }
+            OperationCommands::Reconcile { attempt } => cli::handle_operation_reconcile(&attempt),
+            OperationCommands::Audit { limit } => cli::handle_operation_audit(limit),
             OperationCommands::Identity => cli::handle_operation_identity(),
             OperationCommands::Check { config, operation } => {
                 cli::handle_operation_check(config.as_deref(), operation.as_deref());
@@ -1159,14 +1242,14 @@ async fn main() {
             no_require_identity,
         } => {
             let effective_port = if random_port { 0 } else { port };
-            cli::handle_serve(
+            Box::pin(cli::handle_serve(
                 effective_port,
                 daemon,
                 all_projects,
                 listen,
                 require_identity,
                 no_require_identity,
-            )
+            ))
             .await;
         }
         Commands::Import {
@@ -1206,7 +1289,7 @@ async fn main() {
             cli::handle_status().await;
         }
         Commands::Doctor => {
-            cli::handle_doctor().await;
+            Box::pin(cli::handle_doctor()).await;
         }
         Commands::Integrate {
             client,
