@@ -157,6 +157,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Legacy whole-file import that writes `.env.wispkey` |
 | `wispkey status` | Vault + session + proxy status |
 | `wispkey doctor` | Secret-safe diagnostics (version, permissions, session, proxy, policy, audit, MCP, substitution) |
+| `wispkey operation identity/check` | OS-account identity and private catalog preflight; no grants or execution (see `docs/operation-preflight.md`) |
 | `wispkey integrate <client> [--print] [--path FILE]` | Generate or write MCP client config (`cursor`, `codex`, `claude-code`, `generic-mcp`) |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Audit log |
 | `wispkey audit export [--since TS] [--until TS] [--credential C] [--encoding jsonl|json] [-o FILE]` | Export matching audit events |

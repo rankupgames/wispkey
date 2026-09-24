@@ -182,6 +182,12 @@ enum Commands {
         command: Vec<String>,
     },
 
+    /// Inspect local runner identity and validate a private cross-node operation catalog
+    Operation {
+        #[command(subcommand)]
+        command: OperationCommands,
+    },
+
     /// Run a child process with manifest-defined child-only environment variables
     Run {
         /// Manifest path (default: wispkey.toml in the current directory)
@@ -387,6 +393,21 @@ enum Commands {
 enum AuditOutputFormat {
     Jsonl,
     Json,
+}
+
+#[derive(Subcommand)]
+enum OperationCommands {
+    /// Show the current OS account principal (not an agent identity or authorization)
+    Identity,
+    /// Read-only validation; does not contact targets, unlock a vault, or authorize execution
+    Check {
+        /// Owner-private catalog (default: the vault directory's operations.toml)
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Check one named entry instead of every entry in this runner's catalog
+        #[arg(long)]
+        operation: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1093,6 +1114,12 @@ async fn main() {
             })
             .await;
         }
+        Commands::Operation { command } => match command {
+            OperationCommands::Identity => cli::handle_operation_identity(),
+            OperationCommands::Check { config, operation } => {
+                cli::handle_operation_check(config.as_deref(), operation.as_deref());
+            }
+        },
         Commands::Run {
             manifest,
             project,

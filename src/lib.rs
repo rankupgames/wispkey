@@ -22,6 +22,7 @@ pub mod env_sideload;
 pub mod integrate;
 pub mod mcp;
 pub mod migrate;
+pub(crate) mod operations;
 pub mod owner_ipc;
 pub mod partition;
 pub mod pki;
