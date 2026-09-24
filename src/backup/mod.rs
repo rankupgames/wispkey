@@ -40,6 +40,7 @@ const TABLE_PROJECTS: &str = "projects";
 const TABLE_PARTITIONS: &str = "partitions";
 const TABLE_CREDENTIALS: &str = "credentials";
 const TABLE_AUDIT_LOG: &str = "audit_log";
+const TABLE_OPERATION_AUDIT: &str = "operation_audit";
 const TABLE_INSTANCES: &str = "instances";
 const TABLE_INSTANCE_SCOPES: &str = "instance_scopes";
 const TABLE_ACCESS_REQUESTS: &str = "access_requests";
@@ -156,6 +157,8 @@ pub struct BackupCounts {
     pub partitions: usize,
     pub credentials: usize,
     pub audits: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub operation_audits: usize,
     pub instances: usize,
     pub scopes: usize,
     pub access_requests: usize,
@@ -182,6 +185,8 @@ struct BackupContents {
     credentials: Vec<Map<String, Value>>,
     #[serde(default)]
     audit_log: Vec<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    operation_audit: Vec<Map<String, Value>>,
     #[serde(default)]
     instances: Vec<Map<String, Value>>,
     #[serde(default)]
@@ -366,6 +371,7 @@ pub(crate) fn recovery_limits() -> Vec<String> {
         "Replace refuses stale sessions, remembered protectors, SQLite WAL/journal files, live IPC state, and omitted target sidecars instead of claiming those files were restored.".into(),
         "Instance bearer secrets and bootstrap tokens are never stored at rest. Restored instances are marked needs_reenrollment; run `wispkey instance rotate-secret` to mint a new secret.".into(),
         "Env-sideload secrets live in process environment only and are not part of a vault backup.".into(),
+        "Cross-node operation audit rows are backed up when audits are included. Pending grants and execution attempts are never restored and must be reauthorized.".into(),
     ]
 }
 
@@ -522,6 +528,11 @@ fn dump_contents(db: &Connection, scope: &BackupScope) -> Result<BackupContents>
         } else {
             Vec::new()
         },
+        operation_audit: if scope.audits {
+            dump_table(db, TABLE_OPERATION_AUDIT)?
+        } else {
+            Vec::new()
+        },
         instances: if scope.instances {
             dump_table(db, TABLE_INSTANCES)?
         } else {
@@ -663,11 +674,16 @@ fn counts_from_contents(contents: &BackupContents) -> BackupCounts {
         partitions: contents.partitions.len(),
         credentials: contents.credentials.len(),
         audits: contents.audit_log.len(),
+        operation_audits: contents.operation_audit.len(),
         instances: contents.instances.len(),
         scopes: contents.instance_scopes.len(),
         access_requests: contents.access_requests.len(),
         bootstrap: contents.bootstrap_tokens.len(),
     }
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 fn schema_version_from_db(db: &Connection) -> Result<String> {
@@ -704,6 +720,7 @@ fn parse_schema_version(version: &str) -> Result<u32> {
 fn backup_warnings(scope: &BackupScope) -> Vec<String> {
     let mut warnings = vec![
         "session, protector, proxy, and owner IPC files are excluded".to_string(),
+        "cross-node operation grants and attempts are excluded; operation audit rows follow the audits scope".to_string(),
         "env-sideload secrets are not stored in the vault and are not backed up".to_string(),
         "database rows are captured in one SQLite read transaction; sidecars are read separately, so stop WispKey and quiesce the vault for cross-file consistency".to_string(),
     ];
@@ -946,6 +963,39 @@ fn restore_sidecar_paths(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operation_audit_backup_extension_preserves_old_payload_shape() {
+        let counts = serde_json::to_value(BackupCounts::default()).unwrap();
+        assert!(counts.get("operation_audits").is_none());
+        let contents = serde_json::to_value(BackupContents::default()).unwrap();
+        assert!(contents.get("operation_audit").is_none());
+        let decoded: BackupContents = serde_json::from_value(contents).unwrap();
+        assert!(decoded.operation_audit.is_empty());
+    }
+
+    #[test]
+    fn operation_audit_snapshot_excludes_live_grants_and_attempts() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = Vault::initialize_database_file(&source_dir.path().join("source.db")).unwrap();
+        source.execute(
+            "INSERT INTO operation_audit(timestamp,requester,operation,target,environment,credential_ref,expires_at,result) VALUES ('2026-09-24T00:00:00Z','instance-1','rotate-db','db-1','test','credential-1','2026-09-24T00:05:00Z','started')",
+            [],
+        ).unwrap();
+        let contents = dump_contents(&source, &BackupScope::all_included()).unwrap();
+        assert_eq!(contents.operation_audit.len(), 1);
+        let serialized = serde_json::to_string(&contents).unwrap();
+        assert!(!serialized.contains("operation_grants"));
+        assert!(!serialized.contains("operation_attempts"));
+        let mut excluded = BackupScope::all_included();
+        excluded.exclude_names(&["audits".into()]).unwrap();
+        assert!(
+            dump_contents(&source, &excluded)
+                .unwrap()
+                .operation_audit
+                .is_empty()
+        );
+    }
 
     #[test]
     fn excluded_projects_drop_dependent_scope() {

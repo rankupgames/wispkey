@@ -348,9 +348,10 @@ fn try_resolve_exact_token_for_request(
                 )));
             }
 
+            let agent_name = authenticated_policy_principal(context.instance);
             if let Some(denial) = context.policy_engine.evaluate(
                 &cred.name,
-                None,
+                agent_name.as_deref(),
                 context.target_host,
                 context.target_path,
                 context.http_method,
@@ -449,9 +450,10 @@ fn resolve_env_token_for_request(
         )));
     }
 
+    let agent_name = authenticated_policy_principal(context.instance);
     if let Some(denial) = context.policy_engine.evaluate(
         &env_credential.name,
-        None,
+        agent_name.as_deref(),
         context.target_host,
         context.target_path,
         context.http_method,
@@ -543,6 +545,13 @@ fn audit_denial(
         Some(reason),
         context.project_scope.as_deref(),
     );
+}
+
+/// `InstanceIdentity` is produced only after the proxy verifies the enrolled
+/// instance secret. Its database ID is stable across display-name changes;
+/// request headers and the display name are never policy identities.
+fn authenticated_policy_principal(instance: Option<&InstanceIdentity>) -> Option<String> {
+    instance.map(|instance| format!("instance:{}", instance.id))
 }
 
 fn out_of_scope_response(

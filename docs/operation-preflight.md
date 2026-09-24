@@ -5,9 +5,9 @@ check` validates an owner-private catalog for that account without opening the
 vault, reading SSH keys, connecting to a destination, or launching a child.
 They are the first implementation of the [cross-node contract](cross-node-operations.md).
 
-This release does not issue grants, run SSH operations, or deliver Kubernetes
-Secrets. Successful preflight means that the configuration and local account
-checks passed. It does not verify a credential's existence, a live host key,
+Version 1 remains preflight-only. Version 2 enables the separately authorized
+[runtime commands](operation-runtime.md). Successful preflight means that the
+configuration and private-file checks passed. It does not verify a credential's existence, a live host key,
 SSH authentication, a remote helper, or an authorization grant.
 
 ## Identify the runner
@@ -120,11 +120,17 @@ wispkey --format json operation check --config /private/operations.toml --operat
 Without `--operation`, every entry must match the current OS principal.
 With it, the entire catalog is still parsed and validated; the selected entry
 is checked against the current principal. An absent operation, expired entry,
-principal mismatch, unsafe file or invalid catalog exits with status 1.
+principal mismatch, unsafe file or invalid catalog exits with status 1. Version 2
+binds enrolled instance UUIDs instead of comparing the current OS principal;
+preflight does not authenticate that instance.
 
 JSON success reports `configuration_valid`, `checked_operations`, and a
 `catalog_revision` computed from canonical validated metadata. Formatting and
 comments do not affect the revision. It is a review reference, not a signature
 or grant. `credential_verified`, `live_target_verified` and
-`execution_available` are all `false` in this release. Errors contain fixed
+`execution_authorized` and `requester_authenticated` are always `false`.
+`execution_available` is `false` for version 1 and `true` for version 2, which
+indicates an implemented runtime, not permission to execute. Runtime grant
+bindings use a separate domain-separated digest that includes target CA/posture
+bytes; the preflight review reference alone is not an authorization binding. Errors contain fixed
 diagnostics, never catalog snippets, supplied operation names or input paths.

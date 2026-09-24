@@ -45,7 +45,7 @@ For repeated headless unlocks, prefer `wispkey unlock --remember --password-file
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v12 automatically. Browser fill requests are short-lived metadata, omitted from encrypted backups.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v13 automatically. Browser fill requests are short-lived metadata, omitted from encrypted backups.
 
 ```bash
 # Create a project
@@ -157,7 +157,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Legacy whole-file import that writes `.env.wispkey` |
 | `wispkey status` | Vault + session + proxy status |
 | `wispkey doctor` | Secret-safe diagnostics (version, permissions, session, proxy, policy, audit, MCP, substitution) |
-| `wispkey operation identity/check` | OS-account identity and private catalog preflight; no grants or execution (see `docs/operation-preflight.md`) |
+| `wispkey operation identity/check/authorize/execute/status/cancel/reconcile/audit` | Owner-approved one-use SSH, Kubernetes Secret and PostgreSQL operations (see `docs/operation-runtime.md`) |
 | `wispkey integrate <client> [--print] [--path FILE]` | Generate or write MCP client config (`cursor`, `codex`, `claude-code`, `generic-mcp`) |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Audit log |
 | `wispkey audit export [--since TS] [--until TS] [--credential C] [--encoding jsonl|json] [-o FILE]` | Export matching audit events |
@@ -188,7 +188,7 @@ WispKey stores arbitrary encrypted secret values, not only API keys. Use `api_ke
 
 The proxy scans and replaces wisp tokens in three locations: **headers**, **request body** (text/json/form only), and **URL query parameters**. In reverse-proxy mode, this includes wisp tokens in the `X-Target-Url` query string.
 
-Agent-scoped policies fail closed when the requester's agent identity is unavailable. The proxy currently has no trusted agent identity source, so a policy with an `agent = "..."` scope applies to proxy requests even when no agent name is known.
+Agent-scoped policies fail closed when the requester's agent identity is unavailable. Instance-authenticated proxy requests use the stable `instance:<UUID>` principal for agent-scoped policies. Unauthenticated local requests still fail closed for agent-scoped policies; caller-supplied labels never establish identity. Cross-node operations additionally require a fresh owner-issued one-use grant.
 
 ## Encrypted Export Bundles
 

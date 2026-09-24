@@ -16,6 +16,7 @@ const MAX_FIELD_BYTES: usize = 255;
 
 #[derive(Clone, Serialize)]
 pub struct Catalog {
+    pub version: u32,
     pub operations: Vec<Operation>,
 }
 
@@ -38,6 +39,8 @@ pub struct Operation {
 #[derive(Clone, Serialize)]
 pub enum OperationKind {
     SshHelper(SshTarget),
+    KubernetesSecret(super::environment::KubernetesTarget),
+    PostgresPassword(super::postgres::PostgresTarget),
 }
 
 #[derive(Clone, Serialize)]
@@ -73,7 +76,9 @@ struct RawOperation {
     max_runtime_seconds: u32,
     connect_timeout_seconds: u32,
     max_concurrency: u32,
-    ssh: RawSshTarget,
+    ssh: Option<RawSshTarget>,
+    kubernetes: Option<super::environment::KubernetesTarget>,
+    postgres: Option<super::postgres::PostgresTarget>,
 }
 
 #[derive(Deserialize)]
@@ -88,7 +93,7 @@ struct RawSshTarget {
     identity_file: String,
 }
 
-/// Parses only a bounded v1 SSH-helper catalog. Errors never contain input text.
+/// Parses bounded v1 preflight or v2 runtime catalogs. Errors never contain input text.
 pub fn parse_catalog(raw: &str) -> Result<Catalog, &'static str> {
     if raw.len() > MAX_CATALOG_BYTES {
         return Err("catalog too large");
@@ -99,7 +104,7 @@ pub fn parse_catalog(raw: &str) -> Result<Catalog, &'static str> {
         return Err("invalid catalog");
     }
     let parsed: RawCatalog = toml::from_str(raw).map_err(|_| "invalid catalog")?;
-    if parsed.version != 1 {
+    if !matches!(parsed.version, 1 | 2) {
         return Err("unsupported catalog version");
     }
     if parsed.operation.is_empty() || parsed.operation.len() > MAX_OPERATIONS {
@@ -112,7 +117,13 @@ pub fn parse_catalog(raw: &str) -> Result<Catalog, &'static str> {
         if !valid_slug(&operation.id) || !seen.insert(operation.id.clone()) {
             return Err("invalid operation id");
         }
-        if operation.kind != "ssh-helper" {
+        if operation.kind != "ssh-helper"
+            && !(parsed.version == 2
+                && matches!(
+                    operation.kind.as_str(),
+                    "kubernetes-secret" | "postgres-password"
+                ))
+        {
             return Err("unsupported operation kind");
         }
         if operation.project_id != "default" && !canonical_uuid(&operation.project_id) {
@@ -121,7 +132,13 @@ pub fn parse_catalog(raw: &str) -> Result<Catalog, &'static str> {
         if !canonical_uuid(&operation.credential_id) {
             return Err("invalid credential id");
         }
-        if !valid_principal(&operation.requester_principal) {
+        let instance_principal = operation
+            .requester_principal
+            .strip_prefix("instance:")
+            .is_some_and(canonical_uuid);
+        if (parsed.version == 1 && !valid_principal(&operation.requester_principal))
+            || (parsed.version == 2 && !instance_principal)
+        {
             return Err("invalid requester principal");
         }
         if !valid_slug(&operation.environment_id) || !valid_slug(&operation.target_id) {
@@ -143,7 +160,36 @@ pub fn parse_catalog(raw: &str) -> Result<Catalog, &'static str> {
         {
             return Err("invalid operation bounds");
         }
-        let ssh = parse_ssh_target(operation.ssh)?;
+        let kind = match (
+            operation.kind.as_str(),
+            operation.ssh,
+            operation.kubernetes,
+            operation.postgres,
+        ) {
+            ("ssh-helper", Some(ssh), None, None) => {
+                OperationKind::SshHelper(parse_ssh_target(ssh)?)
+            }
+            ("kubernetes-secret", None, Some(target), None) if parsed.version == 2 => {
+                target.validate()?;
+                if target.environment_id != operation.environment_id
+                    || target.provider_credential_id == operation.credential_id
+                {
+                    return Err("invalid environment credential scope");
+                }
+                OperationKind::KubernetesSecret(target)
+            }
+            ("postgres-password", None, None, Some(target)) if parsed.version == 2 => {
+                target.validate()?;
+                if target.environment_id != operation.environment_id
+                    || target.provider_credential_id == operation.credential_id
+                    || target.previous_credential_id == operation.credential_id
+                {
+                    return Err("invalid database credential scope");
+                }
+                OperationKind::PostgresPassword(target)
+            }
+            _ => return Err("invalid operation target"),
+        };
         operations.push(Operation {
             id: operation.id,
             project_id: operation.project_id,
@@ -156,10 +202,13 @@ pub fn parse_catalog(raw: &str) -> Result<Catalog, &'static str> {
             max_runtime_seconds: operation.max_runtime_seconds,
             connect_timeout_seconds: operation.connect_timeout_seconds,
             max_concurrency: operation.max_concurrency,
-            kind: OperationKind::SshHelper(ssh),
+            kind,
         });
     }
-    Ok(Catalog { operations })
+    Ok(Catalog {
+        version: parsed.version,
+        operations,
+    })
 }
 
 fn parse_ssh_target(raw: RawSshTarget) -> Result<SshTarget, &'static str> {
@@ -363,6 +412,26 @@ identity_file = "/home/runner/.ssh/restricted_key"
             catalog.operations[0].kind,
             OperationKind::SshHelper(_)
         ));
+    }
+
+    #[test]
+    fn runtime_catalog_requires_canonical_enrolled_instance() {
+        let raw = valid().replace("version = 1", "version = 2").replace(
+            "unix-uid:1000",
+            "instance:5af05c13-1c0a-4394-a7a3-7f457ff74a40",
+        );
+        assert_eq!(parse_catalog(&raw).unwrap().version, 2);
+        for bad in [
+            "instance:nil",
+            "instance:00000000-0000-0000-0000-000000000000",
+            "unix-uid:1000",
+            "agent:worker",
+        ] {
+            assert!(
+                parse_catalog(&raw.replace("instance:5af05c13-1c0a-4394-a7a3-7f457ff74a40", bad))
+                    .is_err()
+            );
+        }
     }
 
     #[test]

@@ -1,7 +1,12 @@
-//! Read-only preflight for owner-controlled cross-node operation catalogs.
-//! These checks neither create grants nor prove a remote identity.
+//! Owner-controlled catalogs and authenticated, one-use cross-node operations.
 mod catalog;
+pub(crate) mod environment;
+pub(crate) mod helper;
 mod identity;
+pub(crate) mod postgres;
+pub(crate) mod runtime;
+pub(crate) mod ssh;
+pub(crate) use identity::read_private_catalog as read_private_identity;
 
 use std::path::Path;
 
@@ -19,6 +24,8 @@ pub(crate) struct CheckReport {
     pub credential_verified: bool,
     pub live_target_verified: bool,
     pub execution_available: bool,
+    pub execution_authorized: bool,
+    pub requester_authenticated: bool,
 }
 
 pub(crate) fn check(path: &Path, operation: Option<&str>) -> Result<CheckReport, &'static str> {
@@ -39,7 +46,7 @@ fn check_catalog(
         if selected.is_some_and(|id| entry.id != id) {
             continue;
         }
-        if entry.requester_principal != principal {
+        if catalog.version == 1 && entry.requester_principal != principal {
             return Err("requester does not match current OS account");
         }
         if entry.expires_at <= now {
@@ -62,7 +69,9 @@ fn check_catalog(
         catalog_revision,
         credential_verified: false,
         live_target_verified: false,
-        execution_available: false,
+        execution_available: catalog.version == 2,
+        execution_authorized: false,
+        requester_authenticated: false,
     })
 }
 
@@ -73,6 +82,7 @@ mod tests {
 
     fn fixture() -> Catalog {
         Catalog {
+            version: 1,
             operations: vec![Operation {
                 id: "maintenance".into(),
                 project_id: "default".into(),
@@ -125,7 +135,9 @@ mod tests {
         let mut catalog = fixture();
         let now = "2029-01-01T00:00:00Z".parse().unwrap();
         let before = check_catalog(&catalog, "unix-uid:1000", None, now).unwrap();
-        let OperationKind::SshHelper(target) = &mut catalog.operations[0].kind;
+        let OperationKind::SshHelper(target) = &mut catalog.operations[0].kind else {
+            unreachable!()
+        };
         target.port = 2222;
         let after = check_catalog(&catalog, "unix-uid:1000", None, now).unwrap();
         assert_ne!(before.catalog_revision, after.catalog_revision);

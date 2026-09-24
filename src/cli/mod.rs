@@ -65,7 +65,11 @@ pub use login::{
     handle_list as handle_login_list, handle_restore,
 };
 pub use mcp::handle_mcp_serve;
-pub use operations::{handle_operation_check, handle_operation_identity};
+pub use operations::{
+    handle_operation_audit, handle_operation_authorize, handle_operation_cancel,
+    handle_operation_check, handle_operation_execute, handle_operation_identity,
+    handle_operation_reconcile, handle_operation_status,
+};
 pub use partitions::{
     handle_partition_assign, handle_partition_create, handle_partition_delete,
     handle_partition_export, handle_partition_import, handle_partition_list,

@@ -22,9 +22,10 @@ use super::{
     BackupCounts, BackupScope, SIDECAR_ACTIVE_PROJECT, SIDECAR_AUDIT_FINGERPRINT, SIDECAR_CLOUD,
     SIDECAR_CLOUD_MANIFESTS, SIDECAR_POLICIES, TABLE_ACCESS_REQUESTS, TABLE_AUDIT_LOG,
     TABLE_BOOTSTRAP_TOKENS, TABLE_CREDENTIALS, TABLE_INSTANCE_SCOPES, TABLE_INSTANCES,
-    TABLE_PARTITIONS, TABLE_PROJECTS, TABLE_VAULT_META, VaultBackupPayload, dest_has_vault,
-    insert_row, inspect_payload, read_payload, recovery_limits, restore_sidecar_paths,
-    schema_compatibility, string_field, verify_payload, write_optional_b64, write_optional_text,
+    TABLE_OPERATION_AUDIT, TABLE_PARTITIONS, TABLE_PROJECTS, TABLE_VAULT_META, VaultBackupPayload,
+    dest_has_vault, insert_row, inspect_payload, read_payload, recovery_limits,
+    restore_sidecar_paths, schema_compatibility, string_field, verify_payload, write_optional_b64,
+    write_optional_text,
 };
 use crate::core::{
     Result, Vault, VaultError, prepare_restored_instance_secrets,
@@ -154,6 +155,7 @@ fn restore_replace(
 }
 
 fn restore_replace_into_staging(payload: &VaultBackupPayload, staging: &Path) -> Result<()> {
+    validate_operation_audits(&payload.contents.operation_audit)?;
     secure_files::ensure_private_directory(staging)?;
     let db_path = staging.join("vault.db");
     let db = Vault::initialize_database_file(&db_path)?;
@@ -299,6 +301,7 @@ struct SkipSet {
     partitions: HashSet<String>,
     credentials: HashSet<String>,
     audits: HashSet<String>,
+    operation_audits: HashSet<usize>,
     instances: HashSet<String>,
     scopes: HashSet<String>,
     access_requests: HashSet<String>,
@@ -310,6 +313,62 @@ struct MergePlan {
     skipped: BackupCounts,
     conflicts: Vec<RestoreConflict>,
     skip: SkipSet,
+}
+
+const OPERATION_AUDIT_FIELDS: [&str; 8] = [
+    "timestamp",
+    "requester",
+    "operation",
+    "target",
+    "environment",
+    "credential_ref",
+    "expires_at",
+    "result",
+];
+
+fn validate_operation_audits(rows: &[Map<String, Value>]) -> Result<()> {
+    for row in rows {
+        if row.len() != OPERATION_AUDIT_FIELDS.len()
+            || OPERATION_AUDIT_FIELDS.iter().any(|field| {
+                !row.contains_key(*field)
+                    || (row[*field].as_str().is_none()
+                        && !(*field == "credential_ref" && row[*field].is_null()))
+            })
+        {
+            return Err(VaultError::Backup(
+                "operation audit backup row has an invalid shape".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn classify_operation_audits(
+    source: &[Map<String, Value>],
+    destination: &[Map<String, Value>],
+    imported: &mut usize,
+    skipped: &mut usize,
+) -> Result<HashSet<usize>> {
+    let mut present = HashMap::<String, usize>::new();
+    for row in destination {
+        let key = serde_json::to_string(row)
+            .map_err(|_| VaultError::Backup("operation audit backup row is invalid".into()))?;
+        *present.entry(key).or_default() += 1;
+    }
+    let mut skip = HashSet::new();
+    for (index, row) in source.iter().enumerate() {
+        let key = serde_json::to_string(row)
+            .map_err(|_| VaultError::Backup("operation audit backup row is invalid".into()))?;
+        let count = present.entry(key).or_default();
+        if *count > 0 {
+            *count -= 1;
+            skip.insert(index);
+            *skipped += 1;
+        } else {
+            *imported += 1;
+        }
+    }
+    Ok(skip)
 }
 
 fn plan_merge(db: &Connection, target: &Path, payload: &VaultBackupPayload) -> Result<MergePlan> {
@@ -503,6 +562,13 @@ fn plan_merge(db: &Connection, target: &Path, payload: &VaultBackupPayload) -> R
         &mut skipped.audits,
         &mut conflicts,
     );
+    let existing_operation_audits = super::dump_table(db, TABLE_OPERATION_AUDIT)?;
+    skip.operation_audits = classify_operation_audits(
+        &payload.contents.operation_audit,
+        &existing_operation_audits,
+        &mut imported.operation_audits,
+        &mut skipped.operation_audits,
+    )?;
 
     append_sidecar_conflicts(target, payload, &mut conflicts)?;
 
@@ -872,6 +938,7 @@ fn validate_payload_graph(payload: &VaultBackupPayload) -> Result<()> {
     validate_unique_ids(&payload.contents.access_requests, TABLE_ACCESS_REQUESTS)?;
     validate_unique_ids(&payload.contents.bootstrap_tokens, TABLE_BOOTSTRAP_TOKENS)?;
     validate_unique_ids(&payload.contents.audit_log, TABLE_AUDIT_LOG)?;
+    validate_operation_audits(&payload.contents.operation_audit)?;
 
     for (table, rows, required) in [
         (
@@ -1025,6 +1092,11 @@ fn insert_payload_tables(
         &skip.audits,
         "id",
     )?;
+    for (index, row) in payload.contents.operation_audit.iter().enumerate() {
+        if !skip.operation_audits.contains(&index) {
+            insert_row(db, TABLE_OPERATION_AUDIT, row)?;
+        }
+    }
     Ok(())
 }
 
@@ -1406,6 +1478,38 @@ fn meta_values_equal(left: &Map<String, Value>, right: &Map<String, Value>) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn operation_audit_row(result: &str) -> Map<String, Value> {
+        let mut row = Map::new();
+        for (key, value) in [
+            ("timestamp", "2026-09-24T00:00:00Z"),
+            ("requester", "instance-1"),
+            ("operation", "rotate-db"),
+            ("target", "db-1"),
+            ("environment", "test"),
+            ("credential_ref", "credential-1"),
+            ("expires_at", "2026-09-24T00:05:00Z"),
+            ("result", result),
+        ] {
+            row.insert(key.into(), Value::String(value.into()));
+        }
+        row
+    }
+
+    #[test]
+    fn operation_audit_merge_preserves_event_multiplicity_without_reimporting() {
+        let row = operation_audit_row("started");
+        let source = vec![row.clone(), row.clone(), operation_audit_row("succeeded")];
+        validate_operation_audits(&source).unwrap();
+        let mut imported = 0;
+        let mut skipped = 0;
+        let skip = classify_operation_audits(&source, &[row], &mut imported, &mut skipped).unwrap();
+        assert_eq!((imported, skipped), (2, 1));
+        assert_eq!(skip.len(), 1);
+        let mut invalid = source[0].clone();
+        invalid.insert("plaintext".into(), Value::String("synthetic-canary".into()));
+        assert!(validate_operation_audits(&[invalid]).is_err());
+    }
 
     #[test]
     fn failed_commit_leaves_original_vault() {

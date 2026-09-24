@@ -522,8 +522,23 @@ impl Vault {
             super::browser::create_schema(db)?;
             db.execute(
                 "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
-                params![CURRENT_SCHEMA_VERSION],
+                params!["12"],
             )?;
+        }
+
+        let version: String = db.query_row(
+            "SELECT value FROM vault_meta WHERE key = 'version'",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == "12" {
+            let tx = db.unchecked_transaction()?;
+            super::operation_grants::create_schema(&tx)?;
+            tx.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                [CURRENT_SCHEMA_VERSION],
+            )?;
+            tx.commit()?;
         }
 
         // Older releases stored reusable capability tokens in audit rows. Remove
@@ -603,6 +618,7 @@ impl Vault {
         create_instance_tables(db)?;
         create_bootstrap_token_table(db)?;
         super::browser::create_schema(db)?;
+        super::operation_grants::create_schema(db)?;
         Ok(())
     }
 }

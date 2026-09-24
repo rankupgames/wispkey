@@ -87,7 +87,9 @@ The plaintext value must not transit child argv, parent environment variables ot
 
 ## Agent-Scoped Policies
 
-Agent-scoped policies fail closed when the requester agent identity is unavailable. The proxy currently has no trusted agent identity source, so a policy with an `agent = "..."` scope applies to proxy requests even when no agent name is known.
+Instance-authenticated proxy requests use the stable `instance:<UUID>` principal for agent-scoped policy evaluation. The UUID comes from a successfully authenticated enrolled instance, not its mutable display name or caller-supplied requester headers. Missing identity still fails closed for agent-scoped policies on the trusted-local proxy path.
+
+Cross-node operations additionally require a fresh, interactive owner approval and an exact, one-use grant. Instance substitution scopes alone cannot authorize an operation. Operation authentication rejects rotated secrets even during their ordinary proxy grace period, and every release rechecks the current instance, finite session, catalog and credential revision. See the [operation runtime boundary and operating procedure](operation-runtime.md). Agents sharing the vault owner's OS account remain within that trusted owner boundary.
 
 ## Instance Boundary
 

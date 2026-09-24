@@ -293,6 +293,40 @@ async fn handle_request(
     let headers = req.headers().clone();
 
     if uri.path().starts_with("/api/") {
+        if uri.path().starts_with("/api/operations/") {
+            // This is a requester API, never authenticated by the management token.
+            // Cross-node use requires a trusted local/VM transport or external TLS tunnel.
+            if uri.query().is_some()
+                || headers.contains_key("origin")
+                || headers.get_all(INSTANCE_ID_HEADER).iter().count() != 1
+                || headers.get_all(INSTANCE_SECRET_HEADER).iter().count() != 1
+            {
+                crate::operations::runtime::audit_identity_denial();
+                return Ok(json_response(
+                    StatusCode::UNAUTHORIZED,
+                    &serde_json::json!({"error":"requester authentication failed"}),
+                ));
+            }
+            let id = headers
+                .get(INSTANCE_ID_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let secret = headers
+                .get(INSTANCE_SECRET_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let (status, body) = Box::pin(crate::operations::runtime::handle_api(
+                method.as_str(),
+                uri.path(),
+                id,
+                secret,
+            ))
+            .await;
+            return Ok(json_response(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                &body,
+            ));
+        }
         if method == Method::OPTIONS {
             return Ok(cors_preflight());
         }
