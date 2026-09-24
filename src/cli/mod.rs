@@ -22,6 +22,7 @@ mod integrate;
 mod log;
 mod login;
 mod mcp;
+mod operations;
 mod partitions;
 mod policy;
 mod projects;
@@ -64,6 +65,7 @@ pub use login::{
     handle_list as handle_login_list, handle_restore,
 };
 pub use mcp::handle_mcp_serve;
+pub use operations::{handle_operation_check, handle_operation_identity};
 pub use partitions::{
     handle_partition_assign, handle_partition_create, handle_partition_delete,
     handle_partition_export, handle_partition_import, handle_partition_list,
