@@ -82,6 +82,16 @@ fn write_catalog(root: &Path, principal: &str, contents: &str) -> PathBuf {
             .status()
             .unwrap();
         assert!(status.success());
+        // Elevated Windows runners can create files owned by Administrators.
+        // The catalog reader requires the process account SID as actual owner.
+        let status = Command::new("icacls")
+            .arg(&path)
+            .args(["/setowner", &format!("*{sid}")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
     path
 }

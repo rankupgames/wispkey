@@ -391,7 +391,12 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         #[cfg(windows)]
-        crate::secure_files::harden_existing_file(&path).unwrap();
+        {
+            crate::secure_files::harden_existing_file(&path).unwrap();
+            let principal = current_principal().unwrap();
+            let sid = principal.strip_prefix("windows-sid:").unwrap();
+            set_windows_security(&path, &format!("O:{sid}"), true);
+        }
         assert!(read_private_catalog(&path).unwrap().contains("hello"));
 
         fs::write(&path, vec![b'x'; MAX_CATALOG_BYTES as usize + 1]).unwrap();
@@ -418,7 +423,7 @@ mod tests {
     }
 
     #[cfg(windows)]
-    fn set_windows_dacl(path: &Path, sddl: &str) {
+    fn set_windows_security(path: &Path, sddl: &str, set_owner: bool) {
         use std::os::windows::ffi::OsStrExt;
         use std::ptr::null_mut;
         use windows_sys::Win32::Foundation::LocalFree;
@@ -426,7 +431,8 @@ mod tests {
             ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
         };
         use windows_sys::Win32::Security::{
-            DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetFileSecurityW,
+            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+            SetFileSecurityW,
         };
 
         let sddl: Vec<u16> = sddl.encode_utf16().chain(Some(0)).collect();
@@ -443,8 +449,12 @@ mod tests {
             0
         );
         let wide_path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-        let applied =
-            unsafe { SetFileSecurityW(wide_path.as_ptr(), DACL_SECURITY_INFORMATION, descriptor) };
+        let information = if set_owner {
+            OWNER_SECURITY_INFORMATION
+        } else {
+            DACL_SECURITY_INFORMATION
+        };
+        let applied = unsafe { SetFileSecurityW(wide_path.as_ptr(), information, descriptor) };
         unsafe { LocalFree(descriptor.cast()) };
         assert_ne!(applied, 0);
     }
@@ -455,9 +465,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().canonicalize().unwrap().join("operations.toml");
         fs::write(&path, "safe").unwrap();
-        set_windows_dacl(&path, "D:P(A;;FA;;;WD)");
+        set_windows_security(&path, "D:P(A;;FA;;;WD)", false);
         assert_eq!(read_private_catalog(&path), Err(INVALID_CATALOG));
-        set_windows_dacl(&path, "D:NO_ACCESS_CONTROL");
+        set_windows_security(&path, "D:NO_ACCESS_CONTROL", false);
         assert_eq!(read_private_catalog(&path), Err(INVALID_CATALOG));
     }
 
