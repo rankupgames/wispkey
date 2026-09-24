@@ -503,7 +503,13 @@ pub(crate) mod tests {
             .fingerprint(HashAlg::Sha256)
             .to_string();
         let directory = tempfile::tempdir().unwrap();
-        let identity = directory.path().join("restricted_key");
+        // macOS temp paths can contain /var -> /private/var; the production
+        // private-file reader correctly refuses any linked path component.
+        let identity = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("restricted_key");
         std::fs::write(
             &identity,
             client_key
@@ -731,7 +737,11 @@ pub(crate) mod tests {
             .fingerprint(HashAlg::Sha256)
             .to_string();
         let directory = tempfile::tempdir().unwrap();
-        let identity = directory.path().join("restricted_key");
+        let identity = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("restricted_key");
         std::fs::write(
             &identity,
             client_key
@@ -855,7 +865,11 @@ pub(crate) mod tests {
             .fingerprint(HashAlg::Sha256)
             .to_string();
         let directory = tempfile::tempdir().unwrap();
-        let identity = directory.path().join("restricted_key");
+        let identity = directory
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("restricted_key");
         std::fs::write(
             &identity,
             client_key
