@@ -215,6 +215,7 @@ fn cleanup_endpoint(path: &Path) {
 }
 
 fn handle_request(request: Value) -> Value {
+    let started = std::time::Instant::now();
     let id = request
         .get("id")
         .and_then(Value::as_str)
@@ -241,6 +242,7 @@ fn handle_request(request: Value) -> Value {
         "list_partitions" => list_partitions_response(&params),
         "add_credential" => add_credential_response(&params),
         "add_template" => add_template_response(&params),
+        "generate_login" => generate_login_response(&params),
         "get_settings" => Ok(json!({ "start_at_login": read_start_at_login() })),
         "set_settings" => set_settings_response(&params),
         "shutdown" => Ok(json!({ "ok": true, "shutdown": true })),
@@ -251,6 +253,12 @@ fn handle_request(request: Value) -> Value {
         )),
     };
 
+    tracing::info!(
+        phase = "request_handling",
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        succeeded = result.is_ok(),
+        "owner ipc request completed"
+    );
     match result {
         Ok(value) => json!({ "id": id, "ok": true, "result": value }),
         Err(error) => json!({ "id": id, "ok": false, "error": error }),
@@ -496,6 +504,66 @@ fn set_settings_response(params: &Value) -> Result<Value, Value> {
         error_body("unavailable", &format!("failed to write settings: {error}"))
     })?;
     Ok(json!({ "start_at_login": start_at_login }))
+}
+
+fn generate_login_response(params: &Value) -> Result<Value, Value> {
+    require_destination_confirmation(params)?;
+    let name = required_string(params, "name")?;
+    let username = required_string(params, "username")?;
+    let url = required_string(params, "url")?;
+    let project = optional_string(params, "project").unwrap_or_else(core::resolve_active_project);
+    let partition = optional_string(params, "partition");
+    let vault = Vault::open_with_session().map_err(vault_error)?;
+    // The generation form explicitly confirms creating this destination when
+    // needed. Validate the URL before creating any metadata containers.
+    core::parse_https_origin(&url).map_err(vault_error)?;
+    match vault.get_project(&project) {
+        Ok(_) => {}
+        Err(VaultError::ProjectNotFound(_)) => {
+            vault.create_project(&project, "").map_err(vault_error)?;
+        }
+        Err(error) => return Err(vault_error(error)),
+    }
+    if let Some(partition) = partition.as_deref() {
+        match vault.get_partition_in_project(&project, partition) {
+            Ok(_) => {}
+            Err(VaultError::PartitionNotFound(_)) => {
+                vault
+                    .create_partition(partition, "", Some(&project))
+                    .map_err(vault_error)?;
+            }
+            Err(error) => return Err(vault_error(error)),
+        }
+    }
+    let credential = vault
+        .generate_website_login(core::GenerateWebsiteLoginRequest {
+            name: &name,
+            username: &username,
+            url: &url,
+            project: Some(&project),
+            partition: partition.as_deref(),
+            review_at: Some(chrono::Utc::now() + chrono::Duration::days(180)),
+            length: None,
+            symbols: true,
+        })
+        .map_err(vault_error)?;
+    audit::log_event(
+        vault.db(),
+        "WebsiteLoginCreated",
+        Some(&name),
+        None,
+        Some(&credential.origin),
+        None,
+        None,
+        None,
+        false,
+        None,
+        Some(&project),
+    );
+    Ok(
+        json!({ "credential": credential_metadata(&credential), "origin": credential.origin,
+        "lifecycle_state": credential.lifecycle_state, "review_at": credential.review_at }),
+    )
 }
 
 fn credential_metadata(credential: &core::Credential) -> Value {
@@ -788,27 +856,40 @@ mod windows {
 
     pub(super) async fn call(path: &Path, request: Value) -> Result<Value, OwnerIpcError> {
         let name = pipe_name(path);
+        let started = tokio::time::Instant::now();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         // The server replaces its one-shot pipe instance after each response.
         let mut client = loop {
             match ClientOptions::new().open(&name) {
                 Ok(client) => break client,
                 Err(error)
-                    if (error.kind() == std::io::ErrorKind::NotFound
-                        || error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32))
-                        && tokio::time::Instant::now() < deadline =>
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) =>
                 {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(OwnerIpcError::Protocol(
+                            "connection phase timed out after 5000 ms".into(),
+                        ));
+                    }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
                 Err(error) => return Err(error.into()),
             }
         };
-        write_line(&mut client, &request).await?;
+        let connected_ms = started.elapsed().as_millis();
+        tokio::time::timeout(Duration::from_secs(5), write_line(&mut client, &request))
+            .await
+            .map_err(|_| {
+                OwnerIpcError::Protocol(format!(
+                    "request_write phase timed out after 5000 ms (connection: {connected_ms} ms)"
+                ))
+            })??;
+        let written_ms = started.elapsed().as_millis();
         let mut reader = BufReader::new(client);
         let mut line = String::new();
         tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
             .await
-            .map_err(|_| OwnerIpcError::Protocol("timed out waiting for owner IPC".into()))??;
+            .map_err(|_| OwnerIpcError::Protocol(format!("response_read phase timed out after 5000 ms (connection: {connected_ms} ms; request write: {} ms)", written_ms - connected_ms)))??;
         serde_json::from_str(line.trim())
             .map_err(|error| OwnerIpcError::Protocol(error.to_string()))
     }

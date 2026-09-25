@@ -4,21 +4,25 @@
  * Project: WispKey
  * Description: CLI command handlers -- grouped by command family.
  * Created: 2026-04-07
- * Last Modified: 2026-04-12
+ * Last Modified: 2026-08-26
  */
 
 mod audit;
+mod backup;
 mod cloud;
 mod credential_sharing;
 mod credentials;
+mod doctor;
 mod env;
 mod exec;
 mod guard;
 mod inject;
 mod instances;
+mod integrate;
 mod log;
 mod login;
 mod mcp;
+mod operations;
 mod partitions;
 mod policy;
 mod projects;
@@ -30,6 +34,9 @@ mod tray;
 mod vault;
 
 pub use audit::{AuditExportFormat, handle_audit_export, handle_audit_tail};
+pub use backup::{
+    handle_backup_create, handle_backup_inspect, handle_backup_restore, handle_backup_verify,
+};
 pub use cloud::{
     handle_cloud_login, handle_cloud_logout, handle_cloud_pull, handle_cloud_push,
     handle_cloud_status, handle_cloud_sync,
@@ -39,6 +46,7 @@ pub use credentials::{
     AddCredentialArgs, handle_add, handle_get, handle_import, handle_list, handle_remove,
     handle_rotate,
 };
+pub use doctor::handle_doctor;
 pub use env::{handle_env_attach, handle_env_list};
 pub use exec::{ExecArgs, askpass_mode_enabled, handle_askpass, handle_exec};
 pub use guard::handle_guard_shell;
@@ -50,12 +58,18 @@ pub use instances::{
     handle_instance_rotate_secret, handle_instance_scope_add, handle_instance_scope_remove,
     handle_instance_show,
 };
+pub use integrate::handle_integrate;
 pub use log::handle_log;
 pub use login::{
     GenerateLoginArgs, handle_activate, handle_archive, handle_generate,
     handle_list as handle_login_list, handle_restore,
 };
 pub use mcp::handle_mcp_serve;
+pub use operations::{
+    handle_operation_audit, handle_operation_authorize, handle_operation_cancel,
+    handle_operation_check, handle_operation_execute, handle_operation_identity,
+    handle_operation_reconcile, handle_operation_status,
+};
 pub use partitions::{
     handle_partition_assign, handle_partition_create, handle_partition_delete,
     handle_partition_export, handle_partition_import, handle_partition_list,

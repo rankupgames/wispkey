@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use argon2::password_hash::SaltString;
 use argon2::{Argon2, PasswordHasher};
 use chrono::Utc;
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use uuid::Uuid;
 
 use crate::secure_files;
@@ -73,6 +73,9 @@ impl Vault {
             "INSERT INTO vault_meta (key, value) VALUES ('created_at', ?1)",
             params![Utc::now().to_rfc3339()],
         )?;
+        // A newly created audit table contains no legacy tokens. Initialize its
+        // marker now so concurrent first opens do not both need to write it.
+        crate::audit::redact_legacy_audit_tokens(&db)?;
 
         let now = Utc::now().to_rfc3339();
         db.execute(
@@ -120,14 +123,22 @@ impl Vault {
         Ok(vault)
     }
 
-    pub(super) fn migrate_schema(db: &Connection) -> Result<()> {
+    pub(crate) fn migrate_schema(db: &Connection) -> Result<()> {
         let version: String = db
             .query_row(
                 "SELECT value FROM vault_meta WHERE key = 'version'",
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or_else(|_| "1".to_string());
+            .optional()?
+            .unwrap_or_else(|| "1".to_string());
+
+        // Most opens need no schema writes or repeated version probes. Read
+        // errors (including SQLITE_BUSY) must never select an older migration.
+        if version == CURRENT_SCHEMA_VERSION {
+            crate::audit::redact_legacy_audit_tokens(db)?;
+            return Ok(());
+        }
 
         if version.as_str() == "1" {
             db.execute_batch(
@@ -167,7 +178,8 @@ impl Vault {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or_else(|_| "2".to_string());
+            .optional()?
+            .unwrap_or_else(|| "2".to_string());
 
         if version.as_str() == "2" {
             db.execute_batch(
@@ -218,7 +230,8 @@ impl Vault {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or_else(|_| "3".to_string());
+            .optional()?
+            .unwrap_or_else(|| "3".to_string());
 
         if version.as_str() == "3" {
             let has_description = table_has_column(db, "credentials", "description")?;
@@ -242,7 +255,8 @@ impl Vault {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or_else(|_| "4".to_string());
+            .optional()?
+            .unwrap_or_else(|| "4".to_string());
 
         if version.as_str() == "4" {
             db.execute(
@@ -299,7 +313,8 @@ impl Vault {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or_else(|_| "5".to_string());
+            .optional()?
+            .unwrap_or_else(|| "5".to_string());
 
         if version.as_str() == "5" {
             db.execute_batch(
@@ -338,7 +353,8 @@ impl Vault {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or_else(|_| "6".to_string());
+            .optional()?
+            .unwrap_or_else(|| "6".to_string());
 
         if version.as_str() == "6" {
             create_instance_tables(db)?;
@@ -354,7 +370,8 @@ impl Vault {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or_else(|_| "7".to_string());
+            .optional()?
+            .unwrap_or_else(|| "7".to_string());
 
         if version.as_str() == "7" {
             create_bootstrap_token_table(db)?;
@@ -370,7 +387,8 @@ impl Vault {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or_else(|_| "8".to_string());
+            .optional()?
+            .unwrap_or_else(|| "8".to_string());
 
         if version.as_str() == "8" {
             if !table_has_column(db, "instances", "secret_rotated_at")? {
@@ -407,7 +425,8 @@ impl Vault {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or_else(|_| "9".to_string());
+            .optional()?
+            .unwrap_or_else(|| "9".to_string());
 
         if version.as_str() == "9" {
             if !table_has_column(db, "instance_scopes", "credential_id")? {
@@ -469,7 +488,8 @@ impl Vault {
                 [],
                 |row| row.get(0),
             )
-            .unwrap_or_else(|_| "10".to_string());
+            .optional()?
+            .unwrap_or_else(|| "10".to_string());
 
         if version.as_str() == "10" {
             if !table_has_column(db, "credentials", "origin")? {
@@ -489,8 +509,36 @@ impl Vault {
             }
             db.execute(
                 "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
-                params![CURRENT_SCHEMA_VERSION],
+                params!["11"],
             )?;
+        }
+
+        let version: String = db.query_row(
+            "SELECT value FROM vault_meta WHERE key = 'version'",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == "11" {
+            super::browser::create_schema(db)?;
+            db.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                params!["12"],
+            )?;
+        }
+
+        let version: String = db.query_row(
+            "SELECT value FROM vault_meta WHERE key = 'version'",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == "12" {
+            let tx = db.unchecked_transaction()?;
+            super::operation_grants::create_schema(&tx)?;
+            tx.execute(
+                "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                [CURRENT_SCHEMA_VERSION],
+            )?;
+            tx.commit()?;
         }
 
         // Older releases stored reusable capability tokens in audit rows. Remove
@@ -502,7 +550,18 @@ impl Vault {
         Ok(())
     }
 
-    pub(super) fn create_schema(db: &Connection) -> Result<()> {
+    /// Creates an empty vault database file with the current schema and owner-only permissions.
+    pub(crate) fn initialize_database_file(path: &Path) -> Result<Connection> {
+        if let Some(parent) = path.parent() {
+            secure_files::ensure_private_directory(parent)?;
+        }
+        let db = Connection::open(path)?;
+        harden_db_file(path)?;
+        Self::create_schema(&db)?;
+        Ok(db)
+    }
+
+    pub(crate) fn create_schema(db: &Connection) -> Result<()> {
         db.execute_batch(
             "CREATE TABLE IF NOT EXISTS vault_meta (
 				key TEXT PRIMARY KEY,
@@ -558,6 +617,8 @@ impl Vault {
         )?;
         create_instance_tables(db)?;
         create_bootstrap_token_table(db)?;
+        super::browser::create_schema(db)?;
+        super::operation_grants::create_schema(db)?;
         Ok(())
     }
 }
@@ -633,4 +694,32 @@ fn harden_db_file(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn harden_db_file(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn schema_read_errors_never_select_legacy_migrations() {
+        let db = Connection::open_in_memory().unwrap();
+        Vault::create_schema(&db).unwrap();
+        db.execute("INSERT INTO vault_meta VALUES ('version', X'FFFF')", [])
+            .unwrap();
+        assert!(matches!(
+            Vault::migrate_schema(&db),
+            Err(VaultError::Database(rusqlite::Error::InvalidColumnType(..)))
+        ));
+        let kind: String = db
+            .query_row(
+                "SELECT typeof(value) FROM vault_meta WHERE key='version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            kind, "blob",
+            "a read failure must not downgrade or rewrite the schema"
+        );
+    }
 }

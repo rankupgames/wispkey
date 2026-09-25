@@ -4,7 +4,7 @@
  * Project: WispKey
  * Description: Entry point -- CLI argument parsing and subcommand dispatch.
  * Created: 2026-04-07
- * Last Modified: 2026-04-19
+ * Last Modified: 2026-08-26
  */
 
 #![deny(clippy::correctness)]
@@ -182,6 +182,12 @@ enum Commands {
         command: Vec<String>,
     },
 
+    /// Inspect local runner identity and validate a private cross-node operation catalog
+    Operation {
+        #[command(subcommand)]
+        command: OperationCommands,
+    },
+
     /// Run a child process with manifest-defined child-only environment variables
     Run {
         /// Manifest path (default: wispkey.toml in the current directory)
@@ -278,6 +284,23 @@ enum Commands {
     /// Show vault and proxy status
     Status,
 
+    /// Run secret-safe diagnostics
+    Doctor,
+
+    /// Generate or write MCP client configuration
+    Integrate {
+        /// Target client: cursor, codex, claude-code, or generic-mcp
+        client: IntegrateClient,
+
+        /// Print the generated config without writing
+        #[arg(long)]
+        print: bool,
+
+        /// Override the destination config path
+        #[arg(long)]
+        path: Option<String>,
+    },
+
     /// Manage the local WispKey proxy control plane
     Proxy {
         #[command(subcommand)]
@@ -303,6 +326,12 @@ enum Commands {
     Audit {
         #[command(subcommand)]
         command: AuditCommands,
+    },
+
+    /// Create, inspect, verify, or restore an encrypted full-vault backup
+    Backup {
+        #[command(subcommand)]
+        command: BackupCommands,
     },
 
     /// Manage key partitions
@@ -364,6 +393,60 @@ enum Commands {
 enum AuditOutputFormat {
     Jsonl,
     Json,
+}
+
+#[derive(Subcommand)]
+enum OperationCommands {
+    /// Approve one instance-bound operation with fresh interactive owner confirmation
+    Authorize {
+        operation: String,
+        #[arg(long, default_value_t = 300)]
+        seconds: u32,
+    },
+    /// Execute an existing grant through the authenticated requester API
+    Execute {
+        #[arg(long)]
+        grant: String,
+        #[arg(long)]
+        identity_file: std::path::PathBuf,
+        #[arg(long)]
+        proxy: Option<String>,
+    },
+    /// Inspect one grant or attempt as the local owner
+    Status {
+        #[arg(long, conflicts_with = "attempt", required_unless_present = "attempt")]
+        grant: Option<String>,
+        #[arg(long)]
+        attempt: Option<String>,
+    },
+    /// Cancel a pending grant or request cancellation of an active attempt
+    Cancel {
+        #[arg(long, conflicts_with = "attempt", required_unless_present = "attempt")]
+        grant: Option<String>,
+        #[arg(long)]
+        attempt: Option<String>,
+    },
+    /// Mark an expired interrupted attempt uncertain after checking the remote target
+    Reconcile {
+        #[arg(long)]
+        attempt: String,
+    },
+    /// Read the eight-field operation audit as the local owner
+    Audit {
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+    },
+    /// Show the current OS account principal (not an agent identity or authorization)
+    Identity,
+    /// Read-only validation; does not contact targets, unlock a vault, or authorize execution
+    Check {
+        /// Owner-private catalog (default: the vault directory's operations.toml)
+        #[arg(long)]
+        config: Option<std::path::PathBuf>,
+        /// Check one named entry instead of every entry in this runner's catalog
+        #[arg(long)]
+        operation: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -470,6 +553,58 @@ enum AuditCommands {
         /// Filter by credential name
         #[arg(long)]
         credential: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum BackupCommands {
+    /// Write an encrypted full-vault backup
+    Create {
+        /// Output file path
+        #[arg(long, short)]
+        output: String,
+        /// Comma-separated items to omit: credentials,projects,partitions,policies,audits,instances,scopes,access-requests,bootstrap,cloud,active-project
+        #[arg(long)]
+        exclude: Option<String>,
+        /// Read the backup passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Show backup metadata without secret values
+    Inspect {
+        /// Path to a .wkbackup file
+        path: String,
+        /// Read the backup passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Check backup integrity and schema compatibility
+    Verify {
+        /// Path to a .wkbackup file
+        path: String,
+        /// Read the backup passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Restore a vault backup, optionally as a dry run
+    Restore {
+        /// Path to a .wkbackup file
+        path: String,
+        /// Plan the restore without writing
+        #[arg(long)]
+        dry_run: bool,
+        /// Restore into this vault directory instead of WISPKEY_VAULT_PATH
+        #[arg(long)]
+        target: Option<String>,
+        /// Replace an existing destination vault atomically
+        #[arg(long)]
+        replace: bool,
+        /// Conflict handling for merge restores: fail or skip
+        #[arg(long, default_value = "fail")]
+        on_conflict: String,
+        /// Read the backup passphrase from a protected file
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
     },
 }
 
@@ -853,6 +988,27 @@ enum ProxyCommands {
     Cleanup,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum IntegrateClient {
+    Cursor,
+    Codex,
+    #[value(name = "claude-code")]
+    ClaudeCode,
+    #[value(name = "generic-mcp")]
+    GenericMcp,
+}
+
+impl From<IntegrateClient> for wispkey::integrate::IntegrateClient {
+    fn from(value: IntegrateClient) -> Self {
+        match value {
+            IntegrateClient::Cursor => Self::Cursor,
+            IntegrateClient::Codex => Self::Codex,
+            IntegrateClient::ClaudeCode => Self::ClaudeCode,
+            IntegrateClient::GenericMcp => Self::GenericMcp,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum McpCommands {
     /// Start MCP server (stdio transport)
@@ -871,11 +1027,32 @@ async fn main() {
         .install_default()
         .expect("Failed to install rustls ring CryptoProvider");
 
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("wispkey=info".parse().expect("static directive must parse")),
+    use tracing_subscriber::prelude::*;
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(std::io::stderr)
+                .with_filter(
+                    tracing_subscriber::EnvFilter::from_default_env().add_directive(
+                        "wispkey=info".parse().expect("static directive must parse"),
+                    ),
+                )
+                .with_filter(tracing_subscriber::filter::filter_fn(|metadata| {
+                    // Transport dependencies can debug-print channels, headers or payloads.
+                    // This filter is independent of user RUST_LOG specificity.
+                    ![
+                        "russh",
+                        "ssh_key",
+                        "reqwest",
+                        "hyper",
+                        "h2",
+                        "rustls",
+                        "tokio_postgres",
+                        "postgres_protocol",
+                    ]
+                    .iter()
+                    .any(|prefix| metadata.target().starts_with(prefix))
+                })),
         )
         .init();
 
@@ -903,7 +1080,7 @@ async fn main() {
             cli::handle_lock(forget).await;
         }
         Commands::Tray { ipc_only } => {
-            cli::handle_tray(ipc_only).await;
+            Box::pin(cli::handle_tray(ipc_only)).await;
         }
         Commands::Add {
             name,
@@ -997,6 +1174,35 @@ async fn main() {
             })
             .await;
         }
+        Commands::Operation { command } => match command {
+            OperationCommands::Authorize { operation, seconds } => {
+                cli::handle_operation_authorize(&operation, seconds)
+            }
+            OperationCommands::Execute {
+                grant,
+                identity_file,
+                proxy,
+            } => {
+                Box::pin(cli::handle_operation_execute(
+                    &grant,
+                    &identity_file,
+                    proxy.as_deref(),
+                ))
+                .await
+            }
+            OperationCommands::Status { grant, attempt } => {
+                cli::handle_operation_status(grant.as_deref(), attempt.as_deref())
+            }
+            OperationCommands::Cancel { grant, attempt } => {
+                cli::handle_operation_cancel(grant.as_deref(), attempt.as_deref())
+            }
+            OperationCommands::Reconcile { attempt } => cli::handle_operation_reconcile(&attempt),
+            OperationCommands::Audit { limit } => cli::handle_operation_audit(limit),
+            OperationCommands::Identity => cli::handle_operation_identity(),
+            OperationCommands::Check { config, operation } => {
+                cli::handle_operation_check(config.as_deref(), operation.as_deref());
+            }
+        },
         Commands::Run {
             manifest,
             project,
@@ -1036,14 +1242,14 @@ async fn main() {
             no_require_identity,
         } => {
             let effective_port = if random_port { 0 } else { port };
-            cli::handle_serve(
+            Box::pin(cli::handle_serve(
                 effective_port,
                 daemon,
                 all_projects,
                 listen,
                 require_identity,
                 no_require_identity,
-            )
+            ))
             .await;
         }
         Commands::Import {
@@ -1082,6 +1288,16 @@ async fn main() {
         Commands::Status => {
             cli::handle_status().await;
         }
+        Commands::Doctor => {
+            Box::pin(cli::handle_doctor()).await;
+        }
+        Commands::Integrate {
+            client,
+            print,
+            path,
+        } => {
+            cli::handle_integrate(client.into(), print, path).await;
+        }
         Commands::Proxy { command } => match command {
             ProxyCommands::Status => cli::handle_proxy_status().await,
             ProxyCommands::Stop => cli::handle_proxy_stop().await,
@@ -1113,6 +1329,46 @@ async fn main() {
             }
             AuditCommands::Tail { follow, credential } => {
                 cli::handle_audit_tail(follow, credential.as_deref()).await
+            }
+        },
+        Commands::Backup { command } => match command {
+            BackupCommands::Create {
+                output,
+                exclude,
+                bundle_passphrase_file,
+            } => {
+                cli::handle_backup_create(
+                    &output,
+                    exclude.as_deref(),
+                    bundle_passphrase_file.as_deref(),
+                )
+                .await
+            }
+            BackupCommands::Inspect {
+                path,
+                bundle_passphrase_file,
+            } => cli::handle_backup_inspect(&path, bundle_passphrase_file.as_deref()).await,
+            BackupCommands::Verify {
+                path,
+                bundle_passphrase_file,
+            } => cli::handle_backup_verify(&path, bundle_passphrase_file.as_deref()).await,
+            BackupCommands::Restore {
+                path,
+                dry_run,
+                target,
+                replace,
+                on_conflict,
+                bundle_passphrase_file,
+            } => {
+                cli::handle_backup_restore(
+                    &path,
+                    dry_run,
+                    target.as_deref(),
+                    replace,
+                    &on_conflict,
+                    bundle_passphrase_file.as_deref(),
+                )
+                .await
             }
         },
         Commands::Partition { command } => match command {

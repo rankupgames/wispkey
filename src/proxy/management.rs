@@ -34,6 +34,19 @@ pub(super) async fn handle_management_api(
 ) -> Response<Full<Bytes>> {
     let path = uri.path();
 
+    // The caller authenticates every management route before dispatch. Version
+    // diagnostics do not need to open or unlock the vault.
+    if method.as_str() == "GET" && path == "/api/version" {
+        return json_response(
+            StatusCode::OK,
+            &serde_json::json!({
+                "name": "wispkey",
+                "version": env!("CARGO_PKG_VERSION"),
+                "pid": std::process::id(),
+            }),
+        );
+    }
+
     if method.as_str() == "GET" && path == "/api/logs" {
         return logs_response(uri);
     }

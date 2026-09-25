@@ -45,7 +45,7 @@ For repeated headless unlocks, prefer `wispkey unlock --remember --password-file
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v11 automatically.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v13 automatically. Browser fill requests are short-lived metadata, omitted from encrypted backups.
 
 ```bash
 # Create a project
@@ -156,6 +156,9 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey env attach <path> --project P --key NAME... [--environment E]` | Attach selected secrets to a project/environment and tokenize them in-place |
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Legacy whole-file import that writes `.env.wispkey` |
 | `wispkey status` | Vault + session + proxy status |
+| `wispkey doctor` | Secret-safe diagnostics (version, permissions, session, proxy, policy, audit, MCP, substitution) |
+| `wispkey operation identity/check/authorize/execute/status/cancel/reconcile/audit` | Owner-approved one-use SSH, Kubernetes Secret and PostgreSQL operations (see `docs/operation-runtime.md`) |
+| `wispkey integrate <client> [--print] [--path FILE]` | Generate or write MCP client config (`cursor`, `codex`, `claude-code`, `generic-mcp`) |
 | `wispkey log [--last N] [--credential C] [--since DATE]` | Audit log |
 | `wispkey audit export [--since TS] [--until TS] [--credential C] [--encoding jsonl|json] [-o FILE]` | Export matching audit events |
 | `wispkey audit tail [--follow] [--credential C]` | Stream newest audit events with a forward cursor when following |
@@ -163,6 +166,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey partition create/list/delete/assign/export/import` | Partition management |
 | `wispkey project create/list/delete/use/current/export/import` | Project management and encrypted project bundles |
 | `wispkey credential export/import` | Encrypted single-credential sharing bundles |
+| `wispkey backup create/inspect/verify/restore` | Encrypted full-vault backup, inspection, verification, and atomic restore |
 | `wispkey instance enroll/list/show/scope/bootstrap/join/revoke/requests/approve/deny` | Manage instance identities, bootstrap self-enrollment, scopes, and access requests |
 | `wispkey instance rotate-secret <name> [--if-older-than AGE] [--grace AGE]` | Due-aware instance-secret rotation for protected automation |
 | `wispkey cloud status/login/logout` | Local Cloud session groundwork |
@@ -184,7 +188,7 @@ WispKey stores arbitrary encrypted secret values, not only API keys. Use `api_ke
 
 The proxy scans and replaces wisp tokens in three locations: **headers**, **request body** (text/json/form only), and **URL query parameters**. In reverse-proxy mode, this includes wisp tokens in the `X-Target-Url` query string.
 
-Agent-scoped policies fail closed when the requester's agent identity is unavailable. The proxy currently has no trusted agent identity source, so a policy with an `agent = "..."` scope applies to proxy requests even when no agent name is known.
+Agent-scoped policies fail closed when the requester's agent identity is unavailable. Instance-authenticated proxy requests use the stable `instance:<UUID>` principal for agent-scoped policies. Unauthenticated local requests still fail closed for agent-scoped policies; caller-supplied labels never establish identity. Cross-node operations additionally require a fresh owner-issued one-use grant.
 
 ## Encrypted Export Bundles
 
@@ -205,6 +209,20 @@ wispkey credential import openai-key.wkcred \
 ```
 
 New exports require a 12+ character bundle passphrase. Share the encrypted bundle and passphrase through different channels.
+
+## Vault Backup
+
+Full-vault backups are a different format from sharing bundles. They include credentials, projects, partitions, policies, audits, instances, scopes, access requests, bootstrap metadata, and cloud sidecars. Credential blobs stay encrypted with the original master key.
+
+```bash
+wispkey backup create --output vault.wkbackup
+wispkey backup inspect vault.wkbackup
+wispkey backup verify vault.wkbackup
+wispkey backup restore vault.wkbackup --dry-run
+wispkey backup restore vault.wkbackup --target /tmp/wispkey-restore-test
+```
+
+Use `WISPKEY_BUNDLE_PASSPHRASE` or `--bundle-passphrase-file`. After restore, unlock with the original master password. Instance secrets cannot be restored; restored instances are marked `needs_reenrollment`. See `docs/vault-backup.md`.
 
 ## MCP Tools (for IDE agents)
 
@@ -241,6 +259,8 @@ Available tools:
 - **`wispkey_project_list`** -- List all projects with partition counts and active indicator
 - **`wispkey_set`** -- Create or update a credential (`name`, `value` required; `type`, `description`, `hosts`, `tags`, `project`, `header_name`, `param_name` optional). Refuses to overwrite unless `overwrite: true`. On update, the wisp token is preserved. Refuses `website_login`; use `wispkey_generate_login`.
 - **`wispkey_generate_login`** -- Generate a unique website login (`name`, `username`, `url` required). Returns origin, lifecycle, and username only—never the password.
+- **`wispkey_request_browser_fill`** -- Queue a five-minute one-use request (`name`, `origin`, `requester`, `reason`; optional `project`). Returns only a request ID. Requires human approval in a separate browser profile and Windows Hello; see `docs/browser-handoff.md`.
+- **`wispkey_browser_fill_status`** -- Read request status by `request_id`; metadata only. Completed means fields were filled, not submitted.
 - **`wispkey_delete`** -- Delete a credential by `name` (optional `project` scope)
 - **`wispkey_issue_cert`** -- Issue an X.509 leaf certificate with a CA private key held in the vault (`ca_credential` required). Generates an `ec-p256` keypair by default or signs a PEM `csr`. Returns the leaf certificate and, when generated, the leaf private key. The CA private key never leaves the vault. Optional: `common_name`, `san`, `validity_days` (default 365, max 3650), `key_type` (`ec-p256`, `ec-p384`, `rsa-2048`, `rsa-4096`), `ca_cert` when the credential is key-only, `project`.
 
@@ -265,6 +285,7 @@ When the proxy is running (`wispkey serve`):
 | Endpoint | Returns |
 |----------|---------|
 | `GET /api/status` | Vault info, credential count, session state |
+| `GET /api/version` | Authenticated running proxy name, package version, and PID; available while locked |
 | `GET /api/credentials` | All credentials with tokens (no plaintext values); honors `?project=` |
 | `GET /api/credentials/{name}` | Single credential by name; honors `?project=` |
 | `DELETE /api/credentials/{name}` | Delete credential by name; honors `?project=` |
@@ -291,7 +312,7 @@ When the proxy is running (`wispkey serve`):
 | `WISPKEY_SESSION_TIMEOUT` | Unlocked session lifetime in minutes (default 30; `0` means no expiry) |
 | `WISPKEY_PROTECTOR` | Session protector backend: `auto` (default), `os`, or `file` |
 | `WISPKEY_PROTECTOR_TIMEOUT` | Remembered-protector lifetime in minutes (default 480; `0` means until `lock --forget`) |
-| `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import |
+| `WISPKEY_BUNDLE_PASSPHRASE` | Non-interactive passphrase for encrypted bundle export/import and vault backup |
 | `WISPKEY_SIDELOAD_<SLUG>` | Env-sideload credential value for MCP/proxy use; never print the value |
 
 ## Conventions

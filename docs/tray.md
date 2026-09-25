@@ -18,6 +18,7 @@ Closing a dialog does not quit the tray. Use **Quit** in the tray menu.
 Tray menu:
 
 - Add credential
+- Generate website login
 - List credentials
 - Unlock vault
 - Lock vault
@@ -34,11 +35,19 @@ Newline-delimited JSON methods:
 
 - `status`, `unlock`, `lock`
 - `list_credentials`, `list_projects`, `list_partitions`
-- `add_credential`, `add_template`
+- `add_credential`, `add_template`, `generate_login`
 - `get_settings`, `set_settings`
 - `shutdown`
 
 Responses include names and metadata only. They never include plaintext secret values. Known secret fields are redacted from logs.
+
+`generate_login` accepts `name`, `username`, an HTTPS `url`, optional `project` /
+`partition`, and `destination_confirmed: true`. It saves a strong unique password
+without displaying it, sets lifecycle `pending`, and schedules a review in 180
+days. The job application preset uses `career-ops` / `job-applications`; the
+confirmed project and partition are created if needed. Use the
+[browser handoff preview](browser-handoff.md) to approve a fill separately; owner
+IPC has no browser-fill or password-reveal endpoint.
 
 ## OVH API template
 
@@ -60,3 +69,7 @@ cargo build -p wispkey-tray
 ```
 
 Default `cargo test` does not build the GUI crate.
+
+## IPC troubleshooting
+
+Windows owner IPC calls bound connection, request-write, and response-read phases to five seconds each. Timeout messages identify the phase and prior phase durations without request contents. Server logs include request-handling duration and success status. If a launcher captures stderr, it must continuously drain the pipe; an unread log pipe can stall request handling. The integration harness drains logs while retaining at most 256 KiB, and tests log pressure and concurrent clients without automatic retries.

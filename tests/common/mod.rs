@@ -90,19 +90,37 @@ pub fn output_json(args: &[&str], output: std::process::Output) -> Value {
 }
 
 pub fn wait_for_owner_info(vault_dir: &Path) -> Value {
+    let vault_dir = vault_dir.to_path_buf();
+    std::thread::spawn(move || wait_for_owner_info_blocking(&vault_dir))
+        .join()
+        .expect("owner ipc wait thread")
+}
+
+fn wait_for_owner_info_blocking(vault_dir: &Path) -> Value {
     let owner_info_path = vault_dir.join("owner.json");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let socket_path = vault_dir.join("owner.sock");
+    let deadline = Instant::now() + Duration::from_secs(if cfg!(windows) { 20 } else { 10 });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("owner ipc wait runtime");
+
     loop {
+        if Instant::now() >= deadline {
+            panic!("owner IPC did not become live in time");
+        }
+
         if let Ok(raw) = std::fs::read_to_string(&owner_info_path)
             && let Ok(value) = serde_json::from_str::<Value>(&raw)
             && value.get("endpoint").and_then(Value::as_str).is_some()
+            && runtime.block_on(wispkey::owner_ipc::is_live_at(
+                &socket_path,
+                &owner_info_path,
+            ))
         {
             return value;
         }
-        assert!(
-            Instant::now() < deadline,
-            "owner IPC did not write owner.json in time"
-        );
+
         thread::sleep(Duration::from_millis(50));
     }
 }

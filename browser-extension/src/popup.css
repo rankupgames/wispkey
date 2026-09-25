@@ -1,0 +1,9 @@
+body { width: 360px; padding: 18px; margin: 0; font: 14px/1.5 system-ui, sans-serif; color: #ecf3ef; background: #18211e; }
+h1 { margin: 0; font-size: 22px; }
+#origin { overflow-wrap: anywhere; font-weight: 650; color: #8de5b8; }
+article { margin-top: 16px; padding-top: 12px; border-top: 1px solid #43544b; }
+article p { margin: 4px 0; overflow-wrap: anywhere; }
+button { margin: 8px 8px 0 0; padding: 8px 12px; border-radius: 6px; border: 1px solid #6e8b7b; color: inherit; background: #2b4136; cursor: pointer; }
+button:disabled { opacity: .5; cursor: default; }
+button:focus-visible, input:focus-visible { outline: 2px solid #8de5b8; outline-offset: 2px; }
+#status { min-height: 22px; }
