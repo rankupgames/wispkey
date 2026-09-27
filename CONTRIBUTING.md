@@ -31,7 +31,7 @@ cargo test --all-features
 Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). CI keeps this default matrix and separately checks Linux AF_VSOCK and the optional `wispkey-tray` on Linux, macOS, and Windows. GUI dependencies remain optional for CLI development. To reproduce the native tray job on Debian/Ubuntu:
 
 ```bash
-sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
+sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev
 npm --prefix crates/wispkey-tray/ui ci
 npm --prefix crates/wispkey-tray/ui run build
 cargo build --locked -p wispkey-tray
