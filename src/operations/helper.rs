@@ -581,7 +581,7 @@ mod tests {
         assert_eq!(task.await.unwrap(), 1);
         let completion: serde_json::Value = serde_json::from_str(&output).unwrap();
         // A failed child assertion exits 101, so 42 also proves the stdin,
-        // argv and empty-environment assertions actually ran successfully.
+        // argv and environment-isolation assertions actually ran successfully.
         assert_eq!(completion["exit_code"], 42);
         assert_eq!(completion["outcome"], "failed_child");
         for forbidden in [CHANNEL_CANARY.to_owned(), STANDARD.encode(CHANNEL_CANARY)] {

@@ -26,8 +26,11 @@ destination acceptance run was performed in this session.
 
 PR preparation on 2026-09-28 also reran the focused operation suite with the
 unchanged committed lockfile (`chacha20` 0.10.1): Windows passed 49 tests with
-two expected ignored harness/service tests. This excludes the unrelated local
-lockfile update from the PR.
+two expected ignored harness/service tests; Linux passed 54 with three expected
+ignored tests. This excludes the unrelated local lockfile update from the PR.
+The macOS child permits only CoreFoundation's numeric encoding metadata, which
+the OS initializes after launch; all inherited application variables remain
+forbidden. See Apple's [encoding initialization](https://github.com/apple-oss-distributions/CF/blob/main/CFStringEncodings.c).
 
 ## Repeatable checks
 
@@ -76,7 +79,7 @@ PostgreSQL fixture on Linux.
 | Verified destination before selected-value release | The live SSH fixture rejects a mismatched host key. `untrusted_live_tls_peer_receives_no_http_or_selected_credential` rejects another CA during a real TLS handshake. `live_object_replacement_denies_before_selected_release` rejects replaced namespace and Secret UIDs. | Loopback SSH/TLS peers are controlled fixtures, not a deployed SSH host or Kubernetes API server. |
 | Signed environment scope | `posture_scope_drift_never_releases_either_credential` covers endpoint, CA, cluster, context, environment, namespace/Secret UID, owner, consumer, issuer, encryption revision, and signer changes. `invalid_signed_posture_never_releases_either_credential` covers expired, future, overlong, missing, malformed-scope, and invalid-signature evidence. | Evidence is an owner attestation. WispKey does not discover effective RBAC or encryption-at-rest configuration. |
 | Delivery and cleanup outcomes | Two synthetic environments, repeat delivery, revision changes, altered acknowledgements, lost acknowledgements, and key-only cleanup are exercised by the HTTPS fixtures. Cleanup preserves other keys and never releases the selected value; its result is `revocation_unverified`. | A Secret write acknowledgement is not proof of application reload or issuer revocation. |
-| Private delivery and output | `stdin_only_child_keeps_canaries_out_of_output_and_store` runs a real Unix child that checks its argv, empty environment, and exact stdin; it emits received bytes in chunks and base64 before exiting 42. The parent verifies safe status and scans helper fixture files, including its replay database. SSH/runtime/API fixtures also check canary suppression. | This proves the tested helper channels; privileged destination code can retain plaintext and must be reviewed separately. |
+| Private delivery and output | `stdin_only_child_keeps_canaries_out_of_output_and_store` runs a real Unix child that checks its argv, cleared inherited environment, and exact stdin; it emits received bytes in chunks and base64 before exiting 42. The parent verifies safe status and scans helper fixture files, including its replay database. SSH/runtime/API fixtures also check canary suppression. | This proves the tested helper channels; privileged destination code can retain plaintext and must be reviewed separately. |
 | Audit and vault isolation | Tests enforce the exact eight-field audit and immutable credential reference, reject release when the start audit cannot commit, and preserve audit while excluding grants/attempts from backups. Runtime fixtures use a disposable vault and send only the selected value through the helper protocol. | These are application-level checks, not host-level forensic proof against a compromised runner or destination root. |
 
 ## Destination-owner acceptance still required
