@@ -602,6 +602,10 @@ mod tests {
         OneWrite,
         RepeatSameRevision,
         ChangedRevision,
+        WrongNamespace,
+        WrongSecret,
+        Revoke,
+        LostAcknowledgement,
     }
 
     fn run_fake_api(
@@ -613,18 +617,34 @@ mod tests {
         mode: FakeMode,
     ) -> thread::JoinHandle<()> {
         thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let accept_deadline = std::time::Instant::now() + Duration::from_secs(15);
             let namespace_path = format!("/api/v1/namespaces/{}", target.namespace);
             let secret_path = format!(
                 "/api/v1/namespaces/{}/secrets/{}",
                 target.namespace, target.secret_name
             );
-            let steps = if matches!(mode, FakeMode::RepeatSameRevision) {
-                5
-            } else {
-                3
+            let steps = match mode {
+                FakeMode::RepeatSameRevision => 5,
+                FakeMode::WrongNamespace => 1,
+                FakeMode::WrongSecret => 2,
+                _ => 3,
             };
             for step in 0..steps {
-                let (socket, _) = listener.accept().unwrap();
+                let socket = loop {
+                    match listener.accept() {
+                        Ok((socket, _)) => break socket,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(
+                                std::time::Instant::now() < accept_deadline,
+                                "fixture request deadline exceeded"
+                            );
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => panic!("fixture accept failed"),
+                    }
+                };
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();
@@ -674,12 +694,24 @@ mod tests {
                 let response = match step {
                     0 | 3 => {
                         assert!(headers.starts_with(&format!("GET {namespace_path} ")));
-                        json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":target.namespace,"uid":target.namespace_uid}})
+                        let uid = if matches!(mode, FakeMode::WrongNamespace) {
+                            Uuid::new_v4().to_string()
+                        } else {
+                            target.namespace_uid.clone()
+                        };
+                        json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":target.namespace,"uid":uid}})
                     }
                     1 | 4 => {
                         assert!(headers.starts_with(&format!("GET {secret_path} ")));
                         let version = if step == 4 { "8" } else { "7" };
                         let mut value = json!({"apiVersion":"v1","kind":"Secret","type":"Opaque","metadata":{"name":target.secret_name,"namespace":target.namespace,"uid":target.secret_uid,"resourceVersion":version,"annotations":{"owner":"unchanged"}},"data":{"other":"b3RoZXI="}});
+                        if matches!(mode, FakeMode::WrongSecret) {
+                            value["metadata"]["uid"] = json!(Uuid::new_v4().to_string());
+                        }
+                        if matches!(mode, FakeMode::Revoke) {
+                            value["data"][&target.data_key] =
+                                json!(STANDARD.encode(b"old-password"));
+                        }
                         if step == 4 || matches!(mode, FakeMode::ChangedRevision) {
                             let marker = if step == 4 {
                                 revision_key
@@ -702,10 +734,17 @@ mod tests {
                         assert_eq!(body["metadata"]["resourceVersion"], "7");
                         assert_eq!(body["metadata"]["annotations"]["owner"], "unchanged");
                         assert_eq!(body["data"]["other"], "b3RoZXI=");
-                        assert_eq!(
-                            body["data"][&target.data_key],
-                            STANDARD.encode(b"synthetic-user-password")
-                        );
+                        if matches!(mode, FakeMode::Revoke) {
+                            assert!(body["data"].get(&target.data_key).is_none());
+                        } else {
+                            assert!(
+                                body["data"][&target.data_key]
+                                    == STANDARD.encode(b"synthetic-user-password")
+                            );
+                        }
+                        if matches!(mode, FakeMode::LostAcknowledgement) {
+                            return;
+                        }
                         let mut response = body;
                         response["metadata"]["resourceVersion"] = json!("8");
                         match tamper_put {
@@ -914,5 +953,259 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, KubernetesOutcome::DeliveryAcknowledged);
         server.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn posture_scope_drift_never_releases_either_credential() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (target, _listener, _) = fixture(&root, "env-a");
+        for field in [
+            "endpoint",
+            "cluster_id",
+            "context",
+            "environment_id",
+            "namespace_uid",
+            "secret_uid",
+            "environment_owner",
+            "consumer_id",
+            "issuer_id",
+            "encryption_config_revision",
+            "posture_public_key",
+        ] {
+            let mut changed = serde_json::to_value(&target).unwrap();
+            changed[field] = match field {
+                "endpoint" => json!("https://other.invalid"),
+                "namespace_uid" | "secret_uid" => json!(Uuid::new_v4().to_string()),
+                "posture_public_key" => json!(STANDARD_NO_PAD.encode([0; 32])),
+                _ => json!("other-scope"),
+            };
+            let changed = serde_json::from_value(changed).unwrap();
+            let (_, cancellation) = watch::channel(false);
+            let outcome = execute(
+                &changed,
+                "revision",
+                Instant::now() + Duration::from_secs(5),
+                Duration::from_secs(1),
+                cancellation,
+                || panic!("provider released for invalid posture"),
+                || panic!("selected credential released for invalid posture"),
+            )
+            .await;
+            assert_eq!(outcome, Err(INVALID_POSTURE), "field: {field}");
+        }
+        let (other_ca, _) = certificates();
+        private_file(&target.ca_file, other_ca.as_bytes());
+        assert_eq!(target.validate(), Err(INVALID_POSTURE));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn invalid_signed_posture_never_releases_either_credential() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut target, _listener, _) = fixture(&root, "env-a");
+        let envelope: Value =
+            serde_json::from_slice(&std::fs::read(&target.posture_file).unwrap()).unwrap();
+        let original: Value = serde_json::from_slice(
+            &STANDARD_NO_PAD
+                .decode(envelope["payload"].as_str().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let key = Ed25519KeyPair::from_pkcs8(
+            Ed25519KeyPair::generate_pkcs8(&SystemRandom::new())
+                .unwrap()
+                .as_ref(),
+        )
+        .unwrap();
+        target.posture_public_key = STANDARD_NO_PAD.encode(key.public_key().as_ref());
+        for case in [
+            "expired",
+            "future",
+            "overlong",
+            "unknown-field",
+            "missing-scope",
+            "bad-signature",
+            "missing-file",
+        ] {
+            let mut payload = original.clone();
+            let now = Utc::now();
+            match case {
+                "expired" => payload["expires_at"] = json!(now - chrono::Duration::seconds(1)),
+                "future" => payload["issued_at"] = json!(now + chrono::Duration::minutes(1)),
+                "overlong" => payload["expires_at"] = json!(now + chrono::Duration::hours(2)),
+                "unknown-field" => payload["unreviewed"] = json!(true),
+                "missing-scope" => {
+                    payload.as_object_mut().unwrap().remove("consumer_id");
+                }
+                _ => {}
+            }
+            let bytes = serde_json::to_vec(&payload).unwrap();
+            let signature = if case == "bad-signature" {
+                vec![0; 64]
+            } else {
+                key.sign(&bytes).as_ref().to_vec()
+            };
+            private_file(&target.posture_file, &serde_json::to_vec(&json!({
+                "payload": STANDARD_NO_PAD.encode(bytes), "signature": STANDARD_NO_PAD.encode(signature),
+            })).unwrap());
+            if case == "missing-file" {
+                std::fs::remove_file(&target.posture_file).unwrap();
+            }
+            let (_, cancellation) = watch::channel(false);
+            assert_eq!(
+                execute(
+                    &target,
+                    "revision",
+                    Instant::now() + Duration::from_secs(5),
+                    Duration::from_secs(1),
+                    cancellation,
+                    || panic!("provider released for invalid posture"),
+                    || panic!("selected credential released for invalid posture"),
+                )
+                .await,
+                Err(INVALID_POSTURE),
+                "case: {case}"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn live_object_replacement_denies_before_selected_release() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        for mode in [FakeMode::WrongNamespace, FakeMode::WrongSecret] {
+            let (target, listener, config) = fixture(&root, "env-a");
+            let server = run_fake_api(listener, config, target.clone(), None, "revision", mode);
+            let (_, cancellation) = watch::channel(false);
+            let outcome = execute(
+                &target,
+                "revision",
+                Instant::now() + Duration::from_secs(10),
+                Duration::from_secs(3),
+                cancellation,
+                || Ok(b"test-provider-token".to_vec()),
+                || panic!("selected credential released to replaced object"),
+            )
+            .await;
+            server.join().unwrap();
+            assert_eq!(outcome, Err(TARGET_MISMATCH));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn revoke_preserves_other_keys_without_selected_release() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (mut target, listener, config) = fixture(&root, "env-a");
+        target.action = KubernetesAction::Revoke;
+        let server = run_fake_api(
+            listener,
+            config,
+            target.clone(),
+            None,
+            "revision",
+            FakeMode::Revoke,
+        );
+        let (_, cancellation) = watch::channel(false);
+        let outcome = execute(
+            &target,
+            "revision",
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(3),
+            cancellation,
+            || Ok(b"test-provider-token".to_vec()),
+            || panic!("cleanup must not release selected credential"),
+        )
+        .await;
+        server.join().unwrap();
+        assert_eq!(outcome, Ok(KubernetesOutcome::RevocationUnverified));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn lost_write_acknowledgement_is_unknown() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (target, listener, config) = fixture(&root, "env-a");
+        let server = run_fake_api(
+            listener,
+            config,
+            target.clone(),
+            None,
+            "revision",
+            FakeMode::LostAcknowledgement,
+        );
+        let (_, cancellation) = watch::channel(false);
+        let outcome = execute(
+            &target,
+            "revision",
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(3),
+            cancellation,
+            || Ok(b"test-provider-token".to_vec()),
+            || Ok(b"synthetic-user-password".to_vec()),
+        )
+        .await;
+        server.join().unwrap();
+        assert_eq!(outcome, Ok(KubernetesOutcome::OutcomeUnknown));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn untrusted_live_tls_peer_receives_no_http_or_selected_credential() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let (target, listener, _) = fixture(&root, "env-a");
+        // Keep the signed posture and CA intact, but serve a certificate from
+        // another authority. This exercises the live handshake, not syntax.
+        let (_, other_config) = certificates();
+        listener.set_nonblocking(true).unwrap();
+        let server = thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let socket = loop {
+                match listener.accept() {
+                    Ok((socket, _)) => break socket,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "TLS fixture accept deadline exceeded"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => panic!("TLS fixture accept failed"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = StreamOwned::new(ServerConnection::new(other_config).unwrap(), socket);
+            let mut byte = [0; 1];
+            assert!(
+                stream.read(&mut byte).is_err(),
+                "HTTP data reached an untrusted TLS peer"
+            );
+        });
+        let (_, cancellation) = watch::channel(false);
+        let outcome = execute(
+            &target,
+            "revision",
+            Instant::now() + Duration::from_secs(10),
+            Duration::from_secs(3),
+            cancellation,
+            || Ok(b"test-provider-token".to_vec()),
+            || panic!("selected credential released to untrusted TLS peer"),
+        )
+        .await;
+        server.join().unwrap();
+        assert_eq!(outcome, Err(PROVIDER_UNAVAILABLE));
     }
 }

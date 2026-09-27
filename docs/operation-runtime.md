@@ -6,6 +6,9 @@ key, and PostgreSQL application-password rotation. These are local executor
 features; cloud sync is not involved. Installing a target helper, configuring a
 database or cluster, and using real credentials remain destination-owner tasks.
 
+See the [cross-node validation map](cross-node-validation.md) for repeatable
+checks, coverage boundaries, and the remaining destination-owner acceptance.
+
 ## Approval and execution
 
 Keep the vault, finite unlocked session and catalog on a trusted owner-controlled
