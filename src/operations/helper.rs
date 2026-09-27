@@ -504,11 +504,22 @@ mod tests {
     fn channel_probe_child() {
         use std::io::{Read, Write};
         assert!(std::env::args_os().all(|arg| !arg.to_string_lossy().contains(CHANNEL_CANARY)));
-        assert_eq!(
-            std::env::vars_os().count(),
-            0,
-            "child environment must be empty"
-        );
+        for (key, value) in std::env::vars_os() {
+            // CoreFoundation initializes its own encoding metadata on macOS,
+            // even when exec receives an empty environment. No inherited
+            // application variables or credential bytes are allowed.
+            assert!(!value.to_string_lossy().contains(CHANNEL_CANARY));
+            assert!(
+                cfg!(target_os = "macos") && key == "__CF_USER_TEXT_ENCODING",
+                "unexpected child environment entry"
+            );
+            assert!(
+                value
+                    .to_string_lossy()
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == 'x' || c == ':')
+            );
+        }
         let mut input = Vec::new();
         std::io::stdin().read_to_end(&mut input).unwrap();
         assert!(
