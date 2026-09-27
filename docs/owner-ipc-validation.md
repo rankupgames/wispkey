@@ -34,3 +34,11 @@ handling and connection/write/read phases. Do not increase production deadlines
 to make a stress run pass. If a timeout recurs, retain the exact commit, runner,
 test name and phase timings; compare them with the log-pressure reproduction
 before attributing a cause.
+
+## Recorded local run: 2026-09-28
+
+On Windows with Rust 1.96.0 and the committed lockfile, all 13 tests passed in
+each of three consecutive one-CPU runs with fourteen test threads. Script
+durations were 52.44, 50.07, and 50.86 seconds, all exit 0. The running harness
+affinity was also observed as `1`. These results validate the current harness
+under the stated contention; they do not identify the original hosted timeout.
