@@ -495,6 +495,98 @@ pub async fn run() -> i32 {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    const CHANNEL_CANARY: &str = "synthetic-helper-channel-canary";
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "launched only by stdin_only_child_keeps_canaries_out_of_output_and_store"]
+    fn channel_probe_child() {
+        use std::io::{Read, Write};
+        assert!(std::env::args_os().all(|arg| !arg.to_string_lossy().contains(CHANNEL_CANARY)));
+        assert_eq!(
+            std::env::vars_os().count(),
+            0,
+            "child environment must be empty"
+        );
+        let mut input = Vec::new();
+        std::io::stdin().read_to_end(&mut input).unwrap();
+        assert!(
+            input == CHANNEL_CANARY.as_bytes(),
+            "stdin must contain the selected value"
+        );
+        // Emit actual received data, including chunked and encoded forms. The
+        // helper must discard all bytes, not attempt pattern-based redaction.
+        for chunk in input.chunks(3) {
+            std::io::stdout().write_all(chunk).unwrap();
+            std::io::stdout().flush().unwrap();
+            std::io::stderr().write_all(chunk).unwrap();
+        }
+        eprintln!("{}", STANDARD.encode(&input));
+        std::process::exit(42);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_only_child_keeps_canaries_out_of_output_and_store() {
+        let (dir, mut config, store) = fixture();
+        config.program = std::env::current_exe()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        config.args = vec![
+            "--exact".into(),
+            "operations::helper::tests::channel_probe_child".into(),
+            "--ignored".into(),
+            "--nocapture".into(),
+        ];
+        assert!(config_valid(&config));
+        let id = uuid::Uuid::new_v4().to_string();
+        let (caller, helper) = tokio::io::duplex(4096);
+        let (helper_input, helper_output) = tokio::io::split(helper);
+        let task = tokio::spawn({
+            let store = store.clone();
+            async move { run_with(&config, &store, helper_input, helper_output).await }
+        });
+        let (caller_input, mut caller_output) = tokio::io::split(caller);
+        let mut caller_input = BufReader::new(caller_input);
+        caller_output
+            .write_all(hello(&id, 5000).as_bytes())
+            .await
+            .unwrap();
+        let mut ready = String::new();
+        caller_input.read_line(&mut ready).await.unwrap();
+        assert!(ready.contains("\"ready\""));
+        let delivery = serde_json::json!({"version":1,"attempt_id":id,"phase":"deliver","credential_b64":STANDARD.encode(CHANNEL_CANARY)});
+        caller_output
+            .write_all(format!("{delivery}\n").as_bytes())
+            .await
+            .unwrap();
+        let mut output = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut caller_input, &mut output)
+            .await
+            .unwrap();
+        assert_eq!(task.await.unwrap(), 1);
+        let completion: serde_json::Value = serde_json::from_str(&output).unwrap();
+        // A failed child assertion exits 101, so 42 also proves the stdin,
+        // argv and empty-environment assertions actually ran successfully.
+        assert_eq!(completion["exit_code"], 42);
+        assert_eq!(completion["outcome"], "failed_child");
+        for forbidden in [CHANNEL_CANARY.to_owned(), STANDARD.encode(CHANNEL_CANARY)] {
+            assert!(!ready.contains(&forbidden) && !output.contains(&forbidden));
+            for entry in std::fs::read_dir(dir.path()).unwrap() {
+                let bytes = std::fs::read(entry.unwrap().path()).unwrap();
+                assert!(
+                    !bytes
+                        .windows(forbidden.len())
+                        .any(|part| part == forbidden.as_bytes()),
+                    "canary persisted in helper fixture"
+                );
+            }
+        }
+    }
+
     #[test]
     fn config_and_protocol_reject_unknown_or_unsafe_fields() {
         assert!(
