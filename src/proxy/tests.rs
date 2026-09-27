@@ -6,6 +6,21 @@ use crate::core::CredentialType;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+#[cfg(not(all(target_os = "linux", feature = "vsock")))]
+#[tokio::test]
+async fn vsock_without_platform_feature_reports_unsupported() {
+    let config = transport::ListenConfig::new(
+        transport::ListenSpec::parse("vsock://3:7700").unwrap(),
+        transport::IdentityRequirement::Default,
+    );
+    let result = transport::BoundTransport::bind(config).await;
+    assert!(matches!(
+        result,
+        Err(transport::TransportError::Unsupported(message))
+            if message == "vsock support not compiled in; rebuild with --features vsock"
+    ));
+}
+
 #[test]
 fn listen_spec_parses_supported_transports() {
     let tcp = transport::ListenSpec::parse("tcp://127.0.0.1:7700").unwrap();
