@@ -526,18 +526,7 @@ mod tests {
         assert!(url.contains("127.0.0.1"));
     }
 
-    #[test]
-    fn logout_clears_credentials() {
-        let config = CloudConfig {
-            clerk_session_token: Some("tok".into()),
-            user_id: Some("uid".into()),
-            tier: CloudTier::Cloud,
-            ..CloudConfig::default()
-        };
-        let mut client = CloudClient::new(config);
-        let _ = client.logout();
-        assert!(client.config.clerk_session_token.is_none());
-        assert!(client.config.user_id.is_none());
-        assert_eq!(client.config.tier, CloudTier::Personal);
-    }
+    // Logout persistence is covered by tests/cli_contracts.rs in a child process
+    // with its own WISPKEY_VAULT_PATH. Calling logout here would write the user's
+    // actual Cloud configuration (and race with environment-changing unit tests).
 }
