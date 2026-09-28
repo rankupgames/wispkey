@@ -158,7 +158,7 @@ fn cloud_status_and_logout_json_report_local_state_without_session_token() {
     let dir = tempfile::tempdir().unwrap();
     let disconnected = run_wispkey_json(dir.path(), &["--format", "json", "cloud", "status"]);
     assert_eq!(disconnected["authenticated"], false);
-    assert_eq!(disconnected["sync_available"], false);
+    assert_eq!(disconnected["sync_available"], true);
     let config = json!({"api_url":"https://example.test/api", "clerk_session_token":"synthetic-session-canary", "user_id":"synthetic-user", "org_id":null, "tier":"Cloud", "last_sync":null});
     write_private_test_file(&dir.path().join("cloud.json"), &config.to_string());
     let connected = run_wispkey_json(dir.path(), &["--format", "json", "cloud", "status"]);
@@ -176,21 +176,21 @@ fn cloud_status_and_logout_json_report_local_state_without_session_token() {
 }
 
 #[test]
-fn reserved_cloud_sync_commands_do_not_contact_server_or_claim_success() {
+fn unauthenticated_cloud_sync_does_not_contact_server_or_claim_success() {
     let dir = tempfile::tempdir().unwrap();
     init_vault(dir.path());
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
-    let config = json!({"api_url":format!("http://{}", listener.local_addr().unwrap()), "clerk_session_token":"synthetic-session-canary", "user_id":"synthetic-user", "org_id":null, "tier":"Enterprise", "last_sync":null}).to_string();
+    let config = json!({"api_url":format!("http://{}", listener.local_addr().unwrap()), "clerk_session_token":null, "user_id":"synthetic-user", "org_id":null, "tier":"Enterprise", "last_sync":null}).to_string();
     write_private_test_file(&dir.path().join("cloud.json"), &config);
     for args in [
         vec!["cloud", "push", "personal"],
         vec!["cloud", "pull", "personal"],
         vec!["cloud", "sync"],
     ] {
-        let output = run_wispkey(dir.path(), &args);
+        let output = run_wispkey_bundle(dir.path(), &args);
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("coming soon"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("not authenticated"));
         assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-session-canary"));
         assert!(output.stdout.is_empty());
     }
