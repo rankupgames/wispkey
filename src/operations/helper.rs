@@ -519,7 +519,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let program = dir.path().join("fixed_helper_child");
-        std::fs::write(&program, b"#!/bin/sh\nprintf 'synthetic-stdout-canary\\n'\nprintf 'synthetic-stderr-canary\\n' >&2\n").unwrap();
+        // A successful consumer must read stdin before exiting. Otherwise a
+        // fast shell can close the pipe before delivery and correctly produce
+        // outcome_unknown instead of the success this fixture expects.
+        std::fs::write(&program, b"#!/bin/sh\n/bin/cat >/dev/null\nprintf 'synthetic-stdout-canary\\n'\nprintf 'synthetic-stderr-canary\\n' >&2\n").unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let store = dir.path().join("attempts.db");
         Connection::open(&store).unwrap();
@@ -599,8 +602,16 @@ mod tests {
     #[tokio::test]
     async fn child_exit_42_is_preserved_and_signal_has_no_exit_code() {
         for (script, outcome, code) in [
-            ("#!/bin/sh\nexit 42\n", "failed_child", Some(42)),
-            ("#!/bin/sh\nkill -TERM $$\n", "outcome_unknown", None),
+            (
+                "#!/bin/sh\n/bin/cat >/dev/null\nexit 42\n",
+                "failed_child",
+                Some(42),
+            ),
+            (
+                "#!/bin/sh\n/bin/cat >/dev/null\nkill -TERM $$\n",
+                "outcome_unknown",
+                None,
+            ),
         ] {
             let (_dir, config, store) = fixture();
             std::fs::write(&config.program, script).unwrap();
