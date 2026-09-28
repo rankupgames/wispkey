@@ -84,7 +84,7 @@ features should add a regression at the public interface and update this map.
 | Browser form discovery, navigation, no submission, popup approval gate | `browser-extension/tests/browser/handoff.spec.mjs` in Chromium and Firefox | Browser fixtures mock transport, not human approval |
 | Owner IPC authentication, framing, concurrency, log pressure | `tests/owner_ipc.rs`, owner IPC unit tests | Historical timeout monitoring described below |
 | Tray UI destination confirmation, generated-login metadata, clearing secrets and IPC errors | `browser-extension/tests/browser/tray.spec.mjs`, native tray build/lint checks | Mocked bridge tests complement actual native tray acceptance |
-| Cloud session groundwork, local status/logout, reserved sync commands | `src/cloud/mod.rs` tests, `tests/cli_contracts.rs`, `tests/smoke.rs` | Status is local/unverified; push/pull/sync remain unavailable pending #12 |
+| Cloud sessions, encrypted push/pull/sync, conflicts and recovery | `src/cloud/mod.rs` tests, `tests/cloud_sync.rs`, `tests/cli_contracts.rs`, `tests/smoke.rs` | Requires the compatible backend migration; production Clerk/deployment acceptance remains external |
 | Release assets, installers, Homebrew and packaging | `tests/release_packaging.rs`, `.github/workflows/release.yml` | Signing, registry authentication, and public downloads run in release workflow |
 | Validation runner | `scripts/tests/test_verify.py` | Missing tools and failed subprocesses must produce failure, never a false pass |
 
@@ -92,7 +92,8 @@ features should add a regression at the public interface and update this map.
 
 Do not blanket-run `cargo test -- --ignored`. The SSH runtime's ignored child
 test is invoked by its parent using a disposable vault; the ignored PostgreSQL
-test requires the Docker fixture's explicit settings. Platform-specific ignored
+test requires the Docker fixture's explicit settings. The cloud round-trip child
+test is invoked by its parent with synthetic stdin and a digest. Platform-specific ignored
 tests must be assessed on the required OS/device. An ignored result is not a pass.
 
 - [Cross-node validation #32](https://github.com/rankupgames/wispkey/issues/32):
@@ -110,9 +111,10 @@ tests must be assessed on the required OS/device. An ignored result is not a pas
   monitoring. Its successful runs are evidence for current behavior, not proof
   of the cause of the original failure that lacked diagnostics.
 - [Cloud sync #12](https://github.com/rankupgames/wispkey/issues/12): CLI commands
-  remain explicit stubs. The separate backend needs conditional revision checks
-  and a payload download contract before overwrite-safe synchronization can be
-  completed. A successful local session/status test does not validate sync.
+  now have conditional encrypted transfer and recovery fixtures. The separate
+  backend PR #1 provides revision checks and authenticated payload download; deploy
+  its migration before rollout. See [cloud sync](cloud-sync.md) for the contract
+  and remaining operational boundaries.
 - [Optional native CI #28](https://github.com/rankupgames/wispkey/issues/28),
   [promotion #25](https://github.com/rankupgames/wispkey/issues/25), and
   [dependency maintenance #27](https://github.com/rankupgames/wispkey/issues/27)

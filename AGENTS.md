@@ -170,7 +170,8 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey instance enroll/list/show/scope/bootstrap/join/revoke/requests/approve/deny` | Manage instance identities, bootstrap self-enrollment, scopes, and access requests |
 | `wispkey instance rotate-secret <name> [--if-older-than AGE] [--grace AGE]` | Due-aware instance-secret rotation for protected automation |
 | `wispkey cloud status/login/logout` | Local Cloud session groundwork |
-| `wispkey cloud push/pull/sync` | Reserved sync commands; currently return `coming soon` |
+| `wispkey cloud push/pull/sync` | Conditional encrypted partition sync using a separate bundle passphrase; see `docs/cloud-sync.md` |
+| `wispkey cloud resolve/recover` | Explicit conflict choice with encrypted recovery copies, and atomic local recovery |
 | `wispkey mcp serve` | Start MCP server (stdio) |
 
 ## Credential Types

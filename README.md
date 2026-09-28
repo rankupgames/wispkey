@@ -87,9 +87,9 @@ The attached `.env` stays in place: selected secret values become `wk_*` tokens 
 - **Secret injection for subprocesses and templates** -- `wispkey exec`, `wispkey run`, and `wispkey inject` are audited, owner-only plaintext-egress tools that resolve credentials in-process without placing plaintext in argv, parent env, WispKey stdout except explicit `inject --stdout`, or audit logs
 - **Security model** -- The current boundary and intentional limits are documented in [`docs/security-model.md`](docs/security-model.md)
 
-### Cloud Groundwork
-- **Local session commands** -- `cloud status`, `login`, and `logout` persist local Clerk session metadata
-- **Sync status** -- `cloud push`, `pull`, and `sync` are currently stubs and return a clear `coming soon` error; local vault, proxy, bundles, and sharing remain fully usable without Cloud
+### Encrypted Cloud Sync
+- **Session and status** -- `cloud login` verifies account/plan claims; local status and `cloud status --remote` distinguish pending changes, conflicts, and acknowledged revisions
+- **Encrypted partitions** -- `cloud push`, `pull`, and `sync` use a separate bundle passphrase, conditional revisions, exact retry journals, and atomic imports. Explicit `cloud resolve` preserves encrypted recovery copies. See [setup and recovery](docs/cloud-sync.md); the compatible backend migration must be deployed first
 
 ## Credential Types
 
@@ -406,7 +406,8 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey instance bootstrap create/list/revoke` | Manage scoped, atomic bootstrap tokens for fleet self-enrollment |
 | `wispkey instance join [<bootstrap-token>] [--token-file <path|->] --name <instance-name>` | Redeem a bootstrap token; prefer `--token-file -` to avoid argv exposure |
 | `wispkey cloud status/login/logout` | Manage local Cloud session groundwork |
-| `wispkey cloud push/pull/sync` | Reserved sync commands; currently return `coming soon` |
+| `wispkey cloud push/pull/sync` | Conditional encrypted partition sync; requires a bundle passphrase |
+| `wispkey cloud resolve/recover` | Explicit conflict choice and encrypted local recovery |
 | `wispkey mcp serve` | Start the MCP server over stdio |
 
 ## Tray GUI
@@ -500,7 +501,7 @@ src/
   partition/  # Encrypted bundle export/import (.wkbundle)
   secure_files.rs # Cross-platform owner-only local file protection
   sharing/    # Project and single-credential encrypted share bundles
-  cloud/      # Cloud session groundwork and sync command stubs
+  cloud/      # Cloud sessions, conditional encrypted sync and recovery
   policy/     # Policy engine (TOML rules, rate limiting, time windows)
 tests/             # Command-focused integration tests
 plugin/           # Cursor plugin (rules, skills, hooks, agents)
