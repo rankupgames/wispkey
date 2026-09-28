@@ -14,7 +14,8 @@ permissions:
 
 jobs:
   destinations:
-    runs-on: ubuntu-latest
+    # Match the OpenSSH container's Ubuntu runtime for the host-built helper.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       CARGO_BUILD_JOBS: '2'

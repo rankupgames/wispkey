@@ -1,7 +1,9 @@
 # Disposable SSH and Kubernetes acceptance
 
 Run on Linux or inside WSL, with Docker, Rust, Python 3.10+, `ssh-keygen`, and
-kind 0.33+ available. This fixture creates its own targets; it needs no existing
+kind 0.33+ available. The host-built helper must run in Ubuntu 24.04; the CI job
+uses that same Ubuntu release to keep its libc compatible with the container.
+This fixture creates its own targets; it needs no existing
 cluster, vault, SSH account, or cloud/provider credentials.
 
 ```sh
