@@ -1,0 +1,32 @@
+name: Windows owner IPC contention
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'src/owner_ipc/**'
+      - 'src/core/**'
+      - 'tests/owner_ipc.rs'
+      - 'tests/common/**'
+      - 'scripts/test-owner-ipc-contention.ps1'
+      - '.github/workflows/owner-ipc-contention.yml'
+  schedule:
+    - cron: '37 8 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  contention:
+    name: Three runs, one CPU, fourteen test threads
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
+      - name: Repeat bounded owner IPC checks under CPU contention
+        shell: pwsh
+        run: ./scripts/test-owner-ipc-contention.ps1
