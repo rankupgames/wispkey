@@ -44,8 +44,9 @@ used as the sync passphrase. Without a passphrase file/environment variable, the
 normal hidden bundle prompt is used.
 
 Push and pull bind to the active project's exact name and partition name. A
-stable opaque remote ID derives from those names; the authenticated backend
-account owns the record. The encrypted payload also binds the exact project and
+stable opaque remote ID derives from the API endpoint, authenticated account,
+and those names, allowing different accounts to use the same names independently.
+The authenticated backend account owns the record. The encrypted payload also binds the exact project and
 partition so a server cannot substitute another partition's valid bundle.
 Renaming a project or partition creates a different sync identity; inspect and
 explicitly migrate such changes rather than expecting a remote rename.
