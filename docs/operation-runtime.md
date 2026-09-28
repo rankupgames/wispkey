@@ -167,4 +167,6 @@ Issuer rotation, Secret delivery, and consumer reload are separate steps with
 separate authority. Schedule them with the application's outage/rollout policy;
 this initial adapter does not promise an atomic or zero-downtime rollout.
 Verify consumer reload and retained application data before declaring a rollout
-complete. No real destination or application has been configured by this change.
+complete. Production destination and application configuration remain operator
+work. For reproducible local acceptance against real disposable OpenSSH and
+Kubernetes services, run the [destination fixture](disposable-cross-node-validation.md).
