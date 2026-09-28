@@ -163,6 +163,14 @@ pub async fn handle_partition_assign(credential: &str, partition_name: &str) {
     };
     match vault.assign_credential_to_partition(credential, partition_name) {
         Ok(()) => {
+            if json_output() {
+                print_json(serde_json::json!({
+                    "ok": true,
+                    "credential": credential,
+                    "partition": partition_name,
+                }));
+                return;
+            }
             println!(
                 "Credential '{}' assigned to partition '{}'.",
                 credential, partition_name

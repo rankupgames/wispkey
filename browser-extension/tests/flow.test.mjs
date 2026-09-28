@@ -83,6 +83,7 @@ function documentFixture(options = {}) {
   class Input {
     constructor(type) { this.type = type; this.form = form; this.autocomplete = ""; this.events = []; this.stored = ""; }
     getClientRects() { return options.hidden ? [] : [{}]; }
+    getAttribute(name) { return name === "autocomplete" ? this.autocomplete : null; }
     set value(value) { this.stored = value; }
     dispatchEvent(event) { this.events.push(event.type); }
   }
@@ -93,7 +94,7 @@ function documentFixture(options = {}) {
   const window = {}; window.top = options.iframe ? {} : window;
   const context = vm.createContext({
     URL, window, location: { origin: "https://example.com", protocol: "https:", href: "https://example.com/login" },
-    document: { querySelectorAll: () => passwords }, HTMLInputElement: Input,
+    document: { querySelectorAll: (selector) => selector === "[formaction]" ? [] : passwords }, HTMLInputElement: Input,
     getComputedStyle: () => ({ visibility: "visible" }), Event: class { constructor(type) { this.type = type; } },
     browser: { runtime: { id: "extension", onConnect } },
     setTimeout: () => 1, clearTimeout() {},

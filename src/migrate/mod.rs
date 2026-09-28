@@ -888,7 +888,7 @@ pub fn import_env_file(
                     None,
                 );
                 output_lines.push(format!("{}={}", entry.key, cred.wisp_token));
-                println!(
+                eprintln!(
                     "  + {} -> {} ({})",
                     entry.key,
                     cred.wisp_token,
@@ -897,7 +897,7 @@ pub fn import_env_file(
                 imported += 1;
             }
             Err(VaultError::DuplicateCredential(_)) => {
-                println!("  ~ {} skipped (already exists)", entry.key);
+                eprintln!("  ~ {} skipped (already exists)", entry.key);
                 skipped += 1;
             }
             Err(e) => {

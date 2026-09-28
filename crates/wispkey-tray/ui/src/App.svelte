@@ -54,10 +54,13 @@
       window.__wispkeyPending = window.__wispkeyPending || {};
       window.__wispkeyPending[id] = resolve;
       request.id = id;
-      if (window.ipc && window.ipc.postMessage) {
+      try {
+        if (!window.ipc || typeof window.ipc.postMessage !== "function") {
+          throw new Error("IPC unavailable");
+        }
         window.ipc.postMessage(JSON.stringify(request));
-      } else {
-        resolve({ ok: false, error: { message: "IPC unavailable" } });
+      } catch (_error) {
+        window.__wispkeyResolve(id, { ok: false, error: { message: "IPC unavailable" } });
       }
     });
   }
