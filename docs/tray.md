@@ -64,7 +64,7 @@ If any name already exists or any field is empty, none of the three are saved.
 The tray crate needs platform webview and tray libraries, for example on Debian/Ubuntu:
 
 ```bash
-sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
+sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev
 cargo build -p wispkey-tray
 ```
 

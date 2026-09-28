@@ -33,12 +33,36 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). The optional `wispkey-tray` GUI is a workspace member but is not required for CI. To build it locally on Debian/Ubuntu:
+Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). CI keeps this default matrix and separately checks Linux AF_VSOCK and the optional `wispkey-tray` on Linux, macOS, and Windows. GUI dependencies remain optional for CLI development. To reproduce the native tray job on Debian/Ubuntu:
 
 ```bash
-sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev
-cargo build -p wispkey-tray
+sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev
+npm --prefix crates/wispkey-tray/ui ci
+npm --prefix crates/wispkey-tray/ui run build
+cargo build --locked -p wispkey-tray
+cargo test --locked -p wispkey-tray
 ```
+
+On macOS and Windows, run the same commands without the Linux package install.
+The tray test harness runs without opening windows. The default CLI matrix also
+runs `cargo test --locked --test owner_ipc`, including concurrent clients,
+bounded log-pressure capture, authentication, and redaction with temporary
+vaults and synthetic values. Interactive tray menus, webview focus, OS approval,
+and desktop integration still need a manual check in a real desktop session.
+
+To reproduce the Linux feature job:
+
+```bash
+cargo clippy --locked --all-targets --features vsock -- -D warnings
+cargo test --locked --features vsock
+cargo test --locked --no-default-features vsock_without_platform_feature
+```
+
+These checks compile the AF_VSOCK implementation and exercise applicable tests;
+they do not require or claim a working AF_VSOCK device on hosted runners. A real
+guest/host connection still requires a VM integration run. The default builds
+test the unsupported-feature error, and Unix tests cover the separate
+Firecracker UDS bridge.
 
 See [`docs/tray.md`](docs/tray.md) for owner IPC and tray usage.
 
