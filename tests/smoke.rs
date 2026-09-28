@@ -39,60 +39,29 @@ fn help_flag_shows_commands() {
 }
 
 #[test]
-fn status_without_vault_shows_error() {
-    let output = wispkey_bin()
-        .arg("status")
-        .env("HOME", "/tmp/wispkey-test-nonexistent")
-        .output()
-        .expect("failed to run wispkey");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("vault")
-            || combined.contains("Vault")
-            || combined.contains("No vault")
-            || combined.contains("not found"),
-        "expected vault-related output, got: {combined}"
-    );
+fn status_without_vault_reports_uninitialized() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_wispkey(dir.path(), &["status"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("Vault: not initialized"));
+    assert!(!dir.path().join("vault.db").exists());
 }
 
 #[test]
-fn cloud_status_shows_coming_soon_or_status() {
-    let output = wispkey_bin()
-        .args(["cloud", "status"])
-        .env("HOME", "/tmp/wispkey-test-nonexistent")
-        .output()
-        .expect("failed to run wispkey");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("Cloud") || combined.contains("cloud") || combined.contains("vault"),
-        "expected cloud-related output, got: {combined}"
-    );
+fn cloud_status_without_config_reports_disconnected() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_wispkey(dir.path(), &["cloud", "status"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("WispKey Cloud: not connected"));
+    assert!(!dir.path().join("cloud.json").exists());
 }
 
 #[test]
-fn policy_list_without_vault_fails_gracefully() {
-    let output = wispkey_bin()
-        .args(["policy", "list"])
-        .env("HOME", "/tmp/wispkey-test-nonexistent")
-        .output()
-        .expect("failed to run wispkey");
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("polic") || combined.contains("No") || combined.contains("vault"),
-        "expected policy or vault output, got: {combined}"
-    );
+fn policy_list_without_configuration_reports_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_wispkey(dir.path(), &["policy", "list"]);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("No policies configured."));
 }
 
 #[cfg(unix)]
@@ -107,6 +76,7 @@ fn vault_directory_and_session_file_are_owner_only_on_unix() {
 
 #[test]
 fn format_flag_is_global_after_subcommands() {
+    let dir = tempfile::tempdir().unwrap();
     // Guards against dropping `global = true` on the top-level --format flag,
     // which would make `--format` after a subcommand fail to parse.
     for args in [
@@ -115,11 +85,7 @@ fn format_flag_is_global_after_subcommands() {
         vec!["audit", "export", "--format", "jsonl"],
         vec!["guard", "shell", "--format", "json"],
     ] {
-        let output = wispkey_bin()
-            .args(&args)
-            .env("HOME", "/tmp/wispkey-test-nonexistent")
-            .output()
-            .expect("failed to run wispkey");
+        let output = run_wispkey(dir.path(), &args);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !stderr.contains("unexpected argument '--format'"),

@@ -18,6 +18,11 @@ cargo test
 
 ## Development Workflow
 
+For the feature coverage map and repeatable CLI, browser, tray, and fixture
+commands, see [`docs/testing.md`](docs/testing.md). Run `python scripts/verify.py
+--all` for the CLI, browser UI, and automation suites; optional native/destination
+suites and human acceptance boundaries are documented there.
+
 1. Fork the repo and create a feature branch from `main`
 2. Make your changes
 3. Run the full check suite:

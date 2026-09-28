@@ -79,16 +79,18 @@ jobs:
       - name: Build both browser packages
         working-directory: browser-extension
         run: npm run build
-      - name: Browser engine fixtures
-        working-directory: browser-extension
-        run: |
-          npx playwright install --with-deps chromium firefox
-          npm run test:browser
       - name: Build tray UI
         working-directory: crates/wispkey-tray/ui
         run: |
           npm ci
           npm run build
+      - name: Browser engine and tray UI fixtures
+        working-directory: browser-extension
+        run: |
+          npx playwright install --with-deps chromium firefox
+          npm run test:browser
+      - name: Test validation runner
+        run: python3 -m unittest discover -s scripts/tests -p 'test_verify.py' -v
       - name: Upload unpacked extensions
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
