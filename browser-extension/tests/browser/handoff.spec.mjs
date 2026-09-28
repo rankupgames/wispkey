@@ -62,6 +62,44 @@ test("refuses a login form inside a same-origin iframe", async ({ page }) => {
   expect(await frame.evaluate(() => WispKeyFlow.installReceiver("nonce", location.origin))).toBe(false);
 });
 
+test("refuses cross-origin submit overrides outside the form", async ({ page }) => {
+  await fixture(page, form.replace('<form ', '<form id="login" ')
+    + '<button form="login" formaction="https://other.test/collect">Continue</button>');
+  expect(await page.evaluate(() => WispKeyFlow.installReceiver("nonce", location.origin))).toBe(false);
+  await expect(page.locator("#password")).toHaveValue("");
+});
+
+for (const [name, attributes] of [
+  ["readonly", "readonly"], ["disabled", "disabled"],
+  ["transparent", 'style="opacity:0"'], ["one-time code", 'autocomplete="one-time-code"'],
+]) {
+  test(`refuses ${name} password fields`, async ({ page }) => {
+    await fixture(page, form.replace('id="password"', `id="password" ${attributes}`));
+    expect(await page.evaluate(() => WispKeyFlow.installReceiver("nonce", location.origin))).toBe(false);
+  });
+}
+
+test("fills both new-password fields and dispatches events without submission", async ({ page }) => {
+  await fixture(page, form.replace('type="password"', 'type="password" autocomplete="new-password"')
+    .replace('</form>', '<input id="confirm" type="password" autocomplete="new-password"></form>'));
+  const result = await page.evaluate(() => {
+    const events = [];
+    for (const type of ["input", "change"]) document.addEventListener(type, (event) => events.push(`${event.target.id}:${type}`));
+    const installed = WispKeyFlow.installReceiver("nonce", location.origin);
+    let receive;
+    const replies = [];
+    connectFixture({ name: "wispkey-fill-nonce", sender: { id: "fixture" },
+      onMessage: { addListener(fn) { receive = fn; } }, postMessage(value) { replies.push(value); } });
+    const message = { origin: location.origin, login: { username: "synthetic", password: "synthetic-password" } };
+    receive(message);
+    return { installed, replies, events, submissions, cleared: message.login };
+  });
+  expect(result).toEqual({ installed: true, replies: [{ ready: true }, { completed: true }],
+    events: ["username:input", "username:change", "password:input", "password:change", "confirm:input", "confirm:change"],
+    submissions: 0, cleared: { username: "", password: "" } });
+  await expect(page.locator("#confirm")).toHaveValue("synthetic-password");
+});
+
 test("popup escapes request text and requires profile acknowledgement", async ({ page }, testInfo) => {
   await page.addInitScript(() => {
     globalThis.browser = { runtime: { sendMessage: async () => ({ ok: true, result: {

@@ -144,13 +144,13 @@ cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 npm --prefix browser-extension test
 npm --prefix browser-extension run build
+npm --prefix crates/wispkey-tray/ui ci
+npm --prefix crates/wispkey-tray/ui run build
 cd browser-extension
 npm ci
 npx playwright install chromium firefox
 npm run test:browser
 cd ..
-npm --prefix crates/wispkey-tray/ui ci
-npm --prefix crates/wispkey-tray/ui run build
 cargo check -p wispkey-tray
 ```
 
@@ -159,6 +159,9 @@ expiry, denial, credential changes, concurrent consumption, audit failure, origi
 and form checks, and navigation during approval. Chromium and Firefox fixtures
 exercise real DOM/layout and the popup with synthetic data and mocked extension
 transport. They do not verify extension installation or bypass OS verification.
+The browser suite also tests the built tray UI with a mocked owner IPC bridge.
+Build the tray UI first, or use `python scripts/verify.py --suite browser` to run
+the steps in order. See [the feature validation map](testing.md) for all suites.
 Before release, smoke-test both actual browser families in a disposable human
 profile with synthetic logins: approve/cancel Windows Hello, navigate during
 approval, lock the vault during approval, fill a login/signup form, verify no

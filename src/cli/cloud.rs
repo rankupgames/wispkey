@@ -1,3 +1,4 @@
+use super::shared::{json_output, print_json};
 use crate::cloud::{self, CloudClient, CloudError, CloudTier};
 use crate::core::Vault;
 
@@ -16,6 +17,16 @@ pub async fn handle_cloud_status() {
             std::process::exit(1);
         }
     };
+    if json_output() {
+        let mut output = serde_json::to_value(&status).expect("cloud status is serializable");
+        output["source"] = serde_json::json!("local");
+        output["remote_verified"] = serde_json::json!(false);
+        output["sync_available"] = serde_json::json!(false);
+        output["api_url"] = serde_json::json!(config.api_url);
+        output["last_sync"] = serde_json::json!(config.last_sync);
+        print_json(output);
+        return;
+    }
     if !status.authenticated {
         println!("WispKey Cloud: not connected");
         println!("Run `wispkey cloud login` to connect.");
@@ -74,7 +85,13 @@ pub async fn handle_cloud_logout() {
     };
     let mut client = CloudClient::new(config);
     match client.logout() {
-        Ok(()) => println!("Logged out of WispKey Cloud."),
+        Ok(()) => {
+            if json_output() {
+                print_json(serde_json::json!({"ok": true, "authenticated": false}));
+            } else {
+                println!("Logged out of WispKey Cloud.");
+            }
+        }
         Err(e) => {
             eprintln!("Error: {}", e);
             std::process::exit(1);

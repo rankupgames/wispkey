@@ -14,22 +14,26 @@ globalThis.WispKeyFlow = (() => {
     const visible = (input) => !input.disabled && !input.readOnly
       && input.getClientRects().length > 0 && getComputedStyle(input).visibility === "visible"
       && getComputedStyle(input).opacity !== "0";
+    // Firefox can expose an empty property for valid detail tokens. Inspect the
+    // declared attribute so OTP rejection and signup confirmation work there too.
+    const autocomplete = (input) => (input.getAttribute("autocomplete") || "").toLowerCase().split(/\s+/);
     function fields() {
       const passwords = [...document.querySelectorAll('input[type="password"]')].filter(visible);
       if (passwords.length < 1 || passwords.length > 2) return null;
-      if (passwords.some((input) => input.autocomplete.split(/\s+/).includes("one-time-code"))) return null;
-      if (passwords.length === 2 && passwords.some((input) => !input.autocomplete.split(/\s+/).includes("new-password"))) return null;
+      if (passwords.some((input) => autocomplete(input).includes("one-time-code"))) return null;
+      if (passwords.length === 2 && passwords.some((input) => !autocomplete(input).includes("new-password"))) return null;
       const form = passwords[0].form;
       if (!form || passwords.some((input) => input.form !== form)) return null;
       // Never fill forms that advertise a different destination, even though we
       // do not submit. Includes overrides on individual submit buttons.
-      const destinations = [form.action, ...[...form.querySelectorAll("[formaction]")].map((el) => el.formAction)];
+      const destinations = [form.action, ...[...document.querySelectorAll("[formaction]")]
+        .filter((el) => el.form === form).map((el) => el.formAction)];
       if (destinations.some((value) => {
         try { return new URL(value, location.href).origin !== origin; } catch { return true; }
       })) return null;
       const text = [...form.querySelectorAll('input')].filter((input) =>
         visible(input) && ["text", "email"].includes(input.type));
-      const usernames = text.filter((input) => input.autocomplete.split(/\s+/).includes("username") || input.type === "email");
+      const usernames = text.filter((input) => autocomplete(input).includes("username") || input.type === "email");
       const candidates = usernames.length ? usernames : text;
       if (candidates.length !== 1) return null;
       return { username: candidates[0], passwords };
