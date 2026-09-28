@@ -501,7 +501,7 @@ src/
   partition/  # Encrypted bundle export/import (.wkbundle)
   secure_files.rs # Cross-platform owner-only local file protection
   sharing/    # Project and single-credential encrypted share bundles
-  cloud/      # Cloud session groundwork and sync command stubs
+  cloud/      # Cloud sessions, conditional encrypted sync and recovery
   policy/     # Policy engine (TOML rules, rate limiting, time windows)
 tests/             # Command-focused integration tests
 plugin/           # Cursor plugin (rules, skills, hooks, agents)
