@@ -3,6 +3,8 @@ mod catalog;
 pub(crate) mod environment;
 pub(crate) mod helper;
 mod identity;
+#[cfg(all(test, unix))]
+mod live_tests;
 pub(crate) mod postgres;
 pub(crate) mod runtime;
 pub(crate) mod ssh;

@@ -14,7 +14,8 @@ The runner works from any directory. It stops dependent steps after a failure,
 continues other selected suites, and exits nonzero if anything selected fails or
 cannot start. A dry run prints **PLANNED**, never **PASSED**. It does not retry
 failures. CI supplies job time limits; local runs stream the underlying tools'
-output and can be interrupted. The CLI suite runs both default and all-feature
+output and can be interrupted. Every Cargo test invocation gets its own temporary
+`WISPKEY_VAULT_PATH`, removed on completion or failure. The CLI suite runs both default and all-feature
 tests because transport behavior depends on the feature set. `--all` includes
 CLI, browser/tray web UI, and Python automation; it does not imply every native
 platform or live service has been tested.
@@ -37,6 +38,10 @@ python scripts/verify.py --suite tray
 # Linux/macOS with Docker and Bash (Windows: run inside configured WSL).
 # Creates and removes a loopback-only disposable PostgreSQL container.
 python scripts/verify.py --suite postgres
+
+# Linux/WSL with Docker, kind 0.33+, ssh/ssh-keygen and Rust.
+# Creates and removes real OpenSSH and encrypted Kubernetes destinations.
+python scripts/verify.py --suite cross-node
 ```
 
 The native tray build on Debian/Ubuntu needs `libgtk-3-dev`,
@@ -94,10 +99,11 @@ tests must be assessed on the required OS/device. An ignored result is not a pas
 - [Cross-node validation #32](https://github.com/rankupgames/wispkey/issues/32):
   [PR #35](https://github.com/rankupgames/wispkey/pull/35) adds grant expiration,
   scope/concurrency, Kubernetes TLS/posture, and private helper channel tests.
-  Loopback servers establish protocol behavior; actual SSH/Kubernetes targets
-  still need acceptance by their owner. Use the runtime guide and PR's validation
-  checklist with disposable resources; deployment-specific acceptance must use
-  that deployment's actual posture and identity configuration.
+  The [disposable destination harness](disposable-cross-node-validation.md) also
+  exercises real OpenSSH and an encrypted kind API, including host-key pins,
+  replay rejection, signed posture, narrow RBAC, delivery and revocation.
+  Deployment-specific acceptance must still use that deployment's actual
+  posture and identity configuration.
 - [Owner IPC timeout #26](https://github.com/rankupgames/wispkey/issues/26):
   the demonstrated log-drain defect was fixed in PR #30.
   [PR #39](https://github.com/rankupgames/wispkey/pull/39) adds three repeated

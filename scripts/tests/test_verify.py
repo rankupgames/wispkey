@@ -59,6 +59,20 @@ class VerifyTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertEqual((path / "ran.txt").read_text(), "literal spaces & symbols")
 
+    def test_cargo_tests_get_a_temporary_vault_removed_even_on_failure(self):
+        paths = []
+        def execute(argv, **kwargs):
+            vault = Path(kwargs["env"]["WISPKEY_VAULT_PATH"])
+            self.assertTrue(vault.is_dir())
+            (vault / "cloud.json").write_text("synthetic test configuration")
+            paths.append(vault)
+            return subprocess.CompletedProcess(argv, 1)
+        code, _ = self.run_quietly(["cli"], {"cli": [(Path.cwd(), ["cargo", "test", "--locked"])]},
+                                  execute=execute, find=lambda name: name)
+        self.assertEqual(code, 1)
+        self.assertEqual(len(paths), 1)
+        self.assertFalse(paths[0].exists())
+
 
 if __name__ == "__main__":
     unittest.main()
