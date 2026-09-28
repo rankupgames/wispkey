@@ -13,7 +13,7 @@
 use std::io::Read;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use wispkey::cli;
+use wispkey::{cli, cloud};
 
 #[derive(Parser)]
 #[command(name = "wispkey")]
@@ -964,18 +964,46 @@ enum InstanceScopeCommands {
 
 #[derive(Subcommand)]
 enum CloudCommands {
-    /// Show cloud sync status
-    Status,
-    /// Log in to WispKey Cloud
+    /// Show local sync state; --remote also checks the authenticated backend
+    Status {
+        #[arg(long)]
+        remote: bool,
+    },
     Login,
-    /// Log out of WispKey Cloud
     Logout,
-    /// Push a partition to the cloud
-    Push { partition: String },
-    /// Pull a partition from the cloud
-    Pull { partition: String },
-    /// Sync all cloud-enabled partitions
-    Sync,
+    /// Encrypt and conditionally upload a partition
+    Push {
+        partition: String,
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Authenticate and atomically import a partition
+    Pull {
+        partition: String,
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Sync tracked partitions in the active project
+    Sync {
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Resolve a conflict explicitly, preserving an encrypted recovery copy
+    Resolve {
+        partition: String,
+        #[arg(long, value_parser = ["local", "remote"])]
+        keep: String,
+        #[arg(long)]
+        remote_revision: String,
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
+    /// Restore an encrypted sync recovery file into the active project
+    Recover {
+        path: String,
+        #[arg(long)]
+        bundle_passphrase_file: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1616,14 +1644,7 @@ async fn main() {
             }
             InstanceCommands::Deny { request_id } => cli::handle_instance_deny(&request_id).await,
         },
-        Commands::Cloud { command } => match command {
-            CloudCommands::Status => cli::handle_cloud_status().await,
-            CloudCommands::Login => cli::handle_cloud_login().await,
-            CloudCommands::Logout => cli::handle_cloud_logout().await,
-            CloudCommands::Push { partition } => cli::handle_cloud_push(&partition).await,
-            CloudCommands::Pull { partition } => cli::handle_cloud_pull(&partition).await,
-            CloudCommands::Sync => cli::handle_cloud_sync().await,
-        },
+        Commands::Cloud { command } => Box::pin(dispatch_cloud(command)).await,
         Commands::Mcp { command } => match command {
             McpCommands::Serve => {
                 cli::handle_mcp_serve().await;
@@ -1632,5 +1653,66 @@ async fn main() {
         Commands::Guard { command } => match command {
             GuardCommands::Shell => cli::handle_guard_shell().await,
         },
+    }
+}
+
+async fn dispatch_cloud(command: CloudCommands) {
+    match command {
+        CloudCommands::Recover {
+            path,
+            bundle_passphrase_file,
+        } => cli::handle_cloud_recover(&path, bundle_passphrase_file.as_deref()),
+        CloudCommands::Status { remote } => Box::pin(cli::handle_cloud_status(remote)).await,
+        CloudCommands::Login => cli::handle_cloud_login().await,
+        CloudCommands::Logout => cli::handle_cloud_logout().await,
+        CloudCommands::Push {
+            partition,
+            bundle_passphrase_file,
+        } => {
+            Box::pin(cli::handle_cloud_transfer(
+                Some(&partition),
+                cloud::SyncMode::Push,
+                bundle_passphrase_file.as_deref(),
+                None,
+            ))
+            .await
+        }
+        CloudCommands::Pull {
+            partition,
+            bundle_passphrase_file,
+        } => {
+            Box::pin(cli::handle_cloud_transfer(
+                Some(&partition),
+                cloud::SyncMode::Pull,
+                bundle_passphrase_file.as_deref(),
+                None,
+            ))
+            .await
+        }
+        CloudCommands::Sync {
+            bundle_passphrase_file,
+        } => {
+            Box::pin(cli::handle_cloud_transfer(
+                None,
+                cloud::SyncMode::Sync,
+                bundle_passphrase_file.as_deref(),
+                None,
+            ))
+            .await
+        }
+        CloudCommands::Resolve {
+            partition,
+            keep,
+            remote_revision,
+            bundle_passphrase_file,
+        } => {
+            Box::pin(cli::handle_cloud_transfer(
+                Some(&partition),
+                cloud::SyncMode::Sync,
+                bundle_passphrase_file.as_deref(),
+                Some((&keep, &remote_revision)),
+            ))
+            .await
+        }
     }
 }

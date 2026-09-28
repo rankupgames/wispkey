@@ -2,7 +2,7 @@
  * Author: Miguel A. Lopez
  * Company: RankUp Games LLC
  * Project: WispKey
- * Description: Cloud sync client -- config persistence, tier limits, and API stubs for WispKey Cloud.
+ * Description: Cloud client -- local sessions and conditional encrypted partition sync.
  * Created: 2026-04-08
  * Last Modified: 2026-04-13
  */
@@ -19,8 +19,9 @@ use thiserror::Error;
 
 use crate::core::{Vault, VaultError};
 use crate::secure_files;
+mod sync;
+pub use sync::{PartitionState, SyncMode, recover_partition};
 
-const COMING_SOON: &str = "WispKey Cloud is coming soon. Cloud $1.99/mo | Enterprise: contact us";
 const DEFAULT_CLERK_SIGN_IN_URL: &str = "https://clerk.wispkey.com/sign-in";
 const LOGIN_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -102,6 +103,16 @@ pub enum SyncDirection {
 /// Tracks the sync state of a single partition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SyncManifest {
+    #[serde(default)]
+    pub project: String,
+    #[serde(default)]
+    pub remote_revision: Option<String>,
+    #[serde(default)]
+    pub outcome: String,
+    #[serde(default)]
+    pub local_changes_pending: bool,
+    #[serde(default)]
+    pub recovery_path: Option<String>,
     pub partition_id: String,
     pub partition_name: String,
     pub last_synced_at: String,
@@ -133,9 +144,11 @@ impl CloudClient {
     /// Creates a new cloud client with the given config.
     pub fn new(config: CloudConfig) -> Self {
         let http_client = reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("fixed cloud HTTP client configuration");
         Self {
             config,
             http_client,
@@ -157,9 +170,9 @@ impl CloudClient {
     /// Opens the browser to the Clerk sign-in page and waits for the session token
     /// to arrive via a localhost callback. Returns the updated config with the token stored.
     pub async fn login(&mut self) -> CloudResult<CloudConfig> {
-        let (token, user_email) = browser_login_flow().await?;
+        let (token, _) = browser_login_flow().await?;
         self.config.clerk_session_token = Some(token);
-        self.config.user_id = user_email.clone();
+        self.refresh_account().await?;
         save_config(&self.config)?;
         Ok(self.config.clone())
     }
@@ -174,43 +187,54 @@ impl CloudClient {
         save_config(&self.config)
     }
 
-    /// Pushes a local partition to WispKey Cloud (stub).
+    /// Pushes a client-encrypted partition with an explicit revision precondition.
     pub async fn push_partition(
         &self,
         vault: &Vault,
         partition_name: &str,
+        passphrase: &str,
     ) -> CloudResult<SyncManifest> {
-        self.ensure_authenticated()?;
-        self.check_tier_limit("push_partition")?;
-        let _ = (vault, partition_name);
-        Err(CloudError::ApiError(COMING_SOON.into()))
+        self.synchronize_partition(vault, partition_name, passphrase, SyncMode::Push, None)
+            .await
     }
 
-    /// Pulls a partition from WispKey Cloud (stub).
+    /// Authenticates a remote snapshot before an atomic local replacement.
     pub async fn pull_partition(
         &self,
         vault: &Vault,
         partition_name: &str,
+        passphrase: &str,
     ) -> CloudResult<SyncManifest> {
-        self.ensure_authenticated()?;
-        self.check_tier_limit("pull_partition")?;
-        let _ = (vault, partition_name);
-        Err(CloudError::ApiError(COMING_SOON.into()))
+        self.synchronize_partition(vault, partition_name, passphrase, SyncMode::Pull, None)
+            .await
     }
 
-    /// Syncs all cloud-enabled partitions (stub).
-    pub async fn sync_all(&self, vault: &Vault) -> CloudResult<Vec<SyncManifest>> {
+    /// Syncs explicitly tracked partitions in the active project, stopping on conflict.
+    pub async fn sync_all(
+        &self,
+        vault: &Vault,
+        passphrase: &str,
+    ) -> CloudResult<Vec<SyncManifest>> {
         self.ensure_authenticated()?;
         self.check_tier_limit("sync_all")?;
-        let _ = vault;
-        Err(CloudError::ApiError(COMING_SOON.into()))
-    }
-
-    /// Retrieves remote cloud status (stub).
-    #[allow(dead_code)]
-    pub async fn get_status(&self) -> CloudResult<CloudStatus> {
-        self.ensure_authenticated()?;
-        Err(CloudError::ApiError(COMING_SOON.into()))
+        let mut results = Vec::new();
+        for state in self
+            .partition_states(vault)?
+            .into_iter()
+            .filter(|state| state.project == crate::core::resolve_active_project())
+        {
+            results.push(
+                self.synchronize_partition(
+                    vault,
+                    &state.partition,
+                    passphrase,
+                    SyncMode::Sync,
+                    None,
+                )
+                .await?,
+            );
+        }
+        Ok(results)
     }
 
     /// Validates that the current tier allows the requested operation.
@@ -222,14 +246,6 @@ impl CloudClient {
         }
         if self.config.tier == CloudTier::Enterprise {
             return Ok(());
-        }
-        if operation == "push_partition" {
-            let manifests = load_sync_manifests()?;
-            if manifests.len() >= 10 {
-                return Err(CloudError::TierLimit(format!(
-                    "{operation}: Cloud tier allows up to 10 partitions; contact us for Enterprise"
-                )));
-            }
         }
         Ok(())
     }

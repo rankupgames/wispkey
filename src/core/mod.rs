@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::secure_files;
 
+pub(crate) mod cloud_sync;
 mod crypto;
 mod instances;
 pub(crate) mod operation_grants;

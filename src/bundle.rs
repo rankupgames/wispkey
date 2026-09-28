@@ -65,7 +65,7 @@ pub(crate) fn write_encrypted_payload_with_limit_no_clobber<T: Serialize>(
     Ok(())
 }
 
-fn encrypted_payload_bytes<T: Serialize>(
+pub(crate) fn encrypted_payload_bytes<T: Serialize>(
     magic: &[u8; 4],
     payload: &T,
     passphrase: &str,
@@ -115,6 +115,21 @@ pub(crate) fn read_encrypted_payload_with_limit<T: for<'de> Deserialize<'de>>(
     }
 
     let data = std::fs::read(path).map_err(|e| VaultError::InvalidBundle(e.to_string()))?;
+    decrypt_payload_bytes(magic, &data, passphrase, max_bytes)
+}
+
+/// Authenticate an in-memory encrypted bundle before parsing any payload fields.
+pub(crate) fn decrypt_payload_bytes<T: for<'de> Deserialize<'de>>(
+    magic: &[u8; 4],
+    data: &[u8],
+    passphrase: &str,
+    max_bytes: u64,
+) -> Result<T> {
+    if data.len() as u64 > max_bytes {
+        return Err(VaultError::InvalidBundle(
+            "bundle exceeds size limit".into(),
+        ));
+    }
     if data.len() < BUNDLE_HEADER_LEN {
         return Err(VaultError::InvalidBundle("file too short".into()));
     }
