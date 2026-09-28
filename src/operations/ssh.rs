@@ -318,7 +318,9 @@ where
             | Ok(Some(ChannelMsg::Failure))
             | Ok(Some(ChannelMsg::Close))
             | Ok(None) => return SshResult::new(SshOutcome::FailedChild),
-            Ok(Some(ChannelMsg::Success)) => {}
+            // OpenSSH adjusts its receive window before the helper-ready line.
+            // Flow control carries no helper acknowledgement or credential data.
+            Ok(Some(ChannelMsg::Success | ChannelMsg::WindowAdjusted { .. })) => {}
             Ok(Some(_)) => return SshResult::new(SshOutcome::FailedChild),
             Err(stop) => return stopped(stop, false),
         }
@@ -521,6 +523,9 @@ pub(crate) mod tests {
         private_test_file(&identity);
         let mut server_config = server::Config::default();
         server_config.keys.push(host_key);
+        // Force receive-window adjustments during the hello/ready exchange,
+        // matching the control messages sent by an actual OpenSSH destination.
+        server_config.window_size = 128;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let received = Arc::new(AtomicUsize::new(0));

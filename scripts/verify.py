@@ -2,10 +2,13 @@
 """Run named validation suites from any working directory. Python 3.10+."""
 
 import argparse
+from contextlib import nullcontext
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -38,6 +41,7 @@ def suites(root=ROOT):
             (root, ["cargo", "build", "--locked", "-p", "wispkey-tray"]),
         ],
         "postgres": [(root, ["bash", "tests/support/postgres_operation_fixture.sh"])],
+        "cross-node": [(root, [sys.executable, "tests/support/cross_node_fixture.py"])],
     }
 
 
@@ -54,7 +58,12 @@ def run(selected, catalog, *, dry_run=False, execute=subprocess.run, find=shutil
                 failed.append(name)
                 break
             try:
-                result = execute([executable, *argv[1:]], cwd=directory, check=False)
+                # An accidentally unscoped library test must never write to the
+                # developer's normal vault or Cloud configuration.
+                isolation = tempfile.TemporaryDirectory(prefix="wispkey-verify-") if argv[:2] == ["cargo", "test"] else nullcontext(None)
+                with isolation as vault:
+                    options = {"env": dict(os.environ, WISPKEY_VAULT_PATH=vault)} if vault else {}
+                    result = execute([executable, *argv[1:]], cwd=directory, check=False, **options)
             except OSError:
                 print(f"[{name}] FAILED: could not start {argv[0]}", file=sys.stderr)
                 failed.append(name)
@@ -72,7 +81,7 @@ def main(argv=None):
     catalog = suites()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", action="append", choices=catalog, help="repeat to combine; defaults to cli")
-    parser.add_argument("--all", action="store_true", help="cli, browser and automation; optional native tray/PostgreSQL require explicit --suite")
+    parser.add_argument("--all", action="store_true", help="cli, browser and automation; optional native tray/PostgreSQL/cross-node require explicit --suite")
     parser.add_argument("--dry-run", action="store_true", help="print commands without executing or claiming a pass")
     args = parser.parse_args(argv)
     selected = (["cli", "browser", "automation"] if args.all else []) + (args.suite or [])
