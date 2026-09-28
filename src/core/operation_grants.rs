@@ -1588,4 +1588,162 @@ mod tests {
                 .unwrap();
         assert_ne!(first_revision, third_revision);
     }
+
+    #[test]
+    fn every_scope_field_is_checked_at_reservation_and_release() {
+        let db = db();
+        let binding = binding();
+        let session = session();
+        let grant = issue_with_session(&db, &binding, binding.expires_at, &session).unwrap();
+        let mut changes = Vec::new();
+        for field in [
+            "operation",
+            "target",
+            "environment",
+            "credential",
+            "project",
+            "catalog",
+            "requester",
+            "missing-credential",
+        ] {
+            let mut changed = binding.clone();
+            match field {
+                "operation" => changed.operation = "other-operation".into(),
+                "target" => changed.target = "other-target".into(),
+                "environment" => changed.environment = "other-environment".into(),
+                "credential" => changed.credential_id = Uuid::new_v4().to_string(),
+                "project" => changed.project_id = "other-project".into(),
+                "catalog" => changed.catalog_revision = "b".repeat(64),
+                "requester" => changed.requester_instance_id = Uuid::new_v4().to_string(),
+                "missing-credential" => changed.credential_id.clear(),
+                _ => unreachable!(),
+            }
+            assert!(
+                reserve_with_session(&db, &requester(), &grant.grant_id, &changed, &session)
+                    .is_err(),
+                "field: {field}"
+            );
+            changes.push((field, changed));
+        }
+        assert_eq!(
+            load_grant(&db, &grant.grant_id).unwrap().state,
+            GrantState::Pending
+        );
+        let attempt =
+            reserve_with_session(&db, &requester(), &grant.grant_id, &binding, &session).unwrap();
+        for (field, changed) in changes {
+            assert!(
+                validate_live(&db, &requester(), &attempt, &changed, &session).is_err(),
+                "field: {field}"
+            );
+        }
+        assert!(validate_live(&db, &requester(), &attempt, &binding, &session).is_ok());
+        db.execute(
+            "UPDATE instances SET secret_hash='rotated-instance-hash'",
+            [],
+        )
+        .unwrap();
+        assert!(validate_live(&db, &requester(), &attempt, &binding, &session).is_err());
+        let rotated_requester = AuthenticatedRequester {
+            instance_id: INSTANCE_ID.into(),
+            generation: hash_text("rotated-instance-hash"),
+        };
+        assert!(validate_live(&db, &rotated_requester, &attempt, &binding, &session).is_err());
+    }
+
+    #[test]
+    fn earliest_scope_session_or_requested_expiry_bounds_grant_and_attempt() {
+        for shortest in ["scope", "session", "request"] {
+            let db = db();
+            let mut binding = binding();
+            let mut session = session();
+            let deadline = Utc::now() + Duration::seconds(30);
+            let mut requested = Utc::now() + Duration::minutes(4);
+            match shortest {
+                "scope" => binding.expires_at = deadline,
+                "session" => session.expires_at = deadline,
+                "request" => requested = deadline,
+                _ => unreachable!(),
+            }
+            let grant = issue_with_session(&db, &binding, requested, &session).unwrap();
+            assert_eq!(grant.expires_at, deadline);
+            let attempt =
+                reserve_with_session(&db, &requester(), &grant.grant_id, &binding, &session)
+                    .unwrap();
+            assert_eq!(attempt.hard_deadline, deadline);
+            let expiry: String = db
+                .query_row(
+                    "SELECT expires_at FROM operation_audit WHERE result='started'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(DateTime::parse_from_rfc3339(&expiry).unwrap(), deadline);
+            let mut expired = session.clone();
+            expired.expires_at = Utc::now() - Duration::seconds(1);
+            assert!(validate_live(&db, &requester(), &attempt, &binding, &expired).is_err());
+        }
+    }
+
+    #[test]
+    fn concurrent_reservations_allow_only_one_attempt_per_grant_or_target() {
+        use std::sync::{Arc, Barrier};
+        for same_grant in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("grants.db");
+            db().backup(rusqlite::DatabaseName::Main, &path, None)
+                .unwrap();
+            let db = Connection::open(&path).unwrap();
+            let binding = binding();
+            let session = session();
+            let first = issue_with_session(&db, &binding, binding.expires_at, &session).unwrap();
+            let mut other_binding = binding.clone();
+            // Different named operations still share the destination reservation.
+            other_binding.operation = "other-operation".into();
+            let second = if same_grant {
+                first.clone()
+            } else {
+                issue_with_session(&db, &other_binding, other_binding.expires_at, &session).unwrap()
+            };
+            let barrier = Arc::new(Barrier::new(2));
+            let workers: Vec<_> = [first.grant_id, second.grant_id]
+                .into_iter()
+                .enumerate()
+                .map(|(index, id)| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    let binding = if !same_grant && index == 1 {
+                        other_binding.clone()
+                    } else {
+                        binding.clone()
+                    };
+                    let session = session.clone();
+                    std::thread::spawn(move || {
+                        let db = Connection::open(path).unwrap();
+                        db.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+                        barrier.wait();
+                        reserve_with_session(&db, &requester(), &id, &binding, &session).is_ok()
+                    })
+                })
+                .collect();
+            let succeeded = workers
+                .into_iter()
+                .map(|worker| usize::from(worker.join().unwrap()))
+                .sum::<usize>();
+            assert_eq!(succeeded, 1);
+            let attempts: i64 = db
+                .query_row("SELECT COUNT(*) FROM operation_attempts", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            let started: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM operation_audit WHERE result='started'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!((attempts, started), (1, 1));
+        }
+    }
 }
