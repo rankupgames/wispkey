@@ -17,6 +17,7 @@ use std::{
 
 const SECRET: &str = "synthetic-cloud-secret-canary";
 const SESSION: &str = "synthetic-session-canary";
+const SECOND_SESSION: &str = "synthetic-second-session-canary";
 
 fn hash(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
@@ -27,6 +28,7 @@ fn hash(bytes: &[u8]) -> String {
 }
 
 struct Record {
+    owner: &'static str,
     metadata: Value,
     bytes: Vec<u8>,
 }
@@ -87,7 +89,10 @@ impl Server {
         }
     }
     fn configure(&self, path: &Path) {
-        write_private_test_file(&path.join("cloud.json"), &json!({"api_url":self.url,"clerk_session_token":SESSION,"user_id":"fixture-account","org_id":null,"tier":"Cloud","last_sync":null}).to_string());
+        self.configure_account(path, "fixture-account", SESSION);
+    }
+    fn configure_account(&self, path: &Path, account: &str, session: &str) {
+        write_private_test_file(&path.join("cloud.json"), &json!({"api_url":self.url,"clerk_session_token":session,"user_id":account,"org_id":null,"tier":"Cloud","last_sync":null}).to_string());
     }
 }
 impl Drop for Server {
@@ -116,9 +121,15 @@ async fn handle(
         .map_err(std::io::Error::other)?
         .to_bytes();
     let mut state = state.lock().unwrap();
-    if state.expired
-        || headers.get("authorization").map(String::as_str) != Some(&format!("Bearer {SESSION}"))
-    {
+    let authorization = headers.get("authorization").map(String::as_str);
+    let owner = if authorization == Some(format!("Bearer {SESSION}").as_str()) {
+        Some("fixture-account")
+    } else if authorization == Some(format!("Bearer {SECOND_SESSION}").as_str()) {
+        Some("second-account")
+    } else {
+        None
+    };
+    if state.expired || owner.is_none() {
         return reply(
             401,
             &json!({"error":format!("{SECRET} {SESSION}")})
@@ -127,10 +138,12 @@ async fn handle(
             None,
         );
     }
+    let owner = owner.unwrap();
     if path == "/api/v1/partitions" {
         let rows: Vec<_> = state
             .records
             .values()
+            .filter(|record| record.owner == owner)
             .map(|record| record.metadata.clone())
             .collect();
         return reply(200, &json!({"data":rows}).to_string().into_bytes(), None);
@@ -141,6 +154,13 @@ async fn handle(
         .next()
         .unwrap()
         .to_owned();
+    if state
+        .records
+        .get(&id)
+        .is_some_and(|record| record.owner != owner)
+    {
+        return reply(404, b"missing", None);
+    }
     if path.ends_with("/payload")
         && let Some(callback) = state.before_download.take()
     {
@@ -178,6 +198,7 @@ async fn handle(
         state.records.insert(
             id,
             Record {
+                owner,
                 metadata: metadata.clone(),
                 bytes,
             },
@@ -280,6 +301,47 @@ fn decrypted_cloud_secret_child() {
         hash(&bytes) == std::env::var("WK_EXPECTED_HASH").unwrap(),
         "decrypted secret digest differs"
     );
+}
+
+#[test]
+fn different_accounts_can_sync_the_same_project_and_partition_names() {
+    let server = Server::new();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let first_reader = tempfile::tempdir().unwrap();
+    let second_reader = tempfile::tempdir().unwrap();
+    for dir in [&first, &first_reader] {
+        init_vault(dir.path());
+        server.configure(dir.path());
+    }
+    for dir in [&second, &second_reader] {
+        init_vault(dir.path());
+        server.configure_account(dir.path(), "second-account", SECOND_SESSION);
+    }
+    add(first.path(), "same-key", SECRET, "personal");
+    add(
+        second.path(),
+        "same-key",
+        "synthetic-second-account-value",
+        "personal",
+    );
+    transfer(first.path(), "push");
+    transfer(second.path(), "push");
+    assert_eq!(server.state.lock().unwrap().records.len(), 2);
+    transfer(first_reader.path(), "pull");
+    transfer(second_reader.path(), "pull");
+    verify_secret(first_reader.path(), "same-key", SECRET);
+    verify_secret(
+        second_reader.path(),
+        "same-key",
+        "synthetic-second-account-value",
+    );
+    for dir in [&first, &second] {
+        let report = status(dir.path());
+        assert_eq!(report["tracked_partitions"], 1);
+        assert_eq!(report["partitions"][0]["local_changes_pending"], false);
+        assert_eq!(report["partitions"][0]["remote_changes_pending"], false);
+    }
 }
 
 #[test]

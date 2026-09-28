@@ -270,7 +270,9 @@ impl CloudClient {
         project: &str,
         partition: &str,
     ) -> CloudResult<PartitionState> {
-        let id = digest(format!("wispkey-partition-v1\0{project}\0{partition}").as_bytes());
+        let scope = self.scope_prefix()?;
+        let id =
+            digest(format!("wispkey-partition-v1\0{scope}\0{project}\0{partition}").as_bytes());
         let value: Option<String> = vault
             .db()
             .query_row(
