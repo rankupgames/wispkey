@@ -236,3 +236,33 @@ fn print_cloud_error(error: &CloudError) {
         other => eprintln!("Error: {}", other),
     }
 }
+
+/// Explicit foreground opt-in; no environment passphrase fallback or enrollment.
+#[cfg(feature = "experimental-sync")]
+pub async fn handle_cloud_watch(partition: &str, passphrase_file: &str, seconds: u64) {
+    let contents =
+        crate::secure_files::read_private_string(std::path::Path::new(passphrase_file), 16 * 1024)
+            .map(zeroize::Zeroizing::new)
+            .unwrap_or_else(|_| {
+                eprintln!("Error: watch_passphrase_file_unavailable");
+                std::process::exit(1)
+            });
+    let passphrase = zeroize::Zeroizing::new(contents.trim_end_matches(['\n', '\r']).to_owned());
+    if passphrase.chars().count() < 12 {
+        drop(passphrase);
+        drop(contents);
+        eprintln!("Error: watch_passphrase_too_short");
+        std::process::exit(1);
+    }
+    let result = cloud::watch::watch_partition(partition, &passphrase, seconds).await;
+    // Ensure passphrase buffers are wiped before any process::exit path.
+    drop(passphrase);
+    drop(contents);
+    match result {
+        Ok(report) => print_json(serde_json::json!({"ok":true,"watch":report})),
+        Err(error) => {
+            print_cloud_error(&error);
+            std::process::exit(1);
+        }
+    }
+}

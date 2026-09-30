@@ -165,3 +165,7 @@ a Worker.
 The optional `experimental-sync` feature compiles a metadata-only scheduler contract.
 It does not enable automatic sync or enroll devices. See
 [the contract and remaining activation gates](realtime-sync-coordinator.md).
+
+Experimental builds can opt into a time-bounded owner-run polling session with
+[`cloud watch`](foreground-sync-watch.md) after manual pairing. This is distinct
+from device enrollment and is unavailable in default builds.

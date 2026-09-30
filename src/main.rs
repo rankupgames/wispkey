@@ -1058,6 +1058,15 @@ enum InstanceScopeCommands {
 
 #[derive(Subcommand)]
 enum CloudCommands {
+    /// Bounded foreground polling of an already manually paired partition
+    #[cfg(feature = "experimental-sync")]
+    Watch {
+        partition: String,
+        #[arg(long)]
+        bundle_passphrase_file: String,
+        #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u64).range(1..=3600))]
+        for_seconds: u64,
+    },
     /// Show local sync state; --remote also checks the authenticated backend
     Status {
         #[arg(long)]
@@ -1797,6 +1806,19 @@ async fn main() {
 
 async fn dispatch_cloud(command: CloudCommands) {
     match command {
+        #[cfg(feature = "experimental-sync")]
+        CloudCommands::Watch {
+            partition,
+            bundle_passphrase_file,
+            for_seconds,
+        } => {
+            Box::pin(cli::handle_cloud_watch(
+                &partition,
+                &bundle_passphrase_file,
+                for_seconds,
+            ))
+            .await
+        }
         CloudCommands::Recover {
             path,
             bundle_passphrase_file,

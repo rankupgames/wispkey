@@ -4,10 +4,10 @@ This is a scheduling foundation for [#48](https://github.com/rankupgames/wispkey
 with fail-closed admission states for the future
 [access policy](https://github.com/rankupgames/wispkey/issues/49) and
 [device enrollment](https://github.com/rankupgames/wispkey-cloud/issues/5) adapters.
-It is **not an automatic synchronization feature**. Compile the metadata-only
-module with `--features experimental-sync`; default builds exclude it. No CLI,
-proxy, MCP, daemon or existing sync path calls it. Compiling the feature does not
-enable network activity or authorize any device.
+The coordinator itself is a metadata-only module behind `--features experimental-sync`;
+default builds exclude it. The separately documented foreground watch is its first
+CLI caller. Compiling the feature does not start a daemon, enable network activity
+or authorize any device. Enrolled-device background synchronization remains unimplemented.
 
 ## Implemented contract
 
@@ -72,7 +72,8 @@ not proof of enrollment. Restoring metadata never restores an approval.
 
 ## Remaining acceptance criteria
 
-This slice does not complete #48, #49 or Cloud #5. Outstanding work includes:
+The coordinator and foreground adapter do not complete #48, #49 or Cloud #5.
+Outstanding enrolled-device/background work includes:
 
 1. Review ring policy names, defaults, format, shared enforcement, one-use step-up,
    and the freshness budget; no ring names or grant semantics are finalized here
@@ -98,3 +99,10 @@ versions, 10,000 coalesced hints, duplicate/reordered events, lost notifications
 restart and interrupted attempts, bounded backoff, conflicts and revoked admission
 at completion. These are coordinator tests, not two-device runtime tests. Existing
 cloud, auth release, sharing and backup suites remain the integration baseline.
+
+## First runtime adapter
+
+The optional [foreground watch](foreground-sync-watch.md) adapter uses this
+coordinator with existing manually paired owner vaults and conditional encrypted
+snapshot APIs. It adds bounded polling and live session/scope checks. It does not
+implement the enrolled-device/ring/background-activation gates described above.

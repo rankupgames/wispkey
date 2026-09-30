@@ -36,10 +36,12 @@ struct Record {
 struct ServerState {
     records: BTreeMap<String, Record>,
     uploads: Vec<Value>,
+    requests: Vec<(String, String)>,
     lose_ack: bool,
     expired: bool,
     corrupt: bool,
     before_download: Option<Box<dyn FnOnce() + Send>>,
+    before_upload_ack: Option<Box<dyn FnOnce() + Send>>,
 }
 struct Server {
     url: String,
@@ -121,6 +123,7 @@ async fn handle(
         .map_err(std::io::Error::other)?
         .to_bytes();
     let mut state = state.lock().unwrap();
+    state.requests.push((method.clone(), path.clone()));
     let authorization = headers.get("authorization").map(String::as_str);
     let owner = if authorization == Some(format!("Bearer {SESSION}").as_str()) {
         Some("fixture-account")
@@ -139,6 +142,15 @@ async fn handle(
         );
     }
     let owner = owner.unwrap();
+    if path == "/api/v1/billing/status" {
+        return reply(
+            200,
+            &json!({"data":{"clerkUserId":owner,"sessionClaims":{"plan":"cloud","features":["cloud_sync"]}}})
+                .to_string()
+                .into_bytes(),
+            None,
+        );
+    }
     if path == "/api/v1/partitions" {
         let rows: Vec<_> = state
             .records
@@ -203,6 +215,9 @@ async fn handle(
                 bytes,
             },
         );
+        if let Some(callback) = state.before_upload_ack.take() {
+            callback();
+        }
         if state.lose_ack {
             state.lose_ack = false;
             return Err(std::io::Error::other("synthetic lost acknowledgement"));
@@ -793,4 +808,769 @@ fn registered_auth_roundtrip_preserves_revocation_and_final_deletion() {
     );
     let empty = run_wispkey_json(destination.path(), &["--format", "json", "auth", "list"]);
     assert!(empty["credentials"].as_array().unwrap().is_empty());
+}
+
+#[cfg(not(feature = "experimental-sync"))]
+#[test]
+fn foreground_watch_is_unavailable_without_experimental_feature() {
+    let dir = tempfile::tempdir().unwrap();
+    let output = run_wispkey(
+        dir.path(),
+        &["cloud", "watch", "personal", "--for-seconds", "1"],
+    );
+    assert!(!output.status.success());
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostic.contains("unrecognized subcommand") || diagnostic.contains("experimental-sync")
+    );
+    assert!(!dir.path().join("vault.db").exists());
+}
+
+#[cfg(feature = "experimental-sync")]
+mod foreground_watch {
+    use super::*;
+    use std::process::{Command, Output, Stdio};
+    use std::time::Instant;
+
+    fn command(path: &Path, args: &[&str]) -> Command {
+        let mut command = wispkey_bin();
+        command
+            .args(args)
+            .env("WISPKEY_VAULT_PATH", path)
+            // Intentionally present: watch must never use this to unlock a vault.
+            .env("WISPKEY_PASSWORD", "test-password")
+            .env("WISPKEY_PROTECTOR", "file")
+            .env_remove("WISPKEY_BUNDLE_PASSPHRASE")
+            .env_remove("WISPKEY_PROJECT")
+            .env_remove("WISPKEY_SESSION_TIMEOUT")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn initialize(server: &Server, path: &Path) {
+        let output = command(path, &["init"]).output().unwrap();
+        assert_success(&output);
+        server.configure(path);
+        write_private_test_file(&path.join("watch-passphrase"), TEST_BUNDLE_PASSPHRASE);
+    }
+
+    fn watch_command(path: &Path, seconds: &str) -> Command {
+        command(
+            path,
+            &[
+                "--format",
+                "json",
+                "cloud",
+                "watch",
+                "personal",
+                "--bundle-passphrase-file",
+                path.join("watch-passphrase").to_str().unwrap(),
+                "--for-seconds",
+                seconds,
+            ],
+        )
+    }
+
+    fn finish(child: &mut ChildGuard) -> Output {
+        let status = wait_for_child_exit(&mut child.0, Duration::from_secs(20))
+            .expect("bounded foreground watch failed to terminate");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        child
+            .0
+            .stdout
+            .take()
+            .unwrap()
+            .read_to_end(&mut stdout)
+            .unwrap();
+        child
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_end(&mut stderr)
+            .unwrap();
+        Output {
+            status,
+            stdout,
+            stderr,
+        }
+    }
+
+    fn watch(path: &Path) -> Output {
+        let mut child = ChildGuard(watch_command(path, "5").spawn().unwrap());
+        finish(&mut child)
+    }
+
+    fn assert_success(output: &Output) {
+        assert!(
+            output.status.success(),
+            "command failed\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_redacted(output);
+    }
+
+    fn assert_redacted(output: &Output) {
+        for bytes in [&output.stdout, &output.stderr] {
+            let text = String::from_utf8_lossy(bytes);
+            for secret in [
+                SECRET,
+                SESSION,
+                SECOND_SESSION,
+                "test-password",
+                TEST_BUNDLE_PASSPHRASE,
+            ] {
+                assert!(
+                    !text.contains(secret),
+                    "watch output disclosed synthetic secret material"
+                );
+            }
+        }
+    }
+
+    fn journal(path: &Path) -> Value {
+        let db = rusqlite::Connection::open(path.join("vault.db")).unwrap();
+        let raw: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key LIKE 'cloud_sync_v1:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    }
+
+    fn tracked_pair() -> (Server, tempfile::TempDir, tempfile::TempDir) {
+        let server = Server::new();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for dir in [&first, &second] {
+            initialize(&server, dir.path());
+        }
+        add(first.path(), "base-key", SECRET, "personal");
+        transfer(first.path(), "push");
+        transfer(second.path(), "pull");
+        (server, first, second)
+    }
+
+    #[test]
+    fn two_clients_propagate_encrypted_edits_deletions_and_auth_revocation() {
+        let (server, first, second) = tracked_pair();
+        add(first.path(), "cloud-auth", SECRET, "personal");
+        run_wispkey_json(
+            first.path(),
+            &[
+                "--format",
+                "json",
+                "auth",
+                "register",
+                "cloud-auth",
+                "--project",
+                "default",
+                "--provider",
+                "synthetic-provider",
+                "--account",
+                "synthetic-account",
+                "--origin",
+                "https://api.example.test",
+                "--provider-expiry",
+                "non-expiring",
+                "--use-until",
+                "2099-01-01T00:00:00Z",
+            ],
+        );
+        let original_token = run_wispkey_json(
+            first.path(),
+            &["--format", "json", "get", "base-key", "--show-token"],
+        )["credential"]["wisp_token"]
+            .clone();
+        let rotated = run_wispkey_json(first.path(), &[
+            "--format", "json", "rotate", "base-key",
+        ])["wisp_token"].clone();
+        assert_ne!(rotated, original_token);
+        assert_success(&watch(first.path()));
+        assert_success(&watch(second.path()));
+        assert_eq!(
+            run_wispkey_json(
+                second.path(),
+                &["--format", "json", "get", "base-key", "--show-token",]
+            )["credential"]["wisp_token"],
+            rotated
+        );
+        verify_secret(second.path(), "base-key", SECRET);
+        verify_secret(second.path(), "cloud-auth", SECRET);
+
+        run_wispkey_json(second.path(), &["--format", "json", "remove", "base-key"]);
+        run_wispkey_json(
+            second.path(),
+            &[
+                "--format",
+                "json",
+                "auth",
+                "revoke",
+                "cloud-auth",
+                "--project",
+                "default",
+            ],
+        );
+        assert_success(&watch(second.path()));
+        assert_success(&watch(first.path()));
+        let first_auth = run_wispkey_json(first.path(), &["--format", "json", "auth", "list"]);
+        let second_auth = run_wispkey_json(second.path(), &["--format", "json", "auth", "list"]);
+        assert_eq!(first_auth, second_auth);
+        assert!(!first_auth["credentials"][0]["auth"]["revoked_at"].is_null());
+        assert_eq!(credential_names(&first_auth), vec!["cloud-auth"]);
+        for dir in [&first, &second] {
+            let output = command(
+                dir.path(),
+                &["exec", "--credential", "cloud-auth", "--stdin", "--"],
+            )
+            .arg(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "decrypted_cloud_secret_child"])
+            .env("WK_EXPECTED_HASH", hash(format!("{SECRET}\n").as_bytes()))
+            .output()
+            .unwrap();
+            assert!(!output.status.success(), "revoked credential was released");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .to_lowercase()
+                    .contains("revok")
+            );
+            assert_redacted(&output);
+        }
+        for record in server.state.lock().unwrap().records.values() {
+            assert!(record.bytes.starts_with(b"WKCS"));
+            assert!(
+                !record
+                    .bytes
+                    .windows(SECRET.len())
+                    .any(|bytes| bytes == SECRET.as_bytes())
+            );
+        }
+        for dir in [&first, &second] {
+            let report = status(dir.path());
+            assert_eq!(report["partitions"][0]["local_changes_pending"], false);
+            assert_eq!(report["partitions"][0]["remote_changes_pending"], false);
+        }
+    }
+
+    #[test]
+    fn simultaneous_watches_propagate_an_edit_before_either_process_exits() {
+        let (server, first, second) = tracked_pair();
+        let requests_before = server.state.lock().unwrap().requests.len();
+        // Exercise live propagation without imposing an unsupported seven-second
+        // latency promise on two Argon2 transfers under parallel-test CPU pressure.
+        let mut first_watch = ChildGuard(watch_command(first.path(), "30").spawn().unwrap());
+        let mut second_watch = ChildGuard(watch_command(second.path(), "30").spawn().unwrap());
+        let startup_deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let verified_accounts = server.state.lock().unwrap().requests[requests_before..]
+                .iter()
+                .filter(|(method, path)| method == "GET" && path == "/api/v1/billing/status")
+                .count();
+            if verified_accounts == 2 {
+                break;
+            }
+            assert!(
+                Instant::now() < startup_deadline,
+                "both watches did not verify their account"
+            );
+            assert!(
+                first_watch.0.try_wait().unwrap().is_none(),
+                "first watch exited during startup"
+            );
+            assert!(
+                second_watch.0.try_wait().unwrap().is_none(),
+                "second watch exited during startup"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        add(first.path(), "live-edit", "synthetic-live-edit", "personal");
+        let propagation_started = Instant::now();
+        let deadline = propagation_started + Duration::from_secs(20);
+        let destination = rusqlite::Connection::open(second.path().join("vault.db")).unwrap();
+        let mut committed_after = None;
+        let expected_revision = loop {
+            let count: i64 = destination
+                .query_row(
+                    "SELECT COUNT(*) FROM credentials WHERE name = 'live-edit'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            if count == 1 {
+                if committed_after.is_none() {
+                    committed_after = Some(propagation_started.elapsed());
+                    // Numeric milliseconds only; never log credential material.
+                    eprintln!("{}", committed_after.unwrap().as_millis());
+                }
+                let expected_revision = {
+                    let state = server.state.lock().unwrap();
+                    assert_eq!(state.uploads.len(), 2, "live edit caused repeated uploads");
+                    state.records.values().next().unwrap().metadata["revision"].clone()
+                };
+                if journal(second.path())["revision"] == expected_revision {
+                    break expected_revision;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "concurrent reader never received the live edit"
+            );
+            assert!(
+                first_watch.0.try_wait().unwrap().is_none(),
+                "writer stopped before propagation"
+            );
+            assert!(
+                second_watch.0.try_wait().unwrap().is_none(),
+                "reader stopped before propagation"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            first_watch.0.try_wait().unwrap().is_none(),
+            "writer exited before the live assertion"
+        );
+        assert!(
+            second_watch.0.try_wait().unwrap().is_none(),
+            "reader exited before the live assertion"
+        );
+        assert_eq!(journal(second.path())["revision"], expected_revision);
+        verify_secret(second.path(), "live-edit", "synthetic-live-edit");
+        // The normal finish helper has a shorter timeout than these watch runs.
+        // Await both bounded exits before collecting their output with that helper.
+        wait_for_child_exit(&mut first_watch.0, Duration::from_secs(35))
+            .expect("writer did not finish its bounded watch");
+        wait_for_child_exit(&mut second_watch.0, Duration::from_secs(35))
+            .expect("reader did not finish its bounded watch");
+        assert_success(&finish(&mut first_watch));
+        assert_success(&finish(&mut second_watch));
+        assert_eq!(server.state.lock().unwrap().uploads.len(), 2);
+    }
+
+    #[test]
+    fn polling_uploads_an_edit_made_after_watch_started() {
+        let (server, first, _second) = tracked_pair();
+        let (requests_before, uploads_before) = {
+            let state = server.state.lock().unwrap();
+            (state.requests.len(), state.uploads.len())
+        };
+        let mut child = ChildGuard(watch_command(first.path(), "5").spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let reached_first_poll = server.state.lock().unwrap().requests[requests_before..]
+                .iter()
+                .any(|(method, path)| method == "GET" && path.starts_with("/api/v1/partitions/"));
+            if reached_first_poll {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watch did not poll the acknowledged partition"
+            );
+            assert!(
+                child.0.try_wait().unwrap().is_none(),
+                "watch exited before its first poll"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        add(
+            first.path(),
+            "while-watching",
+            "synthetic-later-edit",
+            "personal",
+        );
+        assert_success(&finish(&mut child));
+        let state = server.state.lock().unwrap();
+        assert_eq!(
+            state.uploads.len(),
+            uploads_before + 1,
+            "periodic watch missed the later edit"
+        );
+        assert!(
+            state.requests[requests_before..]
+                .iter()
+                .filter(|(method, path)| method == "GET" && path.starts_with("/api/v1/partitions/"))
+                .count()
+                >= 2,
+            "watch never performed a later poll"
+        );
+    }
+
+    #[test]
+    fn locked_watch_never_uses_password_environment_to_unlock_or_contact_cloud() {
+        let (server, first, _second) = tracked_pair();
+        assert_success(&command(first.path(), &["lock"]).output().unwrap());
+        let before = server.state.lock().unwrap().requests.len();
+        let output = watch(first.path());
+        assert!(!output.status.success());
+        assert_redacted(&output);
+        assert!(
+            !first.path().join("session").exists(),
+            "watch reminted a revoked session"
+        );
+        assert_eq!(server.state.lock().unwrap().requests.len(), before);
+    }
+
+    #[test]
+    fn untracked_partition_requires_a_manually_acknowledged_baseline() {
+        let server = Server::new();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        for dir in [&first, &second] {
+            initialize(&server, dir.path());
+        }
+        add(first.path(), "remote-only", SECRET, "personal");
+        transfer(first.path(), "push");
+        let before = server.state.lock().unwrap().requests.len();
+        let output = watch(second.path());
+        assert!(!output.status.success());
+        assert_redacted(&output);
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .to_lowercase();
+        assert!(
+            diagnostic.contains("manual")
+                || diagnostic.contains("acknowledg")
+                || diagnostic.contains("untracked"),
+            "missing first-use guidance: {diagnostic}"
+        );
+        assert!(
+            credential_names(&run_wispkey_json(
+                second.path(),
+                &["--format", "json", "list"]
+            ))
+            .is_empty()
+        );
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.uploads.len(), 1);
+        assert!(
+            !state.requests[before..]
+                .iter()
+                .any(|(method, path)| method == "PUT" || path.ends_with("/payload"))
+        );
+    }
+
+    #[test]
+    fn watch_requires_a_protected_passphrase_file_and_bounded_duration() {
+        let (server, first, _second) = tracked_pair();
+        let before = server.state.lock().unwrap().requests.len();
+        let output = command(
+            first.path(),
+            &["cloud", "watch", "personal", "--for-seconds", "1"],
+        )
+        .env("WISPKEY_BUNDLE_PASSPHRASE", TEST_BUNDLE_PASSPHRASE)
+        .output()
+        .unwrap();
+        assert!(
+            !output.status.success(),
+            "watch accepted environment-only bundle credentials"
+        );
+        assert_redacted(&output);
+        for invalid in ["0", "3601"] {
+            let output = watch_command(first.path(), invalid).output().unwrap();
+            assert!(
+                !output.status.success(),
+                "watch accepted an out-of-range duration"
+            );
+            assert_redacted(&output);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(
+                first.path().join("watch-passphrase"),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            let output = watch(first.path());
+            assert!(
+                !output.status.success(),
+                "watch accepted a public passphrase file"
+            );
+            assert_redacted(&output);
+        }
+        assert_eq!(server.state.lock().unwrap().requests.len(), before);
+    }
+
+    #[test]
+    fn watch_rejects_an_unbounded_vault_session() {
+        let (server, first, _second) = tracked_pair();
+        assert_success(
+            &command(first.path(), &["unlock", "--timeout", "0"])
+                .output()
+                .unwrap(),
+        );
+        let before = server.state.lock().unwrap().requests.len();
+        let output = watch(first.path());
+        assert!(
+            !output.status.success(),
+            "watch accepted a session with no expiry"
+        );
+        assert_redacted(&output);
+        assert_eq!(server.state.lock().unwrap().requests.len(), before);
+    }
+
+    #[test]
+    fn concurrent_edits_remain_visible_and_neither_side_is_overwritten() {
+        let (server, first, second) = tracked_pair();
+        add(
+            first.path(),
+            "remote-change",
+            "synthetic-remote-change",
+            "personal",
+        );
+        add(
+            second.path(),
+            "local-change",
+            "synthetic-local-change",
+            "personal",
+        );
+        assert_success(&watch(first.path()));
+        let uploads = server.state.lock().unwrap().uploads.len();
+        let before = journal(second.path());
+        let output = watch(second.path());
+        assert!(
+            !output.status.success(),
+            "conflicting watch claimed success"
+        );
+        assert_redacted(&output);
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+        .to_lowercase();
+        assert!(
+            diagnostic.contains("conflict"),
+            "watch hid the conflict: {diagnostic}"
+        );
+        assert_eq!(status(second.path())["partitions"][0]["conflict"], true);
+        assert_eq!(journal(second.path())["revision"], before["revision"]);
+        assert_eq!(server.state.lock().unwrap().uploads.len(), uploads);
+        verify_secret(second.path(), "local-change", "synthetic-local-change");
+        verify_secret(first.path(), "remote-change", "synthetic-remote-change");
+        assert!(
+            !run_wispkey(second.path(), &["get", "remote-change"])
+                .status
+                .success()
+        );
+        assert!(
+            !run_wispkey(first.path(), &["get", "local-change"])
+                .status
+                .success()
+        );
+    }
+
+    fn rejects_changed_authority_before_import(change: &'static str) {
+        let (server, first, second) = tracked_pair();
+        add(
+            first.path(),
+            "remote-change",
+            "synthetic-remote-change",
+            "personal",
+        );
+        transfer(first.path(), "push");
+        let before = journal(second.path());
+        let destination = second.path().to_path_buf();
+        let url = server.url.clone();
+        let callback_ran = Arc::new(AtomicBool::new(false));
+        let callback_marker = callback_ran.clone();
+        server.state.lock().unwrap().before_download = Some(Box::new(move || {
+            match change {
+                "lock" => assert_success(&command(&destination, &["lock"]).output().unwrap()),
+                "account" => write_private_test_file(&destination.join("cloud.json"), &json!({
+                    "api_url":url,"clerk_session_token":SECOND_SESSION,"user_id":"second-account",
+                    "org_id":null,"tier":"Cloud","last_sync":null,
+                }).to_string()),
+                "project" => {
+                    assert_success(&command(&destination, &["project", "create", "isolated"]).output().unwrap());
+                    assert_success(&command(&destination, &["project", "use", "isolated"]).output().unwrap());
+                }
+                "session" => assert_success(&command(&destination, &["unlock", "--timeout", "30"]).output().unwrap()),
+                _ => unreachable!(),
+            }
+            callback_marker.store(true, Ordering::SeqCst);
+        }));
+        // Authority rejection is the event under test, not a short transfer deadline.
+        // In particular, renewing a session performs Argon2 work inside the callback;
+        // let it finish even when other crypto-heavy tests are running in parallel.
+        let mut child = ChildGuard(watch_command(second.path(), "30").spawn().unwrap());
+        let output = finish(&mut child);
+        assert!(
+            callback_ran.load(Ordering::SeqCst),
+            "download guard fixture was not exercised"
+        );
+        assert!(
+            !output.status.success(),
+            "watch accepted changed {change} authority"
+        );
+        assert_redacted(&output);
+        if change == "lock" {
+            assert!(
+                !second.path().join("session").exists(),
+                "watch unlocked after explicit lock"
+            );
+            assert_success(
+                &command(second.path(), &["unlock", "--timeout", "30"])
+                    .output()
+                    .unwrap(),
+            );
+        }
+        let after = journal(second.path());
+        for field in ["revision", "local_hash", "last_success"] {
+            assert_eq!(
+                after[field], before[field],
+                "watch acknowledged remote data after {change}"
+            );
+        }
+        let list = run_wispkey_json(
+            second.path(),
+            &["--format", "json", "list", "--project", "default"],
+        );
+        assert_eq!(
+            credential_names(&list),
+            vec!["base-key"],
+            "watch imported after {change}"
+        );
+        assert_eq!(server.state.lock().unwrap().uploads.len(), 2);
+    }
+
+    #[test]
+    fn locking_during_download_prevents_import() {
+        rejects_changed_authority_before_import("lock");
+    }
+
+    #[test]
+    fn account_switch_during_download_prevents_import() {
+        rejects_changed_authority_before_import("account");
+    }
+
+    #[test]
+    fn active_project_switch_during_download_prevents_import() {
+        rejects_changed_authority_before_import("project");
+    }
+
+    #[test]
+    fn session_renewal_during_download_prevents_import() {
+        rejects_changed_authority_before_import("session");
+    }
+
+    #[test]
+    fn duration_deadline_cancels_in_flight_download_without_import_or_acknowledgement() {
+        let (server, first, second) = tracked_pair();
+        add(
+            first.path(),
+            "remote-change",
+            "synthetic-remote-change",
+            "personal",
+        );
+        transfer(first.path(), "push");
+        let before = journal(second.path());
+        let download_started = Arc::new(AtomicBool::new(false));
+        let callback_marker = download_started.clone();
+        server.state.lock().unwrap().before_download = Some(Box::new(move || {
+            callback_marker.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_secs(3));
+        }));
+        let started = Instant::now();
+        let mut child = ChildGuard(watch_command(second.path(), "1").spawn().unwrap());
+        let output = finish(&mut child);
+        assert!(
+            download_started.load(Ordering::SeqCst),
+            "deadline did not interrupt a real download"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(2500),
+            "watch waited beyond its deadline for the stalled download"
+        );
+        assert_redacted(&output);
+        let after = journal(second.path());
+        for field in ["revision", "local_hash", "last_success"] {
+            assert_eq!(
+                after[field], before[field],
+                "deadline incorrectly acknowledged remote data"
+            );
+        }
+        assert_eq!(
+            credential_names(&run_wispkey_json(
+                second.path(),
+                &["--format", "json", "list"]
+            )),
+            vec!["base-key"]
+        );
+    }
+
+    #[test]
+    fn upload_deadline_preserves_pending_ciphertext_for_manual_reconciliation() {
+        let (server, first, _second) = tracked_pair();
+        add(
+            first.path(),
+            "local-edit",
+            "synthetic-local-edit",
+            "personal",
+        );
+        let upload_accepted = Arc::new(AtomicBool::new(false));
+        let callback_marker = upload_accepted.clone();
+        server.state.lock().unwrap().before_upload_ack = Some(Box::new(move || {
+            callback_marker.store(true, Ordering::SeqCst);
+            thread::sleep(Duration::from_secs(6));
+        }));
+        let before = journal(first.path());
+        let stopped = watch(first.path());
+        assert_success(&stopped);
+        assert!(
+            upload_accepted.load(Ordering::SeqCst),
+            "deadline did not interrupt a real upload"
+        );
+        let report: Value = serde_json::from_slice(&stopped.stdout).unwrap();
+        assert_eq!(report["watch"]["stopped"], "duration");
+        assert_eq!(report["watch"]["reconciliation_required"], true);
+        assert_eq!(journal(first.path())["revision"], before["revision"]);
+        assert!(!journal(first.path())["pending"].is_null());
+        let uploads = server.state.lock().unwrap().uploads.len();
+        assert_eq!(uploads, 2, "fixture never accepted the uncertain upload");
+        let rejected = watch(first.path());
+        assert!(
+            !rejected.status.success(),
+            "watch silently enrolled an uncertain baseline"
+        );
+        assert_redacted(&rejected);
+        assert_eq!(server.state.lock().unwrap().uploads.len(), uploads);
+        transfer(first.path(), "push");
+        assert!(journal(first.path())["pending"].is_null());
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.uploads.len(), uploads + 1);
+        assert_eq!(
+            state.uploads[1], state.uploads[2],
+            "manual reconciliation changed uncertain ciphertext"
+        );
+    }
+
+    #[test]
+    fn revoked_cloud_authentication_stops_watch_without_echoing_server_secrets() {
+        let (server, first, _second) = tracked_pair();
+        let before = journal(first.path());
+        let uploads = server.state.lock().unwrap().uploads.len();
+        add(
+            first.path(),
+            "pending-local",
+            "synthetic-pending-local",
+            "personal",
+        );
+        server.state.lock().unwrap().expired = true;
+        let output = watch(first.path());
+        assert!(!output.status.success());
+        assert_redacted(&output);
+        assert_eq!(server.state.lock().unwrap().uploads.len(), uploads);
+        assert_eq!(journal(first.path())["revision"], before["revision"]);
+        verify_secret(first.path(), "pending-local", "synthetic-pending-local");
+    }
 }
