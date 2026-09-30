@@ -159,3 +159,9 @@ stdin to check the decrypted value without printing it; do not run it standalone
 The backend's separate fixtures exercise real local D1/R2 concurrency and the
 existing-schema migration. These tests do not log into production Clerk or deploy
 a Worker.
+
+## Realtime coordinator foundation
+
+The optional `experimental-sync` feature compiles a metadata-only scheduler contract.
+It does not enable automatic sync or enroll devices. See
+[the contract and remaining activation gates](realtime-sync-coordinator.md).

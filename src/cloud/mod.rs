@@ -19,6 +19,8 @@ use thiserror::Error;
 
 use crate::core::{Vault, VaultError};
 use crate::secure_files;
+#[cfg(feature = "experimental-sync")]
+pub mod coordinator;
 mod sync;
 pub use sync::{PartitionState, SyncMode, recover_partition};
 
