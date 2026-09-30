@@ -38,6 +38,57 @@ fn help_flag_shows_commands() {
     assert!(stdout.contains("integrate"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_starts_with_a_bounded_main_stack() {
+    use std::os::unix::process::CommandExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["--help"],
+        vec!["--version"],
+        vec!["add", "--help"],
+        vec!["exec", "--help"],
+        vec!["serve", "--help"],
+        vec!["auth", "bundle", "resolve", "--help"],
+        vec!["init"],
+        vec!["--format", "json", "auth", "list"],
+    ] {
+        let mut command = wispkey_bin();
+        command
+            .args(&args)
+            .env("WISPKEY_VAULT_PATH", dir.path())
+            .env("WISPKEY_PASSWORD", "test-password")
+            .env("WISPKEY_PROTECTOR", "file");
+        // Exercise the real entry point, including Tokio and clap's generated
+        // command tree, below Windows's default 1 MiB main-thread stack. Leave
+        // 128 KiB of headroom for platform-specific stack usage.
+        // SAFETY: the post-fork closure only calls async-signal-safe setrlimit
+        // and reads errno; it does not allocate or acquire locks.
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: 896 * 1024,
+                    rlim_max: 896 * 1024,
+                };
+                if libc::setrlimit(libc::RLIMIT_STACK, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().expect("failed to run wispkey");
+        assert!(
+            output.status.success(),
+            "bounded-stack command {args:?} failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    assert!(dir.path().join("vault.db").exists());
+}
+
 #[test]
 fn status_without_vault_reports_uninitialized() {
     let dir = tempfile::tempdir().unwrap();
