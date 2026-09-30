@@ -24,6 +24,8 @@ path = "src/lib.rs"
 
 [features]
 default = []
+# Scheduling contract only; no background worker or device/key enrollment.
+experimental-sync = []
 vsock = ["dep:tokio-vsock"]
 
 [dependencies]

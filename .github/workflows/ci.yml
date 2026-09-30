@@ -24,9 +24,9 @@ jobs:
         with:
           shared-key: cli-vsock
       - name: Lint feature-enabled CLI and tests
-        run: cargo clippy --locked --all-targets --features vsock -- -D warnings
+        run: cargo clippy --locked --all-targets --features vsock,experimental-sync -- -D warnings
       - name: Feature-enabled tests (no AF_VSOCK device required)
-        run: cargo test --locked --features vsock
+        run: cargo test --locked --features vsock,experimental-sync
 
   tray:
     name: Native tray (${{ matrix.os }})
