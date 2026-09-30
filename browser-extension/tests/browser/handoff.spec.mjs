@@ -117,3 +117,73 @@ test("popup escapes request text and requires profile acknowledgement", async ({
   await expect(page.getByRole("button", { name: "Approve with Windows Hello" })).toBeEnabled();
   await page.screenshot({ path: testInfo.outputPath("popup.png") });
 });
+
+async function deliverSyntheticLogin(page, mutate) {
+  return page.evaluate((mutation) => {
+    const installed = WispKeyFlow.installReceiver("signup", location.origin);
+    if (!installed) return { installed, submissions };
+    let receive;
+    const replies = [];
+    connectFixture({ name: "wispkey-fill-signup", sender: { id: "fixture" },
+      onMessage: { addListener(fn) { receive = fn; } }, postMessage(value) { replies.push(value); } });
+    if (mutation === "replace-username") document.querySelector("#username").replaceWith(document.querySelector("#username").cloneNode());
+    if (mutation === "replace-password") document.querySelector("#password").replaceWith(document.querySelector("#password").cloneNode());
+    if (mutation === "change-destination") document.querySelector("form").action = "/different-signup";
+    if (mutation === "change-purpose") document.querySelector("#username").autocomplete = "email";
+    receive({ origin: location.origin, login: { username: "synthetic@example.test", password: "synthetic-test-password" } });
+    return { installed, replies, submissions };
+  }, mutate);
+}
+
+test("maps a signup identity beside profile and consent fields without changing them", async ({ page }) => {
+  await fixture(page, `<form action="/signup">
+    <input id="given" autocomplete="given-name" value="Existing name">
+    <input id="username" type="text" autocomplete="section-signup work email">
+    <input id="password" type="password" autocomplete="section-signup new-password">
+    <input id="confirm" type="password" autocomplete="section-signup new-password">
+    <input id="otp" autocomplete="one-time-code" value="123456">
+    <input id="terms" type="checkbox"><button>Create account</button>
+  </form>`);
+  expect(await deliverSyntheticLogin(page)).toEqual({ installed: true, replies: [{ ready: true }, { completed: true }], submissions: 0 });
+  await expect(page.locator("#username")).toHaveValue("synthetic@example.test");
+  await expect(page.locator("#password")).toHaveValue("synthetic-test-password");
+  await expect(page.locator("#confirm")).toHaveValue("synthetic-test-password");
+  await expect(page.locator("#given")).toHaveValue("Existing name");
+  await expect(page.locator("#otp")).toHaveValue("123456");
+  await expect(page.locator("#terms")).not.toBeChecked();
+});
+
+test("supports external form-owned identity fields and ignores other form ownership", async ({ page }) => {
+  await fixture(page, `<form id="signup" action="/signup">
+    <input id="unrelated" form="other" autocomplete="username" value="Unrelated">
+    <input id="password" type="password" autocomplete="new-password">
+  </form><form id="other"></form>
+  <input id="username" form="signup" autocomplete="username">`);
+  expect(await deliverSyntheticLogin(page)).toEqual({ installed: true, replies: [{ ready: true }, { completed: true }], submissions: 0 });
+  await expect(page.locator("#username")).toHaveValue("synthetic@example.test");
+  await expect(page.locator("#unrelated")).toHaveValue("Unrelated");
+});
+
+for (const identity of [
+  '<input id="username" autocomplete="one-time-code">',
+  '<input id="username" type="email" autocomplete="one-time-code">',
+  '<input id="username" autocomplete="username email">',
+  '<input id="username" autocomplete="given-name">',
+  '<input id="username" autocomplete="username"><input autocomplete="email">',
+  '<fieldset disabled><input id="username" type="email"></fieldset>',
+]) {
+  test(`refuses unsupported or ambiguous identity mapping: ${identity}`, async ({ page }) => {
+    await fixture(page, `<form action="/signup">${identity}<input id="password" type="password"></form>`);
+    expect(await deliverSyntheticLogin(page)).toEqual({ installed: false, submissions: 0 });
+    await expect(page.locator("#password")).toHaveValue("");
+  });
+}
+
+for (const mutation of ["replace-username", "replace-password", "change-destination", "change-purpose"]) {
+  test(`requires a new request after ${mutation} during approval`, async ({ page }) => {
+    await fixture(page);
+    expect(await deliverSyntheticLogin(page, mutation)).toEqual({ installed: true, replies: [{ ready: true }, { completed: false }], submissions: 0 });
+    await expect(page.locator("#username")).toHaveValue("");
+    await expect(page.locator("#password")).toHaveValue("");
+  });
+}
