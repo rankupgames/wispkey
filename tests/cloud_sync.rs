@@ -1062,9 +1062,11 @@ mod foreground_watch {
     fn simultaneous_watches_propagate_an_edit_before_either_process_exits() {
         let (server, first, second) = tracked_pair();
         let requests_before = server.state.lock().unwrap().requests.len();
-        let mut first_watch = ChildGuard(watch_command(first.path(), "10").spawn().unwrap());
-        let mut second_watch = ChildGuard(watch_command(second.path(), "10").spawn().unwrap());
-        let startup_deadline = Instant::now() + Duration::from_secs(3);
+        // Exercise live propagation without imposing an unsupported seven-second
+        // latency promise on two Argon2 transfers under parallel-test CPU pressure.
+        let mut first_watch = ChildGuard(watch_command(first.path(), "30").spawn().unwrap());
+        let mut second_watch = ChildGuard(watch_command(second.path(), "30").spawn().unwrap());
+        let startup_deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let verified_accounts = server.state.lock().unwrap().requests[requests_before..]
                 .iter()
@@ -1088,9 +1090,11 @@ mod foreground_watch {
             thread::sleep(Duration::from_millis(20));
         }
         add(first.path(), "live-edit", "synthetic-live-edit", "personal");
-        let deadline = Instant::now() + Duration::from_secs(7);
+        let propagation_started = Instant::now();
+        let deadline = propagation_started + Duration::from_secs(20);
         let destination = rusqlite::Connection::open(second.path().join("vault.db")).unwrap();
-        loop {
+        let mut committed_after = None;
+        let expected_revision = loop {
             let count: i64 = destination
                 .query_row(
                     "SELECT COUNT(*) FROM credentials WHERE name = 'live-edit'",
@@ -1099,7 +1103,19 @@ mod foreground_watch {
                 )
                 .unwrap();
             if count == 1 {
-                break;
+                if committed_after.is_none() {
+                    committed_after = Some(propagation_started.elapsed());
+                    // Numeric milliseconds only; never log credential material.
+                    eprintln!("{}", committed_after.unwrap().as_millis());
+                }
+                let expected_revision = {
+                    let state = server.state.lock().unwrap();
+                    assert_eq!(state.uploads.len(), 2, "live edit caused repeated uploads");
+                    state.records.values().next().unwrap().metadata["revision"].clone()
+                };
+                if journal(second.path())["revision"] == expected_revision {
+                    break expected_revision;
+                }
             }
             assert!(
                 Instant::now() < deadline,
@@ -1114,7 +1130,7 @@ mod foreground_watch {
                 "reader stopped before propagation"
             );
             thread::sleep(Duration::from_millis(20));
-        }
+        };
         assert!(
             first_watch.0.try_wait().unwrap().is_none(),
             "writer exited before the live assertion"
@@ -1123,7 +1139,14 @@ mod foreground_watch {
             second_watch.0.try_wait().unwrap().is_none(),
             "reader exited before the live assertion"
         );
+        assert_eq!(journal(second.path())["revision"], expected_revision);
         verify_secret(second.path(), "live-edit", "synthetic-live-edit");
+        // The normal finish helper has a shorter timeout than these watch runs.
+        // Await both bounded exits before collecting their output with that helper.
+        wait_for_child_exit(&mut first_watch.0, Duration::from_secs(35))
+            .expect("writer did not finish its bounded watch");
+        wait_for_child_exit(&mut second_watch.0, Duration::from_secs(35))
+            .expect("reader did not finish its bounded watch");
         assert_success(&finish(&mut first_watch));
         assert_success(&finish(&mut second_watch));
         assert_eq!(server.state.lock().unwrap().uploads.len(), 2);
