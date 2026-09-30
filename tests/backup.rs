@@ -893,3 +893,166 @@ fn backup_excluding_credentials_omits_dependent_instance_rows() {
     let listed = run_wispkey_json(dest.path(), &["--format", "json", "instance", "list"]);
     assert_eq!(listed["instances"][0]["status"], "needs_reenrollment");
 }
+
+#[test]
+fn backup_auth_registry_roundtrip_stays_revoked_and_merge_conflicts_fail_closed() {
+    let source = tempfile::tempdir().unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let artifacts = tempfile::tempdir().unwrap();
+    let archive = artifacts.path().join("auth.wkbackup");
+    init_vault(source.path());
+    add_named_secret(source.path(), "auth-backup", "synthetic-auth-backup-secret");
+    let registered = run_wispkey_json(
+        source.path(),
+        &[
+            "--format",
+            "json",
+            "auth",
+            "register",
+            "auth-backup",
+            "--project",
+            "default",
+            "--provider",
+            "example",
+            "--account",
+            "production",
+            "--origin",
+            "https://api.example.com",
+            "--provider-expiry",
+            "2000-01-01T00:00:00Z",
+            "--use-until",
+            "2000-01-01T00:00:00Z",
+        ],
+    );
+    let definition = serde_json::json!({
+        "name":"production", "project":"default", "partition":"personal", "account":"production",
+        "alternatives":[{"name":"api", "members":[{"auth_id":registered["auth"]["id"],
+            "revision":registered["auth"]["revision"], "role":"api_key"}]}]
+    });
+    let definition_path = artifacts.path().join("auth.json");
+    std::fs::write(&definition_path, definition.to_string()).unwrap();
+    run_wispkey_json(
+        source.path(),
+        &[
+            "--format",
+            "json",
+            "auth",
+            "bundle",
+            "set",
+            "--file",
+            definition_path.to_str().unwrap(),
+        ],
+    );
+    run_wispkey_json(
+        source.path(),
+        &[
+            "--format",
+            "json",
+            "auth",
+            "revoke",
+            "auth-backup",
+            "--project",
+            "default",
+        ],
+    );
+    let source_db = Connection::open(source.path().join("vault.db")).unwrap();
+    let expected: (String, String, String) = source_db.query_row(
+        "SELECT a.metadata_json,c.encrypted_value,b.bundle_json FROM auth_registry a JOIN credentials c ON c.id=a.credential_id JOIN auth_bundles b ON b.partition_id=c.partition_id", [],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).unwrap();
+    drop(source_db);
+    assert!(expected.1.starts_with("wka1:"));
+    let created = create_backup(source.path(), archive.to_str().unwrap());
+    assert_eq!(created["format_version"], 2);
+    assert_eq!(created["counts"]["auth_records"], 1);
+    assert_eq!(created["counts"]["auth_bundles"], 1);
+    let verified = run_wispkey_bundle_json(
+        source.path(),
+        &[
+            "--format",
+            "json",
+            "backup",
+            "verify",
+            archive.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(verified["ok"], true);
+    run_wispkey_bundle_json(
+        source.path(),
+        &[
+            "--format",
+            "json",
+            "backup",
+            "restore",
+            archive.to_str().unwrap(),
+            "--target",
+            target.path().to_str().unwrap(),
+        ],
+    );
+    unlock_vault(target.path());
+    let target_db = Connection::open(target.path().join("vault.db")).unwrap();
+    let actual: (String, String, String) = target_db.query_row(
+        "SELECT a.metadata_json,c.encrypted_value,b.bundle_json FROM auth_registry a JOIN credentials c ON c.id=a.credential_id JOIN auth_bundles b ON b.partition_id=c.partition_id", [],
+        |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?)),
+    ).unwrap();
+    assert_eq!(actual, expected);
+    let denied = run_wispkey(
+        target.path(),
+        &[
+            "--format",
+            "json",
+            "auth",
+            "bundle",
+            "resolve",
+            "production",
+            "--project",
+            "default",
+            "--partition",
+            "personal",
+            "--account",
+            "production",
+            "--alternative",
+            "api",
+            "--origin",
+            "https://api.example.com",
+        ],
+    );
+    assert!(!denied.status.success());
+    assert!(denied.stdout.is_empty());
+    let input = artifacts.path().join("template.txt");
+    std::fs::write(&input, "{{ cred:auth-backup }}").unwrap();
+    let denied = run_wispkey(
+        target.path(),
+        &["inject", "-i", input.to_str().unwrap(), "--stdout"],
+    );
+    assert!(!denied.status.success());
+    assert!(!String::from_utf8_lossy(&denied.stdout).contains("synthetic-auth-backup-secret"));
+    let mut changed: Value = serde_json::from_str(&expected.0).unwrap();
+    changed["revoked_at"] = Value::Null;
+    let changed = changed.to_string();
+    target_db
+        .execute("UPDATE auth_registry SET metadata_json=?1", [&changed])
+        .unwrap();
+    drop(target_db);
+    let denied = run_wispkey_bundle(
+        source.path(),
+        &[
+            "backup",
+            "restore",
+            archive.to_str().unwrap(),
+            "--target",
+            target.path().to_str().unwrap(),
+            "--on-conflict",
+            "skip",
+        ],
+    );
+    assert!(!denied.status.success());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("auth restore conflict"));
+    let target_db = Connection::open(target.path().join("vault.db")).unwrap();
+    let unchanged: String = target_db
+        .query_row("SELECT metadata_json FROM auth_registry", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(unchanged, changed);
+}

@@ -35,7 +35,10 @@ pub mod transport;
 use lifecycle::{ProxyMetadata, ProxyState, StartDecision};
 use management::{handle_instance_join_api, handle_management_api, json_response};
 use target::{authority_points_to_proxy, target_points_to_proxy};
-use tokens::{TokenRequestContext, inject_tokens_in_value, replace_tokens_in_uri};
+use tokens::{
+    TokenRequestContext, UsedCredential, inject_tokens_in_value, replace_tokens_in_uri,
+    revalidate_tokens_before_forward,
+};
 
 pub(crate) use tokens::prove_synthetic_token_substitution;
 use transport::{BoundTransport, IdentityRequirement, ListenConfig, ListenSpec, ListenerMetadata};
@@ -402,8 +405,12 @@ async fn handle_request(
 
     let mut new_headers = parts.headers.clone();
     let mut new_body = body_bytes.to_vec();
-    let mut used_credentials: Vec<(String, String)> = Vec::new();
+    let mut used_credentials: Vec<UsedCredential> = Vec::new();
+    let target_origin = url::Url::parse(&parts.uri.to_string())
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_default();
     let context = TokenRequestContext {
+        target_origin: &target_origin,
         target_host: &target_host,
         target_path: parts.uri.path(),
         http_method: parts.method.as_str(),
@@ -503,6 +510,12 @@ async fn handle_request(
         }
     };
 
+    if let Err(response) =
+        revalidate_tokens_before_forward(vault.as_ref(), &context, &used_credentials)
+    {
+        return Ok(*response);
+    }
+
     let response = if target_uri.starts_with("https://") {
         runtime.https_client.request(forward_req).await
     } else {
@@ -519,7 +532,12 @@ async fn handle_request(
                 Err(_) => Bytes::new(),
             };
 
-            for (cred_name, token) in &used_credentials {
+            for UsedCredential {
+                name: cred_name,
+                token,
+                ..
+            } in &used_credentials
+            {
                 if let Some(vault) = &vault {
                     audit::log_event(
                         vault.db(),
@@ -550,7 +568,12 @@ async fn handle_request(
                 .expect("response builder with valid parts"))
         }
         Err(e) => {
-            for (cred_name, token) in &used_credentials {
+            for UsedCredential {
+                name: cred_name,
+                token,
+                ..
+            } in &used_credentials
+            {
                 if let Some(vault) = &vault {
                     audit::log_event(
                         vault.db(),
@@ -612,8 +635,12 @@ async fn handle_reverse_proxy(
     let mut new_headers = parts.headers.clone();
     new_headers.remove("x-target-url");
     let mut new_body = body_bytes.to_vec();
-    let mut used_credentials: Vec<(String, String)> = Vec::new();
+    let mut used_credentials: Vec<UsedCredential> = Vec::new();
+    let target_origin = url::Url::parse(target_url)
+        .map(|url| url.origin().ascii_serialization())
+        .unwrap_or_default();
     let context = TokenRequestContext {
+        target_origin: &target_origin,
         target_host: &target_host,
         target_path: target_uri.path(),
         http_method: parts.method.as_str(),
@@ -705,6 +732,12 @@ async fn handle_reverse_proxy(
         }
     };
 
+    if let Err(response) =
+        revalidate_tokens_before_forward(vault.as_ref(), &context, &used_credentials)
+    {
+        return *response;
+    }
+
     match https_client.request(forward_req).await {
         Ok(resp) => {
             let response_status = resp.status().as_u16();
@@ -714,7 +747,12 @@ async fn handle_reverse_proxy(
                 Err(_) => Bytes::new(),
             };
 
-            for (cred_name, token) in &used_credentials {
+            for UsedCredential {
+                name: cred_name,
+                token,
+                ..
+            } in &used_credentials
+            {
                 if let Some(vault) = &vault {
                     audit::log_event(
                         vault.db(),
@@ -744,7 +782,12 @@ async fn handle_reverse_proxy(
                 .expect("response builder with valid parts")
         }
         Err(e) => {
-            for (cred_name, token) in &used_credentials {
+            for UsedCredential {
+                name: cred_name,
+                token,
+                ..
+            } in &used_credentials
+            {
                 if let Some(vault) = &vault {
                     audit::log_event(
                         vault.db(),

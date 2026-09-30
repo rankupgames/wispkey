@@ -978,7 +978,7 @@ fn handle_tool_issue_cert(arguments: &Value) -> Value {
             ));
         }
     };
-    let ca_pem = match vault.decrypt_credential_value_in_project(&active, ca_credential) {
+    let ca_pem = match vault.decrypt_credential_for_delegated_use(&active, ca_credential) {
         Ok(value) => value,
         Err(error) => return tool_error(&format!("failed to read CA credential: {error}")),
     };
@@ -1003,6 +1003,15 @@ fn handle_tool_issue_cert(arguments: &Value) -> Value {
             .is_some_and(|leaf_key| response_contains_secret(leaf_key, &ca_pem))
     {
         return tool_error("refusing to return output that includes CA private key material");
+    }
+
+    // Signing can be slow (especially RSA generation). Do not release a new
+    // capability after the registered CA expires or is locally revoked.
+    if vault
+        .ensure_auth_usable(&credential.id, true, None)
+        .is_err()
+    {
+        return tool_error("CA auth unavailable");
     }
 
     audit::log_event(
@@ -1042,6 +1051,14 @@ fn handle_tool_issue_cert(arguments: &Value) -> Value {
     });
     if let Some(private_key_pem) = issued.private_key_pem {
         body["private_key_pem"] = json!(private_key_pem);
+    }
+
+    // Audit persistence may wait on another writer; recheck at output too.
+    if vault
+        .ensure_auth_usable(&credential.id, true, None)
+        .is_err()
+    {
+        return tool_error("CA auth unavailable");
     }
 
     json!({

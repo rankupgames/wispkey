@@ -9,7 +9,7 @@
 
 mod restore;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 
 use crate::bundle;
+use crate::core::auth::{AuthBundle, AuthMetadata, CIPHERTEXT_PREFIX};
 use crate::core::{CURRENT_SCHEMA_VERSION, Result, Vault, VaultError};
 use crate::secure_files;
 
@@ -32,6 +33,8 @@ pub use restore::{ConflictPolicy, RestoreOptions, RestoreReport, restore_backup}
 
 const VAULT_BACKUP_MAGIC: &[u8; 4] = b"WKVB";
 const BACKUP_FORMAT_VERSION: u32 = 1;
+const AUTH_BACKUP_FORMAT_VERSION: u32 = 2;
+const AUTH_SCHEMA_VERSION: u32 = 14;
 const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 6;
 const MAX_VAULT_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -39,6 +42,8 @@ const TABLE_VAULT_META: &str = "vault_meta";
 const TABLE_PROJECTS: &str = "projects";
 const TABLE_PARTITIONS: &str = "partitions";
 const TABLE_CREDENTIALS: &str = "credentials";
+const TABLE_AUTH_REGISTRY: &str = "auth_registry";
+const TABLE_AUTH_BUNDLES: &str = "auth_bundles";
 const TABLE_AUDIT_LOG: &str = "audit_log";
 const TABLE_OPERATION_AUDIT: &str = "operation_audit";
 const TABLE_INSTANCES: &str = "instances";
@@ -156,6 +161,10 @@ pub struct BackupCounts {
     pub projects: usize,
     pub partitions: usize,
     pub credentials: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub auth_records: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub auth_bundles: usize,
     pub audits: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub operation_audits: usize,
@@ -183,6 +192,10 @@ struct BackupContents {
     partitions: Vec<Map<String, Value>>,
     #[serde(default)]
     credentials: Vec<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    auth_registry: Vec<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    auth_bundles: Vec<Map<String, Value>>,
     #[serde(default)]
     audit_log: Vec<Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -317,7 +330,11 @@ pub fn create_backup(
     let sidecars = dump_sidecars(vault_dir, scope)?;
     let warnings = backup_warnings(scope);
     let mut payload = VaultBackupPayload {
-        format_version: BACKUP_FORMAT_VERSION,
+        format_version: if has_auth_data(&contents) {
+            AUTH_BACKUP_FORMAT_VERSION
+        } else {
+            BACKUP_FORMAT_VERSION
+        },
         exported_at: Utc::now().to_rfc3339(),
         source_schema_version,
         source_vault_created_at,
@@ -327,6 +344,7 @@ pub fn create_backup(
         warnings: warnings.clone(),
         integrity: BackupIntegrity::default(),
     };
+    validate_auth_contents(&payload)?;
     payload.integrity = compute_integrity(&payload)?;
 
     bundle::write_encrypted_payload_with_limit_no_clobber(
@@ -385,7 +403,8 @@ fn read_payload(path: &str, passphrase: &str) -> Result<VaultBackupPayload> {
 }
 
 fn inspect_payload(payload: &VaultBackupPayload) -> BackupInspect {
-    let compatibility = schema_compatibility(&payload.source_schema_version);
+    let compatibility = schema_compatibility(&payload.source_schema_version)
+        .and_then(|()| validate_backup_format(payload));
     let projects_by_id = index_by(&payload.contents.projects, "id");
     let partitions_by_id = index_by(&payload.contents.partitions, "id");
     let projects = payload
@@ -468,11 +487,11 @@ fn inspect_payload(payload: &VaultBackupPayload) -> BackupInspect {
 
 fn verify_payload(payload: &VaultBackupPayload) -> BackupVerify {
     let mut errors = Vec::new();
-    if payload.format_version != BACKUP_FORMAT_VERSION {
-        errors.push(format!(
-            "unsupported backup format version {}",
-            payload.format_version
-        ));
+    if let Err(error) = validate_backup_format(payload) {
+        errors.push(error.to_string());
+    }
+    if let Err(error) = validate_auth_contents(payload) {
+        errors.push(error.to_string());
     }
     let expected = match compute_integrity(payload) {
         Ok(integrity) => integrity,
@@ -505,6 +524,194 @@ fn verify_payload(payload: &VaultBackupPayload) -> BackupVerify {
     }
 }
 
+fn has_auth_data(contents: &BackupContents) -> bool {
+    !contents.auth_registry.is_empty() || !contents.auth_bundles.is_empty()
+}
+
+fn validate_backup_format(payload: &VaultBackupPayload) -> Result<()> {
+    if !matches!(
+        payload.format_version,
+        BACKUP_FORMAT_VERSION | AUTH_BACKUP_FORMAT_VERSION
+    ) {
+        return Err(VaultError::Backup(format!(
+            "unsupported backup format version {}",
+            payload.format_version
+        )));
+    }
+    if has_auth_data(&payload.contents)
+        && (payload.format_version != AUTH_BACKUP_FORMAT_VERSION
+            || parse_schema_version(&payload.source_schema_version)? < AUTH_SCHEMA_VERSION)
+    {
+        return Err(VaultError::Backup(
+            "auth data requires backup format version 2 and schema version 14 or newer".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate identities and metadata before accepting or producing a backup. The
+/// raw JSON strings remain untouched, including expiry and revocation details.
+fn validate_auth_contents(payload: &VaultBackupPayload) -> Result<()> {
+    validate_backup_format(payload)?;
+    let contents = &payload.contents;
+    if has_auth_data(contents)
+        && (!payload.scope.credentials || !payload.scope.partitions || !payload.scope.projects)
+    {
+        return Err(auth_backup_invalid(
+            "auth data is outside the recorded backup scope",
+        ));
+    }
+    if has_auth_data(contents) {
+        let stored_version = contents
+            .vault_meta
+            .iter()
+            .find(|row| row.get("key").and_then(Value::as_str) == Some("version"))
+            .and_then(|row| row.get("value").and_then(Value::as_str));
+        if stored_version != Some(payload.source_schema_version.as_str()) {
+            return Err(auth_backup_invalid(
+                "auth vault schema metadata is inconsistent",
+            ));
+        }
+    }
+    let credentials = index_by(&contents.credentials, "id");
+    let partitions = index_by(&contents.partitions, "id");
+    let projects = index_by(&contents.projects, "id");
+    let mut registered = BTreeSet::new();
+    let mut auth_ids = BTreeMap::new();
+    if has_auth_data(contents)
+        && (credentials.len() != contents.credentials.len()
+            || partitions.len() != contents.partitions.len()
+            || projects.len() != contents.projects.len())
+    {
+        return Err(auth_backup_invalid(
+            "duplicate or missing auth dependency identity",
+        ));
+    }
+    for row in &contents.auth_registry {
+        validate_auth_row_shape(row, &["credential_id", "auth_id", "metadata_json"])?;
+        let credential_id = row["credential_id"].as_str().unwrap();
+        let auth_id = row["auth_id"].as_str().unwrap();
+        if !registered.insert(credential_id) || auth_ids.contains_key(auth_id) {
+            return Err(auth_backup_invalid("duplicate auth registry identity"));
+        }
+        let credential = credentials
+            .get(credential_id)
+            .ok_or_else(|| auth_backup_invalid("auth registry references a missing credential"))?;
+        if !credential
+            .get("encrypted_value")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.starts_with(CIPHERTEXT_PREFIX))
+        {
+            return Err(auth_backup_invalid(
+                "registered ciphertext is missing its auth marker",
+            ));
+        }
+        let partition_id = credential
+            .get("partition_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| auth_backup_invalid("auth credential is missing its partition"))?;
+        let partition = partitions
+            .get(partition_id)
+            .ok_or_else(|| auth_backup_invalid("auth credential references a missing partition"))?;
+        let project_id = partition
+            .get("project_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| auth_backup_invalid("auth partition is missing its project"))?;
+        if !projects.contains_key(project_id) {
+            return Err(auth_backup_invalid(
+                "auth partition references a missing project",
+            ));
+        }
+        let metadata: AuthMetadata =
+            serde_json::from_str(row["metadata_json"].as_str().unwrap())
+                .map_err(|_| auth_backup_invalid("invalid auth metadata JSON"))?;
+        metadata
+            .validate()
+            .map_err(|_| auth_backup_invalid("invalid auth metadata"))?;
+        if metadata.id != auth_id {
+            return Err(auth_backup_invalid(
+                "auth metadata identity does not match its registry row",
+            ));
+        }
+        auth_ids.insert(auth_id, (partition_id, metadata));
+    }
+    for credential in &contents.credentials {
+        if credential
+            .get("encrypted_value")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value.starts_with(CIPHERTEXT_PREFIX))
+            && !credential
+                .get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| registered.contains(id))
+        {
+            return Err(auth_backup_invalid(
+                "auth ciphertext has no registry metadata",
+            ));
+        }
+    }
+    let mut bundle_ids = BTreeSet::new();
+    for row in &contents.auth_bundles {
+        validate_auth_row_shape(row, &["partition_id", "name", "bundle_json"])?;
+        let partition_id = row["partition_id"].as_str().unwrap();
+        let name = row["name"].as_str().unwrap();
+        if !bundle_ids.insert((partition_id, name)) || !partitions.contains_key(partition_id) {
+            return Err(auth_backup_invalid(
+                "auth bundle identity or partition reference is invalid",
+            ));
+        }
+        let bundle: AuthBundle = serde_json::from_str(row["bundle_json"].as_str().unwrap())
+            .map_err(|_| auth_backup_invalid("invalid auth bundle JSON"))?;
+        bundle
+            .validate()
+            .map_err(|_| auth_backup_invalid("invalid auth bundle"))?;
+        let partition = partitions.get(partition_id).unwrap();
+        let project = partition
+            .get("project_id")
+            .and_then(Value::as_str)
+            .and_then(|id| projects.get(id))
+            .ok_or_else(|| auth_backup_invalid("auth bundle project is missing"))?;
+        if bundle.name != name
+            || partition.get("name").and_then(Value::as_str) != Some(bundle.partition.as_str())
+            || project.get("name").and_then(Value::as_str) != Some(bundle.project.as_str())
+        {
+            return Err(auth_backup_invalid(
+                "auth bundle scope does not match its row",
+            ));
+        }
+        for alternative in &bundle.alternatives {
+            for member in &alternative.members {
+                let (member_partition, metadata) = auth_ids
+                    .get(member.auth_id.as_str())
+                    .ok_or_else(|| auth_backup_invalid("auth bundle member is missing"))?;
+                if *member_partition != partition_id || metadata.account != bundle.account {
+                    return Err(auth_backup_invalid("auth bundle member scope mismatch"));
+                }
+                // Stale pinned revisions are recovery data. Keep them unchanged;
+                // resolution will continue to reject them after restore.
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_auth_row_shape(row: &Map<String, Value>, fields: &[&str]) -> Result<()> {
+    if row.len() != fields.len()
+        || fields.iter().any(|field| {
+            !row.get(*field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty())
+        })
+    {
+        return Err(auth_backup_invalid("auth table row has an invalid shape"));
+    }
+    Ok(())
+}
+
+fn auth_backup_invalid(reason: &str) -> VaultError {
+    VaultError::Backup(format!("invalid auth backup data: {reason}"))
+}
+
 fn dump_contents(db: &Connection, scope: &BackupScope) -> Result<BackupContents> {
     Ok(BackupContents {
         vault_meta: dump_table(db, TABLE_VAULT_META)?,
@@ -520,6 +727,16 @@ fn dump_contents(db: &Connection, scope: &BackupScope) -> Result<BackupContents>
         },
         credentials: if scope.credentials {
             dump_table(db, TABLE_CREDENTIALS)?
+        } else {
+            Vec::new()
+        },
+        auth_registry: if scope.credentials {
+            dump_table(db, TABLE_AUTH_REGISTRY)?
+        } else {
+            Vec::new()
+        },
+        auth_bundles: if scope.credentials {
+            dump_table(db, TABLE_AUTH_BUNDLES)?
         } else {
             Vec::new()
         },
@@ -673,6 +890,8 @@ fn counts_from_contents(contents: &BackupContents) -> BackupCounts {
         projects: contents.projects.len(),
         partitions: contents.partitions.len(),
         credentials: contents.credentials.len(),
+        auth_records: contents.auth_registry.len(),
+        auth_bundles: contents.auth_bundles.len(),
         audits: contents.audit_log.len(),
         operation_audits: contents.operation_audit.len(),
         instances: contents.instances.len(),
@@ -1194,6 +1413,178 @@ mod tests {
             .expect("lifecycle");
         assert_eq!(origin, "");
         assert_eq!(lifecycle, "active");
+    }
+
+    pub(super) fn auth_payload() -> VaultBackupPayload {
+        let now = "2026-08-26T00:00:00Z";
+        let metadata = serde_json::json!({
+            "id": "34f6a3c9-5e62-4ce7-b453-d2957a393202",
+            "revision": "2e711d62-77d9-476f-9499-6ef5a3b245a3",
+            "provider": "example", "account": "production",
+            "origins": ["https://api.example.com"],
+            "provider_expiry": {"state": "expires_at", "at": "2026-01-01T00:00:00Z"},
+            "use_until": "2026-02-01T00:00:00Z", "revoked_at": "2026-03-01T00:00:00Z"
+        });
+        let bundle = serde_json::json!({
+            "name": "production", "project": "default", "partition": "personal",
+            "account": "production", "alternatives": [{"name": "bearer", "members": [{
+                "auth_id": metadata["id"],
+                "revision": "17e9c906-41e4-48f9-94b8-af1b75b5547e",
+                "role": "access_token"
+            }]}]
+        });
+        let row = |value: Value| value.as_object().unwrap().clone();
+        let mut payload = VaultBackupPayload {
+            format_version: AUTH_BACKUP_FORMAT_VERSION,
+            exported_at: now.into(),
+            source_schema_version: CURRENT_SCHEMA_VERSION.into(),
+            source_vault_created_at: Some(now.into()),
+            scope: BackupScope::all_included(),
+            contents: BackupContents {
+                vault_meta: vec![
+                    meta_row("version", CURRENT_SCHEMA_VERSION),
+                    meta_row("password_hash", "test-hash"),
+                    meta_row("created_at", now),
+                ],
+                projects: vec![row(
+                    serde_json::json!({"id":"default", "name":"default", "description":"", "created_at":now, "updated_at":now}),
+                )],
+                partitions: vec![row(
+                    serde_json::json!({"id":"personal", "name":"personal", "project_id":"default", "description":"", "created_at":now, "updated_at":now}),
+                )],
+                credentials: vec![row(serde_json::json!({
+                    "id":"credential-auth", "name":"auth-key", "description":"", "credential_type":"\"ApiKey\"",
+                    "encrypted_value":"wka1:AAAA", "wisp_token":"wk_auth_testonly", "hosts":"api.example.com", "tags":"",
+                    "created_at":now, "updated_at":now, "last_used_at":null, "partition_id":"personal",
+                    "origin":"", "lifecycle_state":"active", "review_at":null
+                }))],
+                auth_registry: vec![row(
+                    serde_json::json!({"credential_id":"credential-auth", "auth_id":metadata["id"], "metadata_json":metadata.to_string()}),
+                )],
+                auth_bundles: vec![row(
+                    serde_json::json!({"partition_id":"personal", "name":"production", "bundle_json":bundle.to_string()}),
+                )],
+                ..BackupContents::default()
+            },
+            sidecars: BackupSidecars::default(),
+            warnings: Vec::new(),
+            integrity: BackupIntegrity::default(),
+        };
+        payload.integrity = compute_integrity(&payload).unwrap();
+        payload
+    }
+
+    #[test]
+    fn auth_backup_extension_preserves_legacy_hash_shape() {
+        let counts = serde_json::to_value(BackupCounts::default()).unwrap();
+        assert!(counts.get("auth_records").is_none());
+        assert!(counts.get("auth_bundles").is_none());
+        let contents = serde_json::to_value(BackupContents::default()).unwrap();
+        assert!(contents.get("auth_registry").is_none());
+        assert!(contents.get("auth_bundles").is_none());
+    }
+
+    #[test]
+    fn auth_backup_requires_new_format_and_complete_valid_metadata() {
+        let payload = auth_payload();
+        assert!(verify_payload(&payload).ok);
+        let mut legacy = payload.clone();
+        legacy.format_version = BACKUP_FORMAT_VERSION;
+        legacy.integrity = compute_integrity(&legacy).unwrap();
+        assert!(!verify_payload(&legacy).ok);
+        let mut missing = payload.clone();
+        missing.contents.auth_registry.clear();
+        missing.contents.auth_bundles.clear();
+        missing.integrity = compute_integrity(&missing).unwrap();
+        assert!(!verify_payload(&missing).ok);
+        let mut unmarked = payload.clone();
+        unmarked.contents.credentials[0]
+            .insert("encrypted_value".into(), Value::String("AAAA".into()));
+        unmarked.integrity = compute_integrity(&unmarked).unwrap();
+        assert!(!verify_payload(&unmarked).ok);
+        let mut malformed = payload.clone();
+        malformed.contents.auth_registry[0]
+            .insert("metadata_json".into(), Value::String("{}".into()));
+        malformed.integrity = compute_integrity(&malformed).unwrap();
+        assert!(!verify_payload(&malformed).ok);
+        let mut absent_member = payload;
+        let raw = absent_member.contents.auth_bundles[0]["bundle_json"]
+            .as_str()
+            .unwrap();
+        let mut bundle: AuthBundle = serde_json::from_str(raw).unwrap();
+        bundle.alternatives[0].members[0].auth_id = uuid::Uuid::new_v4().to_string();
+        absent_member.contents.auth_bundles[0].insert(
+            "bundle_json".into(),
+            Value::String(serde_json::to_string(&bundle).unwrap()),
+        );
+        absent_member.integrity = compute_integrity(&absent_member).unwrap();
+        assert!(!verify_payload(&absent_member).ok);
+    }
+
+    #[test]
+    fn auth_encrypted_backup_restores_revocation_expiry_and_stale_bundle_exactly() {
+        let source = auth_payload();
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive = archive_dir.path().join("auth.wkbackup");
+        let target = tempfile::tempdir().unwrap();
+        let passphrase = "test-bundle-passphrase";
+        bundle::write_encrypted_payload_with_limit(
+            VAULT_BACKUP_MAGIC,
+            &source,
+            passphrase,
+            archive.to_str().unwrap(),
+            MAX_VAULT_BACKUP_BYTES,
+        )
+        .unwrap();
+        assert!(
+            verify_backup(archive.to_str().unwrap(), passphrase)
+                .unwrap()
+                .ok
+        );
+        let report = restore_backup(
+            archive.to_str().unwrap(),
+            passphrase,
+            RestoreOptions {
+                target_dir: target.path(),
+                dry_run: false,
+                replace: false,
+                on_conflict: ConflictPolicy::Fail,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.imported.auth_records, 1);
+        assert_eq!(report.imported.auth_bundles, 1);
+        let db = Connection::open(target.path().join("vault.db")).unwrap();
+        let restored = dump_contents(&db, &BackupScope::all_included()).unwrap();
+        assert_eq!(restored.auth_registry, source.contents.auth_registry);
+        assert_eq!(restored.auth_bundles, source.contents.auth_bundles);
+        assert_eq!(
+            restored.credentials[0]["encrypted_value"],
+            source.contents.credentials[0]["encrypted_value"]
+        );
+        let metadata: AuthMetadata =
+            serde_json::from_str(restored.auth_registry[0]["metadata_json"].as_str().unwrap())
+                .unwrap();
+        assert!(metadata.ensure_usable_at(Utc::now(), false).is_err());
+        let mut excluded = BackupScope::all_included();
+        excluded.exclude_names(&["credentials".into()]).unwrap();
+        let excluded_contents = dump_contents(&db, &excluded).unwrap();
+        assert!(excluded_contents.auth_registry.is_empty());
+        assert!(excluded_contents.auth_bundles.is_empty());
+        drop(db);
+        let report = restore_backup(
+            archive.to_str().unwrap(),
+            passphrase,
+            RestoreOptions {
+                target_dir: target.path(),
+                dry_run: false,
+                replace: false,
+                on_conflict: ConflictPolicy::Skip,
+            },
+        )
+        .unwrap();
+        assert_eq!(report.skipped.auth_records, 1);
+        assert_eq!(report.skipped.auth_bundles, 1);
     }
 
     fn meta_row(key: &str, value: &str) -> Map<String, Value> {

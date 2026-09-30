@@ -292,6 +292,80 @@ fn tools_list_includes_issue_cert() {
 }
 
 #[test]
+fn issue_cert_registered_ca_requires_bounded_live_auth() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let (bundle, _, ca_key) = test_ca_bundle();
+    add_ca_credential(vault_dir.path(), "registered-ca", &bundle);
+    let issue = || {
+        call_mcp_tool(
+            vault_dir.path(),
+            serde_json::json!({
+                "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+                    "name": "wispkey_issue_cert", "arguments": {
+                        "ca_credential": "registered-ca", "common_name": "synthetic-leaf"
+                    }
+                }
+            }),
+        )
+    };
+    let future = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+    let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    for (provider_expiry, local_deadline, permitted) in [
+        ("non-expiring", None, false),
+        ("non-expiring", Some(past.as_str()), false),
+        (past.as_str(), Some(future.as_str()), false),
+        ("non-expiring", Some(future.as_str()), true),
+    ] {
+        let mut args = vec![
+            "auth",
+            "register",
+            "registered-ca",
+            "--project",
+            "default",
+            "--provider",
+            "synthetic-ca",
+            "--account",
+            "synthetic-account",
+            "--origin",
+            "https://ca.example.com",
+            "--provider-expiry",
+            provider_expiry,
+        ];
+        if let Some(deadline) = local_deadline {
+            args.extend(["--use-until", deadline]);
+        }
+        assert!(run_wispkey(vault_dir.path(), &args).status.success());
+        let response = issue();
+        let text = response["result"]["content"][0]["text"].as_str().unwrap();
+        assert_eq!(
+            !response["result"]["isError"].as_bool().unwrap_or(false),
+            permitted,
+            "{text}"
+        );
+        assert!(!compact_text(text).contains(&ca_private_key_body(&ca_key)));
+        if permitted {
+            assert!(text.contains("BEGIN CERTIFICATE"));
+        } else {
+            assert!(!text.contains("BEGIN CERTIFICATE"));
+            assert!(!text.contains("BEGIN PRIVATE KEY"));
+        }
+    }
+    assert!(
+        run_wispkey(
+            vault_dir.path(),
+            &["auth", "revoke", "registered-ca", "--project", "default"]
+        )
+        .status
+        .success()
+    );
+    let response = issue();
+    assert_eq!(response["result"]["isError"], true);
+    assert!(!response.to_string().contains("BEGIN CERTIFICATE"));
+    assert!(!response.to_string().contains("BEGIN PRIVATE KEY"));
+}
+
+#[test]
 fn issue_cert_returns_leaf_and_never_ca_key() {
     let vault_dir = tempfile::tempdir().expect("temp vault dir");
     init_vault(vault_dir.path());

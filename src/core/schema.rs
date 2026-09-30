@@ -536,9 +536,26 @@ impl Vault {
             super::operation_grants::create_schema(&tx)?;
             tx.execute(
                 "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
+                ["13"],
+            )?;
+            tx.commit()?;
+        }
+
+        let version: String = db.query_row(
+            "SELECT value FROM vault_meta WHERE key='version'",
+            [],
+            |row| row.get(0),
+        )?;
+        if version == "13" {
+            let tx = db.unchecked_transaction()?;
+            super::auth::create_schema(&tx)?;
+            tx.execute(
+                "UPDATE vault_meta SET value=?1 WHERE key='version'",
                 [CURRENT_SCHEMA_VERSION],
             )?;
             tx.commit()?;
+        } else if version != CURRENT_SCHEMA_VERSION {
+            return Err(VaultError::AuthRejected("unsupported vault schema"));
         }
 
         // Older releases stored reusable capability tokens in audit rows. Remove
@@ -619,6 +636,7 @@ impl Vault {
         create_bootstrap_token_table(db)?;
         super::browser::create_schema(db)?;
         super::operation_grants::create_schema(db)?;
+        super::auth::create_schema(db)?;
         Ok(())
     }
 }

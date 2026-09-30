@@ -410,7 +410,10 @@ impl CloudClient {
         let snapshot: Snapshot =
             crate::bundle::decrypt_payload_bytes(MAGIC, &bytes, password, MAX_BYTES as u64)
                 .map_err(|_| invalid("bundle_authentication_failed"))?;
-        if snapshot.version != 1 || snapshot.project != project || snapshot.partition != partition {
+        if !matches!(snapshot.version, 1 | 2)
+            || snapshot.project != project
+            || snapshot.partition != partition
+        {
             return Err(invalid("bundle_scope_mismatch"));
         }
         Ok((snapshot, bytes))

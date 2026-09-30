@@ -358,6 +358,12 @@ enum Commands {
         command: LoginCommands,
     },
 
+    /// Opt in credentials to an exact-origin auth registry and reusable bundles
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
+    },
+
     /// Manage access policies
     Policy {
         #[command(subcommand)]
@@ -720,6 +726,83 @@ enum CredentialCommands {
         /// Destination partition override
         #[arg(long)]
         partition: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Register metadata for an existing credential (never reads its secret)
+    Register {
+        /// Existing credential name
+        credential: String,
+        /// Exact project containing the credential
+        #[arg(long)]
+        project: String,
+        /// Provider label, such as github or example-api
+        #[arg(long)]
+        provider: String,
+        /// Explicit provider account identity
+        #[arg(long)]
+        account: String,
+        /// Exact HTTPS origin; repeat for each allowed origin
+        #[arg(long = "origin", required = true)]
+        origins: Vec<String>,
+        /// unknown, non-expiring, or an RFC3339 timestamp with timezone
+        #[arg(long)]
+        provider_expiry: String,
+        /// Local use deadline in RFC3339; required for unknown expiry and bundle resolution
+        #[arg(long)]
+        use_until: Option<String>,
+    },
+    /// Inventory metadata only, including unregistered credentials; never emits tokens
+    List {
+        /// Filter by project (default: active project)
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Revoke registry eligibility without deleting the underlying credential
+    Revoke {
+        credential: String,
+        #[arg(long)]
+        project: String,
+    },
+    /// Store and resolve metadata-only bundles with explicit alternative selection
+    Bundle {
+        #[command(subcommand)]
+        command: AuthBundleCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthBundleCommands {
+    /// Create or replace a bundle from an explicit metadata-only JSON file
+    Set {
+        /// JSON: name, project, partition, account, alternatives [{name, members [{auth_id, revision, role}]}]
+        #[arg(long)]
+        file: String,
+    },
+    /// List bundle metadata and pinned member revisions; never emits tokens
+    List {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        partition: String,
+    },
+    /// Emit opaque tokens only if every member of the chosen alternative is eligible
+    Resolve {
+        name: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        partition: String,
+        #[arg(long)]
+        account: String,
+        /// Required explicit choice; never tries another alternative on failure
+        #[arg(long)]
+        alternative: String,
+        /// Exact HTTPS destination origin for all required-together members
+        #[arg(long)]
+        origin: String,
     },
 }
 
@@ -1468,6 +1551,51 @@ async fn main() {
                 )
                 .await
             }
+        },
+        Commands::Auth { command } => match command {
+            AuthCommands::Register {
+                credential,
+                project,
+                provider,
+                account,
+                origins,
+                provider_expiry,
+                use_until,
+            } => cli::handle_auth_register(cli::AuthRegisterArgs {
+                name: &credential,
+                project: &project,
+                provider: &provider,
+                account: &account,
+                origins,
+                provider_expiry: &provider_expiry,
+                use_until: use_until.as_deref(),
+            }),
+            AuthCommands::List { project } => cli::handle_auth_list(project.as_deref()),
+            AuthCommands::Revoke {
+                credential,
+                project,
+            } => cli::handle_auth_revoke(&credential, &project),
+            AuthCommands::Bundle { command } => match command {
+                AuthBundleCommands::Set { file } => cli::handle_auth_bundle_set(&file),
+                AuthBundleCommands::List { project, partition } => {
+                    cli::handle_auth_bundle_list(&project, &partition)
+                }
+                AuthBundleCommands::Resolve {
+                    name,
+                    project,
+                    partition,
+                    account,
+                    alternative,
+                    origin,
+                } => cli::handle_auth_bundle_resolve(
+                    &name,
+                    &project,
+                    &partition,
+                    &account,
+                    &alternative,
+                    &origin,
+                ),
+            },
         },
         Commands::Login { command } => match command {
             LoginCommands::Generate {

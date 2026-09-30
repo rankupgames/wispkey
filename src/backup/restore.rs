@@ -21,11 +21,11 @@ use uuid::Uuid;
 use super::{
     BackupCounts, BackupScope, SIDECAR_ACTIVE_PROJECT, SIDECAR_AUDIT_FINGERPRINT, SIDECAR_CLOUD,
     SIDECAR_CLOUD_MANIFESTS, SIDECAR_POLICIES, TABLE_ACCESS_REQUESTS, TABLE_AUDIT_LOG,
-    TABLE_BOOTSTRAP_TOKENS, TABLE_CREDENTIALS, TABLE_INSTANCE_SCOPES, TABLE_INSTANCES,
-    TABLE_OPERATION_AUDIT, TABLE_PARTITIONS, TABLE_PROJECTS, TABLE_VAULT_META, VaultBackupPayload,
-    dest_has_vault, insert_row, inspect_payload, read_payload, recovery_limits,
-    restore_sidecar_paths, schema_compatibility, string_field, verify_payload, write_optional_b64,
-    write_optional_text,
+    TABLE_AUTH_BUNDLES, TABLE_AUTH_REGISTRY, TABLE_BOOTSTRAP_TOKENS, TABLE_CREDENTIALS,
+    TABLE_INSTANCE_SCOPES, TABLE_INSTANCES, TABLE_OPERATION_AUDIT, TABLE_PARTITIONS,
+    TABLE_PROJECTS, TABLE_VAULT_META, VaultBackupPayload, dest_has_vault, insert_row,
+    inspect_payload, read_payload, recovery_limits, restore_sidecar_paths, schema_compatibility,
+    string_field, verify_payload, write_optional_b64, write_optional_text,
 };
 use crate::core::{
     Result, Vault, VaultError, prepare_restored_instance_secrets,
@@ -300,6 +300,8 @@ struct SkipSet {
     projects: HashSet<String>,
     partitions: HashSet<String>,
     credentials: HashSet<String>,
+    auth_records: HashSet<String>,
+    auth_bundles: HashSet<(String, String)>,
     audits: HashSet<String>,
     operation_audits: HashSet<usize>,
     instances: HashSet<String>,
@@ -492,6 +494,7 @@ fn plan_merge(db: &Connection, target: &Path, payload: &VaultBackupPayload) -> R
             available_credentials.remove(&id);
         }
     }
+    classify_auth_rows(db, payload, &mut skip, &mut imported, &mut skipped)?;
     classify_rows(
         &payload.contents.instances,
         "id",
@@ -578,6 +581,133 @@ fn plan_merge(db: &Connection, target: &Path, payload: &VaultBackupPayload) -> R
         conflicts,
         skip,
     })
+}
+
+/// Auth restrictions must never be dropped by the ordinary skip-conflicts policy.
+/// Only byte-identical registry/bundle rows can be treated as already restored.
+fn classify_auth_rows(
+    db: &Connection,
+    payload: &VaultBackupPayload,
+    skip: &mut SkipSet,
+    imported: &mut BackupCounts,
+    skipped: &mut BackupCounts,
+) -> Result<()> {
+    let registry = load_table_index(db, TABLE_AUTH_REGISTRY, "credential_id")?;
+    let auth_ids = load_table_index(db, TABLE_AUTH_REGISTRY, "auth_id")?;
+    let credentials = load_table_index(db, TABLE_CREDENTIALS, "id")?;
+    let partitions = load_table_index(db, TABLE_PARTITIONS, "id")?;
+    let projects = load_table_index(db, TABLE_PROJECTS, "id")?;
+    let bundles = super::dump_table(db, TABLE_AUTH_BUNDLES)?
+        .into_iter()
+        .map(|row| Ok((auth_bundle_identity(&row)?, row)))
+        .collect::<Result<HashMap<_, _>>>()?;
+
+    for row in &payload.contents.auth_registry {
+        let credential_id = string_field(row, "credential_id").unwrap_or_default();
+        let auth_id = string_field(row, "auth_id").unwrap_or_default();
+        if let Some(existing) = registry.get(&credential_id) {
+            if existing != row {
+                return Err(auth_restore_conflict(
+                    "credential registry metadata differs",
+                ));
+            }
+            skip.auth_records.insert(credential_id.clone());
+            skipped.auth_records += 1;
+        } else {
+            if auth_ids.contains_key(&auth_id) {
+                return Err(auth_restore_conflict(
+                    "auth identity belongs to another credential",
+                ));
+            }
+            imported.auth_records += 1;
+        }
+        let credential = payload
+            .contents
+            .credentials
+            .iter()
+            .find(|item| string_field(item, "id").as_deref() == Some(&credential_id))
+            .ok_or_else(|| auth_restore_conflict("registered credential is missing"))?;
+        if skip.credentials.contains(&credential_id)
+            && !credentials
+                .get(&credential_id)
+                .is_some_and(|existing| rows_equivalent(existing, credential))
+        {
+            return Err(auth_restore_conflict(
+                "registered credential cannot be restored unchanged",
+            ));
+        }
+        let partition_id = string_field(credential, "partition_id").unwrap_or_default();
+        require_unchanged_auth_partition(payload, &partition_id, &partitions, &projects, skip)?;
+    }
+    for row in &payload.contents.auth_bundles {
+        let identity = auth_bundle_identity(row)?;
+        require_unchanged_auth_partition(payload, &identity.0, &partitions, &projects, skip)?;
+        match bundles.get(&identity) {
+            Some(existing) if existing == row => {
+                skip.auth_bundles.insert(identity);
+                skipped.auth_bundles += 1;
+            }
+            Some(_) => return Err(auth_restore_conflict("auth bundle metadata differs")),
+            None => imported.auth_bundles += 1,
+        }
+    }
+    Ok(())
+}
+
+fn require_unchanged_auth_partition(
+    payload: &VaultBackupPayload,
+    partition_id: &str,
+    partitions: &RowIndex,
+    projects: &RowIndex,
+    skip: &SkipSet,
+) -> Result<()> {
+    let partition = payload
+        .contents
+        .partitions
+        .iter()
+        .find(|item| string_field(item, "id").as_deref() == Some(partition_id))
+        .ok_or_else(|| auth_restore_conflict("auth partition is missing"))?;
+    if skip.partitions.contains(partition_id)
+        && !partitions
+            .get(partition_id)
+            .is_some_and(|existing| rows_equivalent(existing, partition))
+    {
+        return Err(auth_restore_conflict(
+            "auth partition cannot be restored unchanged",
+        ));
+    }
+    let project_id = string_field(partition, "project_id").unwrap_or_default();
+    let project = payload
+        .contents
+        .projects
+        .iter()
+        .find(|item| string_field(item, "id").as_deref() == Some(&project_id))
+        .ok_or_else(|| auth_restore_conflict("auth project is missing"))?;
+    if skip.projects.contains(&project_id)
+        && !projects
+            .get(&project_id)
+            .is_some_and(|existing| rows_equivalent(existing, project))
+    {
+        return Err(auth_restore_conflict(
+            "auth project cannot be restored unchanged",
+        ));
+    }
+    Ok(())
+}
+
+fn auth_bundle_identity(row: &Map<String, Value>) -> Result<(String, String)> {
+    let partition = row.get("partition_id").and_then(Value::as_str);
+    let name = row.get("name").and_then(Value::as_str);
+    match (partition, name) {
+        (Some(partition), Some(name)) => Ok((partition.into(), name.into())),
+        _ => Err(auth_restore_conflict("auth bundle identity is invalid")),
+    }
+}
+
+fn auth_restore_conflict(reason: &str) -> VaultError {
+    VaultError::Backup(format!(
+        "auth restore conflict: {reason}; metadata cannot be skipped; use --replace or an empty --target"
+    ))
 }
 
 type RowIndex = HashMap<String, Map<String, Value>>;
@@ -1059,6 +1189,19 @@ fn insert_payload_tables(
     )?;
     insert_table(
         db,
+        TABLE_AUTH_REGISTRY,
+        &payload.contents.auth_registry,
+        &skip.auth_records,
+        "credential_id",
+    )?;
+    for row in &payload.contents.auth_bundles {
+        let identity = auth_bundle_identity(row)?;
+        if !skip.auth_bundles.contains(&identity) {
+            insert_row(db, TABLE_AUTH_BUNDLES, row)?;
+        }
+    }
+    insert_table(
+        db,
         TABLE_INSTANCES,
         &payload.contents.instances,
         &skip.instances,
@@ -1478,6 +1621,88 @@ fn meta_values_equal(left: &Map<String, Value>, right: &Map<String, Value>) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_auth_partition_history_marker_survives_backup_snapshot_and_restore() {
+        let mut payload = super::super::tests::auth_payload();
+        payload.format_version = super::super::BACKUP_FORMAT_VERSION;
+        payload.contents.credentials.clear();
+        payload.contents.auth_registry.clear();
+        payload.contents.auth_bundles.clear();
+        let marker = serde_json::json!({"key": "auth_partition_v1:personal", "value": "1"})
+            .as_object()
+            .unwrap()
+            .clone();
+        payload.contents.vault_meta.push(marker.clone());
+        payload.integrity = super::super::compute_integrity(&payload).unwrap();
+        assert!(verify_payload(&payload).ok);
+        let target = tempfile::tempdir().unwrap();
+        let staging = target.path().join("restore");
+        restore_replace_into_staging(&payload, &staging).unwrap();
+        let db = Connection::open(staging.join("vault.db")).unwrap();
+        let (schema, _, contents) =
+            super::super::snapshot_database(&db, &BackupScope::all_included()).unwrap();
+        assert_eq!(schema, crate::core::CURRENT_SCHEMA_VERSION);
+        assert!(contents.auth_registry.is_empty());
+        assert!(contents.auth_bundles.is_empty());
+        assert!(contents.vault_meta.contains(&marker));
+        let plan = plan_merge(&db, &staging, &payload).unwrap();
+        assert!(plan.skip.vault_meta.contains("auth_partition_v1:personal"));
+    }
+
+    #[test]
+    fn auth_merge_rejects_metadata_and_bundle_conflicts_instead_of_skipping() {
+        let payload = super::super::tests::auth_payload();
+        let target = tempfile::tempdir().unwrap();
+        let db = Vault::initialize_database_file(&target.path().join("vault.db")).unwrap();
+        insert_payload_tables(&db, &payload, &SkipSet::default()).unwrap();
+        let plan = plan_merge(&db, target.path(), &payload).unwrap();
+        assert_eq!(plan.skipped.auth_records, 1);
+        assert_eq!(plan.skipped.auth_bundles, 1);
+        let original_metadata = &payload.contents.auth_registry[0]["metadata_json"];
+        db.execute("UPDATE auth_registry SET metadata_json = '{}'", [])
+            .unwrap();
+        let error = plan_merge(&db, target.path(), &payload).err().unwrap();
+        assert!(error.to_string().contains("auth restore conflict"));
+        db.execute(
+            "UPDATE auth_registry SET metadata_json = ?1",
+            [original_metadata.as_str().unwrap()],
+        )
+        .unwrap();
+        db.execute("UPDATE auth_bundles SET bundle_json = '{}'", [])
+            .unwrap();
+        let error = plan_merge(&db, target.path(), &payload).err().unwrap();
+        assert!(error.to_string().contains("auth bundle metadata differs"));
+    }
+
+    #[test]
+    fn auth_merge_rejects_skipped_credential_or_partition_dependencies() {
+        let payload = super::super::tests::auth_payload();
+        let target = tempfile::tempdir().unwrap();
+        let db = Vault::initialize_database_file(&target.path().join("vault.db")).unwrap();
+        insert_payload_tables(&db, &payload, &SkipSet::default()).unwrap();
+        db.execute(
+            "UPDATE credentials SET encrypted_value = 'wka1:different'",
+            [],
+        )
+        .unwrap();
+        let error = plan_merge(&db, target.path(), &payload).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("registered credential cannot be restored unchanged")
+        );
+        db.execute("UPDATE credentials SET encrypted_value = 'wka1:AAAA'", [])
+            .unwrap();
+        db.execute("UPDATE partitions SET name = 'different'", [])
+            .unwrap();
+        let error = plan_merge(&db, target.path(), &payload).err().unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("auth partition cannot be restored unchanged")
+        );
+    }
 
     fn operation_audit_row(result: &str) -> Map<String, Value> {
         let mut row = Map::new();

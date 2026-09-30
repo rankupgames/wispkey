@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::secure_files;
 
+pub mod auth;
 pub(crate) mod cloud_sync;
 mod crypto;
 mod instances;
@@ -54,7 +55,7 @@ pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
 /// Current on-disk SQLite schema version written to `vault_meta`.
-pub const CURRENT_SCHEMA_VERSION: &str = "13";
+pub const CURRENT_SCHEMA_VERSION: &str = "14";
 
 pub mod browser;
 
@@ -62,6 +63,8 @@ pub mod browser;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum VaultError {
+    #[error("{0}")]
+    AuthRejected(&'static str),
     #[error("vault already exists at {0}")]
     AlreadyExists(PathBuf),
     #[error("vault not found -- run `wispkey init` first")]
@@ -596,6 +599,10 @@ impl Vault {
     /// patches metadata fields while preserving the wisp token, id, and partition.
     pub fn update_credential(&self, request: UpdateCredentialRequest<'_>) -> Result<Credential> {
         let key = self.ensure_unlocked()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
         let active = resolve_active_project();
         let project_name = request.project.unwrap_or(&active);
         let project_id = self.resolve_project_id(project_name)?;
@@ -627,6 +634,11 @@ impl Vault {
             )
             .map_err(|_| VaultError::CredentialNotFound(request.name.to_string()))?;
 
+        if self.auth_metadata_for_id(&cred_id)?.is_some() {
+            return Err(VaultError::AuthRejected(
+                "registered auth cannot be overwritten; create a new credential",
+            ));
+        }
         let encrypted_value = self.encrypt_bytes(key, request.value.as_bytes())?;
         let type_json = serde_json::to_string(&request.credential_type)
             .expect("CredentialType serializes to json");
@@ -643,6 +655,7 @@ impl Vault {
         let created_at =
             rows::parse_datetime_column(0, &created_at_str).unwrap_or_else(|_| Utc::now());
 
+        tx.commit()?;
         Ok(Credential {
             id: cred_id,
             name: request.name.to_string(),
@@ -755,12 +768,25 @@ impl Vault {
     /// Deletes a partition in a specific project and moves credentials to that project's personal partition.
     pub fn delete_partition_in_project(&self, project_name: &str, name: &str) -> Result<()> {
         let _ = self.ensure_unlocked()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
 
         if name == DEFAULT_PARTITION_NAME {
             return Err(VaultError::CannotDeleteDefaultPartition);
         }
 
         let partition: Partition = self.get_partition_in_project(project_name, name)?;
+        if !self
+            .export_auth_partition(project_name, name)?
+            .records
+            .is_empty()
+        {
+            return Err(VaultError::AuthRejected(
+                "partition contains registered auth",
+            ));
+        }
         let personal_id =
             self.resolve_partition_id_for_insert(Some(DEFAULT_PARTITION_NAME), Some(project_name))?;
 
@@ -775,6 +801,7 @@ impl Vault {
         if affected == 0 {
             return Err(VaultError::PartitionNotFound(name.to_string()));
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -785,6 +812,10 @@ impl Vault {
         partition_name: &str,
     ) -> Result<()> {
         let _ = self.ensure_unlocked()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
 
         let exists: bool = self.db.query_row(
             "SELECT COUNT(*) > 0 FROM credentials WHERE name = ?1",
@@ -796,6 +827,12 @@ impl Vault {
         }
 
         let credential = self.get_credential(credential_name)?;
+        if self.auth_metadata_for_id(&credential.id)?.is_some() {
+            return Err(VaultError::AuthRejected(
+                "registered auth cannot change partition",
+            ));
+        }
+
         let project_name = credential
             .partition_id
             .as_ref()
@@ -807,6 +844,7 @@ impl Vault {
             "UPDATE credentials SET partition_id = ?1, updated_at = ?2 WHERE id = ?3",
             params![partition_id, Utc::now().to_rfc3339(), credential.id],
         )?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -884,21 +922,56 @@ impl Vault {
         project_name: &str,
         name: &str,
     ) -> Result<String> {
+        self.decrypt_credential_for_use(project_name, name, false)
+    }
+
+    pub(crate) fn decrypt_credential_for_delegated_use(
+        &self,
+        project_name: &str,
+        name: &str,
+    ) -> Result<String> {
+        self.decrypt_credential_for_use(project_name, name, true)
+    }
+
+    fn decrypt_credential_for_use(
+        &self,
+        project_name: &str,
+        name: &str,
+        delegated: bool,
+    ) -> Result<String> {
+        let transaction = if self.db.is_autocommit() {
+            Some(self.db.unchecked_transaction()?)
+        } else {
+            None
+        };
+        let credential = self.get_credential_in_project(project_name, name)?;
+        self.ensure_auth_usable(&credential.id, delegated, None)?;
+        let value = self.decrypt_credential_for_transfer(project_name, name)?;
+        self.ensure_auth_usable(&credential.id, delegated, None)?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(value)
+    }
+
+    /// Recovery-only primitive: used exclusively by authenticated encrypted transfer.
+    /// No CLI/MCP/plaintext-egress caller may use this bypass.
+    pub(crate) fn decrypt_credential_for_transfer(
+        &self,
+        project_name: &str,
+        name: &str,
+    ) -> Result<String> {
         let key = self.ensure_unlocked()?;
-        let project_id = self.resolve_project_id(project_name)?;
-        let encoded: String = self
-            .db
-            .query_row(
-                "SELECT c.encrypted_value FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
-                params![project_id, name],
-                |row| row.get(0),
-            )
-            .map_err(|_| VaultError::CredentialNotFound(name.to_string()))?;
-        let encrypted = BASE64
-            .decode(&encoded)
-            .map_err(|e| VaultError::Encryption(e.to_string()))?;
+        let credential = self.get_credential_in_project(project_name, name)?;
+        let encoded: String = self.db.query_row(
+            "SELECT encrypted_value FROM credentials WHERE id=?1",
+            [&credential.id],
+            |row| row.get(0),
+        )?;
+        let encrypted = self.decode_auth_ciphertext(&credential.id, &encoded)?;
         let decrypted = self.decrypt_bytes(key, &encrypted)?;
-        String::from_utf8(decrypted).map_err(|e| VaultError::Encryption(e.to_string()))
+        String::from_utf8(decrypted)
+            .map_err(|_| VaultError::AuthRejected("credential plaintext invalid"))
     }
 
     /// Deletes a credential row by name.
@@ -909,13 +982,30 @@ impl Vault {
 
     pub fn remove_credential_in_project(&self, project_name: &str, name: &str) -> Result<()> {
         let _ = self.ensure_unlocked()?;
+        let transaction = if self.db.is_autocommit() {
+            Some(rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?)
+        } else {
+            None
+        };
         let project_id = self.resolve_project_id(project_name)?;
+        let credential = self.get_credential_in_project(project_name, name)?;
+        self.ensure_auth_unreferenced(project_name, &credential)?;
+        self.db.execute(
+            "DELETE FROM auth_registry WHERE credential_id=?1",
+            [&credential.id],
+        )?;
         let affected = self.db.execute(
             "DELETE FROM credentials WHERE name = ?1 AND partition_id IN (SELECT id FROM partitions WHERE project_id = ?2)",
             params![name, project_id],
         )?;
         if affected == 0 {
             return Err(VaultError::CredentialNotFound(name.to_string()));
+        }
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
         }
         Ok(())
     }
@@ -949,8 +1039,21 @@ impl Vault {
 
     /// Resolves a wisp token to credential metadata and decrypted secret; updates `last_used_at`.
     pub fn lookup_by_wisp_token(&self, token: &str) -> Result<(Credential, String)> {
-        let key = self.ensure_unlocked()?;
+        self.lookup_auth_token(token, false, None)
+    }
 
+    pub(crate) fn lookup_auth_token(
+        &self,
+        token: &str,
+        delegated: bool,
+        origin: Option<&str>,
+    ) -> Result<(Credential, String)> {
+        let key = self.ensure_unlocked()?;
+        let transaction = if self.db.is_autocommit() {
+            Some(self.db.unchecked_transaction()?)
+        } else {
+            None
+        };
         let mut stmt = self.db.prepare("SELECT id, name, description, credential_type, wisp_token, hosts, tags, created_at, updated_at, last_used_at, partition_id, origin, lifecycle_state, review_at, encrypted_value FROM credentials WHERE wisp_token = ?1")?;
         let (cred, encoded) = stmt
             .query_row(params![token], |row| {
@@ -958,20 +1061,25 @@ impl Vault {
                 let cred = credential_from_row(row)?;
                 Ok((cred, encrypted_value))
             })
-            .map_err(|_| VaultError::CredentialNotFound(token.to_string()))?;
-
-        let encrypted = BASE64
-            .decode(&encoded)
-            .map_err(|e| VaultError::Encryption(e.to_string()))?;
+            .map_err(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => {
+                    VaultError::CredentialNotFound("token".to_owned())
+                }
+                other => VaultError::Database(other),
+            })?;
+        self.ensure_auth_usable(&cred.id, delegated, origin)?;
+        let encrypted = self.decode_auth_ciphertext(&cred.id, &encoded)?;
         let decrypted = self.decrypt_bytes(key, &encrypted)?;
-        let value =
-            String::from_utf8(decrypted).map_err(|e| VaultError::Encryption(e.to_string()))?;
-
+        let value = String::from_utf8(decrypted)
+            .map_err(|_| VaultError::AuthRejected("credential plaintext invalid"))?;
+        self.ensure_auth_usable(&cred.id, delegated, origin)?;
         self.db.execute(
-            "UPDATE credentials SET last_used_at = ?1 WHERE wisp_token = ?2",
-            params![Utc::now().to_rfc3339(), token],
+            "UPDATE credentials SET last_used_at=?1 WHERE id=?2",
+            params![Utc::now().to_rfc3339(), cred.id],
         )?;
-
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
         Ok((cred, value))
     }
 
@@ -1034,12 +1142,23 @@ impl Vault {
     /// Credentials in partitions that already exist in default move to that default partition.
     pub fn delete_project(&self, name: &str) -> Result<()> {
         let _ = self.ensure_unlocked()?;
+        let tx = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
 
         if name == DEFAULT_PROJECT_NAME {
             return Err(VaultError::CannotDeleteDefaultProject);
         }
 
         let project = self.get_project(name)?;
+        if self
+            .list_auth_inventory(name)?
+            .iter()
+            .any(|item| item.auth.is_some())
+        {
+            return Err(VaultError::AuthRejected("project contains registered auth"));
+        }
         let default_id: String = self.db.query_row(
             "SELECT id FROM projects WHERE name = ?1",
             params![DEFAULT_PROJECT_NAME],
@@ -1090,6 +1209,7 @@ impl Vault {
         if affected == 0 {
             return Err(VaultError::ProjectNotFound(name.to_string()));
         }
+        tx.commit()?;
         Ok(())
     }
 

@@ -305,10 +305,16 @@ pub(crate) fn release(vault: &Vault, approved: &FillRequest) -> Result<WebsiteLo
         "approved",
         "BrowserFillApproved",
     )?;
+    vault
+        .ensure_auth_usable(&credential.id, true, Some(&current.origin))
+        .map_err(|_| "auth unavailable")?;
     let plaintext = vault
         .decrypt_credential_value_in_project(&current.project, &current.name)
         .map_err(|_| "login unavailable")?;
     let payload = serde_json::from_str(&plaintext).map_err(|_| "invalid website login")?;
+    vault
+        .ensure_auth_usable(&credential.id, true, Some(&current.origin))
+        .map_err(|_| "auth unavailable")?;
     tx.commit()
         .map_err(|_| "browser request store unavailable")?;
     Ok(payload)
@@ -383,6 +389,50 @@ mod tests {
             "Apply for a job",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn registered_login_expiry_and_revocation_deny_actual_browser_release() {
+        use crate::core::auth::{AuthRegistration, ProviderExpiry};
+        for revoked in [false, true] {
+            let vault = fixture();
+            vault
+                .register_auth(
+                    "default",
+                    "careers",
+                    AuthRegistration {
+                        provider: "example".into(),
+                        account: "test".into(),
+                        origins: vec!["https://jobs.example.com".into()],
+                        provider_expiry: ProviderExpiry::NonExpiring,
+                        use_until: Some(Utc::now() + chrono::Duration::hours(1)),
+                    },
+                )
+                .unwrap();
+            let pending = enqueue(&vault);
+            if revoked {
+                vault.revoke_auth("default", "careers").unwrap();
+            } else {
+                let mut auth = vault
+                    .auth_metadata_for_id(&pending.credential_id)
+                    .unwrap()
+                    .unwrap();
+                auth.use_until = Some(Utc::now() - chrono::Duration::seconds(1));
+                vault
+                    .db
+                    .execute(
+                        "UPDATE auth_registry SET metadata_json=?1 WHERE credential_id=?2",
+                        params![serde_json::to_string(&auth).unwrap(), pending.credential_id],
+                    )
+                    .unwrap();
+            }
+            assert!(release(&vault, &pending).is_err());
+            assert_eq!(
+                status(&vault, &pending.request_id).unwrap().status,
+                "pending",
+                "denied release transaction rolls back approval"
+            );
+        }
     }
 
     #[test]
