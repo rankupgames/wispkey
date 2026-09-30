@@ -302,6 +302,24 @@ async fn send_callback(address: std::net::SocketAddr, target: &str) -> String {
     String::from_utf8(bytes).unwrap()
 }
 
+async fn assert_replay_not_acknowledged(address: std::net::SocketAddr, state: &str) {
+    // A completed TCP handshake can race kernel teardown (especially on macOS).
+    // Check the auth boundary: the consumed listener must never acknowledge another code.
+    let response = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut stream = TcpStream::connect(address).await?;
+        stream.write_all(format!("GET /callback?code=synthetic-replay&state={state} HTTP/1.1\r\nHost: {address}\r\n\r\n").as_bytes()).await?;
+        let mut bytes = Vec::new();
+        stream.take(MAX_CALLBACK_BYTES as u64).read_to_end(&mut bytes).await?;
+        Ok::<_, std::io::Error>(bytes)
+    }).await;
+    if let Ok(Ok(bytes)) = response {
+        assert!(
+            !String::from_utf8_lossy(&bytes).contains("WispKey received the sign-in response"),
+            "consumed callback acknowledged a replay"
+        );
+    }
+}
+
 #[tokio::test]
 async fn listener_rejects_injection_then_accepts_once_and_closes() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -335,7 +353,7 @@ async fn listener_rejects_injection_then_accepts_once_and_closes() {
         .contains("no-store")
     );
     assert_eq!(task.await.unwrap().unwrap().as_str(), "synthetic-code");
-    assert!(TcpStream::connect(address).await.is_err());
+    assert_replay_not_acknowledged(address, &state).await;
 }
 
 #[tokio::test]
@@ -343,6 +361,7 @@ async fn timeout_cancellation_slow_requests_and_oversize_are_bounded() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let secrets = LoginSecrets::generate().unwrap();
+    let state = secrets.state.to_string();
     let task = tokio::spawn(async move {
         receive_code(
             listener,
@@ -360,10 +379,11 @@ async fn timeout_cancellation_slow_requests_and_oversize_are_bounded() {
             .to_string()
             .contains("timed_out")
     );
-    assert!(TcpStream::connect(address).await.is_err());
+    assert_replay_not_acknowledged(address, &state).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let secrets = LoginSecrets::generate().unwrap();
+    let state = secrets.state.to_string();
     let result = cancellable(
         receive_code(
             listener,
@@ -375,7 +395,7 @@ async fn timeout_cancellation_slow_requests_and_oversize_are_bounded() {
     )
     .await;
     assert!(result.unwrap_err().to_string().contains("cancelled"));
-    assert!(TcpStream::connect(address).await.is_err());
+    assert_replay_not_acknowledged(address, &state).await;
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let task = tokio::spawn(async move {
@@ -401,6 +421,7 @@ struct Fixture {
     client: reqwest::Client,
     requests: Arc<Mutex<Vec<String>>>,
     challenge: Arc<Mutex<String>>,
+    callback: Arc<Mutex<Option<(std::net::SocketAddr, String)>>>,
     stop: Arc<AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
@@ -455,6 +476,9 @@ impl Fixture {
                     }
                     Err(_) => break,
                 };
+                // BSD/macOS can inherit O_NONBLOCK from the listening socket.
+                // StreamOwned below is deliberately synchronous on this fixture thread.
+                stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(3)))
                     .unwrap();
@@ -589,6 +613,7 @@ impl Fixture {
             client,
             requests,
             challenge,
+            callback: Arc::new(Mutex::new(None)),
             stop,
             worker: Some(worker),
         }
@@ -602,6 +627,7 @@ impl Fixture {
             http_client: self.client.clone(),
         };
         let proof = self.challenge.clone();
+        let callback = self.callback.clone();
         client
             .login_inner(|url| {
                 let params: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
@@ -611,6 +637,7 @@ impl Fixture {
                     .parse()
                     .unwrap();
                 let state = params["state"].clone();
+                *callback.lock().unwrap() = Some((address, state.clone()));
                 tokio::spawn(async move {
                     send_callback(
                         address,
@@ -641,7 +668,17 @@ async fn synthetic_https_oauth_flow_verifies_before_returning_candidate() {
         fixture.issuer
     );
     ensure_session(&config).unwrap();
+    let (address, state) = fixture.callback.lock().unwrap().clone().unwrap();
+    assert_replay_not_acknowledged(address, &state).await;
     let requests = fixture.requests.lock().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.starts_with("POST /oauth/token"))
+            .count(),
+        1,
+        "a replay caused another code exchange"
+    );
     assert_eq!(requests.len(), 4);
     assert!(requests[0].starts_with("GET /api/v1/auth/cli-config"));
     assert!(!requests[0].to_lowercase().contains("authorization:"));
@@ -694,7 +731,7 @@ async fn valid_provider_denial_ends_attempt_and_closes_listener() {
             .to_string()
             .contains("cloud_login_denied")
     );
-    assert!(TcpStream::connect(address).await.is_err());
+    assert_replay_not_acknowledged(address, &state).await;
 }
 
 #[tokio::test]

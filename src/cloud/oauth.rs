@@ -499,7 +499,7 @@ async fn receive_code(
         .local_addr()
         .map_err(|_| invalid("callback_address_failed"))?
         .to_string();
-    tokio::time::timeout(timeout, async {
+    let outcome = tokio::time::timeout(timeout, async {
         loop {
             let (mut stream, peer) = listener.accept().await.map_err(|_| invalid("callback_accept_failed"))?;
             if !peer.ip().is_loopback() { continue; }
@@ -519,7 +519,11 @@ async fn receive_code(
             }).await;
             if parsed.is_ok() || denied { return parsed; }
         }
-    }).await.map_err(|_| invalid("cloud_login_timed_out; run `wispkey cloud login` to retry"))?
+    }).await;
+    // Close the owned socket after the response attempt and before returning a
+    // code, so any pending TCP handshake cannot lead to another callback exchange.
+    drop(listener);
+    outcome.map_err(|_| invalid("cloud_login_timed_out; run `wispkey cloud login` to retry"))?
 }
 
 async fn cancellable<T>(
