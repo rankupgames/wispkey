@@ -89,9 +89,22 @@ before approving with Windows Hello. Requester and reason are **unverified
 agent-supplied labels**, not proof of identity. Denying a request never decrypts it.
 
 The extension needs one visible username/email field and one password field in
-the top-level form. It also supports two password fields when both explicitly
-declare `autocomplete="new-password"`. Ambiguous forms, hidden/disabled fields,
-iframes, OTP fields and forms with a different submission origin are refused.
+the top-level form. It recognizes `autocomplete="username"` and
+`autocomplete="email"` on text/email inputs, including section and supported
+contact prefixes. If neither is declared, it accepts one email input or one
+otherwise-unclassified text input. Fields with other declared purposes (names,
+addresses, OTPs, payment fields, or unknown purposes) are never username fallback
+candidates and remain untouched. Controls linked with `form="id"` are supported.
+Separate email and username inputs remain ambiguous until distinct profile values
+are supported; WispKey does not guess or copy one identity into both.
+
+Two password fields are supported only when both explicitly declare
+`autocomplete="new-password"`; both receive the same saved password. Ambiguous
+forms, hidden/disabled fields (including disabled fieldsets), iframes, unsupported
+password purposes, and different submission origins are refused. The selected
+form, input elements, field purposes and submission destinations must still match
+the inspected mapping after approval. A changed or replaced target requires a
+fresh request. Unrelated profile fields and consent controls are never changed.
 There is no broad host permission, persistent content script, clipboard use,
 automatic form submission, or external messaging endpoint.
 

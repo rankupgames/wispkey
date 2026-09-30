@@ -11,34 +11,65 @@ globalThis.WispKeyFlow = (() => {
   function installReceiver(nonce, origin) {
     const api = globalThis.browser || globalThis.chrome;
     if (window !== window.top || location.origin !== origin || location.protocol !== "https:") return false;
-    const visible = (input) => !input.disabled && !input.readOnly
+    const visible = (input) => !input.disabled && !input.matches(":disabled") && !input.readOnly
       && input.getClientRects().length > 0 && getComputedStyle(input).visibility === "visible"
       && getComputedStyle(input).opacity !== "0";
-    // Firefox can expose an empty property for valid detail tokens. Inspect the
-    // declared attribute so OTP rejection and signup confirmation work there too.
-    const autocomplete = (input) => (input.getAttribute("autocomplete") || "").toLowerCase().split(/\s+/);
+    // Read the declared attribute: Firefox may expose an empty property for
+    // valid detail tokens. Unknown/ambiguous purposes must not become username
+    // fallback candidates. Only the supported subset of HTML autocomplete is
+    // recognized; this is not a general profile/address autofill engine.
+    function purpose(input) {
+      const value = (input.getAttribute("autocomplete") || "").trim().toLowerCase();
+      if (!value || value === "on" || value === "off") return "unspecified";
+      const tokens = value.split(/\s+/);
+      if (tokens.at(-1) === "webauthn") tokens.pop();
+      if (tokens[0]?.startsWith("section-") && tokens[0].length > 8) tokens.shift();
+      if (["shipping", "billing"].includes(tokens[0])) tokens.shift();
+      const contact = ["home", "work", "mobile", "fax", "pager"].includes(tokens[0]);
+      if (contact) tokens.shift();
+      if (tokens.length !== 1 || (contact && tokens[0] !== "email")) return "other";
+      return ["username", "email", "new-password", "current-password", "one-time-code"].includes(tokens[0])
+        ? tokens[0] : "other";
+    }
     function fields() {
       const passwords = [...document.querySelectorAll('input[type="password"]')].filter(visible);
       if (passwords.length < 1 || passwords.length > 2) return null;
-      if (passwords.some((input) => autocomplete(input).includes("one-time-code"))) return null;
-      if (passwords.length === 2 && passwords.some((input) => !autocomplete(input).includes("new-password"))) return null;
+      const passwordPurposes = passwords.map(purpose);
+      if (passwordPurposes.some((value) => !["unspecified", "current-password", "new-password"].includes(value))) return null;
+      if (passwords.length === 2 && passwordPurposes.some((value) => value !== "new-password")) return null;
       const form = passwords[0].form;
       if (!form || passwords.some((input) => input.form !== form)) return null;
       // Never fill forms that advertise a different destination, even though we
       // do not submit. Includes overrides on individual submit buttons.
-      const destinations = [form.action, ...[...document.querySelectorAll("[formaction]")]
-        .filter((el) => el.form === form).map((el) => el.formAction)];
-      if (destinations.some((value) => {
-        try { return new URL(value, location.href).origin !== origin; } catch { return true; }
-      })) return null;
-      const text = [...form.querySelectorAll('input')].filter((input) =>
-        visible(input) && ["text", "email"].includes(input.type));
-      const usernames = text.filter((input) => autocomplete(input).includes("username") || input.type === "email");
-      const candidates = usernames.length ? usernames : text;
+      let destinations;
+      try {
+        destinations = [form.action, ...[...document.querySelectorAll("[formaction]")]
+          .filter((el) => el.form === form).map((el) => el.formAction)]
+          .map((value) => new URL(value, location.href));
+      } catch { return null; }
+      if (destinations.some((url) => url.origin !== origin)) return null;
+      // Form ownership, rather than DOM ancestry, also covers controls attached
+      // with form="id" and excludes descendants owned by a different form.
+      const text = [...form.elements].filter((input) => input instanceof HTMLInputElement
+        && input.form === form && visible(input) && ["text", "email"].includes(input.type));
+      const usernames = text.filter((input) => ["username", "email"].includes(purpose(input))
+        || (input.type === "email" && purpose(input) === "unspecified"));
+      const candidates = usernames.length ? usernames : text.filter((input) => purpose(input) === "unspecified");
       if (candidates.length !== 1) return null;
-      return { username: candidates[0], passwords };
+      const username = candidates[0];
+      return { form, username, passwords, destinations: destinations.map((url) => url.href).sort(),
+        purposes: [purpose(username), ...passwordPurposes], usernameType: username.type };
     }
-    if (!fields()) return false;
+    const inspected = fields();
+    if (!inspected) return false;
+    function sameTargets(current) {
+      return current && current.form === inspected.form && current.username === inspected.username
+        && current.usernameType === inspected.usernameType
+        && current.passwords.length === inspected.passwords.length
+        && current.passwords.every((input, index) => input === inspected.passwords[index])
+        && JSON.stringify(current.purposes) === JSON.stringify(inspected.purposes)
+        && JSON.stringify(current.destinations) === JSON.stringify(inspected.destinations);
+    }
     const listener = (port) => {
       if (port.name !== `wispkey-fill-${nonce}` || port.sender?.id !== api.runtime.id) return;
       api.runtime.onConnect.removeListener(listener);
@@ -48,7 +79,7 @@ globalThis.WispKeyFlow = (() => {
         if (used) return;
         used = true;
         const targets = fields();
-        if (location.origin !== origin || window !== window.top || !targets
+        if (location.origin !== origin || window !== window.top || !sameTargets(targets)
           || message.origin !== origin || typeof message.login?.username !== "string"
           || typeof message.login?.password !== "string") {
           port.postMessage({ completed: false });
