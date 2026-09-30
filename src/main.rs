@@ -34,6 +34,112 @@ enum OutputFormat {
     Json,
 }
 
+// Keep argument-heavy commands in separate Args implementations so clap does
+// not accumulate every builder temporary in one debug-build stack frame.
+#[derive(Args)]
+struct AddArgs {
+    /// Human-readable credential name
+    name: String,
+
+    /// Credential type (bearer_token, api_key, basic_auth, custom_header, query_param)
+    #[arg(long, default_value = "bearer_token")]
+    r#type: String,
+
+    /// Short human-readable description of what this credential is for
+    #[arg(long)]
+    description: Option<String>,
+
+    /// The secret value to store; exposed in shell history and process listings
+    #[arg(long, allow_hyphen_values = true)]
+    value: Option<String>,
+
+    /// Read the secret value from a file, or '-' for stdin
+    #[arg(long)]
+    value_file: Option<String>,
+
+    /// Allowed target hosts (comma-separated, glob patterns)
+    #[arg(long)]
+    hosts: Option<String>,
+
+    /// Tags (comma-separated)
+    #[arg(long)]
+    tags: Option<String>,
+
+    /// Custom header name (required for custom_header type)
+    #[arg(long)]
+    header_name: Option<String>,
+
+    /// Query parameter name (required for query_param type)
+    #[arg(long)]
+    param_name: Option<String>,
+
+    /// Partition to add to (default: personal)
+    #[arg(long)]
+    partition: Option<String>,
+
+    /// Project override (default: active project)
+    #[arg(long)]
+    project: Option<String>,
+}
+
+#[derive(Args)]
+struct ServeArgs {
+    /// Port to listen on (ignored when --random-port is set)
+    #[arg(long, default_value = "7700")]
+    port: u16,
+
+    /// Let the OS pick a random available port (written to proxy.json for discovery)
+    #[arg(long)]
+    random_port: bool,
+
+    /// Run as a background daemon
+    #[arg(long)]
+    daemon: bool,
+
+    /// Allow credentials from all projects (default: active project only)
+    #[arg(long)]
+    all_projects: bool,
+
+    /// Add a listener: TCP, Unix socket, Linux vsock, or Firecracker UDS-backed vsock
+    #[arg(long = "listen")]
+    listen: Vec<String>,
+
+    /// Require per-request instance identity on all listeners
+    #[arg(long, conflicts_with = "no_require_identity")]
+    require_identity: bool,
+
+    /// Do not require per-request instance identity on any listener
+    #[arg(long, conflicts_with = "require_identity")]
+    no_require_identity: bool,
+}
+
+#[derive(Args)]
+struct ExecArgs {
+    /// Credential name
+    #[arg(long)]
+    credential: String,
+
+    /// Project override (default: active project)
+    #[arg(long)]
+    project: Option<String>,
+
+    /// Write the secret plus a newline to the child's stdin, then close stdin
+    #[arg(long = "stdin")]
+    stdin_channel: bool,
+
+    /// Set a child-only environment variable to the secret value
+    #[arg(long = "env")]
+    env_vars: Vec<String>,
+
+    /// Configure SUDO_ASKPASS, SSH_ASKPASS, and GIT_ASKPASS for the child
+    #[arg(long)]
+    askpass: bool,
+
+    /// Child command and arguments after --
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    command: Vec<String>,
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Create a new vault with a master password
@@ -73,50 +179,7 @@ enum Commands {
     },
 
     /// Add a credential to the vault
-    Add {
-        /// Human-readable credential name
-        name: String,
-
-        /// Credential type (bearer_token, api_key, basic_auth, custom_header, query_param)
-        #[arg(long, default_value = "bearer_token")]
-        r#type: String,
-
-        /// Short human-readable description of what this credential is for
-        #[arg(long)]
-        description: Option<String>,
-
-        /// The secret value to store; exposed in shell history and process listings
-        #[arg(long, allow_hyphen_values = true)]
-        value: Option<String>,
-
-        /// Read the secret value from a file, or '-' for stdin
-        #[arg(long)]
-        value_file: Option<String>,
-
-        /// Allowed target hosts (comma-separated, glob patterns)
-        #[arg(long)]
-        hosts: Option<String>,
-
-        /// Tags (comma-separated)
-        #[arg(long)]
-        tags: Option<String>,
-
-        /// Custom header name (required for custom_header type)
-        #[arg(long)]
-        header_name: Option<String>,
-
-        /// Query parameter name (required for query_param type)
-        #[arg(long)]
-        param_name: Option<String>,
-
-        /// Partition to add to (default: personal)
-        #[arg(long)]
-        partition: Option<String>,
-
-        /// Project override (default: active project)
-        #[arg(long)]
-        project: Option<String>,
-    },
+    Add(AddArgs),
 
     /// List all credentials (names only, never values)
     List {
@@ -156,31 +219,7 @@ enum Commands {
     },
 
     /// Run a child process with a credential injected through controlled channels
-    Exec {
-        /// Credential name
-        #[arg(long)]
-        credential: String,
-
-        /// Project override (default: active project)
-        #[arg(long)]
-        project: Option<String>,
-
-        /// Write the secret plus a newline to the child's stdin, then close stdin
-        #[arg(long = "stdin")]
-        stdin_channel: bool,
-
-        /// Set a child-only environment variable to the secret value
-        #[arg(long = "env")]
-        env_vars: Vec<String>,
-
-        /// Configure SUDO_ASKPASS, SSH_ASKPASS, and GIT_ASKPASS for the child
-        #[arg(long)]
-        askpass: bool,
-
-        /// Child command and arguments after --
-        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
-        command: Vec<String>,
-    },
+    Exec(ExecArgs),
 
     /// Inspect local runner identity and validate a private cross-node operation catalog
     Operation {
@@ -227,35 +266,7 @@ enum Commands {
     Askpass,
 
     /// Start the wisp token proxy
-    Serve {
-        /// Port to listen on (ignored when --random-port is set)
-        #[arg(long, default_value = "7700")]
-        port: u16,
-
-        /// Let the OS pick a random available port (written to proxy.json for discovery)
-        #[arg(long)]
-        random_port: bool,
-
-        /// Run as a background daemon
-        #[arg(long)]
-        daemon: bool,
-
-        /// Allow credentials from all projects (default: active project only)
-        #[arg(long)]
-        all_projects: bool,
-
-        /// Add a listener: TCP, Unix socket, Linux vsock, or Firecracker UDS-backed vsock
-        #[arg(long = "listen")]
-        listen: Vec<String>,
-
-        /// Require per-request instance identity on all listeners
-        #[arg(long, conflicts_with = "no_require_identity")]
-        require_identity: bool,
-
-        /// Do not require per-request instance identity on any listener
-        #[arg(long, conflicts_with = "require_identity")]
-        no_require_identity: bool,
-    },
+    Serve(ServeArgs),
 
     /// Import credentials from a .env file
     Import {
@@ -356,6 +367,12 @@ enum Commands {
     Login {
         #[command(subcommand)]
         command: LoginCommands,
+    },
+
+    /// Opt in credentials to an exact-origin auth registry and reusable bundles
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommands,
     },
 
     /// Manage access policies
@@ -720,6 +737,83 @@ enum CredentialCommands {
         /// Destination partition override
         #[arg(long)]
         partition: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthCommands {
+    /// Register metadata for an existing credential (never reads its secret)
+    Register {
+        /// Existing credential name
+        credential: String,
+        /// Exact project containing the credential
+        #[arg(long)]
+        project: String,
+        /// Provider label, such as github or example-api
+        #[arg(long)]
+        provider: String,
+        /// Explicit provider account identity
+        #[arg(long)]
+        account: String,
+        /// Exact HTTPS origin; repeat for each allowed origin
+        #[arg(long = "origin", required = true)]
+        origins: Vec<String>,
+        /// unknown, non-expiring, or an RFC3339 timestamp with timezone
+        #[arg(long)]
+        provider_expiry: String,
+        /// Local use deadline in RFC3339; required for unknown expiry and bundle resolution
+        #[arg(long)]
+        use_until: Option<String>,
+    },
+    /// Inventory metadata only, including unregistered credentials; never emits tokens
+    List {
+        /// Filter by project (default: active project)
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Revoke registry eligibility without deleting the underlying credential
+    Revoke {
+        credential: String,
+        #[arg(long)]
+        project: String,
+    },
+    /// Store and resolve metadata-only bundles with explicit alternative selection
+    Bundle {
+        #[command(subcommand)]
+        command: AuthBundleCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum AuthBundleCommands {
+    /// Create or replace a bundle from an explicit metadata-only JSON file
+    Set {
+        /// JSON: name, project, partition, account, alternatives [{name, members [{auth_id, revision, role}]}]
+        #[arg(long)]
+        file: String,
+    },
+    /// List bundle metadata and pinned member revisions; never emits tokens
+    List {
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        partition: String,
+    },
+    /// Emit opaque tokens only if every member of the chosen alternative is eligible
+    Resolve {
+        name: String,
+        #[arg(long)]
+        project: String,
+        #[arg(long)]
+        partition: String,
+        #[arg(long)]
+        account: String,
+        /// Required explicit choice; never tries another alternative on failure
+        #[arg(long)]
+        alternative: String,
+        /// Exact HTTPS destination origin for all required-together members
+        #[arg(long)]
+        origin: String,
     },
 }
 
@@ -1110,7 +1204,7 @@ async fn main() {
         Commands::Tray { ipc_only } => {
             Box::pin(cli::handle_tray(ipc_only)).await;
         }
-        Commands::Add {
+        Commands::Add(AddArgs {
             name,
             r#type,
             description,
@@ -1122,7 +1216,7 @@ async fn main() {
             param_name,
             partition,
             project,
-        } => {
+        }) => {
             let resolved_value = match (&value, &value_file) {
                 (Some(_), Some(_)) => {
                     eprintln!("Error: cannot use both --value and --value-file");
@@ -1184,14 +1278,14 @@ async fn main() {
         Commands::Rotate { name } => {
             cli::handle_rotate(&name).await;
         }
-        Commands::Exec {
+        Commands::Exec(ExecArgs {
             credential,
             project,
             stdin_channel,
             env_vars,
             askpass,
             command,
-        } => {
+        }) => {
             cli::handle_exec(cli::ExecArgs {
                 credential: &credential,
                 project: project.as_deref(),
@@ -1260,7 +1354,7 @@ async fn main() {
         Commands::Askpass => {
             cli::handle_askpass().await;
         }
-        Commands::Serve {
+        Commands::Serve(ServeArgs {
             port,
             random_port,
             daemon,
@@ -1268,7 +1362,7 @@ async fn main() {
             listen,
             require_identity,
             no_require_identity,
-        } => {
+        }) => {
             let effective_port = if random_port { 0 } else { port };
             Box::pin(cli::handle_serve(
                 effective_port,
@@ -1468,6 +1562,51 @@ async fn main() {
                 )
                 .await
             }
+        },
+        Commands::Auth { command } => match command {
+            AuthCommands::Register {
+                credential,
+                project,
+                provider,
+                account,
+                origins,
+                provider_expiry,
+                use_until,
+            } => cli::handle_auth_register(cli::AuthRegisterArgs {
+                name: &credential,
+                project: &project,
+                provider: &provider,
+                account: &account,
+                origins,
+                provider_expiry: &provider_expiry,
+                use_until: use_until.as_deref(),
+            }),
+            AuthCommands::List { project } => cli::handle_auth_list(project.as_deref()),
+            AuthCommands::Revoke {
+                credential,
+                project,
+            } => cli::handle_auth_revoke(&credential, &project),
+            AuthCommands::Bundle { command } => match command {
+                AuthBundleCommands::Set { file } => cli::handle_auth_bundle_set(&file),
+                AuthBundleCommands::List { project, partition } => {
+                    cli::handle_auth_bundle_list(&project, &partition)
+                }
+                AuthBundleCommands::Resolve {
+                    name,
+                    project,
+                    partition,
+                    account,
+                    alternative,
+                    origin,
+                } => cli::handle_auth_bundle_resolve(
+                    &name,
+                    &project,
+                    &partition,
+                    &account,
+                    &alternative,
+                    &origin,
+                ),
+            },
         },
         Commands::Login { command } => match command {
             LoginCommands::Generate {

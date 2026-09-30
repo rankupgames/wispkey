@@ -3,8 +3,6 @@
 //! are references, not bearer credentials. No function here decrypts a secret.
 
 use argon2::{Argon2, PasswordVerifier};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use chrono::{DateTime, Duration, Utc};
 use ring::digest::{SHA256, digest};
 use rusqlite::{Connection, params};
@@ -385,13 +383,23 @@ pub fn decrypt_reserved(
             |row| row.get(0),
         )
         .map_err(|_| "credential unavailable")?;
-    let ciphertext = BASE64
-        .decode(encoded)
+    vault
+        .ensure_auth_usable(&binding.credential_id, true, None)
+        .map_err(|_| "auth unavailable")?;
+    let ciphertext = vault
+        .decode_auth_ciphertext(&binding.credential_id, &encoded)
         .map_err(|_| "credential unavailable")?;
     let key = vault.ensure_unlocked().map_err(|_| "session unavailable")?;
     let mut plaintext = vault
         .decrypt_bytes(key, &ciphertext)
         .map_err(|_| "credential unavailable")?;
+    if vault
+        .ensure_auth_usable(&binding.credential_id, true, None)
+        .is_err()
+    {
+        plaintext.fill(0);
+        return Err("auth unavailable");
+    }
     let renewed = vault
         .operation_session_binding()
         .map_err(|_| "session unavailable");
@@ -442,13 +450,23 @@ pub fn decrypt_provider(
         params![provider_credential, provider_project],
         |row| row.get(0),
     ).map_err(|_| "provider credential unavailable")?;
-    let ciphertext = BASE64
-        .decode(encoded)
-        .map_err(|_| "provider credential unavailable")?;
+    vault
+        .ensure_auth_usable(provider_credential, true, None)
+        .map_err(|_| "auth unavailable")?;
+    let ciphertext = vault
+        .decode_auth_ciphertext(provider_credential, &encoded)
+        .map_err(|_| "credential unavailable")?;
     let key = vault.ensure_unlocked().map_err(|_| "session unavailable")?;
     let mut plaintext = vault
         .decrypt_bytes(key, &ciphertext)
         .map_err(|_| "provider credential unavailable")?;
+    if vault
+        .ensure_auth_usable(provider_credential, true, None)
+        .is_err()
+    {
+        plaintext.fill(0);
+        return Err("auth unavailable");
+    }
     let renewed = vault
         .operation_session_binding()
         .map_err(|_| "session unavailable");
@@ -501,13 +519,20 @@ pub fn decrypt_previous(
             |row| row.get(0),
         )
         .map_err(|_| "previous credential unavailable")?;
-    let ciphertext = BASE64
-        .decode(encoded)
-        .map_err(|_| "previous credential unavailable")?;
+    vault
+        .ensure_auth_usable(old_id, true, None)
+        .map_err(|_| "auth unavailable")?;
+    let ciphertext = vault
+        .decode_auth_ciphertext(old_id, &encoded)
+        .map_err(|_| "credential unavailable")?;
     let key = vault.ensure_unlocked().map_err(|_| "session unavailable")?;
     let mut plaintext = vault
         .decrypt_bytes(key, &ciphertext)
         .map_err(|_| "previous credential unavailable")?;
+    if vault.ensure_auth_usable(old_id, true, None).is_err() {
+        plaintext.fill(0);
+        return Err("auth unavailable");
+    }
     let renewed = vault
         .operation_session_binding()
         .map_err(|_| "session unavailable");
@@ -531,10 +556,20 @@ fn validate_live(
     binding: &OperationBinding,
     session: &SessionLease,
 ) -> GrantResult<StoredGrant> {
+    validate_live_at(db, requester, attempt, binding, session, Utc::now())
+}
+
+fn validate_live_at(
+    db: &Connection,
+    requester: &AuthenticatedRequester,
+    attempt: &AttemptStatus,
+    binding: &OperationBinding,
+    session: &SessionLease,
+    now: DateTime<Utc>,
+) -> GrantResult<StoredGrant> {
     validate_binding(binding)?;
     let stored_attempt = load_attempt(db, &attempt.attempt_id)?;
     let grant = load_grant(db, &stored_attempt.grant_id)?;
-    let now = Utc::now();
     if stored_attempt.state != GrantState::Started
         || stored_attempt.cancel_requested
         || grant.state != GrantState::Started
@@ -560,7 +595,7 @@ fn validate_live(
         || requester.instance_id != grant.requester_instance_id
         || requester.generation != grant.instance_generation
         || instance_generation(db, &requester.instance_id)? != requester.generation
-        || credential_revision(db, &binding.project_id, &binding.credential_id)?
+        || credential_revision_at(db, &binding.project_id, &binding.credential_id, now)?
             != grant.credential_revision
         || match (
             &binding.provider_project_id,
@@ -568,7 +603,7 @@ fn validate_live(
             &grant.provider_revision,
         ) {
             (Some(project), Some(credential), Some(revision)) => {
-                credential_revision(db, project, credential)? != *revision
+                credential_revision_at(db, project, credential, now)? != *revision
             }
             (None, None, None) => false,
             _ => true,
@@ -578,7 +613,7 @@ fn validate_live(
             &grant.old_password_revision,
         ) {
             (Some(credential), Some(revision)) => {
-                credential_revision(db, &binding.project_id, credential)? != *revision
+                credential_revision_at(db, &binding.project_id, credential, now)? != *revision
             }
             (None, None) => false,
             _ => true,
@@ -1135,17 +1170,44 @@ fn instance_generation(db: &Connection, id: &str) -> GrantResult<String> {
 }
 
 fn credential_revision(db: &Connection, project_id: &str, id: &str) -> GrantResult<String> {
-    let (encrypted, updated_at, lifecycle, kind): (String, String, String, String) = db
+    credential_revision_at(db, project_id, id, Utc::now())
+}
+
+fn credential_revision_at(
+    db: &Connection,
+    project_id: &str,
+    id: &str,
+    now: DateTime<Utc>,
+) -> GrantResult<String> {
+    let (encrypted, updated_at, lifecycle, kind, auth_id, auth_json) = db
         .query_row(
-            "SELECT c.encrypted_value,c.updated_at,c.lifecycle_state,c.credential_type FROM credentials c JOIN partitions p ON p.id=c.partition_id WHERE c.id=?1 AND p.project_id=?2",
+            "SELECT c.encrypted_value,c.updated_at,c.lifecycle_state,c.credential_type,a.auth_id,a.metadata_json FROM credentials c JOIN partitions p ON p.id=c.partition_id LEFT JOIN auth_registry a ON a.credential_id=c.id WHERE c.id=?1 AND p.project_id=?2",
             params![id,project_id],
-            |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?)),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?, row.get::<_, Option<String>>(5)?)),
         )
         .map_err(|_| "credential unavailable")?;
     if lifecycle == "archived" || kind.contains("website_login") {
         return Err("credential unavailable");
     }
-    Ok(hash_text(&format!("{encrypted}\0{updated_at}")))
+    if encrypted.starts_with(super::auth::CIPHERTEXT_PREFIX) != auth_json.is_some() {
+        return Err("auth unavailable");
+    }
+    if let Some(json) = auth_json {
+        let metadata: super::auth::AuthMetadata =
+            serde_json::from_str(&json).map_err(|_| "auth unavailable")?;
+        if auth_id.as_deref() != Some(metadata.id.as_str()) {
+            return Err("auth unavailable");
+        }
+        metadata
+            .ensure_usable_at(now, true)
+            .map_err(|_| "auth unavailable")?;
+        // Bind owner approval to the entire registered policy, not merely the
+        // secret ciphertext. The same validation also runs in the live watcher.
+        Ok(hash_text(&format!("{encrypted}\0{updated_at}\0{json}")))
+    } else {
+        // Preserve revisions for existing, unregistered operation grants.
+        Ok(hash_text(&format!("{encrypted}\0{updated_at}")))
+    }
 }
 
 fn update_terminal(
@@ -1223,6 +1285,7 @@ mod tests {
             INSERT INTO partitions VALUES ('personal','default');
             INSERT INTO credentials VALUES ('00000000-0000-4000-8000-000000000002','personal','synthetic-ciphertext','2099-01-01T00:00:00Z','active','\"api_key\"');").unwrap();
         create_schema(&db).unwrap();
+        super::super::auth::create_schema(&db).unwrap();
         db
     }
 
@@ -1255,6 +1318,161 @@ mod tests {
         AuthenticatedRequester {
             instance_id: INSTANCE_ID.into(),
             generation: hash_text("instance-hash-one"),
+        }
+    }
+
+    fn registered_binding(
+        db: &Connection,
+    ) -> (OperationBinding, Vec<super::super::auth::AuthMetadata>) {
+        use super::super::auth::{AuthMetadata, ProviderExpiry};
+        let mut binding = binding();
+        let provider_id = "00000000-0000-4000-8000-000000000003";
+        let previous_id = "00000000-0000-4000-8000-000000000004";
+        for id in [provider_id, previous_id] {
+            db.execute("INSERT INTO credentials VALUES (?1,'personal','synthetic-ciphertext','2099-01-01T00:00:00Z','active','\"api_key\"')", [id]).unwrap();
+        }
+        binding.provider_credential_id = Some(provider_id.into());
+        binding.provider_project_id = Some("default".into());
+        binding.old_password_credential_id = Some(previous_id.into());
+        let mut records = Vec::new();
+        for id in [CREDENTIAL_ID, provider_id, previous_id] {
+            let metadata = AuthMetadata {
+                id: Uuid::new_v4().to_string(),
+                revision: Uuid::new_v4().to_string(),
+                provider: "synthetic-provider".into(),
+                account: "synthetic-account".into(),
+                origins: vec!["https://api.example.com".into()],
+                provider_expiry: ProviderExpiry::NonExpiring,
+                use_until: Some(Utc::now() + Duration::minutes(5)),
+                revoked_at: None,
+            };
+            db.execute(
+                "INSERT INTO auth_registry(credential_id,auth_id,metadata_json) VALUES(?1,?2,?3)",
+                params![id, metadata.id, serde_json::to_string(&metadata).unwrap()],
+            )
+            .unwrap();
+            db.execute(
+                "UPDATE credentials SET encrypted_value='wka1:' || encrypted_value WHERE id=?1",
+                [id],
+            )
+            .unwrap();
+            records.push(metadata);
+        }
+        (binding, records)
+    }
+
+    #[test]
+    fn registered_auth_changes_stop_live_attempts_for_every_bound_credential() {
+        for index in 0..3 {
+            for change in [
+                "revoked",
+                "revision",
+                "unbounded",
+                "missing",
+                "unmarked",
+                "wrong-id",
+            ] {
+                let db = db();
+                let (binding, mut records) = registered_binding(&db);
+                let session = session();
+                let grant =
+                    issue_with_session(&db, &binding, binding.expires_at, &session).unwrap();
+                let attempt =
+                    reserve_with_session(&db, &requester(), &grant.grant_id, &binding, &session)
+                        .unwrap();
+                // Exercise the same authorization path used by the runtime's
+                // watcher and final success check, after all one-use releases.
+                db.execute("UPDATE operation_attempts SET secret_released=1,provider_released=1,old_password_released=1 WHERE id=?1", [&attempt.attempt_id]).unwrap();
+                assert!(validate_live(&db, &requester(), &attempt, &binding, &session).is_ok());
+                let id = [
+                    Some(&binding.credential_id),
+                    binding.provider_credential_id.as_ref(),
+                    binding.old_password_credential_id.as_ref(),
+                ][index]
+                    .unwrap();
+                let metadata = &mut records[index];
+                match change {
+                    "revoked" => metadata.revoked_at = Some(Utc::now()),
+                    "revision" => metadata.revision = Uuid::new_v4().to_string(),
+                    "unbounded" => metadata.use_until = None,
+                    "wrong-id" => metadata.id = Uuid::new_v4().to_string(),
+                    "missing" => {
+                        db.execute("DELETE FROM auth_registry WHERE credential_id=?1", [id])
+                            .unwrap();
+                    }
+                    "unmarked" => {
+                        db.execute("UPDATE credentials SET encrypted_value='synthetic-ciphertext' WHERE id=?1", [id]).unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                if !matches!(change, "missing" | "unmarked") {
+                    db.execute(
+                        "UPDATE auth_registry SET metadata_json=?1 WHERE credential_id=?2",
+                        params![serde_json::to_string(metadata).unwrap(), id],
+                    )
+                    .unwrap();
+                }
+                assert!(
+                    validate_live(&db, &requester(), &attempt, &binding, &session).is_err(),
+                    "index={index} change={change}"
+                );
+                assert!(
+                    delivery_revision_with_session(&db, &requester(), &attempt, &binding, &session)
+                        .is_err()
+                );
+                if change != "revision" {
+                    assert!(
+                        issue_with_session(&db, &binding, binding.expires_at, &session).is_err(),
+                        "invalid auth may not authorize a fresh grant"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn registered_deadlines_stop_live_attempts_without_metadata_changes() {
+        use super::super::auth::ProviderExpiry;
+        for index in 0..3 {
+            for provider_deadline in [false, true] {
+                let db = db();
+                let (binding, mut records) = registered_binding(&db);
+                let session = session();
+                let deadline = Utc::now() + Duration::seconds(10);
+                let metadata = &mut records[index];
+                if provider_deadline {
+                    metadata.provider_expiry = ProviderExpiry::ExpiresAt { at: deadline };
+                } else {
+                    metadata.use_until = Some(deadline);
+                }
+                db.execute(
+                    "UPDATE auth_registry SET metadata_json=?1 WHERE auth_id=?2",
+                    params![serde_json::to_string(metadata).unwrap(), metadata.id],
+                )
+                .unwrap();
+                let grant =
+                    issue_with_session(&db, &binding, binding.expires_at, &session).unwrap();
+                let attempt =
+                    reserve_with_session(&db, &requester(), &grant.grant_id, &binding, &session)
+                        .unwrap();
+                db.execute("UPDATE operation_attempts SET secret_released=1,provider_released=1,old_password_released=1 WHERE id=?1", [&attempt.attempt_id]).unwrap();
+                assert!(
+                    validate_live_at(
+                        &db,
+                        &requester(),
+                        &attempt,
+                        &binding,
+                        &session,
+                        deadline - Duration::nanoseconds(1)
+                    )
+                    .is_ok()
+                );
+                assert!(
+                    validate_live_at(&db, &requester(), &attempt, &binding, &session, deadline)
+                        .is_err(),
+                    "index={index} provider_deadline={provider_deadline}"
+                );
+            }
         }
     }
 

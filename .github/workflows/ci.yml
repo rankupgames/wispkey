@@ -100,7 +100,8 @@ jobs:
   check:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Cold Windows builds need room for the full suite, release build and cache cleanup.
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:

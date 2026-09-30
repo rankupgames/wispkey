@@ -20,7 +20,7 @@ pub(super) fn replace_tokens_in_uri(
     vault: Option<&Vault>,
     wisp_pattern: &Regex,
     context: &TokenRequestContext<'_>,
-    used_credentials: &mut Vec<(String, String)>,
+    used_credentials: &mut Vec<UsedCredential>,
 ) -> ProxyActionResult<String> {
     if !wisp_pattern.is_match(uri) {
         return Ok(uri.to_string());
@@ -115,6 +115,7 @@ struct EnvCredentialResolution {
 
 pub(super) struct TokenRequestContext<'a> {
     pub(super) target_host: &'a str,
+    pub(super) target_origin: &'a str,
     pub(super) target_path: &'a str,
     pub(super) http_method: &'a str,
     pub(super) project_scope: &'a Option<String>,
@@ -122,7 +123,14 @@ pub(super) struct TokenRequestContext<'a> {
     pub(super) instance: Option<&'a InstanceIdentity>,
 }
 
+pub(super) struct UsedCredential {
+    pub(super) name: String,
+    pub(super) token: String,
+    pub(super) vault_id: Option<String>,
+}
+
 struct ResolvedToken {
+    vault_id: Option<String>,
     credential_name: String,
     token: String,
     credential_type: CredentialType,
@@ -140,7 +148,7 @@ pub(super) fn inject_tokens_in_value(
     vault: Option<&Vault>,
     wisp_pattern: &Regex,
     context: &TokenRequestContext<'_>,
-    used_credentials: &mut Vec<(String, String)>,
+    used_credentials: &mut Vec<UsedCredential>,
 ) -> ProxyActionResult<String> {
     if !wisp_pattern.is_match(value) {
         return Ok(value.to_string());
@@ -170,11 +178,46 @@ pub(super) fn inject_tokens_in_value(
     Ok(replaced)
 }
 
+/// Recheck immediately before network release, after all substitutions have run.
+/// This also prevents a late revocation from falling back to another source.
+pub(super) fn revalidate_tokens_before_forward(
+    vault: Option<&Vault>,
+    context: &TokenRequestContext<'_>,
+    used_credentials: &[UsedCredential],
+) -> ProxyActionResult<()> {
+    for used in used_credentials {
+        if let Some(id) = &used.vault_id {
+            let Some(vault) = vault else {
+                return Err(Box::new(error_response(
+                    StatusCode::FORBIDDEN,
+                    "credential unavailable",
+                )));
+            };
+            if vault
+                .recheck_auth_token(id, &used.token, context.target_origin)
+                .is_err()
+            {
+                let reason = "credential unavailable or auth use denied";
+                audit_denial(
+                    vault,
+                    "CredentialDenied",
+                    Some(&used.name),
+                    &used.token,
+                    context,
+                    reason,
+                );
+                return Err(Box::new(error_response(StatusCode::FORBIDDEN, reason)));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn replace_tokens_in_candidate(
     candidate: &str,
     vault: Option<&Vault>,
     context: &TokenRequestContext<'_>,
-    used_credentials: &mut Vec<(String, String)>,
+    used_credentials: &mut Vec<UsedCredential>,
     sideload_tokens: &[String],
     output: &mut String,
 ) -> ProxyActionResult<()> {
@@ -195,7 +238,11 @@ fn replace_tokens_in_candidate(
             &resolved.credential_type,
             &resolved.value,
         ));
-        used_credentials.push((resolved.credential_name, resolved.token));
+        used_credentials.push(UsedCredential {
+            name: resolved.credential_name,
+            token: resolved.token,
+            vault_id: resolved.vault_id,
+        });
         cursor = start + consumed;
     }
 
@@ -268,7 +315,7 @@ fn try_resolve_exact_token_for_request(
         return try_resolve_env_token_for_request(None, token, context);
     };
 
-    match vault.lookup_by_wisp_token(token) {
+    match vault.lookup_auth_token(token, true, Some(context.target_origin)) {
         Ok((cred, real_value)) => {
             if cred.credential_type == CredentialType::WebsiteLogin {
                 let reason = "website login credentials require an approved local fill flow";
@@ -371,13 +418,21 @@ fn try_resolve_exact_token_for_request(
             }
 
             TokenResolution::Resolved(ResolvedToken {
+                vault_id: Some(cred.id),
                 credential_name: cred.name,
                 token: token.to_string(),
                 credential_type: cred.credential_type,
                 value: real_value,
             })
         }
-        Err(_) => try_resolve_env_token_for_request(Some(vault), token, context),
+        Err(crate::core::VaultError::CredentialNotFound(_)) => {
+            try_resolve_env_token_for_request(Some(vault), token, context)
+        }
+        Err(_) => {
+            let reason = "credential unavailable or auth use denied";
+            audit_denial(vault, "CredentialDenied", None, token, context, reason);
+            TokenResolution::Denied(Box::new(error_response(StatusCode::FORBIDDEN, reason)))
+        }
     }
 }
 
@@ -517,6 +572,7 @@ fn resolve_env_token_for_request(
     }
 
     Ok(ResolvedToken {
+        vault_id: None,
         credential_name: env_credential.env_key,
         token: token.to_string(),
         credential_type: CredentialType::BearerToken,

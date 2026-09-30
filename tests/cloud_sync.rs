@@ -712,3 +712,85 @@ fn expired_authentication_does_not_echo_response_secrets_or_claim_remote_success
         assert!(!text.contains(SESSION));
     }
 }
+
+#[test]
+fn registered_auth_roundtrip_preserves_revocation_and_final_deletion() {
+    let server = Server::new();
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    for dir in [&source, &destination] {
+        init_vault(dir.path());
+        server.configure(dir.path());
+    }
+    add(source.path(), "cloud-auth", SECRET, "personal");
+    run_wispkey_json(
+        source.path(),
+        &[
+            "--format",
+            "json",
+            "auth",
+            "register",
+            "cloud-auth",
+            "--project",
+            "default",
+            "--provider",
+            "synthetic-provider",
+            "--account",
+            "synthetic-account",
+            "--origin",
+            "https://api.example.test",
+            "--provider-expiry",
+            "non-expiring",
+            "--use-until",
+            "2000-01-01T00:00:00Z",
+        ],
+    );
+    run_wispkey_json(
+        source.path(),
+        &[
+            "--format",
+            "json",
+            "auth",
+            "revoke",
+            "cloud-auth",
+            "--project",
+            "default",
+        ],
+    );
+    let original = run_wispkey_json(source.path(), &["--format", "json", "auth", "list"]);
+    assert_eq!(
+        transfer(source.path(), "push")["partitions"][0]["outcome"],
+        "uploaded"
+    );
+    assert_eq!(
+        transfer(destination.path(), "pull")["partitions"][0]["outcome"],
+        "downloaded"
+    );
+    let restored = run_wispkey_json(destination.path(), &["--format", "json", "auth", "list"]);
+    assert_eq!(original, restored);
+    assert!(!restored["credentials"][0]["auth"]["revoked_at"].is_null());
+    assert_eq!(
+        transfer(destination.path(), "pull")["partitions"][0]["outcome"],
+        "unchanged"
+    );
+    for record in server.state.lock().unwrap().records.values() {
+        assert!(
+            !record
+                .bytes
+                .windows(SECRET.len())
+                .any(|window| window == SECRET.as_bytes())
+        );
+    }
+
+    run_wispkey_json(source.path(), &["--format", "json", "remove", "cloud-auth"]);
+    assert_eq!(
+        transfer(source.path(), "push")["partitions"][0]["outcome"],
+        "uploaded"
+    );
+    assert_eq!(
+        transfer(destination.path(), "pull")["partitions"][0]["outcome"],
+        "downloaded"
+    );
+    let empty = run_wispkey_json(destination.path(), &["--format", "json", "auth", "list"]);
+    assert!(empty["credentials"].as_array().unwrap().is_empty());
+}

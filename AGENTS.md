@@ -45,7 +45,7 @@ For repeated headless unlocks, prefer `wispkey unlock --remember --password-file
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v13 automatically. Browser fill requests are short-lived metadata, omitted from encrypted backups.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v14 automatically. Browser fill requests are short-lived metadata, omitted from encrypted backups.
 
 ```bash
 # Create a project
@@ -334,3 +334,7 @@ Workspace crate with an optional `wispkey-tray` GUI member. Default `cargo test`
 - Running the CLI/proxy non-interactively: set `WISPKEY_PASSWORD` to skip master-password prompts, and set `WISPKEY_VAULT_PATH` to a scratch dir (e.g. `/tmp/wk-demo`) so you never touch a real `~/.wispkey` vault.
 - `wispkey serve` is a long-running foreground process — run it in a tmux session (or `serve --daemon`). Forward-proxy (`HTTP_PROXY`) token swapping only works for plain HTTP; HTTPS requires reverse-proxy mode via the `X-Target-Url` header (see "HTTPS Proxy" above).
 - `wispkey tray --ipc-only` is a long-running owner IPC server. The optional GUI crate needs extra system libraries (`libgtk-3-dev`, `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev` on Debian/Ubuntu); see `docs/tray.md`.
+
+## Auth registry foundation
+
+Use `wispkey auth register/list/revoke` and `auth bundle set/list/resolve` for opt-in lifecycle-managed credential references. The registry inventory never returns secret values or wisp tokens; explicit bundle resolution returns opaque capabilities. Read `docs/auth-registry.md` before changing policy or transfer code. All use paths must honor registered expiry/revocation and delegated local deadlines; only encrypted recovery helpers may bypass eligibility. Keep ciphertext markers, portable auth identities and policy data together atomically. This is not OAuth refresh, browser-session capture, or cloud execution.

@@ -8,6 +8,7 @@
  */
 
 mod audit;
+mod auth;
 mod backup;
 mod cloud;
 mod credential_sharing;
@@ -34,6 +35,10 @@ mod tray;
 mod vault;
 
 pub use audit::{AuditExportFormat, handle_audit_export, handle_audit_tail};
+pub use auth::{
+    AuthRegisterArgs, handle_auth_bundle_list, handle_auth_bundle_resolve, handle_auth_bundle_set,
+    handle_auth_list, handle_auth_register, handle_auth_revoke,
+};
 pub use backup::{
     handle_backup_create, handle_backup_inspect, handle_backup_restore, handle_backup_verify,
 };
