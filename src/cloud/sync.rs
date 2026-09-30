@@ -298,6 +298,33 @@ impl CloudClient {
         }
     }
 
+    #[cfg(feature = "experimental-sync")]
+    pub(super) fn watch_has_acknowledgement(
+        &self,
+        vault: &Vault,
+        project: &str,
+        partition: &str,
+    ) -> CloudResult<bool> {
+        let state = self.load_state(vault, project, partition)?;
+        let scope = self.scope_prefix()?;
+        let expected_id =
+            digest(format!("wispkey-partition-v1\0{scope}\0{project}\0{partition}").as_bytes());
+        Ok(state.project == project
+            && state.partition == partition
+            && state.remote_id == expected_id
+            && state.revision.as_deref().is_some_and(valid_revision)
+            && state
+                .local_hash
+                .as_deref()
+                .is_some_and(|hash| BASE64.decode(hash).is_ok_and(|bytes| bytes.len() == 32))
+            && state
+                .last_success
+                .as_deref()
+                .is_some_and(|time| chrono::DateTime::parse_from_rfc3339(time).is_ok())
+            && state.pending.is_none()
+            && state.conflict_revision.is_none())
+    }
+
     fn save_state(&self, vault: &Vault, state: &PartitionState) -> CloudResult<()> {
         let value = serde_json::to_string(state).map_err(|_| invalid("invalid_sync_state"))?;
         vault.db().execute("INSERT INTO vault_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![self.state_key(&state.remote_id)?, value]).map_err(|_| invalid("sync_state_write_failed"))?;
@@ -379,7 +406,9 @@ impl CloudClient {
         password: &str,
         project: &str,
         partition: &str,
+        guard: &dyn Fn() -> crate::core::Result<()>,
     ) -> CloudResult<(Snapshot, Vec<u8>)> {
+        guard()?;
         let response = self
             .request(
                 reqwest::Method::GET,
@@ -407,6 +436,7 @@ impl CloudClient {
         {
             return Err(invalid("ciphertext_hash_mismatch"));
         }
+        guard()?;
         let snapshot: Snapshot =
             crate::bundle::decrypt_payload_bytes(MAGIC, &bytes, password, MAX_BYTES as u64)
                 .map_err(|_| invalid("bundle_authentication_failed"))?;
@@ -419,7 +449,13 @@ impl CloudClient {
         Ok((snapshot, bytes))
     }
 
-    async fn send_pending(&self, vault: &Vault, state: &mut PartitionState) -> CloudResult<()> {
+    async fn send_pending(
+        &self,
+        vault: &Vault,
+        state: &mut PartitionState,
+        guard: &dyn Fn() -> crate::core::Result<()>,
+    ) -> CloudResult<()> {
+        guard()?;
         let pending = state
             .pending
             .as_ref()
@@ -434,6 +470,7 @@ impl CloudClient {
             Some(revision) => request.header(reqwest::header::IF_MATCH, format!("\"{revision}\"")),
             None => request.header(reqwest::header::IF_NONE_MATCH, "*"),
         };
+        guard()?;
         let response = request.send().await.map_err(|_| {
             CloudError::Network("upload_interrupted; retry the same command".into())
         })?;
@@ -448,6 +485,7 @@ impl CloudClient {
         {
             return Err(invalid("invalid_upload_receipt"));
         }
+        guard()?;
         state.local_hash = Some(pending.local_hash.clone());
         state.revision = Some(receipt.data.revision);
         state.pending = None;
@@ -465,6 +503,30 @@ impl CloudClient {
         mode: SyncMode,
         resolution: Option<(&str, &str)>,
     ) -> CloudResult<SyncManifest> {
+        self.synchronize_scoped(
+            vault,
+            &resolve_active_project(),
+            partition,
+            password,
+            mode,
+            resolution,
+            &|| Ok(()),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn synchronize_scoped(
+        &self,
+        vault: &Vault,
+        project: &str,
+        partition: &str,
+        password: &str,
+        mode: SyncMode,
+        resolution: Option<(&str, &str)>,
+        guard: &dyn Fn() -> crate::core::Result<()>,
+    ) -> CloudResult<SyncManifest> {
+        guard()?;
         self.ensure_authenticated()?;
         self.check_tier_limit("sync")?;
         if password.chars().count() < 12 {
@@ -473,12 +535,11 @@ impl CloudClient {
             ));
         }
         let _lock = SyncLock::acquire()?;
-        let project = resolve_active_project();
-        let mut state = self.load_state(vault, &project, partition)?;
+        let mut state = self.load_state(vault, project, partition)?;
         // Keep the network/import state machine off the CLI's bounded native
         // stack (Windows debug builds otherwise overflow even on other commands).
         let result =
-            Box::pin(self.sync_locked(vault, &mut state, password, mode, resolution)).await;
+            Box::pin(self.sync_locked(vault, &mut state, password, mode, resolution, guard)).await;
         let result = match result {
             Err(CloudError::ApiError(code)) if code == "revision_conflict" => {
                 state.conflict_revision = Some("refresh_required".into());
@@ -505,6 +566,7 @@ impl CloudClient {
         result
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn sync_locked(
         &self,
         vault: &Vault,
@@ -512,7 +574,9 @@ impl CloudClient {
         password: &str,
         mode: SyncMode,
         resolution: Option<(&str, &str)>,
+        guard: &dyn Fn() -> crate::core::Result<()>,
     ) -> CloudResult<SyncManifest> {
+        guard()?;
         let local = vault.cloud_snapshot(&state.project, &state.partition)?;
         let local_hash = local
             .as_ref()
@@ -521,10 +585,12 @@ impl CloudClient {
         let mut outcome = "unchanged";
         let mut recovery_path = None;
         if state.pending.is_some() && resolution.is_none() {
-            self.send_pending(vault, state).await?;
+            self.send_pending(vault, state, guard).await?;
             outcome = "uploaded";
         } else {
+            guard()?;
             let remote = self.remote(&state.remote_id).await?;
+            guard()?;
             if state.revision.is_none()
                 && self.config.tier == CloudTier::Cloud
                 && self
@@ -569,9 +635,15 @@ impl CloudClient {
                 let recovery = if keep == "local" {
                     if let Some(remote) = &remote {
                         Some(
-                            self.download(remote, password, &state.project, &state.partition)
-                                .await?
-                                .1,
+                            self.download(
+                                remote,
+                                password,
+                                &state.project,
+                                &state.partition,
+                                guard,
+                            )
+                            .await?
+                            .1,
                         )
                     } else {
                         None
@@ -619,7 +691,7 @@ impl CloudClient {
                         (MAX_BYTES - 65) as u64,
                     )
                     .map_err(|_| invalid("bundle_encryption_failed"))?;
-                    state.pending = Some(PendingUpload {
+                    let pending = PendingUpload {
                         expected_revision: revision.map(str::to_owned),
                         local_hash: local_hash
                             .clone()
@@ -631,16 +703,18 @@ impl CloudClient {
                             content_hash: digest(&bytes),
                             mutation_id: uuid::Uuid::new_v4().to_string(),
                         },
-                    });
+                    };
+                    guard()?;
+                    state.pending = Some(pending);
                     self.save_state(vault, state)?;
-                    self.send_pending(vault, state).await?;
+                    self.send_pending(vault, state, guard).await?;
                     outcome = "uploaded";
                 }
             } else {
                 let remote = remote.ok_or_else(|| invalid("remote_partition_missing"))?;
                 if remote_changed || resolution.is_some() || state.last_success.is_none() {
                     let (snapshot, _) = self
-                        .download(&remote, password, &state.project, &state.partition)
+                        .download(&remote, password, &state.project, &state.partition, guard)
                         .await?;
                     let mut committed = state.clone();
                     committed.revision = Some(remote.revision);
@@ -649,7 +723,7 @@ impl CloudClient {
                     committed.conflict_revision = None;
                     committed.pending = None;
                     let hash = vault
-                        .cloud_apply(
+                        .cloud_apply_guarded(
                             &snapshot,
                             local_hash.as_deref(),
                             Some((
@@ -657,6 +731,7 @@ impl CloudClient {
                                 serde_json::to_value(&committed)
                                     .map_err(|_| invalid("invalid_sync_state"))?,
                             )),
+                            guard,
                         )
                         .map_err(|_| invalid("atomic_import_failed; local partition unchanged"))?;
                     committed.local_hash = Some(hash);
@@ -665,6 +740,7 @@ impl CloudClient {
                 }
             }
         }
+        guard()?;
         let current = vault.cloud_snapshot(&state.project, &state.partition)?;
         if outcome == "unchanged"
             && (state.last_error.is_some() || state.conflict_revision.is_some())

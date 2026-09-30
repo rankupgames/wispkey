@@ -1,8 +1,8 @@
 //! Experimental scheduling only: hints never authorize sync, decryption, or release.
 //!
-//! No production caller uses this module. A future adapter must authenticate the
-//! feed, verify device enrollment and policy, obtain owner-approved local key
-//! access, and use the existing conditional encrypted sync transaction.
+//! The bounded foreground watch uses the existing manually paired owner model.
+//! An enrolled-device/background adapter must still authenticate its feed, verify
+//! enrollment and policy, and obtain owner-approved local key access.
 use serde::{Deserialize, Serialize};
 
 const MAX_CURSOR_BYTES: usize = 256;
@@ -128,6 +128,12 @@ impl Coordinator {
             failures: 0,
             conflict: false,
         })
+    }
+
+    /// Request a bounded full reconciliation without fabricating a feed cursor.
+    /// The normal backoff still applies.
+    pub fn request_reconciliation(&mut self) {
+        self.dirty = true;
     }
 
     pub fn checkpoint(&self) -> &Checkpoint {

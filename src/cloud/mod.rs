@@ -22,6 +22,8 @@ use crate::secure_files;
 #[cfg(feature = "experimental-sync")]
 pub mod coordinator;
 mod sync;
+#[cfg(feature = "experimental-sync")]
+pub mod watch;
 pub use sync::{PartitionState, SyncMode, recover_partition};
 
 const DEFAULT_CLERK_SIGN_IN_URL: &str = "https://clerk.wispkey.com/sign-in";

@@ -193,6 +193,17 @@ impl Vault {
         expected_hash: Option<&str>,
         state_update: Option<(&str, serde_json::Value)>,
     ) -> Result<String> {
+        self.cloud_apply_guarded(snapshot, expected_hash, state_update, &|| Ok(()))
+    }
+
+    pub(crate) fn cloud_apply_guarded(
+        &self,
+        snapshot: &Snapshot,
+        expected_hash: Option<&str>,
+        state_update: Option<(&str, serde_json::Value)>,
+        guard: &dyn Fn() -> Result<()>,
+    ) -> Result<String> {
+        guard()?;
         let key = self.ensure_unlocked()?;
         if !matches!(
             (snapshot.version, snapshot.auth_data.is_some()),
@@ -413,6 +424,7 @@ impl Vault {
             state["local_hash"] = serde_json::json!(hash);
             self.db.execute("INSERT INTO vault_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![state_key,state.to_string()])?;
         }
+        guard()?;
         tx.commit()?;
         Ok(hash)
     }
@@ -500,6 +512,54 @@ mod auth_transport_tests {
                     .unwrap(),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn cloud_apply_guard_denial_at_commit_rolls_back_credentials_and_journal() {
+        let source = vault();
+        add(&source, "incoming", true);
+        let snapshot = source
+            .cloud_snapshot("default", "personal")
+            .unwrap()
+            .unwrap();
+        let target = vault();
+        add(&target, "existing", false);
+        let before = current_hash(&target);
+        let calls = std::cell::Cell::new(0);
+        let guard = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                Err(VaultError::Locked)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(
+            target
+                .cloud_apply_guarded(
+                    &snapshot,
+                    Some(&before),
+                    Some(("synthetic-watch-journal", serde_json::json!({}))),
+                    &guard
+                )
+                .is_err()
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(current_hash(&target), before);
+        let auth_rows: i64 = target
+            .db
+            .query_row("SELECT count(*) FROM auth_registry", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(auth_rows, 0);
+        let rows: i64 = target
+            .db
+            .query_row(
+                "SELECT count(*) FROM vault_meta WHERE key='synthetic-watch-journal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
     }
 
     #[test]

@@ -42,6 +42,8 @@ pub use auth::{
 pub use backup::{
     handle_backup_create, handle_backup_inspect, handle_backup_restore, handle_backup_verify,
 };
+#[cfg(feature = "experimental-sync")]
+pub use cloud::handle_cloud_watch;
 pub use cloud::{
     handle_cloud_login, handle_cloud_logout, handle_cloud_recover, handle_cloud_status,
     handle_cloud_transfer,
