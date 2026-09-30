@@ -9,6 +9,12 @@
 - Enforced registered policy at proxy, owner process, approved browser, MCP certificate and one-use operation release boundaries. Registered ciphertext fails closed in older readers; imports/sync/backup preserve restrictions atomically.
 - Added synthetic expiry, revision, scope, redaction and encrypted recovery coverage. OAuth refresh, browser-session reuse and cloud credential execution remain future gates; see `docs/auth-registry.md`.
 
+### Conservative signup form mapping
+
+- Browser handoff recognizes explicitly declared username/email purposes, including supported section/contact prefixes, and form-associated controls outside the form element.
+- Unrelated profile/OTP fields and consent controls stay untouched. Ambiguous identity mappings and unsupported password purposes are refused; two explicit new-password fields still receive the same saved password.
+- Changed form targets, purposes, and submission destinations during approval require a fresh request. Added Node and browser-engine fixtures; reusable profile storage, macOS approval, and Cloud relay remain separate work under #43.
+
 ### Local diagnostics and owner IPC reliability
 
 - Doctor now reports PATH shadowing with `binary.path` and compares the running proxy's authenticated package version with `proxy.version`. It reports older or unavailable version endpoints as unknown, without executing another installation or restarting services.

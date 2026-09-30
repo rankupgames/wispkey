@@ -140,6 +140,12 @@ snapshots and does not execute credentials.
 
 ## Boundaries and next gates
 
+Compatibility limit: existing `website_login` credentials with a non-default
+HTTPS port cannot yet opt into the registry because their legacy host metadata
+includes the port. Registration is rejected safely; no secret is released. Generic
+API credential exact-origin/port checks are supported. Fixing that existing login
+representation is a separate browser-login compatibility slice.
+
 Local expiry/revocation does not revoke the provider token, sign out a remote
 browser, or invalidate previously copied material. Provider-side revocation and
 verification require separate provider integrations. Browser validity is distinct

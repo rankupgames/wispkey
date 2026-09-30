@@ -79,15 +79,18 @@ test("navigation during OS approval never sends the login to a page", async () =
 });
 
 function documentFixture(options = {}) {
-  const form = { action: options.action || "https://example.com/login", querySelectorAll: (selector) => selector === "[formaction]" ? [] : [username, ...passwords] };
+  const form = { action: options.action || "https://example.com/login", get elements() { return [...text, ...passwords]; } };
   class Input {
     constructor(type) { this.type = type; this.form = form; this.autocomplete = ""; this.events = []; this.stored = ""; }
     getClientRects() { return options.hidden ? [] : [{}]; }
+    matches(selector) { return selector === ":disabled" && this.fieldsetDisabled === true; }
     getAttribute(name) { return name === "autocomplete" ? this.autocomplete : null; }
     set value(value) { this.stored = value; }
     dispatchEvent(event) { this.events.push(event.type); }
   }
-  const username = new Input("email");
+  const username = new Input(options.usernameType ?? "email");
+  username.autocomplete = options.usernameAutocomplete ?? "";
+  const text = [username, ...(options.extraText ?? []).map((attributes) => Object.assign(new Input("text"), attributes))];
   const passwords = Array.from({ length: options.passwords ?? 1 }, () => new Input("password"));
   for (const password of passwords) password.autocomplete = options.autocomplete ?? (passwords.length === 2 ? "new-password" : "current-password");
   const onConnect = event();
@@ -100,7 +103,7 @@ function documentFixture(options = {}) {
     setTimeout: () => 1, clearTimeout() {},
   });
   vm.runInContext(source, context);
-  return { context, username, passwords, onConnect, install: () => context.WispKeyFlow.installReceiver("nonce", "https://example.com") };
+  return { context, username, text, passwords, form, Input, onConnect, install: () => context.WispKeyFlow.installReceiver("nonce", "https://example.com") };
 }
 
 test("receiver refuses hidden, ambiguous, framed and cross-origin forms", () => {
@@ -132,4 +135,66 @@ test("receiver fills once, revalidates origin and never submits", () => {
   second.onMessage.emit({ origin: "https://example.com", login: { username: "test", password: "synthetic-password" } });
   assert.equal(navigated.passwords[0].stored, "");
   assert.equal(second.sent.at(-1).completed, false);
+});
+
+function connectReceiver(fixture) {
+  assert.equal(fixture.install(), true);
+  const content = port();
+  content.name = "wispkey-fill-nonce";
+  content.sender = { id: "extension" };
+  fixture.onConnect.emit(content);
+  return content;
+}
+
+for (const autocomplete of ["email", "section-signup email", "section-signup billing work email", "USERNAME", "section-signup username webauthn"]) {
+  test(`receiver maps declared identity (${autocomplete}) without touching profile fields`, () => {
+    const fixture = documentFixture({ usernameType: "text", usernameAutocomplete: autocomplete, passwords: 2,
+      extraText: [{ autocomplete: "given-name", stored: "Existing name" }, { autocomplete: "one-time-code", stored: "123456" }] });
+    const content = connectReceiver(fixture);
+    content.onMessage.emit({ origin: "https://example.com", login: { username: "synthetic@example.test", password: "synthetic-password" } });
+    assert.equal(fixture.username.stored, "synthetic@example.test");
+    assert.equal(fixture.passwords[0].stored, fixture.passwords[1].stored);
+    assert.equal(fixture.text[1].stored, "Existing name");
+    assert.equal(fixture.text[2].stored, "123456");
+    assert.deepEqual(fixture.text[1].events, []);
+    assert.deepEqual(fixture.text[2].events, []);
+    assert.equal(content.sent.at(-1).completed, true);
+  });
+}
+
+test("receiver limits fallback to one text field without a declared non-login purpose", () => {
+  assert.equal(documentFixture({ usernameType: "text", extraText: [{ autocomplete: "given-name" }] }).install(), true);
+  assert.equal(documentFixture({ usernameType: "text", extraText: [{}] }).install(), false);
+  for (const usernameAutocomplete of ["one-time-code", "given-name", "cc-number", "username email", "home username", "section- username", "unrecognized"])
+    assert.equal(documentFixture({ usernameType: "text", usernameAutocomplete }).install(), false, usernameAutocomplete);
+  assert.equal(documentFixture({ usernameAutocomplete: "one-time-code" }).install(), false, "email input with a declared non-login purpose");
+  assert.equal(documentFixture({ usernameAutocomplete: "username", extraText: [{ autocomplete: "email" }] }).install(), false, "separate email and username require distinct profile values");
+});
+
+test("receiver rejects unsupported password purposes and disabled fieldsets", () => {
+  for (const autocomplete of ["email", "one-time-code", "new-password current-password", "new-password one-time-code", "home new-password"])
+    assert.equal(documentFixture({ autocomplete }).install(), false, autocomplete);
+  const fixture = documentFixture();
+  fixture.username.fieldsetDisabled = true;
+  assert.equal(fixture.install(), false);
+});
+
+test("receiver refuses replaced targets, changed purposes and same-origin destination changes", () => {
+  for (const mutate of [
+    (fixture) => { fixture.text[0] = new fixture.Input("email"); },
+    (fixture) => { fixture.passwords[0] = new fixture.Input("password"); },
+    (fixture) => { fixture.username.autocomplete = "username"; },
+    (fixture) => { fixture.form.action = "https://example.com/different-signup"; },
+    (fixture) => { fixture.username.form = {}; },
+    (fixture) => { fixture.username.fieldsetDisabled = true; },
+  ]) {
+    const fixture = documentFixture();
+    const content = connectReceiver(fixture);
+    mutate(fixture);
+    content.onMessage.emit({ origin: "https://example.com", login: { username: "synthetic", password: "synthetic-password" } });
+    assert.equal(content.sent.at(-1).completed, false);
+    assert.equal(fixture.username.stored, "");
+    assert.equal(fixture.passwords[0].stored, "");
+    assert.equal(fixture.text[0].stored, "");
+  }
 });
