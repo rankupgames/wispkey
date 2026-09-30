@@ -927,6 +927,20 @@ mod foreground_watch {
         }
     }
 
+    fn finish_success_watch(child: &mut ChildGuard) -> Output {
+        // Successful encrypted transfers are not a five-second latency contract.
+        // Keep the same bounded window as the simultaneous-live fixture; dedicated
+        // one-second deadline/cancellation tests below keep their original limits.
+        wait_for_child_exit(&mut child.0, Duration::from_secs(35))
+            .expect("successful watch did not finish its bounded run");
+        finish(child)
+    }
+
+    fn watch_success(path: &Path) -> Output {
+        let mut child = ChildGuard(watch_command(path, "30").spawn().unwrap());
+        finish_success_watch(&mut child)
+    }
+
     fn watch(path: &Path) -> Output {
         let mut child = ChildGuard(watch_command(path, "5").spawn().unwrap());
         finish(&mut child)
@@ -1020,8 +1034,8 @@ mod foreground_watch {
             "--format", "json", "rotate", "base-key",
         ])["wisp_token"].clone();
         assert_ne!(rotated, original_token);
-        assert_success(&watch(first.path()));
-        assert_success(&watch(second.path()));
+        assert_success(&watch_success(first.path()));
+        assert_success(&watch_success(second.path()));
         assert_eq!(
             run_wispkey_json(
                 second.path(),
@@ -1045,8 +1059,8 @@ mod foreground_watch {
                 "default",
             ],
         );
-        assert_success(&watch(second.path()));
-        assert_success(&watch(first.path()));
+        assert_success(&watch_success(second.path()));
+        assert_success(&watch_success(first.path()));
         let first_auth = run_wispkey_json(first.path(), &["--format", "json", "auth", "list"]);
         let second_auth = run_wispkey_json(second.path(), &["--format", "json", "auth", "list"]);
         assert_eq!(first_auth, second_auth);
@@ -1187,7 +1201,7 @@ mod foreground_watch {
             let state = server.state.lock().unwrap();
             (state.requests.len(), state.uploads.len())
         };
-        let mut child = ChildGuard(watch_command(first.path(), "5").spawn().unwrap());
+        let mut child = ChildGuard(watch_command(first.path(), "30").spawn().unwrap());
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let reached_first_poll = server.state.lock().unwrap().requests[requests_before..]
@@ -1212,7 +1226,7 @@ mod foreground_watch {
             "synthetic-later-edit",
             "personal",
         );
-        assert_success(&finish(&mut child));
+        assert_success(&finish_success_watch(&mut child));
         let state = server.state.lock().unwrap();
         assert_eq!(
             state.uploads.len(),
@@ -1361,7 +1375,7 @@ mod foreground_watch {
             "synthetic-local-change",
             "personal",
         );
-        assert_success(&watch(first.path()));
+        assert_success(&watch_success(first.path()));
         let uploads = server.state.lock().unwrap().uploads.len();
         let before = journal(second.path());
         let output = watch(second.path());
