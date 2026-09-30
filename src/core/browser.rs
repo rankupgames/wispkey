@@ -365,11 +365,15 @@ mod tests {
     }
 
     fn create_login(vault: &Vault) {
+        create_login_at(vault, "https://jobs.example.com");
+    }
+
+    fn create_login_at(vault: &Vault, origin: &str) {
         vault
             .generate_website_login(GenerateWebsiteLoginRequest {
                 name: "careers",
                 username: "test@example.com",
-                url: "https://jobs.example.com",
+                url: origin,
                 project: Some("default"),
                 partition: None,
                 review_at: None,
@@ -394,8 +398,15 @@ mod tests {
     #[test]
     fn registered_login_expiry_and_revocation_deny_actual_browser_release() {
         use crate::core::auth::{AuthRegistration, ProviderExpiry};
-        for revoked in [false, true] {
+        for (origin, revoked) in [
+            ("https://jobs.example.com", false),
+            ("https://jobs.example.com", true),
+            ("https://jobs.example.com:8443", false),
+            ("https://jobs.example.com:8443", true),
+        ] {
             let vault = fixture();
+            vault.remove_credential("careers").unwrap();
+            create_login_at(&vault, origin);
             vault
                 .register_auth(
                     "default",
@@ -403,13 +414,60 @@ mod tests {
                     AuthRegistration {
                         provider: "example".into(),
                         account: "test".into(),
-                        origins: vec!["https://jobs.example.com".into()],
+                        origins: vec![origin.into()],
                         provider_expiry: ProviderExpiry::NonExpiring,
                         use_until: Some(Utc::now() + chrono::Duration::hours(1)),
                     },
                 )
                 .unwrap();
-            let pending = enqueue(&vault);
+            // Import into a different vault key, preserving origin, port and policy.
+            let exported = tempfile::tempdir().unwrap();
+            let path = exported.path().join("login.wkbundle");
+            let path = path.to_str().unwrap();
+            let passphrase = "synthetic-roundtrip-passphrase";
+            crate::sharing::export_project(&vault, "default", passphrase, path).unwrap();
+            let mut restored = fixture();
+            restored.remove_credential("careers").unwrap();
+            restored.master_key = Some([8; 32]);
+            crate::sharing::import_project(&restored, path, passphrase).unwrap();
+            let vault = restored;
+            let successful = request(
+                &vault,
+                "careers",
+                "default",
+                origin,
+                "agent",
+                "synthetic test",
+            )
+            .unwrap();
+            let released = release(&vault, &successful).unwrap();
+            assert_eq!(released.username, "test@example.com");
+            assert!(!released.password.is_empty());
+            let pending = request(
+                &vault,
+                "careers",
+                "default",
+                origin,
+                "agent",
+                "synthetic test",
+            )
+            .unwrap();
+            let wrong_port = if origin.ends_with(":8443") {
+                "https://jobs.example.com"
+            } else {
+                "https://jobs.example.com:8443"
+            };
+            assert!(
+                request(
+                    &vault,
+                    "careers",
+                    "default",
+                    wrong_port,
+                    "agent",
+                    "synthetic test"
+                )
+                .is_err()
+            );
             if revoked {
                 vault.revoke_auth("default", "careers").unwrap();
             } else {

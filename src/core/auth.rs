@@ -368,10 +368,16 @@ impl Vault {
                 .ok_or_else(|| rejected("invalid auth origin"))?;
             if !credential.hosts.is_empty()
                 && !credential.hosts.iter().any(|pattern| {
-                    glob_match::glob_match(
-                        &pattern.to_ascii_lowercase(),
-                        &host.to_ascii_lowercase(),
-                    )
+                    if credential.credential_type == CredentialType::WebsiteLogin {
+                        // Generated logins store the exact authority, including any
+                        // non-default port, rather than a generic hostname glob.
+                        pattern == &origin_host(origin)
+                    } else {
+                        glob_match::glob_match(
+                            &pattern.to_ascii_lowercase(),
+                            &host.to_ascii_lowercase(),
+                        )
+                    }
                 })
             {
                 return Err(rejected("auth origin exceeds credential scope"));
@@ -931,6 +937,105 @@ mod tests {
             vault.lookup_by_wisp_token(&credential.wisp_token).is_err(),
             "re-registration must not clear revocation"
         );
+    }
+
+    #[test]
+    fn website_login_registration_keeps_canonical_authority() {
+        for input in [
+            "https://Jobs.Example.com:443",
+            "https://127.0.0.1:8443",
+            "https://[::1]:8443",
+        ] {
+            let vault = vault();
+            let credential = vault
+                .generate_website_login(GenerateWebsiteLoginRequest {
+                    name: "login",
+                    username: "synthetic-user",
+                    url: input,
+                    project: Some("default"),
+                    partition: None,
+                    review_at: None,
+                    length: None,
+                    symbols: true,
+                })
+                .unwrap();
+            let mut request = registration();
+            request.origins = vec![input.into()];
+            let auth = vault.register_auth("default", "login", request).unwrap();
+            assert_eq!(auth.origins, vec![credential.origin.clone()]);
+            assert_eq!(credential.hosts, vec![origin_host(&credential.origin)]);
+        }
+    }
+
+    #[test]
+    fn website_login_registration_preserves_exact_nondefault_port() {
+        let vault = vault();
+        let origin = "https://jobs.example.com:8443";
+        let credential = vault
+            .generate_website_login(GenerateWebsiteLoginRequest {
+                name: "login",
+                username: "synthetic-user",
+                url: origin,
+                project: Some("default"),
+                partition: None,
+                review_at: None,
+                length: None,
+                symbols: true,
+            })
+            .unwrap();
+        assert_eq!(credential.hosts, vec!["jobs.example.com:8443"]);
+        let mut request = registration();
+        request.origins = vec![origin.into()];
+        let metadata = vault
+            .register_auth("default", "login", request.clone())
+            .unwrap();
+        assert_eq!(metadata.origins, vec![origin]);
+        assert!(
+            vault
+                .lookup_auth_token(&credential.wisp_token, true, Some(origin))
+                .is_ok()
+        );
+        for denied in [
+            "https://jobs.example.com",
+            "https://jobs.example.com:443",
+            "https://jobs.example.com:8444",
+            "https://other.example.com:8443",
+            "http://jobs.example.com:8443",
+            "https://user:pass@jobs.example.com:8443",
+            "https://jobs.example.com:65536",
+            "https://jobs.example.com:-1",
+            "https://jobs.example.com:8443/path",
+            "https://jobs.example.com:8443?x=1",
+            "https://jobs.example.com:8443#fragment",
+        ] {
+            request.origins = vec![denied.into()];
+            assert!(
+                vault
+                    .register_auth("default", "login", request.clone())
+                    .is_err(),
+                "{denied}"
+            );
+            assert!(
+                vault
+                    .lookup_auth_token(&credential.wisp_token, true, Some(denied))
+                    .is_err(),
+                "{denied}"
+            );
+        }
+        assert_eq!(
+            vault.auth_metadata_for_id(&credential.id).unwrap().unwrap(),
+            metadata
+        );
+        // A matching login origin cannot override a narrower/corrupt stored host scope.
+        vault
+            .db
+            .execute(
+                "UPDATE credentials SET hosts='other.example.com:8443' WHERE id=?1",
+                [&credential.id],
+            )
+            .unwrap();
+        request.origins = vec![origin.into()];
+        assert!(vault.register_auth("default", "login", request).is_err());
     }
 
     #[test]
