@@ -1376,7 +1376,11 @@ mod foreground_watch {
             }
             callback_marker.store(true, Ordering::SeqCst);
         }));
-        let output = watch(second.path());
+        // Authority rejection is the event under test, not a short transfer deadline.
+        // In particular, renewing a session performs Argon2 work inside the callback;
+        // let it finish even when other crypto-heavy tests are running in parallel.
+        let mut child = ChildGuard(watch_command(second.path(), "30").spawn().unwrap());
+        let output = finish(&mut child);
         assert!(
             callback_ran.load(Ordering::SeqCst),
             "download guard fixture was not exercised"
