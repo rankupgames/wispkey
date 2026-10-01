@@ -125,9 +125,14 @@ The profile unit suite covers ciphertext/metadata binding, stale selections,
 profile edits and recreation, project/partition isolation, explicit identity
 choice, fresh passwords, duplicate names, injected database failures, denial
 recovery, encrypted sync round trips/deletion/conflicts, export/import, malformed
-and old-format rejection, migration and legacy login generation. The integration
+and old-format rejection, migration and legacy login generation. A two-connection
+SQLite regression pauses the encrypted profile read and checks that competing
+update/generate/remove operations cannot write before generation commits. Backup
+recovery also checks that deleting the last profile retains the managed-history
+marker and rejects legacy snapshots after restore. The integration
 suite uses actual CLI/MCP subprocesses with synthetic temporary vaults to check
-setup, file/stdin input, metadata-only outputs, backup restoration, merge conflicts and exclusions. A synthetic HTTP
+setup, file/stdin input, metadata-only outputs, structured-error and stored-audit
+redaction, backup restoration, merge conflicts and exclusions. A synthetic HTTP
 sync fixture additionally checks profile-only conflicts, edits, deletion and Cloud-account
 isolation without contacting a live service. Existing
 browser suites cover form mapping, navigation, exact origin, request expiry,
