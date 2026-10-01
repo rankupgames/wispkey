@@ -169,7 +169,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey backup create/inspect/verify/restore` | Encrypted full-vault backup, inspection, verification, and atomic restore |
 | `wispkey instance enroll/list/show/scope/bootstrap/join/revoke/requests/approve/deny` | Manage instance identities, bootstrap self-enrollment, scopes, and access requests |
 | `wispkey instance rotate-secret <name> [--if-older-than AGE] [--grace AGE]` | Due-aware instance-secret rotation for protected automation |
-| `wispkey cloud status/login/logout` | Local Cloud session groundwork |
+| `wispkey cloud status/login/logout` | Public OAuth + S256 PKCE; see `docs/cloud-login.md` |
 | `wispkey cloud push/pull/sync` | Conditional encrypted partition sync using a separate bundle passphrase; see `docs/cloud-sync.md` |
 | `wispkey cloud resolve/recover` | Explicit conflict choice with encrypted recovery copies, and atomic local recovery |
 | `wispkey mcp serve` | Start MCP server (stdio) |
