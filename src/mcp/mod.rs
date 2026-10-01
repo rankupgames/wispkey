@@ -155,13 +155,21 @@ async fn handle_jsonrpc(request: &Value) -> Option<Value> {
                             }
                         },
                         {
+                            "name": "wispkey_signup_profile_list",
+                            "description": "List signup profile IDs, revisions and labels only; never returns email or username. Explicit scope required.",
+                            "inputSchema": { "type": "object", "properties": { "project": {"type": "string"}, "partition": {"type": "string"} }, "required": ["project", "partition"] }
+                        },
+                        {
                             "name": "wispkey_generate_login",
                             "description": "Generate a unique website login password, store username+password encrypted in the vault, and return non-secret metadata only. Never returns the password. Use this instead of wispkey_set for website_login credentials.",
                             "inputSchema": {
                                 "type": "object",
                                 "properties": {
                                     "name": { "type": "string", "description": "Credential name (lowercase, hyphen-separated)" },
-                                    "username": { "type": "string", "description": "Username or email for the website" },
+                                    "username": { "type": "string", "description": "Legacy inline identity; mutually exclusive with profile" },
+                                    "profile": { "type": "string", "description": "Explicit profile ID; requires profile_revision, project, partition" },
+                                    "profile_revision": { "type": "string" },
+                                    "profile_username": { "type": "boolean", "description": "Select optional username instead of email" },
                                     "url": { "type": "string", "description": "Website URL; must be https and is stored as an exact origin" },
                                     "project": { "type": "string", "description": "Project to scope to (default: active project)" },
                                     "partition": { "type": "string", "description": "Partition to add to (default: personal)" },
@@ -169,7 +177,7 @@ async fn handle_jsonrpc(request: &Value) -> Option<Value> {
                                     "length": { "type": "integer", "description": "Password length; must keep at least 128 bits of entropy" },
                                     "symbols": { "type": "boolean", "description": "Include symbols (default true)" }
                                 },
-                                "required": ["name", "username", "url"]
+                                "required": ["name", "url"]
                             }
                         },
                         {
@@ -241,6 +249,7 @@ async fn handle_jsonrpc(request: &Value) -> Option<Value> {
                 "wispkey_proxy_status" => handle_tool_proxy_status().await,
                 "wispkey_project_list" => handle_tool_project_list(),
                 "wispkey_set" => handle_tool_set(&arguments),
+                "wispkey_signup_profile_list" => handle_tool_signup_profile_list(&arguments),
                 "wispkey_generate_login" => handle_tool_generate_login(&arguments),
                 "wispkey_request_browser_fill" => handle_browser_request(&arguments, false),
                 "wispkey_browser_fill_status" => handle_browser_request(&arguments, true),
@@ -759,10 +768,40 @@ fn handle_tool_generate_login(arguments: &Value) -> Value {
         Some(n) => n,
         None => return tool_error("missing required argument: name"),
     };
-    let username = match arguments.get("username").and_then(|n| n.as_str()) {
-        Some(n) => n,
-        None => return tool_error("missing required argument: username"),
-    };
+    for field in ["username", "profile", "profile_revision"] {
+        if arguments.get(field).is_some_and(|v| !v.is_string()) {
+            return tool_error("identity selection fields must be strings");
+        }
+    }
+    if arguments
+        .get("profile_username")
+        .is_some_and(|v| !v.is_boolean())
+    {
+        return tool_error("profile_username must be a boolean");
+    }
+    let username = arguments.get("username").and_then(Value::as_str);
+    let profile = arguments.get("profile").and_then(Value::as_str);
+    if username.is_some() == profile.is_some() {
+        return tool_error("provide exactly one of username or profile");
+    }
+    if profile.is_none()
+        && (arguments.get("profile_revision").is_some()
+            || arguments.get("profile_username").is_some())
+    {
+        return tool_error("profile selection required");
+    }
+    if profile.is_some()
+        && ["profile_revision", "project", "partition"]
+            .iter()
+            .any(|key| {
+                arguments
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+            })
+    {
+        return tool_error("profile requires explicit revision, project and partition");
+    }
     let url = match arguments.get("url").and_then(|n| n.as_str()) {
         Some(n) => n,
         None => return tool_error("missing required argument: url"),
@@ -800,16 +839,34 @@ fn handle_tool_generate_login(arguments: &Value) -> Value {
         .map(String::from)
         .unwrap_or_else(core::resolve_active_project);
 
-    match vault.generate_website_login(core::GenerateWebsiteLoginRequest {
+    let request = core::GenerateWebsiteLoginRequest {
         name,
-        username,
+        username: username.unwrap_or(""),
         url,
         project: Some(&active),
         partition,
         review_at,
         length,
         symbols,
-    }) {
+    };
+    let result = if let Some(id) = profile {
+        vault.generate_signup_login(
+            core::signup::ProfileSelection {
+                id,
+                revision: arguments["profile_revision"].as_str().unwrap_or(""),
+                project: &active,
+                partition: partition.unwrap_or(""),
+                use_username: arguments
+                    .get("profile_username")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            },
+            request,
+        )
+    } else {
+        vault.generate_website_login(request)
+    };
+    match result {
         Ok(cred) => {
             audit::log_event(
                 vault.db(),
@@ -834,7 +891,6 @@ fn handle_tool_generate_login(arguments: &Value) -> Value {
                         "origin": cred.origin,
                         "lifecycle_state": cred.lifecycle_state,
                         "review_at": cred.review_at.map(|value| value.to_rfc3339()),
-                        "username": username,
                         "project": active,
                     })).expect("json serialize")
                 }]
@@ -1140,4 +1196,19 @@ fn tool_error(message: &str) -> Value {
         }],
         "isError": true
     })
+}
+
+fn handle_tool_signup_profile_list(arguments: &Value) -> Value {
+    let Some(project) = arguments.get("project").and_then(Value::as_str) else {
+        return tool_error("explicit project required");
+    };
+    let Some(partition) = arguments.get("partition").and_then(Value::as_str) else {
+        return tool_error("explicit partition required");
+    };
+    match Vault::open_with_session().and_then(|v| v.list_signup_profiles(project, partition)) {
+        Ok(profiles) => {
+            json!({"content": [{"type": "text", "text": serde_json::to_string(&json!({"profiles":profiles})).expect("metadata JSON")}]})
+        }
+        Err(error) => tool_error(&format!("profile inventory unavailable: {error}")),
+    }
 }

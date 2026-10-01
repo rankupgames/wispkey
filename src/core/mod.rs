@@ -32,6 +32,7 @@ mod rows;
 mod schema;
 mod session;
 mod session_store;
+pub mod signup;
 mod templates;
 #[cfg(test)]
 mod tests;
@@ -55,7 +56,7 @@ pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
 /// Current on-disk SQLite schema version written to `vault_meta`.
-pub const CURRENT_SCHEMA_VERSION: &str = "14";
+pub const CURRENT_SCHEMA_VERSION: &str = "15";
 
 pub mod browser;
 
@@ -506,6 +507,10 @@ impl Vault {
         &self,
         request: GenerateWebsiteLoginRequest<'_>,
     ) -> Result<Credential> {
+        self.with_transport_transaction(|| self.insert_website_login(request))
+    }
+
+    fn insert_website_login(&self, request: GenerateWebsiteLoginRequest<'_>) -> Result<Credential> {
         let origin = parse_https_origin(request.url)?;
         if request.username.trim().is_empty() {
             return Err(VaultError::InvalidCredentialType(
@@ -526,7 +531,7 @@ impl Vault {
             .map_err(|error| VaultError::Encryption(error.to_string()))?;
         let host = origin_host(&origin);
         let review_at = request.review_at.map(|value| value.to_rfc3339());
-        self.add_credential(AddCredentialRequest {
+        self.insert_transport_credential(AddCredentialRequest {
             name: request.name,
             credential_type: CredentialType::WebsiteLogin,
             value: &value,
@@ -787,6 +792,11 @@ impl Vault {
         {
             return Err(VaultError::AuthRejected(
                 "partition contains registered auth",
+            ));
+        }
+        if !self.list_signup_profiles(project_name, name)?.is_empty() {
+            return Err(VaultError::AuthRejected(
+                "partition contains signup profiles",
             ));
         }
         let personal_id =
@@ -1160,6 +1170,11 @@ impl Vault {
             .any(|item| item.auth.is_some())
         {
             return Err(VaultError::AuthRejected("project contains registered auth"));
+        }
+        for partition in self.list_partitions_in_project(name)? {
+            if !self.list_signup_profiles(name, &partition.name)?.is_empty() {
+                return Err(VaultError::AuthRejected("project contains signup profiles"));
+            }
         }
         let default_id: String = self.db.query_row(
             "SELECT id FROM projects WHERE name = ?1",

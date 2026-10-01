@@ -68,6 +68,8 @@ struct BundlePartition {
     credentials: Vec<BundleCredential>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth_data: Option<AuthPartitionData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signup_profiles: Option<Vec<crate::core::signup::PortableProfile>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -108,13 +110,26 @@ pub(crate) fn write_transport_payload<T: Serialize>(
     passphrase: &str,
     output_path: &str,
 ) -> crate::core::Result<()> {
-    if registered {
+    write_versioned_transport_payload(
+        magic,
+        payload,
+        if registered { 2 } else { 1 },
+        passphrase,
+        output_path,
+    )
+}
+
+pub(crate) fn write_versioned_transport_payload<T: Serialize>(
+    magic: &[u8; 4],
+    payload: &T,
+    version: u8,
+    passphrase: &str,
+    output_path: &str,
+) -> crate::core::Result<()> {
+    if version > 1 {
         bundle::write_encrypted_payload(
             magic,
-            &AuthEnvelope {
-                version: 2,
-                payload,
-            },
+            &AuthEnvelope { version, payload },
             passphrase,
             output_path,
         )
@@ -132,9 +147,18 @@ pub(crate) fn read_transport_payload<T: DeserializeOwned>(
     // failed v2 decode as legacy: malformed policy must not be silently ignored.
     let value: serde_json::Value = bundle::read_encrypted_payload(magic, bundle_path, passphrase)?;
     if value.get("version").is_some() || value.get("payload").is_some() {
+        let profiles = value["payload"].get("signup_profiles").is_some()
+            || value["payload"]["partitions"]
+                .as_array()
+                .is_some_and(|ps| ps.iter().any(|p| p.get("signup_profiles").is_some()));
+        if (value["version"] == 3) != profiles {
+            return Err(VaultError::InvalidBundle(
+                "signup profile transport version mismatch".into(),
+            ));
+        }
         let envelope: AuthEnvelope<T> = serde_json::from_value(value)
             .map_err(|_| VaultError::InvalidBundle("invalid auth bundle envelope".into()))?;
-        if envelope.version != 2 {
+        if !matches!(envelope.version, 2 | 3) {
             return Err(VaultError::InvalidBundle(
                 "unsupported auth bundle version".into(),
             ));
@@ -165,11 +189,13 @@ pub fn export_project(
             let credentials = export_bundle_credentials(vault, project_name, &partition.name)?;
             let auth_data =
                 optional_auth_data(vault.export_auth_partition(project_name, &partition.name)?);
+            let signup_profiles = vault.export_signup_profiles(project_name, &partition.name)?;
             bundle_partitions.push(BundlePartition {
                 name: partition.name,
                 description: partition.description,
                 credentials,
                 auth_data,
+                signup_profiles,
             });
         }
         Ok(ProjectBundlePayload {
@@ -182,16 +208,26 @@ pub fn export_project(
     let registered = payload
         .partitions
         .iter()
-        .any(|partition| partition.auth_data.is_some());
+        .any(|partition| partition.auth_data.is_some() || partition.signup_profiles.is_some());
     let count = payload
         .partitions
         .iter()
         .map(|partition| partition.credentials.len())
         .sum();
-    write_transport_payload(
+    write_versioned_transport_payload(
         PROJECT_BUNDLE_MAGIC,
         &payload,
-        registered,
+        if payload
+            .partitions
+            .iter()
+            .any(|p| p.signup_profiles.is_some())
+        {
+            3
+        } else if registered {
+            2
+        } else {
+            1
+        },
         passphrase,
         output_path,
     )?;
@@ -212,7 +248,7 @@ pub fn import_project(
         payload
             .partitions
             .iter()
-            .any(|partition| partition.auth_data.is_some()),
+            .any(|partition| partition.auth_data.is_some() || partition.signup_profiles.is_some()),
     )?;
     for partition in &payload.partitions {
         validate_bundle_auth_bindings(&partition.credentials, partition.auth_data.as_ref())?;
@@ -241,6 +277,9 @@ pub fn import_project(
                 registered,
                 &mut results,
             )?;
+            if let Some(profiles) = &partition.signup_profiles {
+                vault.import_signup_profiles(&payload.project, &partition.name, profiles, false)?;
+            }
             if let Some(auth_data) = &partition.auth_data {
                 merge_auth_data(
                     vault,

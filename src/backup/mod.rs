@@ -34,6 +34,7 @@ pub use restore::{ConflictPolicy, RestoreOptions, RestoreReport, restore_backup}
 const VAULT_BACKUP_MAGIC: &[u8; 4] = b"WKVB";
 const BACKUP_FORMAT_VERSION: u32 = 1;
 const AUTH_BACKUP_FORMAT_VERSION: u32 = 2;
+const SIGNUP_BACKUP_FORMAT_VERSION: u32 = 3;
 const AUTH_SCHEMA_VERSION: u32 = 14;
 const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 6;
 const MAX_VAULT_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
@@ -42,6 +43,7 @@ const TABLE_VAULT_META: &str = "vault_meta";
 const TABLE_PROJECTS: &str = "projects";
 const TABLE_PARTITIONS: &str = "partitions";
 const TABLE_CREDENTIALS: &str = "credentials";
+const TABLE_SIGNUP_PROFILES: &str = "signup_profiles";
 const TABLE_AUTH_REGISTRY: &str = "auth_registry";
 const TABLE_AUTH_BUNDLES: &str = "auth_bundles";
 const TABLE_AUDIT_LOG: &str = "audit_log";
@@ -162,6 +164,8 @@ pub struct BackupCounts {
     pub partitions: usize,
     pub credentials: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
+    pub signup_profiles: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
     pub auth_records: usize,
     #[serde(default, skip_serializing_if = "is_zero")]
     pub auth_bundles: usize,
@@ -194,6 +198,8 @@ struct BackupContents {
     credentials: Vec<Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     auth_registry: Vec<Map<String, Value>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    signup_profiles: Vec<Map<String, Value>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     auth_bundles: Vec<Map<String, Value>>,
     #[serde(default)]
@@ -330,7 +336,9 @@ pub fn create_backup(
     let sidecars = dump_sidecars(vault_dir, scope)?;
     let warnings = backup_warnings(scope);
     let mut payload = VaultBackupPayload {
-        format_version: if has_auth_data(&contents) {
+        format_version: if !contents.signup_profiles.is_empty() {
+            SIGNUP_BACKUP_FORMAT_VERSION
+        } else if has_auth_data(&contents) {
             AUTH_BACKUP_FORMAT_VERSION
         } else {
             BACKUP_FORMAT_VERSION
@@ -531,15 +539,23 @@ fn has_auth_data(contents: &BackupContents) -> bool {
 fn validate_backup_format(payload: &VaultBackupPayload) -> Result<()> {
     if !matches!(
         payload.format_version,
-        BACKUP_FORMAT_VERSION | AUTH_BACKUP_FORMAT_VERSION
+        BACKUP_FORMAT_VERSION | AUTH_BACKUP_FORMAT_VERSION | SIGNUP_BACKUP_FORMAT_VERSION
     ) {
         return Err(VaultError::Backup(format!(
             "unsupported backup format version {}",
             payload.format_version
         )));
     }
+    if !payload.contents.signup_profiles.is_empty()
+        && (payload.format_version != SIGNUP_BACKUP_FORMAT_VERSION
+            || parse_schema_version(&payload.source_schema_version)? < 15)
+    {
+        return Err(VaultError::Backup(
+            "signup profiles require backup format 3 and schema 15".into(),
+        ));
+    }
     if has_auth_data(&payload.contents)
-        && (payload.format_version != AUTH_BACKUP_FORMAT_VERSION
+        && (payload.format_version < AUTH_BACKUP_FORMAT_VERSION
             || parse_schema_version(&payload.source_schema_version)? < AUTH_SCHEMA_VERSION)
     {
         return Err(VaultError::Backup(
@@ -554,6 +570,40 @@ fn validate_backup_format(payload: &VaultBackupPayload) -> Result<()> {
 fn validate_auth_contents(payload: &VaultBackupPayload) -> Result<()> {
     validate_backup_format(payload)?;
     let contents = &payload.contents;
+    let mut profile_ids = BTreeSet::new();
+    let mut profile_names = BTreeSet::new();
+    for row in &contents.signup_profiles {
+        validate_auth_row_shape(
+            row,
+            &["id", "name", "revision", "partition_id", "encrypted_value"],
+        )?;
+        let partition_id = row["partition_id"].as_str().unwrap();
+        let partition = contents
+            .partitions
+            .iter()
+            .find(|p| p.get("id").and_then(Value::as_str) == Some(partition_id));
+        if !payload.scope.credentials
+            || !payload.scope.partitions
+            || !payload.scope.projects
+            || !profile_ids.insert(row["id"].as_str().unwrap())
+            || !profile_names.insert((partition_id, row["name"].as_str().unwrap()))
+            || uuid::Uuid::parse_str(row["id"].as_str().unwrap()).is_err()
+            || uuid::Uuid::parse_str(row["revision"].as_str().unwrap()).is_err()
+            || !partition.is_some_and(|p| {
+                contents
+                    .projects
+                    .iter()
+                    .any(|pr| pr.get("id") == p.get("project_id"))
+            })
+            || BASE64
+                .decode(row["encrypted_value"].as_str().unwrap())
+                .is_err()
+        {
+            return Err(VaultError::Backup(
+                "invalid signup profile dependencies".into(),
+            ));
+        }
+    }
     if has_auth_data(contents)
         && (!payload.scope.credentials || !payload.scope.partitions || !payload.scope.projects)
     {
@@ -698,9 +748,9 @@ fn validate_auth_contents(payload: &VaultBackupPayload) -> Result<()> {
 fn validate_auth_row_shape(row: &Map<String, Value>, fields: &[&str]) -> Result<()> {
     if row.len() != fields.len()
         || fields.iter().any(|field| {
-            !row.get(*field)
+            row.get(*field)
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
+                .is_none_or(|value| value.is_empty())
         })
     {
         return Err(auth_backup_invalid("auth table row has an invalid shape"));
@@ -727,6 +777,11 @@ fn dump_contents(db: &Connection, scope: &BackupScope) -> Result<BackupContents>
         },
         credentials: if scope.credentials {
             dump_table(db, TABLE_CREDENTIALS)?
+        } else {
+            Vec::new()
+        },
+        signup_profiles: if scope.credentials {
+            dump_table(db, TABLE_SIGNUP_PROFILES)?
         } else {
             Vec::new()
         },
@@ -890,6 +945,7 @@ fn counts_from_contents(contents: &BackupContents) -> BackupCounts {
         projects: contents.projects.len(),
         partitions: contents.partitions.len(),
         credentials: contents.credentials.len(),
+        signup_profiles: contents.signup_profiles.len(),
         auth_records: contents.auth_registry.len(),
         auth_bundles: contents.auth_bundles.len(),
         audits: contents.audit_log.len(),
@@ -1592,5 +1648,55 @@ mod tests {
         row.insert("key".into(), Value::String(key.into()));
         row.insert("value".into(), Value::String(value.into()));
         row
+    }
+}
+
+#[cfg(test)]
+mod signup_tests {
+    use super::*;
+    fn fixture() -> VaultBackupPayload {
+        let mut payload = tests::auth_payload();
+        payload.format_version = SIGNUP_BACKUP_FORMAT_VERSION;
+        let partition = payload.contents.partitions[0]["id"].clone();
+        payload.contents.signup_profiles.push(
+            serde_json::json!({
+                "id":uuid::Uuid::new_v4().to_string(), "name":"synthetic-profile",
+                "revision":uuid::Uuid::new_v4().to_string(), "partition_id":partition,
+                "encrypted_value":BASE64.encode([1u8;32]),
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        );
+        payload.integrity = compute_integrity(&payload).unwrap();
+        payload
+    }
+    #[test]
+    fn signup_backup_rejects_old_format_invalid_scope_duplicates_and_missing_dependencies() {
+        let original = fixture();
+        validate_auth_contents(&original).unwrap();
+        for change in 0..6 {
+            let mut payload = original.clone();
+            match change {
+                0 => payload.format_version = 2,
+                1 => payload.source_schema_version = "14".into(),
+                2 => payload
+                    .contents
+                    .signup_profiles
+                    .push(payload.contents.signup_profiles[0].clone()),
+                3 => {
+                    payload.contents.signup_profiles[0]
+                        .insert("partition_id".into(), Value::String("missing".into()));
+                }
+                4 => payload.scope.credentials = false,
+                _ => {
+                    payload.contents.signup_profiles[0]
+                        .insert("encrypted_value".into(), Value::String("not-base64".into()));
+                }
+            }
+            assert!(validate_auth_contents(&payload).is_err());
+        }
+        let legacy: Value = serde_json::to_value(BackupContents::default()).unwrap();
+        assert!(legacy.get("signup_profiles").is_none());
     }
 }

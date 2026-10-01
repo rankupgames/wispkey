@@ -109,6 +109,8 @@ windows-sys = { version = "0.59", features = [
 
 [dev-dependencies]
 tempfile = "3"
+# SQLite read barrier for deterministic two-connection profile race regression.
+rusqlite = { version = "0.32", features = ["functions"] }
 
 [profile.release]
 lto = true

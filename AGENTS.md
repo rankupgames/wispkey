@@ -45,7 +45,7 @@ For repeated headless unlocks, prefer `wispkey unlock --remember --password-file
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v14 automatically. Browser fill requests are short-lived metadata, omitted from encrypted backups.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v15 automatically. Encrypted signup profiles have explicit project/partition scope; see `docs/signup-profiles.md`. Browser fill requests are short-lived metadata, omitted from encrypted backups.
 
 ```bash
 # Create a project
@@ -145,6 +145,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
 | `wispkey remove <name>` | Delete credential |
 | `wispkey rotate <name>` | Regenerate wisp token |
+| `wispkey signup-profile create/list/update/remove` | Manage encrypted reusable identities; owner input from file/stdin, metadata-only output |
 | `wispkey login generate <name> --username U --url HTTPS [--project P] [--partition P] [--review-after 180d]` | Generate and store a unique website login (password never printed) |
 | `wispkey login list/archive/restore/activate` | Website-login metadata and lifecycle; review dates never auto-delete |
 | `wispkey exec --credential <name> [--project P] [--stdin] [--env VAR]... [--askpass] -- <command> [args...]` | Audited child-process secret injection |
@@ -259,7 +260,8 @@ Available tools:
 - **`wispkey_proxy_status`** -- Check vault/session/proxy state
 - **`wispkey_project_list`** -- List all projects with partition counts and active indicator
 - **`wispkey_set`** -- Create or update a credential (`name`, `value` required; `type`, `description`, `hosts`, `tags`, `project`, `header_name`, `param_name` optional). Refuses to overwrite unless `overwrite: true`. On update, the wisp token is preserved. Refuses `website_login`; use `wispkey_generate_login`.
-- **`wispkey_generate_login`** -- Generate a unique website login (`name`, `username`, `url` required). Returns origin, lifecycle, and username only—never the password.
+- **`wispkey_signup_profile_list`** -- List profile IDs, revisions, labels and scope only; explicit `project` and `partition` required.
+- **`wispkey_generate_login`** -- Generate a unique website login (`name` and `url` required). Accepts either legacy `username` or an explicit `profile` ID with `profile_revision`, `project`, and `partition`. Returns metadata only—never identity or password.
 - **`wispkey_request_browser_fill`** -- Queue a five-minute one-use request (`name`, `origin`, `requester`, `reason`; optional `project`). Returns only a request ID. Requires human approval in a separate browser profile and Windows Hello; see `docs/browser-handoff.md`.
 - **`wispkey_browser_fill_status`** -- Read request status by `request_id`; metadata only. Completed means fields were filled, not submitted.
 - **`wispkey_delete`** -- Delete a credential by `name` (optional `project` scope)

@@ -467,7 +467,7 @@ impl CloudClient {
         let snapshot: Snapshot =
             crate::bundle::decrypt_payload_bytes(MAGIC, &bytes, password, MAX_BYTES as u64)
                 .map_err(|_| invalid("bundle_authentication_failed"))?;
-        if !matches!(snapshot.version, 1 | 2)
+        if !matches!(snapshot.version, 1..=3)
             || snapshot.project != project
             || snapshot.partition != partition
         {
@@ -634,9 +634,9 @@ impl CloudClient {
             let local_changed = local_hash != state.local_hash;
             let remote_changed = revision != state.revision.as_deref();
             let fresh_empty = state.revision.is_none()
-                && local
-                    .as_ref()
-                    .is_none_or(|value| value.credentials.is_empty());
+                && local.as_ref().is_none_or(|value| {
+                    value.credentials.is_empty() && value.signup_profiles.is_none()
+                });
             let mut action = match mode {
                 SyncMode::Push => "push",
                 SyncMode::Pull => "pull",

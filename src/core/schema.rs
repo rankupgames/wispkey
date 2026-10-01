@@ -549,6 +549,15 @@ impl Vault {
         if version == "13" {
             let tx = db.unchecked_transaction()?;
             super::auth::create_schema(&tx)?;
+            super::signup::create_schema(&tx)?;
+            tx.execute(
+                "UPDATE vault_meta SET value=?1 WHERE key='version'",
+                [CURRENT_SCHEMA_VERSION],
+            )?;
+            tx.commit()?;
+        } else if version == "14" {
+            let tx = db.unchecked_transaction()?;
+            super::signup::create_schema(&tx)?;
             tx.execute(
                 "UPDATE vault_meta SET value=?1 WHERE key='version'",
                 [CURRENT_SCHEMA_VERSION],
@@ -637,6 +646,7 @@ impl Vault {
         super::browser::create_schema(db)?;
         super::operation_grants::create_schema(db)?;
         super::auth::create_schema(db)?;
+        super::signup::create_schema(db)?;
         Ok(())
     }
 }
