@@ -6,7 +6,7 @@ including workspace/optional dependencies present in that lockfile. Deleted or
 unavailable maintained branches fail checkout instead of silently losing coverage.
 This RustSec monitor does not cover npm dependencies or deployed artifacts.
 
-Every job fetches a new advisory database with pinned cargo-audit 0.22.1, runs
+Every job fetches a new advisory database with pinned cargo-audit 0.22.2, runs
 outside branch-local configuration, and has a bounded timeout. Blocking
 advisories fail the job and the Actions summary lists dependency/version,
 RustSec ID, and patched versions (or the need to replace/mitigate). Informational
@@ -46,6 +46,40 @@ No advisory exception or automatic suppression is configured. Any future
 exception requires a separate reviewed change with advisory ID, affected
 versions, rationale, compensating controls, owner, and expiry. Informational
 warnings do not constitute approved exceptions to blocking advisories.
+
+## Stable refresh constraints (October 2026)
+
+The compatible refresh replaces yanked `chacha20 0.10.1` with `0.10.2`.
+The [upstream fix](https://github.com/RustCrypto/stream-ciphers/pull/580)
+corrects CPU-intrinsic selection; no application cipher, key derivation, or
+stored format is changed. The refresh also updates compatible HTTP, certificate,
+CLI, UUID, error, and browser-launch dependencies within existing constraints.
+Existing proxy, certificate, bundle/backup, login, and owner-IPC regression suites
+and the native three-platform CI matrix remain required before merging.
+
+`toml 0.8.2` cannot currently resolve to `0.8.23`: the optional Linux webview
+graph contains `glib-macros 0.18.5 -> proc-macro-crate 2.0.2`, which pins
+`toml_datetime =0.6.3`, while newer TOML 0.8 requires `^0.6.11`. Address this with
+the coordinated native/TOML migration; do not force overrides or drop platform
+features to make a patch-only update resolve.
+
+Major migrations require separate review of behavior and compatibility:
+
+- Reqwest 0.13 changes TLS-provider and form/query feature selection. Preserve
+  the explicit ring provider, trust roots, proxy behavior, and redirect policy.
+- Keyring 4 splits platform stores. Prove existing remembered protectors remain
+  recoverable and forgetting them still removes the correct OS entry.
+- Native tao/tray-icon/wry upgrades need Linux GTK/WebKit, macOS and Windows
+  builds; recheck the remaining RustSec warnings rather than suppressing them.
+- `windows 0.62.2` requires `windows-future 0.3.2`; `windows-future 0.100.0`
+  changes its core types and cannot be substituted independently in consent code.
+- Storage, Argon2, TOML and encoding major updates need existing-file and
+  encrypted-bundle compatibility evidence, beyond successful compilation.
+
+CI follows stable Rust; retain the declared minimum until a tested migration
+requires raising it. Do not introduce prereleases as a substitute for a stable
+upgrade. Existing upstream constraints (including russh's ssh-key release
+candidate) need an upstream-compatible replacement, not an arbitrary downgrade.
 
 Offline fixtures exercise failure/reporting without changing dependencies:
 
