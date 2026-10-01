@@ -1,5 +1,5 @@
 {
-  "contract": "wispkey-access-enrollment/draft-1",
+  "contract": "wispkey-access-enrollment/draft-2",
   "description": "Apply overrides to fixture() in test_policy_model.py; synthetic facts, no cryptographic vectors.",
   "decisions": [
     {
@@ -430,6 +430,182 @@
       },
       "grant": {},
       "expect": "legacy_route"
+    },
+    {
+      "id": "freshness-restart",
+      "right": "replicate",
+      "context": {
+        "clock_epoch": "boot-2"
+      },
+      "grant": {},
+      "expect": "stale_policy"
+    },
+    {
+      "id": "freshness-clock-uncertain",
+      "right": "replicate",
+      "context": {
+        "clock_certain": false
+      },
+      "grant": {},
+      "expect": "stale_policy"
+    },
+    {
+      "id": "head-expired",
+      "right": "replicate",
+      "context": {
+        "head_expires_at": 110
+      },
+      "grant": {},
+      "expect": "stale_policy"
+    },
+    {
+      "id": "head-wall-clock-rollback",
+      "right": "replicate",
+      "context": {
+        "now": 109
+      },
+      "grant": {},
+      "expect": "stale_policy"
+    },
+    {
+      "id": "challenge-still-outstanding",
+      "right": "replicate",
+      "challenge": {
+        "outstanding": true
+      },
+      "expect": "stale_policy"
+    }
+  ],
+  "freshness_responses": [
+    {
+      "id": "on-time",
+      "expect": "allow"
+    },
+    {
+      "id": "delayed-within-original-deadline",
+      "context": {
+        "now_monotonic": 39
+      },
+      "expect": "allow"
+    },
+    {
+      "id": "arrives-at-deadline",
+      "context": {
+        "now_monotonic": 40
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "arrives-after-deadline",
+      "context": {
+        "now_monotonic": 41
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "replayed-consumed-challenge",
+      "challenge": {
+        "outstanding": false
+      },
+      "expect": "challenge_not_outstanding"
+    },
+    {
+      "id": "wrong-nonce",
+      "response": {
+        "nonce": "replayed-nonce"
+      },
+      "expect": "freshness_proof_required"
+    },
+    {
+      "id": "unsigned",
+      "response": {
+        "signature_verified": false
+      },
+      "expect": "freshness_proof_required"
+    },
+    {
+      "id": "restarted",
+      "context": {
+        "clock_epoch": "boot-2"
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "clock-uncertain",
+      "context": {
+        "clock_certain": false
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "monotonic-rollback",
+      "context": {
+        "now_monotonic": 9
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "oversized-dispatch-budget",
+      "challenge": {
+        "deadline_monotonic": 41
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "signed-head-expired",
+      "response": {
+        "expires_at": 110
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "signed-head-not-yet-valid",
+      "response": {
+        "issued_at": 111
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "local-session-expired",
+      "context": {
+        "session_expires_at": 110
+      },
+      "expect": "expired"
+    },
+    {
+      "id": "enrollment-expired",
+      "context": {
+        "enrollment_expires_at": 110
+      },
+      "expect": "expired"
+    },
+    {
+      "id": "grant-expired",
+      "grant": {
+        "expires_at": 110
+      },
+      "expect": "expired"
+    },
+    {
+      "id": "restore",
+      "context": {
+        "restored": true
+      },
+      "expect": "inactive_context"
+    },
+    {
+      "id": "cancelled",
+      "context": {
+        "cancelled": true
+      },
+      "expect": "inactive_context"
+    },
+    {
+      "id": "disabled",
+      "context": {
+        "enabled": false
+      },
+      "expect": "disabled"
     }
   ]
 }

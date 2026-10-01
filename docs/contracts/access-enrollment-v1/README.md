@@ -1,7 +1,7 @@
-# Access rings and trusted-device enrollment — draft 1
+# Access rings and trusted-device enrollment — draft 2
 
 **Status: proposed for parent/owner review; not an approved or implemented protocol.**
-Contract identifier: `wispkey-access-enrollment/draft-1`. Related issues:
+Contract identifier: `wispkey-access-enrollment/draft-2`. Related issues:
 [WispKey #49](https://github.com/rankupgames/wispkey/issues/49),
 [Cloud #5](https://github.com/rankupgames/wispkey-cloud/issues/5), and
 [sync #48](https://github.com/rankupgames/wispkey/issues/48).
@@ -226,22 +226,39 @@ an explicit authenticated transition, not accepting the largest untrusted number
 
 ## Freshness, revocation, rotation and recovery
 
-Candidate first-slice freshness: **online primary required**. Secondary requests a
-nonce-bound owner-signed head binding account, device/grant, scope, epoch, policy
-revision and current sequence/hash. Match a locally outstanding one-use challenge;
-Cloud cannot mint or refresh it. A frozen server-signed timestamp is insufficient.
-Candidate maximum local monotonic lease is 30 seconds, bounded further by all
-signed expiries and finite session expiry. At the exact deadline deny. A new
-challenge must not extend authority if the owner has revoked it. Restart,
-clock uncertainty/rollback, missing protected checkpoint, logout, lock, account
-switch, cancellation, restore or conflict invalidates cached admission.
+Candidate first-slice freshness: **online primary required**. Before dispatch,
+secondary records an outstanding one-use challenge with nonce, exact binding,
+process-local clock epoch, monotonic dispatch time and immutable deadline. The
+proposed deadline is at most dispatch + 30 seconds, never receipt + 30 seconds.
+The owner-signed reply binds the nonce, account, device/grant, scope, epoch,
+policy revision, current sequence/hash and signed issued/expiry times. Cloud
+cannot mint or refresh it. A frozen server-signed timestamp is insufficient.
 
-This gives a proposed **up to 30-second stale-authority window** for a previously
-issued lease if a revocation is not yet observed. Observed revocation stops action
-immediately at the next check. No claim of instantaneous remote revocation or
-atomic recall of bytes already sent is made. The budget is unapproved. A stricter
+Accept only a verified reply matching the currently outstanding challenge and
+binding, in the same process/clock epoch, with trusted clock state and
+`dispatch <= receipt < deadline <= dispatch + 30`. At the exact deadline deny.
+Atomically consume the challenge and store the accepted head/lease; a repeated
+reply cannot consume it again or extend the deadline. A delayed reply arriving
+at dispatch + 29 has at most one second left, not a fresh 30-second lease.
+An adapter must persist the returned state atomically; replaying an earlier copy
+of an immutable model object is not a valid store operation. This model does
+not establish database CAS behavior or cryptographic verification.
+
+At use/import recheck `receipt <= now_monotonic < original_deadline`, unchanged
+binding/clock epoch, consumed challenge, verified proof, trusted clock state and
+signed head expiry. Wall time must not precede receipt or signed issue time.
+The earliest head, grant, enrollment and local-session expiry always wins.
+Restart creates a new non-restored clock epoch and clears outstanding challenges
+and leases. Clock uncertainty/rollback, missing protected checkpoint, logout,
+lock, account switch, cancellation, restore or conflict invalidates admission.
+A new challenge must not extend authority if the owner has revoked it.
+
+The 30-second dispatch budget and 300-second enrollment/request lifetime remain
+**proposed and unapproved**. No measured end-to-end stale-authority bound or
+instantaneous remote-revocation guarantee is claimed. Observed revocation stops
+action at the next check; bytes already sent cannot be recalled. A stricter
 zero-offline-use promise needs owner authorization per actual release, not this
-lease. For restricted/critical use no offline lease is enabled at all.
+lease. Restricted/critical use remains disabled entirely in this slice.
 
 Store the last accepted epoch/sequence/hash and policy floor atomically with the
 import. A first or restored reader gets a baseline only from a fresh nonce-bound
@@ -333,8 +350,7 @@ python3 -B -m unittest discover -s docs/contracts/access-enrollment-v1 -v
 No setup credentials, environment variables, vault initialization, Cargo build,
 service, browser, network or filesystem data beyond these source fixtures are
 needed. Tests use reserved `.test` endpoints and symbolic public-key/hash IDs;
-**these are policy vectors, not valid crypto material**. `vectors.json` has 47
-portable decision cases applied to the fixture in `test_policy_model.py`.
-The 19 test methods also enumerate independent right subsets, exact scope/key
+**these are policy vectors, not valid crypto material**. `vectors.json` has 52 decision cases and 19 freshness-response cases applied to the fixture in `test_policy_model.py`.
+The 22 test methods also enumerate independent right subsets, exact scope/key
 binding, state transitions, release-time changes and snapshot ordering. See
 [the adversarial/integration plan](TEST-PLAN.md) for unimplemented checks.

@@ -7,7 +7,7 @@ import unittest
 
 from policy_model import (VERSION, Scope, Binding, Enrollment, Approval, Denied,
                           transition, Grant, Context, decide, Snapshot, Checkpoint,
-                          accept_snapshot, classify)
+                          accept_snapshot, classify, FreshnessChallenge, accept_freshness)
 
 
 def fixture():
@@ -26,7 +26,10 @@ def fixture():
                       entire_partition_routine=True, fresh_owner_response_verified=True,
                       freshness_nonce_matches=True, freshness_binding_matches=True,
                       freshness_received_monotonic=10, now_monotonic=11,
-                      freshness_deadline_monotonic=40)
+                      freshness_deadline_monotonic=40,
+                      freshness_challenge=FreshnessChallenge(binding, 'nonce-head', 'boot-1', 10, 40, False),
+                      clock_epoch='boot-1', clock_certain=True,
+                      head_issued_at=100, head_expires_at=400, head_received_at=110)
     return binding, grant, context
 
 
@@ -51,6 +54,9 @@ class PolicyTests(unittest.TestCase):
                     g['rights'] = frozenset(g['rights'])
                 grant = replace(grant, **g)
                 context = replace(context, **vector.get('context', {}))
+                if 'challenge' in vector:
+                    context = replace(context, freshness_challenge=replace(
+                        context.freshness_challenge, **vector['challenge']))
                 self.assertEqual(decide(grant, context, vector['right']), vector['expect'])
 
     def test_default_context_is_disabled(self):
@@ -177,6 +183,57 @@ class EnrollmentTests(unittest.TestCase):
             altered = replace(record, **change)
             with self.subTest(change=change), self.assertRaises(Denied):
                 transition(altered, 'approve', 110, 0, enabled=True, approval=replace(approval, request=altered))
+
+
+class FreshnessTests(unittest.TestCase):
+    def test_response_vectors(self):
+        vectors = json.loads(Path(__file__).with_name('vectors.json').read_text())
+        for vector in vectors['freshness_responses']:
+            with self.subTest(vector=vector['id']):
+                binding, grant, context = fixture()
+                changes = {'outstanding': True} | vector.get('challenge', {})
+                context = replace(context, freshness_challenge=replace(
+                    context.freshness_challenge, **changes))
+                context = replace(context, **vector.get('context', {}))
+                grant = replace(grant, **vector.get('grant', {}))
+                args = dict(nonce='nonce-head', binding=binding, issued_at=100,
+                            expires_at=400, signature_verified=True)
+                args.update(vector.get('response', {}))
+                if vector['expect'] == 'allow':
+                    accepted = accept_freshness(grant, context, **args)
+                    self.assertFalse(accepted.freshness_challenge.outstanding)
+                    self.assertEqual(accepted.freshness_deadline_monotonic, 40)
+                    self.assertEqual(decide(grant, accepted, 'replicate'), 'allow')
+                else:
+                    with self.assertRaisesRegex(Denied, '^' + vector['expect'] + '$'):
+                        accept_freshness(grant, context, **args)
+
+    def test_response_consumption_replay_and_no_receipt_extension(self):
+        binding, grant, context = fixture()
+        context = replace(context, now_monotonic=39,
+                          freshness_challenge=replace(context.freshness_challenge, outstanding=True))
+        args = dict(nonce='nonce-head', binding=binding, issued_at=100,
+                    expires_at=400, signature_verified=True)
+        accepted = accept_freshness(grant, context, **args)
+        self.assertEqual(accepted.freshness_received_monotonic, 39)
+        self.assertEqual(accepted.freshness_deadline_monotonic, 40)
+        self.assertEqual(decide(grant, replace(accepted, now_monotonic=40), 'replicate'), 'stale_policy')
+        with self.assertRaisesRegex(Denied, '^challenge_not_outstanding$'):
+            accept_freshness(grant, accepted, **args)
+        for change in ({'clock_epoch': 'boot-2'}, {'clock_certain': False},
+                       {'now_monotonic': 38}, {'now': 109}):
+            with self.subTest(change=change):
+                self.assertNotEqual(decide(grant, replace(accepted, **change), 'replicate'), 'allow')
+
+    def test_wrong_binding_and_missing_challenge(self):
+        binding, grant, context = fixture()
+        args = dict(nonce='nonce-head', binding=replace(binding, root='wrong-root'),
+                    issued_at=100, expires_at=400, signature_verified=True)
+        context = replace(context, freshness_challenge=replace(context.freshness_challenge, outstanding=True))
+        with self.assertRaisesRegex(Denied, '^freshness_proof_required$'):
+            accept_freshness(grant, context, **args)
+        with self.assertRaisesRegex(Denied, '^challenge_not_outstanding$'):
+            accept_freshness(grant, replace(context, freshness_challenge=None), **args)
 
 
 class SnapshotTests(unittest.TestCase):

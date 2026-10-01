@@ -1,4 +1,4 @@
-# Adversarial and setup plan — draft 1
+# Adversarial and setup plan — draft 2
 
 This plan is a release gate list, not a claim that runtime behavior exists.
 Everything uses generated disposable fixtures. Never run against a real vault,
@@ -14,7 +14,7 @@ production Clerk, Cloudflare resources, live grants or personal OS key entries.
 | Unknown classification restricted | Null, empty, unknown, case mismatch and higher classes never replicate |
 | Sign-in is insufficient | Missing identity proof, owner grant, approval state, local unlock or plugin consent denied |
 | Independent plugin boundary | Device approval alone insufficient; only separately authorized metadata/request; hosted kind rejected |
-| Lifecycle/freshness | Exact deadline, not-yet-valid, stale nonce/binding, missing signed head, clock rollback, excessive budget |
+| Lifecycle/freshness | Exact deadline, not-yet-valid, stale nonce/binding, missing signed head, dispatch deadline, delayed reply, replay, restart, clock uncertainty/rollback, excessive budget |
 | Last-moment changes | Re-evaluation after revocation, lock, cancel, ring/revision change, lease expiry |
 | Enrollment substitution | Altered request ID, nonce, keys, account, scope, description, rights or expiry rejected |
 | Enrollment race/replay | Both cancel/approve serializations, repeated approve, terminal-state revival, stale CAS revision |
@@ -26,7 +26,7 @@ production Clerk, Cloudflare resources, live grants or personal OS key entries.
 | Legacy compatibility | Old project/partition/share/account-only route inputs denied |
 
 Run `python3 -B -m unittest discover -s docs/contracts/access-enrollment-v1 -v`.
-Expected: 19 methods, 47 JSON decision vectors plus enumerated subcases. Under one
+Expected: 22 methods, 52 decision vectors and 19 freshness-response vectors, plus enumerated subcases. Under one
 second on the inspected host. Test count is not a cryptographic assurance measure.
 
 ## Required before runtime integration
@@ -59,8 +59,10 @@ baselines, not evidence that this draft has been enforced on those surfaces.
   software-only prohibition on external use; read-only is sync authority. This is
   a product/security decision, not a test that can make export revocable.
 - **Freshness:** timestamps/monotonic counters alone cannot defeat a malicious
-  frozen relay. Proposed nonce-bound owner head and explicit 30-second residual
-  window; primary-online dependency and budget remain unapproved.
+  frozen relay. Nonce-bound owner head now uses the original local challenge dispatch deadline,
+  atomic one-use consumption and non-restored clock epoch; receipt cannot reset
+  the budget. No measured stale-authority bound is claimed; the budget remains
+  unapproved.
 - **Second key possession:** an Ed25519 device signature does not prove possession
   of a distinct age recipient key. Pairing handshake is blocked on review of both
   proofs and out-of-band transcript comparison.

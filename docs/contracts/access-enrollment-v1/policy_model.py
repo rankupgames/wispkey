@@ -1,11 +1,11 @@
-"""DRAFT-1 reference model. Synthetic trusted facts only; NEVER a wire/auth API.
+"""DRAFT-2 reference model. Synthetic trusted facts only; NEVER a wire/auth API.
 
 No crypto, storage, network, credentials, environment reads or runtime imports.
 Verification booleans stand for obligations of a future reviewed adapter.
 """
 from dataclasses import dataclass, replace
 
-VERSION = 'wispkey-access-enrollment/draft-1'
+VERSION = 'wispkey-access-enrollment/draft-2'
 RIGHTS = frozenset({'discover', 'replicate', 'request', 'use'})
 RINGS = frozenset({'routine', 'restricted', 'critical'})
 
@@ -113,6 +113,16 @@ class Grant:
 
 
 @dataclass(frozen=True)
+class FreshnessChallenge:
+    binding: Binding
+    nonce: str
+    clock_epoch: str
+    dispatched_monotonic: int
+    deadline_monotonic: int
+    outstanding: bool = True
+
+
+@dataclass(frozen=True)
 class Context:
     binding: Binding
     principal: str
@@ -143,10 +153,64 @@ class Context:
     now_monotonic: int = 0
     # 30s is an explicit DRAFT budget, not a shipping promise.
     freshness_deadline_monotonic: int = 0
+    freshness_challenge: FreshnessChallenge | None = None
+    clock_epoch: str = ''
+    clock_certain: bool = False
+    head_issued_at: int = 0
+    head_expires_at: int = 0
+    head_received_at: int = 0
     grant_revoked: bool = False
     plugin_grant_verified: bool = False
     restored: bool = False
     cancelled: bool = False
+
+
+def freshness_valid(c):
+    q = c.freshness_challenge
+    return bool(q and not q.outstanding and q.nonce and q.clock_epoch
+                and c.clock_certain and q.clock_epoch == c.clock_epoch
+                and q.binding == c.binding
+                and c.fresh_owner_response_verified and c.freshness_nonce_matches
+                and c.freshness_binding_matches
+                and q.dispatched_monotonic <= c.freshness_received_monotonic
+                <= c.now_monotonic < q.deadline_monotonic
+                <= q.dispatched_monotonic + 30
+                and c.freshness_deadline_monotonic == q.deadline_monotonic
+                and c.head_issued_at <= c.head_received_at <= c.now
+                < c.head_expires_at)
+
+
+def accept_freshness(grant, context, *, nonce, binding, issued_at, expires_at,
+                     signature_verified=False):
+    """Consume the authoritative outstanding challenge; never extend its deadline.
+
+    Adapter must atomically replace context with the returned value. Reusing a
+    saved pre-consumption copy is forbidden; this pure model is not a CAS store.
+    Clock epoch is process-local, regenerated on restart and never restored.
+    """
+    c = context
+    q = c.freshness_challenge
+    if not c.enabled:
+        raise Denied('disabled')
+    if c.restored or c.cancelled:
+        raise Denied('inactive_context')
+    if not q or not q.outstanding:
+        raise Denied('challenge_not_outstanding')
+    if not signature_verified or nonce != q.nonce or binding != q.binding:
+        raise Denied('freshness_proof_required')
+    candidate = replace(c, freshness_challenge=replace(q, outstanding=False),
+                        fresh_owner_response_verified=True,
+                        freshness_nonce_matches=True, freshness_binding_matches=True,
+                        freshness_received_monotonic=c.now_monotonic,
+                        freshness_deadline_monotonic=q.deadline_monotonic,
+                        head_issued_at=issued_at, head_expires_at=expires_at,
+                        head_received_at=c.now)
+    if grant.binding != c.binding or not freshness_valid(candidate):
+        raise Denied('stale_policy')
+    if not (grant.issued_at <= c.now < min(grant.expires_at, c.enrollment_expires_at,
+                                          c.session_expires_at, expires_at)):
+        raise Denied('expired')
+    return candidate
 
 
 def decide(grant, context, right):
@@ -172,11 +236,7 @@ def decide(grant, context, right):
     if not (grant.issued_at <= c.now < min(grant.expires_at, c.enrollment_expires_at,
                                           c.session_expires_at)):
         return 'expired'
-    if not (c.fresh_owner_response_verified and c.freshness_nonce_matches
-            and c.freshness_binding_matches
-            and c.freshness_received_monotonic <= c.now_monotonic
-            < c.freshness_deadline_monotonic
-            <= c.freshness_received_monotonic + 30):
+    if not freshness_valid(c):
         return 'stale_policy'
     if (grant.credential, grant.credential_revision, grant.origin, grant.operation) != (
             c.credential, c.credential_revision, c.origin, c.operation):
