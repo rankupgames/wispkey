@@ -67,6 +67,32 @@ sticky shared ancestors protect the trusted child entries; other shared-writable
 ancestors fail closed. Original input aliases cannot redirect a manifest after
 canonicalization. Same-owner tampering remains outside this isolation boundary.
 
+POSIX mode bits alone do not establish this boundary on macOS: an extended ACL
+can grant another user write or delete access without changing those bits. The
+installer reads Darwin ACLs through `acl_get_fd_np` on a non-following, read-only
+descriptor, checks path/descriptor identity before and after inspection, and
+bounds enumeration to Darwin's 128-entry limit. It checks the host, every canonical
+ancestor, registration directories (including newly created ones), and the
+temporary manifest before publication. Planning checks existing directories
+without creating them. Missing APIs, unsupported ACLs and inspection errors fail
+closed; descriptor `ENOENT` denotes the absent ACL property in Apple's API.
+
+The policy preserves deny entries, including the common macOS deny-delete entry,
+and allow entries containing only read/search/execute, metadata-read or synchronize
+rights. It rejects every mutation-capable or unknown allow right, including
+inherited and inherit-only grants. This is deliberately conservative: even grants
+to the owner/root or grants preceded by a deny are refused; principal membership
+and ACE ordering are not inferred. The installer never removes or repairs ACLs.
+Manifest mode is 0600; an inherited read-only ACL may still permit reading this
+non-secret registration metadata. Tests exercise native ACLs allocated only in
+memory and synthetic reader failures; no test changes a filesystem ACL or proves
+physical user presence.
+
+ACL references: [Apple ACL permissions](https://raw.githubusercontent.com/apple-oss-distributions/file_cmds/main/chmod/chmod.1),
+[descriptor ACL reader](https://raw.githubusercontent.com/apple-oss-distributions/Libc/main/posix1e/acl_file.c),
+[absent ACL property](https://raw.githubusercontent.com/apple-oss-distributions/Libc/main/gen/filesec.c),
+[Darwin entry iteration](https://raw.githubusercontent.com/apple-oss-distributions/Libc/main/posix1e/acl_entry.c).
+
 ## Required human acceptance — NOT RUN by automated suites
 
 Record commit, date, tester, macOS version, Mac/Touch ID hardware, browser/version,

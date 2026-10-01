@@ -115,6 +115,10 @@ jobs:
           toolchain: stable
           components: clippy, rustfmt
 
+      - name: macOS native-host installer and ACL fixtures
+        if: runner.os == 'macOS'
+        run: python3 -B -m unittest discover -s scripts/tests -p test_browser_host_macos.py -v
+
       - name: Rust cache
         uses: Swatinem/rust-cache@f13886b937689c021905a6b90929199931d60db1 # v2.8.1
 

@@ -1,12 +1,15 @@
 import importlib.util
 import contextlib
+import ctypes
+import errno
 import io
 import json
 import os
 from pathlib import Path
 import tempfile
+import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 spec = importlib.util.spec_from_file_location("installer", Path(__file__).parents[1] / "install-browser-host-macos.py")
 installer = importlib.util.module_from_spec(spec)
@@ -16,6 +19,12 @@ spec.loader.exec_module(installer)
 @unittest.skipUnless(os.name == "posix", "macOS per-user filesystem contract")
 class NativeHostInstallerTests(unittest.TestCase):
     def setUp(self):
+        if sys.platform != "darwin":
+            # POSIX filesystem tests are portable; only Darwin jobs exercise
+            # the actual OS ACL reader. Production has no non-Darwin bypass.
+            acl_reader = patch.object(installer, "validate_acl_fd")
+            acl_reader.start()
+            self.addCleanup(acl_reader.stop)
         self.scratch = tempfile.TemporaryDirectory(prefix="wispkey installer ")
         self.addCleanup(self.scratch.cleanup)
         self.home = Path(self.scratch.name)
@@ -165,6 +174,177 @@ class NativeHostInstallerTests(unittest.TestCase):
             with patch.object(installer.sys, "platform", platform), patch.object(installer.os, "geteuid", return_value=uid), contextlib.redirect_stderr(io.StringIO()):
                 self.assertEqual(installer.main(["--browser", "Firefox", "--host-path", str(self.host), "--install"]), 1)
         self.assertFalse((self.home / "Library").exists())
+
+    def test_acl_grants_on_host_ancestor_and_registration_refuse_read_only_plan(self):
+        library = self.home / "Library"
+        library.mkdir(mode=0o700)
+        for target in (self.host, self.home, library):
+            with self.subTest(target=target.name):
+                def check(path, info):
+                    if path.resolve() == target.resolve():
+                        raise ValueError("synthetic mutation grant")
+                with patch.object(installer, "validate_acl", side_effect=check), self.assertRaises(ValueError):
+                    self.plan()
+                self.assertEqual(list(library.iterdir()), [])
+
+    def test_new_directory_and_inherited_manifest_acl_refused_without_publication(self):
+        destination, manifest = self.plan()
+        def check_directory(path, info):
+            if path == self.home / "Library":
+                raise ValueError("synthetic inherited directory grant")
+        with patch.object(installer, "validate_acl", side_effect=check_directory), self.assertRaises(ValueError):
+            installer.install(destination, manifest, self.home)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list((self.home / "Library").iterdir()), [])
+        # Directory preflight is controlled separately to inject an inherited
+        # file ACL at the real temporary-file boundary, before JSON publication.
+        with patch.object(installer, "validate_acl"), patch.object(installer, "validate_acl_fd", side_effect=ValueError("synthetic inherited file grant")), self.assertRaises(ValueError):
+            installer.install(destination, manifest, self.home)
+        self.assertFalse(destination.exists())
+        self.assertEqual(list(destination.parent.iterdir()), [])
+
+    def test_acl_changed_after_plan_is_refused(self):
+        destination, manifest = self.plan()
+        with patch.object(installer, "validate_acl_fd", side_effect=ValueError("changed ACL")), self.assertRaises(ValueError):
+            installer.install(destination, manifest, self.home)
+        self.assertFalse((self.home / "Library").exists())
+
+    def test_acl_path_identity_change_and_symlink_refused(self):
+        info = self.host.lstat()
+        moved = self.home / "moved"
+        self.host.rename(moved)
+        self.host.write_text("replacement")
+        with self.assertRaises(ValueError):
+            installer.validate_acl(self.host, info)
+        self.host.unlink()
+        self.host.symlink_to(moved)
+        with self.assertRaises(OSError):
+            installer.validate_acl(self.host, info)
+
+    def test_path_replaced_during_acl_read_and_missing_path_refused(self):
+        info = self.host.lstat()
+        def replace(fd):
+            self.host.rename(self.home / "moved")
+            self.host.write_text("replacement")
+        with patch.object(installer, "validate_acl_fd", side_effect=replace), self.assertRaises(ValueError):
+            installer.validate_acl(self.host, info)
+        self.host.unlink()
+        with self.assertRaises(FileNotFoundError):
+            installer.validate_acl(self.host, info)
+
+
+class AclReaderTests(unittest.TestCase):
+    def library(self, entries=()):
+        lib = Mock()
+        lib.acl_valid.return_value = 0
+        lib.acl_get_fd_np.return_value = 123
+        def get_entry(acl, index, output):
+            if index >= len(entries):
+                ctypes.set_errno(errno.EINVAL)
+                return -1
+            output._obj.value = index + 1
+            return 0
+        def get_tag(entry, output):
+            output._obj.value = entries[entry.value - 1][0]
+            return 0
+        def get_permissions(entry, output):
+            output._obj.value = entries[entry.value - 1][1]
+            return 0
+        lib.acl_get_entry.side_effect = get_entry
+        lib.acl_get_tag_type.side_effect = get_tag
+        lib.acl_get_permset_mask_np.side_effect = get_permissions
+        return lib
+
+    def test_absent_acl_only_accepts_descriptor_enoent(self):
+        for error in (errno.ENOENT, errno.EACCES, errno.EIO, errno.ENOTSUP, errno.EBADF, 0):
+            lib = self.library()
+            def absent(fd, kind):
+                ctypes.set_errno(error)
+                return None
+            lib.acl_get_fd_np.side_effect = absent
+            with self.subTest(error=error), patch.object(installer, "acl_library", return_value=lib):
+                if error == errno.ENOENT:
+                    installer.validate_acl_fd(7)
+                else:
+                    with self.assertRaises(ValueError):
+                        installer.validate_acl_fd(7)
+            lib.acl_free.assert_not_called()
+
+    def test_safe_allow_and_deny_entries_preserved(self):
+        for entries in ([], [(2, 1 << 4)], [(1, installer.ACL_SAFE_ALLOW)], [(2, (1 << 64) - 1)]):
+            lib = self.library(entries)
+            with patch.object(installer, "acl_library", return_value=lib):
+                installer.validate_acl_fd(7)
+            lib.acl_free.assert_called_once_with(123)
+
+    def test_every_mutation_right_unknown_right_and_tag_refused_and_freed(self):
+        for entry in [(1, 1 << bit) for bit in (2, 4, 5, 6, 8, 10, 12, 13, 63)] + [(3, 0)]:
+            lib = self.library([entry])
+            with self.subTest(entry=entry), patch.object(installer, "acl_library", return_value=lib), self.assertRaises(ValueError):
+                installer.validate_acl_fd(7)
+            lib.acl_free.assert_called_once_with(123)
+
+    def test_invalid_unreadable_and_oversized_acls_fail_closed(self):
+        for function in ("acl_valid", "acl_get_entry", "acl_get_tag_type", "acl_get_permset_mask_np"):
+            lib = self.library([(2, 16)])
+            getattr(lib, function).side_effect = lambda *args: -1
+            with self.subTest(function=function), patch.object(installer, "acl_library", return_value=lib), self.assertRaises(ValueError):
+                installer.validate_acl_fd(7)
+            lib.acl_free.assert_called_once_with(123)
+        for count in (128, 129):
+            lib = self.library([(2, 16)] * count)
+            with patch.object(installer, "acl_library", return_value=lib):
+                if count == 128:
+                    installer.validate_acl_fd(7)
+                else:
+                    with self.assertRaises(ValueError):
+                        installer.validate_acl_fd(7)
+            self.assertLessEqual(lib.acl_get_entry.call_count, 129)
+            lib.acl_free.assert_called_once_with(123)
+
+    def test_missing_native_api_and_non_darwin_fail_closed(self):
+        with patch.object(installer.sys, "platform", "linux"), self.assertRaises(ValueError):
+            installer.acl_library()
+        with patch.object(installer.sys, "platform", "darwin"), patch.object(installer.ctypes, "CDLL", side_effect=OSError()), self.assertRaises(ValueError):
+            installer.acl_library()
+        with patch.object(installer.sys, "platform", "darwin"), patch.object(installer.ctypes, "CDLL", return_value=object()), self.assertRaises(ValueError):
+            installer.acl_library()
+
+    @unittest.skipUnless(sys.platform == "darwin", "native Darwin ACL ABI")
+    def test_native_in_memory_inherited_acl_classification(self):
+        # These APIs modify only an allocated ACL, never a filesystem ACL.
+        lib = installer.acl_library()
+        pointer = ctypes.c_void_p
+        for name, arguments, result in (
+            ("acl_init", [ctypes.c_int], pointer),
+            ("acl_create_entry", [ctypes.POINTER(pointer), ctypes.POINTER(pointer)], ctypes.c_int),
+            ("acl_set_tag_type", [pointer, ctypes.c_int], ctypes.c_int),
+            ("acl_set_permset_mask_np", [pointer, ctypes.c_uint64], ctypes.c_int),
+            ("acl_get_flagset_np", [pointer, ctypes.POINTER(pointer)], ctypes.c_int),
+            ("acl_add_flag_np", [pointer, ctypes.c_int], ctypes.c_int),
+        ):
+            function = getattr(lib, name)
+            function.argtypes, function.restype = arguments, result
+        for flag in (0, 1 << 4, (1 << 5) | (1 << 6) | (1 << 8)):
+            for tag, rights, allowed in ((2, 16, True), (1, installer.ACL_SAFE_ALLOW, True), (1, 4, False), (1, 64, False)):
+                with self.subTest(flag=flag, tag=tag, rights=rights):
+                    acl = pointer(lib.acl_init(1))
+                    self.assertTrue(acl.value)
+                    try:
+                        entry, flags = pointer(), pointer()
+                        self.assertEqual(lib.acl_create_entry(ctypes.byref(acl), ctypes.byref(entry)), 0)
+                        self.assertEqual(lib.acl_set_tag_type(entry, tag), 0)
+                        self.assertEqual(lib.acl_set_permset_mask_np(entry, rights), 0)
+                        self.assertEqual(lib.acl_get_flagset_np(entry, ctypes.byref(flags)), 0)
+                        if flag:
+                            self.assertEqual(lib.acl_add_flag_np(flags, flag), 0)
+                        if allowed:
+                            installer.validate_acl_entries(lib, acl)
+                        else:
+                            with self.assertRaises(ValueError):
+                                installer.validate_acl_entries(lib, acl)
+                    finally:
+                        lib.acl_free(acl)
 
 
 if __name__ == "__main__":
