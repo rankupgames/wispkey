@@ -1,4 +1,8 @@
+#[path = "common/owner_ipc_capture.rs"]
+mod capture;
 mod common;
+
+use capture::PhaseCapture;
 
 use common::*;
 use serde_json::json;
@@ -13,6 +17,7 @@ struct OwnerServer {
     child: ChildGuard,
     logs: Arc<Mutex<Vec<u8>>>,
     reader: Option<thread::JoinHandle<()>>,
+    phases: Arc<Mutex<PhaseCapture>>,
 }
 
 impl OwnerServer {
@@ -32,7 +37,35 @@ impl OwnerServer {
 
 impl Drop for OwnerServer {
     fn drop(&mut self) {
+        let failing = thread::panicking();
+        let before_cleanup = if failing {
+            let (index, report) = self
+                .phases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot_since(0);
+            eprintln!(
+                "owner IPC failure phases before cleanup (server_pid={}):\n{report}",
+                self.child.0.id()
+            );
+            index
+        } else {
+            0
+        };
         self.stop();
+        if failing {
+            let (_, report) = self
+                .phases
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .snapshot_since(before_cleanup);
+            if !report.is_empty() {
+                eprintln!(
+                    "owner IPC failure phases after drain (server_pid={}):\n{report}",
+                    self.child.0.id()
+                );
+            }
+        }
     }
 }
 
@@ -43,6 +76,7 @@ fn start_owner_ipc(vault_dir: &std::path::Path) -> OwnerServer {
             .args(["tray", "--ipc-only"])
             .env("WISPKEY_VAULT_PATH", vault_dir)
             .env("WISPKEY_PASSWORD", "test-password")
+            .env("WISPKEY_OWNER_IPC_DIAGNOSTICS", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -51,12 +85,15 @@ fn start_owner_ipc(vault_dir: &std::path::Path) -> OwnerServer {
     let mut stderr = child.0.stderr.take().expect("server stderr");
     let logs = Arc::new(Mutex::new(Vec::new()));
     let captured = Arc::clone(&logs);
+    let phases = Arc::new(Mutex::new(PhaseCapture::new(child.0.id())));
+    let captured_phases = Arc::clone(&phases);
     let reader = thread::spawn(move || {
         let mut buffer = [0; 4096];
         while let Ok(size) = stderr.read(&mut buffer) {
             if size == 0 {
                 break;
             }
+            captured_phases.lock().unwrap().feed(&buffer[..size]);
             // Keep draining even after reaching the capture limit. An unread
             // pipe can block tracing before the server handles a request.
             let mut logs = captured.lock().unwrap();
@@ -68,9 +105,14 @@ fn start_owner_ipc(vault_dir: &std::path::Path) -> OwnerServer {
         child,
         logs,
         reader: Some(reader),
+        phases,
     };
     wait_for_owner_info(vault_dir);
-    eprintln!("owner IPC readiness: {} ms", started.elapsed().as_millis());
+    eprintln!(
+        "owner IPC readiness: {} ms (server_pid={})",
+        started.elapsed().as_millis(),
+        server.child.0.id()
+    );
     server
 }
 
@@ -80,8 +122,12 @@ async fn owner_call(vault_dir: &std::path::Path, request: serde_json::Value) -> 
     owner_ipc::call(&path, request)
         .await
         .unwrap_or_else(|error| {
+            let server_pid = std::fs::read(vault_dir.join("owner.json"))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<owner_ipc::OwnerEndpoint>(&bytes).ok())
+                .map_or(0, |endpoint| endpoint.pid);
             panic!(
-                "owner IPC request failed after {} ms: {error}",
+                "owner IPC request failed after {} ms (server_pid={server_pid}): {error}",
                 started.elapsed().as_millis()
             )
         })
