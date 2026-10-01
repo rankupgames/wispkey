@@ -56,6 +56,11 @@ An interrupted upload retains its exact encrypted journal/mutation ID for manual
 reconciliation; stopping never claims the write was rolled back. Guard checks
 cannot atomically retract bytes sent just before an external lock.
 
+A requested-duration stop has the same outcome whether the asynchronous timer or
+a synchronous guard notices it first. It never acknowledges the interrupted
+attempt. Expiry of the owner session remains an authorization failure, including
+when that expiry shortens the requested duration.
+
 Duration/cancellation returns a final metadata-only JSON report: stop reason,
 successful-attempt count (including attempts with local changes still pending)
 and the last local sync result. Failures return a nonzero exit with an error on
@@ -84,6 +89,10 @@ propagation target. Existing plaintext or old keys cannot be remotely erased.
 `cargo test --locked --all-features --test cloud_sync watch` exercises real CLI
 clients against synthetic loopback Cloud storage. The core
 `cloud_apply_guard_denial_at_commit_rolls_back_credentials_and_journal` test proves
-rollback when authority disappears at the transaction's final guard. Run the full
+rollback when authority disappears at the transaction's final guard. The typed
+duration-deadline rollback test covers that same boundary without committing
+credentials or journal state. Deterministic watch unit tests inject exact-boundary
+time before transfer and before acknowledgment, verify session expiry stays an
+error, and retain network backoff without advancing the cursor. Run the full
 existing default/all-feature suites to check compatibility of the shared manual
 sync/import path; watch is excluded from default builds.
