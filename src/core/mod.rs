@@ -63,6 +63,8 @@ pub mod browser;
 #[derive(Error, Debug)]
 #[non_exhaustive]
 pub enum VaultError {
+    #[error("watch duration elapsed")]
+    WatchDurationElapsed,
     #[error("{0}")]
     AuthRejected(&'static str),
     #[error("vault already exists at {0}")]

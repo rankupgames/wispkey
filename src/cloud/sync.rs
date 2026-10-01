@@ -760,7 +760,10 @@ impl CloudClient {
                             )),
                             guard,
                         )
-                        .map_err(|_| invalid("atomic_import_failed; local partition unchanged"))?;
+                        .map_err(|error| match error {
+                            VaultError::WatchDurationElapsed => CloudError::Vault(error),
+                            _ => invalid("atomic_import_failed; local partition unchanged"),
+                        })?;
                     committed.local_hash = Some(hash);
                     *state = committed;
                     outcome = "downloaded";
