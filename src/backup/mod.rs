@@ -698,9 +698,9 @@ fn validate_auth_contents(payload: &VaultBackupPayload) -> Result<()> {
 fn validate_auth_row_shape(row: &Map<String, Value>, fields: &[&str]) -> Result<()> {
     if row.len() != fields.len()
         || fields.iter().any(|field| {
-            !row.get(*field)
+            row.get(*field)
                 .and_then(Value::as_str)
-                .is_some_and(|value| !value.is_empty())
+                .is_none_or(|value| value.is_empty())
         })
     {
         return Err(auth_backup_invalid("auth table row has an invalid shape"));
