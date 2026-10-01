@@ -16,8 +16,8 @@ use std::{
 };
 
 const SECRET: &str = "synthetic-cloud-secret-canary";
-const SESSION: &str = "synthetic-session-canary";
-const SECOND_SESSION: &str = "synthetic-second-session-canary";
+const SESSION: &str = "oat_synthetic_session_canary";
+const SECOND_SESSION: &str = "oat_synthetic_second_session_canary";
 
 fn hash(bytes: &[u8]) -> String {
     ring::digest::digest(&ring::digest::SHA256, bytes)
@@ -35,6 +35,8 @@ struct Record {
 #[derive(Default)]
 struct ServerState {
     records: BTreeMap<String, Record>,
+    issued_at: i64,
+    api_origin: String,
     uploads: Vec<Value>,
     requests: Vec<(String, String)>,
     lose_ack: bool,
@@ -54,7 +56,11 @@ impl Server {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         listener.set_nonblocking(true).unwrap();
-        let state = Arc::new(Mutex::new(ServerState::default()));
+        let state = Arc::new(Mutex::new(ServerState {
+            issued_at: chrono::Utc::now().timestamp(),
+            api_origin: url.clone(),
+            ..ServerState::default()
+        }));
         let stop = Arc::new(AtomicBool::new(false));
         let state_worker = state.clone();
         let stop_worker = stop.clone();
@@ -94,7 +100,28 @@ impl Server {
         self.configure_account(path, "fixture-account", SESSION);
     }
     fn configure_account(&self, path: &Path, account: &str, session: &str) {
-        write_private_test_file(&path.join("cloud.json"), &json!({"api_url":self.url,"clerk_session_token":session,"user_id":account,"org_id":null,"tier":"Cloud","last_sync":null}).to_string());
+        let issued_at = self.state.lock().unwrap().issued_at;
+        let expires_at = issued_at + 3600;
+        let resource = format!("{}/api/v1", self.url);
+        let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+        hash.update(b"wispkey-cloud-oauth-v1");
+        for value in [
+            session,
+            "https://issuer.example",
+            "fixture-client",
+            &self.url,
+            &resource,
+            account,
+            "opaque",
+        ] {
+            hash.update(&(value.len() as u64).to_be_bytes());
+            hash.update(value.as_bytes());
+        }
+        hash.update(&issued_at.to_be_bytes());
+        hash.update(&expires_at.to_be_bytes());
+        let binding_sha256 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(hash.finish());
+        write_private_test_file(&path.join("cloud.json"), &json!({"api_url":self.url,"clerk_session_token":session,"user_id":account,"org_id":null,"tier":"Cloud","last_sync":null,
+            "oauth_session":{"issuer":"https://issuer.example","client_id":"fixture-client","api_origin":self.url,"resource":format!("{}/api/v1",self.url),"account_id":account,"issued_at":issued_at,"expires_at":expires_at,"token_format":"opaque","binding_sha256":binding_sha256}}).to_string());
     }
 }
 impl Drop for Server {
@@ -145,7 +172,8 @@ async fn handle(
     if path == "/api/v1/billing/status" {
         return reply(
             200,
-            &json!({"data":{"clerkUserId":owner,"sessionClaims":{"plan":"cloud","features":["cloud_sync"]}}})
+            &json!({"success":true,"data":{"clerkUserId":owner,"sessionClaims":{"sub":owner,"plan":"cloud","features":["cloud_sync"]},
+                "oauth":{"issuer":"https://issuer.example","clientId":"fixture-client","resource":format!("{}/api/v1",state.api_origin),"issuedAt":state.issued_at,"expiresAt":state.issued_at+3600,"tokenFormat":"opaque"}}})
                 .to_string()
                 .into_bytes(),
             None,
@@ -899,6 +927,20 @@ mod foreground_watch {
         }
     }
 
+    fn finish_success_watch(child: &mut ChildGuard) -> Output {
+        // Successful encrypted transfers are not a five-second latency contract.
+        // Keep the same bounded window as the simultaneous-live fixture; dedicated
+        // one-second deadline/cancellation tests below keep their original limits.
+        wait_for_child_exit(&mut child.0, Duration::from_secs(35))
+            .expect("successful watch did not finish its bounded run");
+        finish(child)
+    }
+
+    fn watch_success(path: &Path) -> Output {
+        let mut child = ChildGuard(watch_command(path, "30").spawn().unwrap());
+        finish_success_watch(&mut child)
+    }
+
     fn watch(path: &Path) -> Output {
         let mut child = ChildGuard(watch_command(path, "5").spawn().unwrap());
         finish(&mut child)
@@ -992,8 +1034,8 @@ mod foreground_watch {
             "--format", "json", "rotate", "base-key",
         ])["wisp_token"].clone();
         assert_ne!(rotated, original_token);
-        assert_success(&watch(first.path()));
-        assert_success(&watch(second.path()));
+        assert_success(&watch_success(first.path()));
+        assert_success(&watch_success(second.path()));
         assert_eq!(
             run_wispkey_json(
                 second.path(),
@@ -1017,8 +1059,8 @@ mod foreground_watch {
                 "default",
             ],
         );
-        assert_success(&watch(second.path()));
-        assert_success(&watch(first.path()));
+        assert_success(&watch_success(second.path()));
+        assert_success(&watch_success(first.path()));
         let first_auth = run_wispkey_json(first.path(), &["--format", "json", "auth", "list"]);
         let second_auth = run_wispkey_json(second.path(), &["--format", "json", "auth", "list"]);
         assert_eq!(first_auth, second_auth);
@@ -1159,7 +1201,7 @@ mod foreground_watch {
             let state = server.state.lock().unwrap();
             (state.requests.len(), state.uploads.len())
         };
-        let mut child = ChildGuard(watch_command(first.path(), "5").spawn().unwrap());
+        let mut child = ChildGuard(watch_command(first.path(), "30").spawn().unwrap());
         let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let reached_first_poll = server.state.lock().unwrap().requests[requests_before..]
@@ -1184,7 +1226,7 @@ mod foreground_watch {
             "synthetic-later-edit",
             "personal",
         );
-        assert_success(&finish(&mut child));
+        assert_success(&finish_success_watch(&mut child));
         let state = server.state.lock().unwrap();
         assert_eq!(
             state.uploads.len(),
@@ -1333,7 +1375,7 @@ mod foreground_watch {
             "synthetic-local-change",
             "personal",
         );
-        assert_success(&watch(first.path()));
+        assert_success(&watch_success(first.path()));
         let uploads = server.state.lock().unwrap().uploads.len();
         let before = journal(second.path());
         let output = watch(second.path());
@@ -1395,6 +1437,14 @@ mod foreground_watch {
                     assert_success(&command(&destination, &["project", "use", "isolated"]).output().unwrap());
                 }
                 "session" => assert_success(&command(&destination, &["unlock", "--timeout", "30"]).output().unwrap()),
+                "cloud_token" => {
+                    let path = destination.join("cloud.json");
+                    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    config["clerk_session_token"] = json!("oat_new_login_for_same_account");
+                    config["auth_generation"] = json!("synthetic-renewed-login");
+                    write_private_test_file(&path, &config.to_string());
+                }
+                "cloud_logout" => assert_success(&command(&destination, &["cloud", "logout"]).output().unwrap()),
                 _ => unreachable!(),
             }
             callback_marker.store(true, Ordering::SeqCst);
@@ -1461,6 +1511,16 @@ mod foreground_watch {
     #[test]
     fn session_renewal_during_download_prevents_import() {
         rejects_changed_authority_before_import("session");
+    }
+
+    #[test]
+    fn cloud_token_renewal_during_download_prevents_import() {
+        rejects_changed_authority_before_import("cloud_token");
+    }
+
+    #[test]
+    fn cloud_logout_during_download_prevents_import() {
+        rejects_changed_authority_before_import("cloud_logout");
     }
 
     #[test]

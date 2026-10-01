@@ -162,7 +162,7 @@ fn cloud_status_and_logout_json_report_local_state_without_session_token() {
     let config = json!({"api_url":"https://example.test/api", "clerk_session_token":"synthetic-session-canary", "user_id":"synthetic-user", "org_id":null, "tier":"Cloud", "last_sync":null});
     write_private_test_file(&dir.path().join("cloud.json"), &config.to_string());
     let connected = run_wispkey_json(dir.path(), &["--format", "json", "cloud", "status"]);
-    assert_eq!(connected["authenticated"], true);
+    assert_eq!(connected["authenticated"], false); // Legacy raw sessions require a fresh PKCE login.
     assert_eq!(connected["source"], "local");
     assert_eq!(connected["remote_verified"], false);
     assert!(!connected.to_string().contains("synthetic-session-canary"));

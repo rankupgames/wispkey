@@ -10,7 +10,7 @@ pub async fn handle_cloud_status(remote: bool) {
             std::process::exit(1);
         }
     };
-    if config.clerk_session_token.is_some() && Vault::exists() {
+    if config.has_active_session() && Vault::exists() {
         let opened = Vault::open_with_session()
             .or_else(|error| if remote { Err(error) } else { Vault::open() });
         match opened {
@@ -58,12 +58,26 @@ pub async fn handle_cloud_status(remote: bool) {
         output["pending_changes"] = serde_json::json!("unknown_until_unlocked");
         output["api_url"] = serde_json::json!(config.api_url);
         output["last_sync"] = serde_json::json!(config.last_sync);
+        output["reauthentication_required"] =
+            serde_json::json!(config.clerk_session_token.is_some() && !status.authenticated);
+        output["session_expires_at"] = serde_json::json!(
+            config
+                .oauth_session
+                .as_ref()
+                .map(|session| session.expires_at)
+        );
         print_json(output);
         return;
     }
     if !status.authenticated {
         println!("WispKey Cloud: not connected");
-        println!("Run `wispkey cloud login` to connect.");
+        if config.clerk_session_token.is_some() {
+            println!(
+                "Saved session is expired, legacy, or has changed bindings. Run `wispkey cloud login` again."
+            );
+        } else {
+            println!("Run `wispkey cloud login` to connect.");
+        }
         println!("Pricing: Personal free local-only | Cloud $1.99/mo | Enterprise contact us");
         println!("API: {}", config.api_url);
         return;
@@ -122,12 +136,16 @@ pub async fn handle_cloud_logout() {
         }
     };
     let mut client = CloudClient::new(config);
-    match client.logout() {
-        Ok(()) => {
+    match client.logout().await {
+        Ok(report) => {
             if json_output() {
-                print_json(serde_json::json!({"ok": true, "authenticated": false}));
+                print_json(serde_json::to_value(&report).expect("logout report serializes"));
             } else {
-                println!("Logged out of WispKey Cloud.");
+                println!("{}", report.warning);
+                println!("Remote revocation: {}", report.remote_revocation);
+                if let Some(expires_at) = report.may_remain_valid_until {
+                    println!("Token expiry (Unix seconds): {expires_at}");
+                }
             }
         }
         Err(e) => {

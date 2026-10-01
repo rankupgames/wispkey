@@ -175,21 +175,45 @@ pub fn recover_partition(
 }
 
 impl CloudClient {
-    pub(super) async fn refresh_account(&mut self) -> CloudResult<()> {
+    /// Recheck the saved account and OAuth bindings against the Cloud API.
+    pub async fn refresh_account(&mut self) -> CloudResult<()> {
         let response = self
             .request(reqwest::Method::GET, "/api/v1/billing/status")?
             .send()
             .await
             .map_err(|_| CloudError::Network("account_verification_failed".into()))?;
         Self::check_response(&response)?;
-        let envelope: Envelope<serde_json::Value> =
+        let envelope: serde_json::Value =
             serde_json::from_slice(&Self::response_bytes(response, 65536).await?)
                 .map_err(|_| invalid("invalid_account_response"))?;
-        let id = envelope.data["clerkUserId"]
+        if envelope["success"] != true {
+            return Err(invalid("invalid_account_response"));
+        }
+        self.apply_verified_account(&envelope["data"])
+    }
+
+    pub(super) fn apply_verified_account(&mut self, data: &serde_json::Value) -> CloudResult<()> {
+        let id = data["clerkUserId"]
             .as_str()
             .filter(|id| !id.is_empty())
             .ok_or_else(|| invalid("invalid_account_response"))?;
-        let claims = &envelope.data["sessionClaims"];
+        if let Some(session) = &self.config.oauth_session {
+            let binding = &data["oauth"];
+            if id != session.account_id
+                || binding["issuer"].as_str() != Some(session.issuer.as_str())
+                || binding["clientId"].as_str() != Some(session.client_id.as_str())
+                || binding["resource"].as_str() != Some(session.resource.as_str())
+                || binding["expiresAt"].as_i64() != Some(session.expires_at)
+                || binding["issuedAt"].as_i64() != Some(session.issued_at)
+                || binding["tokenFormat"].as_str() != Some("opaque")
+            {
+                return Err(invalid("cloud_account_binding_mismatch; log in again"));
+            }
+        }
+        let claims = &data["sessionClaims"];
+        if claims["sub"].as_str() != Some(id) || !claims["org_id"].is_null() {
+            return Err(invalid("cloud_account_binding_mismatch; log in again"));
+        }
         let metadata = &claims["public_metadata"];
         let plans = [claims["plan"].as_str(), metadata["plan"].as_str()];
         let has_feature = [claims, metadata].iter().any(|value| {
@@ -344,7 +368,10 @@ impl CloudClient {
             ))
     }
 
-    async fn response_bytes(mut response: reqwest::Response, max: usize) -> CloudResult<Vec<u8>> {
+    pub(super) async fn response_bytes(
+        mut response: reqwest::Response,
+        max: usize,
+    ) -> CloudResult<Vec<u8>> {
         if response
             .content_length()
             .is_some_and(|size| size > max as u64)
@@ -814,7 +841,7 @@ impl CloudClient {
                 "remote_revision":remote_revision.unwrap_or_else(|| "absent".into()),"acknowledged_revision":state.revision}));
         }
         Ok(
-            json!({"authenticated": self.config.clerk_session_token.is_some(),"source":if remote { "remote" } else { "local" },
+            json!({"authenticated": self.ensure_authenticated().is_ok(),"source":if remote { "remote" } else { "local" },
             "remote_verified":remote,"sync_available":true,"tracked_partitions":partitions.len(),"partitions":partitions}),
         )
     }
