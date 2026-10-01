@@ -86,7 +86,11 @@ python3 scripts/install-browser-host-macos.py --browser Chrome \
 
 Only after reviewing that exact manifest, rerun with `--install` to register it.
 The script refuses root/sudo, invalid IDs, missing/non-executable or shared-writable
-hosts, insecure/symlink registration directories, and existing manifests. It
+hosts, unsafe host ancestors, insecure/symlink registration directories, and
+existing manifests. Canonical host ancestors must be owned by root or the current
+user and prevent untrusted entry replacement (sticky shared ancestors such as
+`/tmp` are accepted only with trusted owners throughout the path). The canonical
+host path is checked again before publication; a newly redirected path is refused. It
 writes an owner-only manifest under the selected browser's user directory:
 
 | Browser | Directory below your home |

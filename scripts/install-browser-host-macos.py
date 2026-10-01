@@ -18,18 +18,33 @@ LOCATIONS = {
 }
 
 
-def plan(browser, extension_id, host_path, home):
-    if browser not in LOCATIONS:
-        raise ValueError("unsupported browser")
+def validate_host(host_path):
     host = Path(host_path)
     if not host.is_absolute():
         raise ValueError("host path must be absolute")
     host = host.resolve(strict=True)
-    info = host.stat()
+    info = host.lstat()
     if not stat.S_ISREG(info.st_mode) or not os.access(host, os.X_OK):
         raise ValueError("host must be an executable regular file")
     if info.st_uid != os.getuid() or info.st_mode & 0o022:
         raise ValueError("host must be owned by this user and not writable by other users")
+    # An executable's mode alone does not protect its directory entry. Validate
+    # the whole canonical chain so another user cannot replace an ancestor or
+    # the executable. Sticky shared ancestors (e.g. /tmp) protect entries whose
+    # owners are trusted; every child in this chain is independently checked.
+    for ancestor in host.parents:
+        info = ancestor.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid not in (0, os.getuid()):
+            raise ValueError("host ancestors must be non-symlink directories owned by root or this user")
+        if info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX:
+            raise ValueError("host ancestors must not permit untrusted entry replacement")
+    return host
+
+
+def plan(browser, extension_id, host_path, home):
+    if browser not in LOCATIONS:
+        raise ValueError("unsupported browser")
+    host = validate_host(host_path)
     manifest = {"name": NAME, "description": "WispKey local browser approval host", "path": str(host), "type": "stdio"}
     if browser == "Firefox":
         if extension_id not in (None, FIREFOX_ID):
@@ -48,6 +63,10 @@ def plan(browser, extension_id, host_path, home):
 
 def install(destination, manifest, home):
     """No sudo, browser settings, extension installation or host execution."""
+    # Revalidate the canonical path at publication; do not follow a new symlink
+    # introduced after planning. No chmod, copying or repair of existing paths.
+    if str(validate_host(manifest["path"])) != manifest["path"]:
+        raise ValueError("host path changed after planning")
     home = Path(home)
     relative = destination.relative_to(home)
     current = home

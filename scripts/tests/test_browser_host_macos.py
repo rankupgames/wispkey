@@ -76,6 +76,62 @@ class NativeHostInstallerTests(unittest.TestCase):
         self.assertEqual(self.host.read_text(), "synthetic executable fixture; never executed")
         self.assertEqual(sorted(p.name for p in destination.parent.iterdir()), [destination.name])
 
+    def test_secure_host_in_writable_parent_or_ancestor_is_refused(self):
+        ancestor = self.home / "shared"
+        parent = ancestor / "bin"
+        parent.mkdir(parents=True, mode=0o700)
+        host = parent / "host"
+        host.write_text("synthetic")
+        host.chmod(0o700)
+        for directory, mode in [(parent, 0o777), (ancestor, 0o770)]:
+            with self.subTest(directory=directory):
+                directory.chmod(mode)
+                with self.assertRaises(ValueError):
+                    self.plan(host=host)
+                directory.chmod(0o700)
+        self.assertEqual(self.plan(host=host)[1]["path"], str(host.resolve()))
+
+    def test_untrusted_ancestor_owner_is_refused_even_when_not_writable(self):
+        original = installer.Path.lstat
+        canonical_home = self.home.resolve()
+        def lstat(path, *args, **kwargs):
+            result = original(path, *args, **kwargs)
+            if path == canonical_home:
+                fields = list(result)
+                fields[4] = os.getuid() + 10000
+                return os.stat_result(fields)
+            return result
+        with patch.object(installer.Path, "lstat", lstat), self.assertRaises(ValueError):
+            self.plan()
+
+    def test_input_symlink_is_canonicalized_and_cannot_redirect_manifest(self):
+        alias = self.home / "host-alias"
+        alias.symlink_to(self.host)
+        destination, manifest = self.plan(host=alias)
+        self.assertEqual(manifest["path"], str(self.host.resolve()))
+        alias.unlink()
+        alias.symlink_to(self.home / "different-host")
+        installer.install(destination, manifest, self.home)
+        self.assertEqual(json.loads(destination.read_text())["path"], str(self.host.resolve()))
+
+    def test_parent_permissions_or_symlink_substitution_after_plan_is_refused(self):
+        parent = self.home / "bin"
+        parent.mkdir(mode=0o700)
+        host = parent / "host"
+        host.write_text("synthetic")
+        host.chmod(0o700)
+        destination, manifest = self.plan(host=host)
+        parent.chmod(0o777)
+        with self.assertRaises(ValueError):
+            installer.install(destination, manifest, self.home)
+        parent.chmod(0o700)
+        moved = self.home / "moved"
+        parent.rename(moved)
+        parent.symlink_to(moved, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            installer.install(destination, manifest, self.home)
+        self.assertFalse(destination.exists())
+
     def test_redirected_or_shared_parent_refused(self):
         destination, manifest = self.plan()
         other = self.home / "other"

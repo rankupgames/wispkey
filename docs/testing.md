@@ -91,7 +91,7 @@ features should add a regression at the public interface and update this map.
 | Tray UI destination confirmation, generated-login metadata, clearing secrets and IPC errors | `browser-extension/tests/browser/tray.spec.mjs`, native tray build/lint checks | Mocked bridge tests complement actual native tray acceptance |
 | Cloud sessions, encrypted push/pull/sync, conflicts and recovery | `src/cloud/mod.rs` tests, `tests/cloud_sync.rs`, `tests/cli_contracts.rs`, `tests/smoke.rs` | Requires the compatible backend migration; production Clerk/deployment acceptance remains external |
 | Release assets, installers, Homebrew and packaging | `tests/release_packaging.rs`, `.github/workflows/release.yml` | Signing, registry authentication, and public downloads run in release workflow |
-| macOS per-user native host installer | `scripts/tests/test_browser_host_macos.py`: browser allowlists, paths, permissions, symlinks, no overwrite | Plan is read-only; real registration is explicit user action |
+| macOS per-user native host installer | `scripts/tests/test_browser_host_macos.py`: browser allowlists, full host ancestor trust, post-plan path substitution, permissions, symlinks, no overwrite | Plan is read-only; real registration is explicit user action |
 | Validation runner | `scripts/tests/test_verify.py` | Missing tools and failed subprocesses must produce failure, never a false pass |
 
 ## Ignored tests and pending backlog

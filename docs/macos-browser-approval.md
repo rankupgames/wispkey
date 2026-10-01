@@ -57,6 +57,11 @@ there is no production configuration that selects a mock verifier. They do not
 invoke or prove physical user presence. On macOS the real Objective-C bridge is
 compiled and linked by Cargo. Python tests create only disposable installation
 fixtures and never execute the fixture host or write a real browser manifest.
+Host validation covers the complete canonical ancestor chain, including ownership,
+entry replacement permissions and post-plan symlink substitution. Root/user-owned
+sticky shared ancestors protect the trusted child entries; other shared-writable
+ancestors fail closed. Original input aliases cannot redirect a manifest after
+canonicalization. Same-owner tampering remains outside this isolation boundary.
 
 ## Required human acceptance — NOT RUN by automated suites
 
