@@ -150,7 +150,7 @@
   },
   "owner-ipc-contention.yml": {
     "events": [
-      "on:\n  workflow_dispatch:\n  pull_request:\n    paths:\n      - 'src/owner_ipc/**'\n      - 'src/core/**'\n      - 'tests/owner_ipc.rs'\n      - 'tests/common/**'\n      - 'scripts/test-owner-ipc-contention.ps1'\n      - '.github/workflows/owner-ipc-contention.yml'\n  schedule:\n    - cron: '37 8 * * 1'"
+      "on:\n  workflow_dispatch:\n  pull_request:\n    paths:\n      - 'src/owner_ipc/**'\n      - 'src/core/**'\n      - 'tests/owner_ipc.rs'\n      - 'tests/owner_ipc_diagnostics.rs'\n      - 'tests/common/**'\n      - 'scripts/test-owner-ipc-contention.ps1'\n      - '.github/workflows/owner-ipc-contention.yml'\n  schedule:\n    - cron: '37 8 * * 1'"
     ],
     "permissions": [
       "permissions:\n  contents: read"
