@@ -27,7 +27,7 @@ async function refresh() {
         article.append(paragraph);
       }
       const approve = document.createElement("button");
-      approve.textContent = "Approve with Windows Hello";
+      approve.textContent = "Verify with OS approval";
       approve.disabled = !human.checked || !result.approval_available;
       approve.dataset.approval = String(result.approval_available);
       approve.addEventListener("click", async () => {

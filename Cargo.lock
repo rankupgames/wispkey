@@ -5940,6 +5940,7 @@ dependencies = [
  "argon2 0.5.3",
  "base64",
  "bytes",
+ "cc",
  "chrono",
  "clap",
  "dirs",

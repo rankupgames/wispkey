@@ -1,8 +1,56 @@
 use crate::core::browser::{FillRequest, Result};
 
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 pub(super) fn verify(_: &FillRequest) -> Result<bool> {
-    Err("browser fill requires Windows Hello; this platform has no approval backend yet")
+    Err("this platform has no browser approval backend yet")
+}
+
+pub(super) fn available() -> bool {
+    #[cfg(target_os = "macos")]
+    // SAFETY: no arguments, ownership or callbacks cross this synchronous ABI.
+    return unsafe { wispkey_macos_biometry_available() == 1 };
+    #[cfg(not(target_os = "macos"))]
+    cfg!(windows)
+}
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn wispkey_macos_biometry_available() -> std::ffi::c_int;
+    fn wispkey_macos_verify(
+        reason: *const std::ffi::c_char,
+        details: *const std::ffi::c_char,
+        seconds: std::ffi::c_uint,
+    ) -> std::ffi::c_int;
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn verify(request: &FillRequest) -> Result<bool> {
+    use std::ffi::CString;
+
+    let remaining = request
+        .expires_at
+        .saturating_sub(chrono::Utc::now().timestamp());
+    if remaining <= 0 {
+        return Ok(false);
+    }
+    let reason = CString::new(format!("Fill saved login only at {}", request.origin))
+        .map_err(|_| "invalid approval metadata")?;
+    let details = CString::new(format!(
+        "Fill only at {}\nLogin: {} / {}\nRequest: {}\nExpires (UTC epoch): {}\n\nAgent label (unverified): {}\nReason (unverified): {}\n\nVerify with Touch ID in the macOS prompt. Closing this window cancels. WispKey never submits the form.",
+        request.origin, request.project, request.name, request.request_id,
+        request.expires_at, request.requester, request.reason,
+    ))
+    .map_err(|_| "invalid approval metadata")?;
+    // SAFETY: the bridge copies these NUL-terminated strings synchronously. It
+    // retains no Rust pointer and returns no OS error text or authentication data.
+    let result = unsafe {
+        wispkey_macos_verify(reason.as_ptr(), details.as_ptr(), remaining.min(110) as u32)
+    };
+    match result {
+        1 => Ok(true),
+        0 => Ok(false),
+        _ => Err("macOS Touch ID approval unavailable; fill refused"),
+    }
 }
 
 #[cfg(windows)]

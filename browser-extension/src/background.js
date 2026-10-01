@@ -25,7 +25,7 @@ async function dispatch(message) {
     }
     if (!result.approval_available) throw new Error("This platform has no browser approval backend yet.");
     detached = true;
-    lastStatus = "Waiting for Windows Hello approval.";
+    lastStatus = "Waiting for OS user verification.";
     // Keep the native connection and document Port in the background when the
     // popup closes as the OS approval dialog takes focus.
     void flow.fill(api, native, tab, request)

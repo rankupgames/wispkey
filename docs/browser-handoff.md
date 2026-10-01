@@ -3,11 +3,14 @@
 An agent can request a website login fill and poll its status without receiving
 the username/password payload. A person opens the site in a **separate,
 human-controlled browser profile**, reviews the request in the WispKey extension,
-and verifies with Windows Hello. WispKey fills the form but never submits it.
+and verifies with Windows Hello or macOS Touch ID. WispKey fills the form but never submits it.
 
-This source-build preview targets Chrome, Edge and Firefox on Windows 11. Windows
-Hello must be configured; there is no passwordless approval-button fallback.
-macOS and Linux native hosts refuse fills until they have an OS approval backend.
+This source-build preview targets Chrome, Edge and Firefox on Windows 11 and
+macOS with enrolled, available Touch ID. Windows Hello must be configured on
+Windows. macOS uses biometric-only LocalAuthentication, with a fresh context and
+no reuse of a recent device unlock. There is no password or approval-button
+fallback on macOS; absent, unenrolled or locked-out biometrics refuse fills.
+Linux still refuses fills because it has no OS approval backend.
 The extension is not yet published in browser stores or included in release archives.
 
 ## Set up the human profile
@@ -15,8 +18,10 @@ The extension is not yet published in browser stores or included in release arch
 Create a separate profile that your agent/browser automation cannot control.
 Do not enable remote debugging in that profile, expose it to a browser-control
 MCP server, or install the extension in the agent's profile. Native host
-registration is per Windows user, **not** per browser profile; install the
+registration is per OS user, **not** per browser profile; install the
 extension only in the intended human profile.
+
+### Windows setup
 
 From the repository root:
 
@@ -57,6 +62,54 @@ different build. It does not install an extension or change a browser profile.
 To uninstall, remove the extension, that browser's registry key, and its manifest
 (`chrome.json`, `edge.json` or `firefox.json`). Rebuild/re-register after moving the binary.
 
+### macOS setup (explicit user action)
+
+Build with Rust and Apple's command-line SDK, Node for the extension, and
+Python 3.10+ for the installer:
+
+```sh
+cargo build --locked --release --bin wispkey --bin wispkey-browser-host
+npm --prefix browser-extension ci
+npm --prefix browser-extension run build
+```
+
+Load the extension manually in the separate human profile as described above.
+For Chrome/Edge, copy the actual unpacked extension ID from that browser. First
+inspect the installer plan, which creates no files:
+
+```sh
+python3 scripts/install-browser-host-macos.py --browser Chrome \
+  --extension-id '<extension-id>' --host-path "$PWD/target/release/wispkey-browser-host"
+# Firefox: --browser Firefox, without --extension-id
+# Edge: --browser Edge, using Edge's extension ID
+```
+
+Only after reviewing that exact manifest, rerun with `--install` to register it.
+The script refuses root/sudo, invalid IDs, missing/non-executable or shared-writable
+hosts, insecure/symlink registration directories, and existing manifests. It
+writes an owner-only manifest under the selected browser's user directory:
+
+| Browser | Directory below your home |
+| --- | --- |
+| Chrome | `Library/Application Support/Google/Chrome/NativeMessagingHosts` |
+| Edge | `Library/Application Support/Microsoft Edge/NativeMessagingHosts` |
+| Firefox | `Library/Application Support/Mozilla/NativeMessagingHosts` |
+
+The filename is `com.wispkey.browser.json`. It points at the canonical absolute
+host binary; it does not copy binaries, install extensions, enroll biometrics,
+change browser/security settings, add autostart or request persistent access.
+Keep the build at that path. To uninstall, manually remove the selected manifest
+and extension. To change registrations, inspect and remove the old manifest
+before installing its replacement. No automatic overwrite or system-wide path
+is supported. Signing/distribution and installed-browser acceptance remain
+separate release gates; do not disable Gatekeeper or change security policy.
+
+The host shows a read-only metadata window and Apple's Touch ID prompt. Closing
+the window or cancelling the prompt denies the request. A fresh request is
+required after denial or unavailable verification. The prompt is bounded by the
+request deadline and at most 110 seconds. The host invalidates its LAContext on
+every exit and reopens the vault session only after successful verification.
+
 ## Generate, request, approve, fill
 
 Unlock WispKey normally. Use **Generate website login** in the optional desktop
@@ -85,7 +138,7 @@ An agent then calls:
 The result contains only `request_id`. In the human profile, navigate to the
 matching HTTPS page, open the extension, confirm that this is your human profile,
 and select the request. Review the full origin, project/name, requester and reason
-before approving with Windows Hello. Requester and reason are **unverified
+before approving in the OS verification prompt. Requester and reason are **unverified
 agent-supplied labels**, not proof of identity. Denying a request never decrypts it.
 
 The extension needs one visible username/email field and one password field in
@@ -119,7 +172,7 @@ States: `pending`, `approved`, `denied`, `completed`, `failed`. `approved` means
 OS verification succeeded and the payload was consumed once. `completed` is the
 extension's report that it set the fields; it is **not** evidence of submission,
 successful login, or account creation. Keep the site open while approving.
-Reopen the extension to see the last local result if Windows Hello closed its popup.
+Reopen the extension to see the last local result if OS verification closed its popup.
 Confirm account creation yourself, then use `wispkey login activate <name>`.
 
 ## Boundaries and recovery
@@ -176,10 +229,11 @@ The browser suite also tests the built tray UI with a mocked owner IPC bridge.
 Build the tray UI first, or use `python scripts/verify.py --suite browser` to run
 the steps in order. See [the feature validation map](testing.md) for all suites.
 Before release, smoke-test both actual browser families in a disposable human
-profile with synthetic logins: approve/cancel Windows Hello, navigate during
+profile with synthetic logins: approve/cancel OS verification, navigate during
 approval, lock the vault during approval, fill a login/signup form, verify no
-submission, and inspect metadata-only request status. The real Windows Hello
-prompt and browser extension installation require a human check.
+submission, and inspect metadata-only request status. The real Windows Hello/Touch ID
+prompt and browser extension installation require a human check. See the
+[macOS trust boundary and acceptance record](macos-browser-approval.md).
 
 Protocol references: [Chrome native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging),
 [Firefox native messaging](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/Native_messaging),
