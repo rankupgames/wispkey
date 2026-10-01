@@ -1,0 +1,435 @@
+{
+  "contract": "wispkey-access-enrollment/draft-1",
+  "description": "Apply overrides to fixture() in test_policy_model.py; synthetic facts, no cryptographic vectors.",
+  "decisions": [
+    {
+      "id": "routine-explicit-replica",
+      "right": "replicate",
+      "context": {},
+      "grant": {},
+      "expect": "allow"
+    },
+    {
+      "id": "enabled-off",
+      "right": "replicate",
+      "context": {
+        "enabled": false
+      },
+      "grant": {},
+      "expect": "disabled"
+    },
+    {
+      "id": "identity_verified-missing",
+      "right": "replicate",
+      "context": {
+        "identity_verified": false
+      },
+      "grant": {},
+      "expect": "unverified_authority"
+    },
+    {
+      "id": "owner_grant_verified-missing",
+      "right": "replicate",
+      "context": {
+        "owner_grant_verified": false
+      },
+      "grant": {},
+      "expect": "unverified_authority"
+    },
+    {
+      "id": "unlocked-missing",
+      "right": "replicate",
+      "context": {
+        "unlocked": false
+      },
+      "grant": {},
+      "expect": "unverified_authority"
+    },
+    {
+      "id": "restored",
+      "right": "replicate",
+      "context": {
+        "restored": true
+      },
+      "grant": {},
+      "expect": "inactive_context"
+    },
+    {
+      "id": "cancelled",
+      "right": "replicate",
+      "context": {
+        "cancelled": true
+      },
+      "grant": {},
+      "expect": "inactive_context"
+    },
+    {
+      "id": "enrollment-pending",
+      "right": "replicate",
+      "context": {
+        "enrollment_state": "pending"
+      },
+      "grant": {},
+      "expect": "revoked_or_unapproved"
+    },
+    {
+      "id": "enrollment-revoked",
+      "right": "replicate",
+      "context": {
+        "enrollment_state": "revoked"
+      },
+      "grant": {},
+      "expect": "revoked_or_unapproved"
+    },
+    {
+      "id": "enrollment-expired",
+      "right": "replicate",
+      "context": {
+        "enrollment_state": "expired"
+      },
+      "grant": {},
+      "expect": "revoked_or_unapproved"
+    },
+    {
+      "id": "enrollment-unknown",
+      "right": "replicate",
+      "context": {
+        "enrollment_state": "unknown"
+      },
+      "grant": {},
+      "expect": "revoked_or_unapproved"
+    },
+    {
+      "id": "grant-revoked",
+      "right": "replicate",
+      "context": {
+        "grant_revoked": true
+      },
+      "grant": {},
+      "expect": "revoked_or_unapproved"
+    },
+    {
+      "id": "enrollment_expires_at-equal-now",
+      "right": "replicate",
+      "context": {
+        "enrollment_expires_at": 110
+      },
+      "grant": {},
+      "expect": "expired"
+    },
+    {
+      "id": "session_expires_at-equal-now",
+      "right": "replicate",
+      "context": {
+        "session_expires_at": 110
+      },
+      "grant": {},
+      "expect": "expired"
+    },
+    {
+      "id": "grant-deadline",
+      "right": "replicate",
+      "context": {},
+      "grant": {
+        "expires_at": 110
+      },
+      "expect": "expired"
+    },
+    {
+      "id": "grant-not-yet-valid",
+      "right": "replicate",
+      "context": {},
+      "grant": {
+        "issued_at": 111
+      },
+      "expect": "expired"
+    },
+    {
+      "id": "fresh_owner_response_verified-missing",
+      "right": "replicate",
+      "context": {
+        "fresh_owner_response_verified": false
+      },
+      "grant": {},
+      "expect": "stale_policy"
+    },
+    {
+      "id": "freshness_nonce_matches-missing",
+      "right": "replicate",
+      "context": {
+        "freshness_nonce_matches": false
+      },
+      "grant": {},
+      "expect": "stale_policy"
+    },
+    {
+      "id": "freshness_binding_matches-missing",
+      "right": "replicate",
+      "context": {
+        "freshness_binding_matches": false
+      },
+      "grant": {},
+      "expect": "stale_policy"
+    },
+    {
+      "id": "freshness-exact-deadline",
+      "right": "replicate",
+      "context": {
+        "now_monotonic": 40
+      },
+      "grant": {},
+      "expect": "stale_policy"
+    },
+    {
+      "id": "freshness-clock-rollback",
+      "right": "replicate",
+      "context": {
+        "now_monotonic": 9
+      },
+      "grant": {},
+      "expect": "stale_policy"
+    },
+    {
+      "id": "freshness-budget-too-long",
+      "right": "replicate",
+      "context": {
+        "freshness_deadline_monotonic": 41
+      },
+      "grant": {},
+      "expect": "stale_policy"
+    },
+    {
+      "id": "wrong-credential",
+      "right": "replicate",
+      "context": {
+        "credential": "other"
+      },
+      "grant": {},
+      "expect": "resource_mismatch"
+    },
+    {
+      "id": "wrong-credential_revision",
+      "right": "replicate",
+      "context": {
+        "credential_revision": "other"
+      },
+      "grant": {},
+      "expect": "resource_mismatch"
+    },
+    {
+      "id": "wrong-origin",
+      "right": "replicate",
+      "context": {
+        "origin": "other"
+      },
+      "grant": {},
+      "expect": "resource_mismatch"
+    },
+    {
+      "id": "wrong-operation",
+      "right": "replicate",
+      "context": {
+        "operation": "other"
+      },
+      "grant": {},
+      "expect": "resource_mismatch"
+    },
+    {
+      "id": "existing_policy_allows-false",
+      "right": "replicate",
+      "context": {
+        "existing_policy_allows": false
+      },
+      "grant": {},
+      "expect": "existing_policy_denied"
+    },
+    {
+      "id": "resource_active-false",
+      "right": "replicate",
+      "context": {
+        "resource_active": false
+      },
+      "grant": {},
+      "expect": "existing_policy_denied"
+    },
+    {
+      "id": "exportable-false",
+      "right": "replicate",
+      "context": {
+        "exportable": false
+      },
+      "grant": {},
+      "expect": "replication_denied"
+    },
+    {
+      "id": "dedicated_partition-false",
+      "right": "replicate",
+      "context": {
+        "dedicated_partition": false
+      },
+      "grant": {},
+      "expect": "replication_denied"
+    },
+    {
+      "id": "entire_partition_routine-false",
+      "right": "replicate",
+      "context": {
+        "entire_partition_routine": false
+      },
+      "grant": {},
+      "expect": "replication_denied"
+    },
+    {
+      "id": "ring-restricted",
+      "right": "replicate",
+      "context": {
+        "ring": "restricted"
+      },
+      "grant": {
+        "ring": "restricted"
+      },
+      "expect": "replication_denied"
+    },
+    {
+      "id": "ring-critical",
+      "right": "replicate",
+      "context": {
+        "ring": "critical"
+      },
+      "grant": {
+        "ring": "critical"
+      },
+      "expect": "replication_denied"
+    },
+    {
+      "id": "ring-None",
+      "right": "replicate",
+      "context": {
+        "ring": null
+      },
+      "grant": {
+        "ring": null
+      },
+      "expect": "replication_denied"
+    },
+    {
+      "id": "ring-future",
+      "right": "replicate",
+      "context": {
+        "ring": "future"
+      },
+      "grant": {
+        "ring": "future"
+      },
+      "expect": "replication_denied"
+    },
+    {
+      "id": "ring-increased",
+      "right": "replicate",
+      "context": {
+        "ring": "critical"
+      },
+      "grant": {},
+      "expect": "ring_changed"
+    },
+    {
+      "id": "unsupported-version",
+      "right": "replicate",
+      "context": {},
+      "grant": {
+        "version": "v999"
+      },
+      "expect": "unsupported_version"
+    },
+    {
+      "id": "discover-no-replica",
+      "right": "replicate",
+      "context": {},
+      "grant": {
+        "rights": [
+          "discover"
+        ]
+      },
+      "expect": "right_denied"
+    },
+    {
+      "id": "replica-no-request",
+      "right": "request",
+      "context": {},
+      "grant": {},
+      "expect": "right_denied"
+    },
+    {
+      "id": "use-is-never-enabled-in-slice",
+      "right": "use",
+      "context": {},
+      "grant": {
+        "rights": [
+          "use"
+        ]
+      },
+      "expect": "use_not_in_slice"
+    },
+    {
+      "id": "unknown-right",
+      "right": "admin",
+      "context": {},
+      "grant": {},
+      "expect": "right_denied"
+    },
+    {
+      "id": "wrong-principal",
+      "right": "replicate",
+      "context": {
+        "principal": "device-c"
+      },
+      "grant": {},
+      "expect": "principal_mismatch"
+    },
+    {
+      "id": "spoofed-kind",
+      "right": "replicate",
+      "context": {
+        "kind": "owner"
+      },
+      "grant": {},
+      "expect": "principal_mismatch"
+    },
+    {
+      "id": "account-only",
+      "right": "replicate",
+      "context": {
+        "route": "account-only"
+      },
+      "grant": {},
+      "expect": "legacy_route"
+    },
+    {
+      "id": "legacy-project",
+      "right": "replicate",
+      "context": {
+        "route": "legacy-project"
+      },
+      "grant": {},
+      "expect": "legacy_route"
+    },
+    {
+      "id": "legacy-share",
+      "right": "replicate",
+      "context": {
+        "route": "legacy-share"
+      },
+      "grant": {},
+      "expect": "legacy_route"
+    },
+    {
+      "id": "legacy-partition",
+      "right": "replicate",
+      "context": {
+        "route": "legacy-partition"
+      },
+      "grant": {},
+      "expect": "legacy_route"
+    }
+  ]
+}
