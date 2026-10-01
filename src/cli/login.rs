@@ -10,7 +10,10 @@ use super::shared::{credential_json, json_output, print_json};
 
 pub struct GenerateLoginArgs<'a> {
     pub name: &'a str,
-    pub username: &'a str,
+    pub username: Option<&'a str>,
+    pub profile: Option<&'a str>,
+    pub profile_revision: Option<&'a str>,
+    pub profile_username: bool,
     pub url: &'a str,
     pub project: Option<&'a str>,
     pub partition: Option<&'a str>,
@@ -49,16 +52,31 @@ pub async fn handle_generate(args: GenerateLoginArgs<'_>) {
         .map(String::from)
         .unwrap_or_else(core::resolve_active_project);
 
-    match vault.generate_website_login(GenerateWebsiteLoginRequest {
+    let request = GenerateWebsiteLoginRequest {
         name: args.name,
-        username: args.username,
+        username: args.username.unwrap_or(""),
         url: args.url,
         project: args.project,
         partition: args.partition,
         review_at,
         length: args.length,
         symbols: !args.no_symbols,
-    }) {
+    };
+    let result = if let Some(id) = args.profile {
+        vault.generate_signup_login(
+            core::signup::ProfileSelection {
+                id,
+                revision: args.profile_revision.unwrap_or(""),
+                project: &active_project,
+                partition: args.partition.unwrap_or(""),
+                use_username: args.profile_username,
+            },
+            request,
+        )
+    } else {
+        vault.generate_website_login(request)
+    };
+    match result {
         Ok(cred) => {
             audit::log_event(
                 vault.db(),
@@ -77,14 +95,12 @@ pub async fn handle_generate(args: GenerateLoginArgs<'_>) {
                 print_json(serde_json::json!({
                     "ok": true,
                     "credential": credential_json(&cred),
-                    "username": args.username,
                     "project": active_project,
                 }));
                 return;
             }
             println!("Website login '{}' saved.", args.name);
             println!("Origin:     {}", cred.origin);
-            println!("Username:   {}", args.username);
             println!("Lifecycle:  {}", cred.lifecycle_state);
             if let Some(review_at) = cred.review_at {
                 println!("Review at:  {}", review_at.format("%Y-%m-%d %H:%M:%S UTC"));

@@ -15,7 +15,7 @@ use crate::core::{self, Vault};
 use crate::sharing::{
     BundleCredential, ensure_partition, ensure_project, export_bundle_credentials,
     import_bundle_credentials, merge_auth_data, optional_auth_data, read_transport_payload,
-    validate_bundle_auth_bindings, validate_transport_format, write_transport_payload,
+    validate_bundle_auth_bindings, validate_transport_format, write_versioned_transport_payload,
 };
 
 const BUNDLE_MAGIC: &[u8; 4] = b"WKBX";
@@ -31,6 +31,8 @@ struct BundlePayload {
     credentials: Vec<BundleCredential>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth_data: Option<AuthPartitionData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    signup_profiles: Option<Vec<crate::core::signup::PortableProfile>>,
 }
 
 pub use crate::sharing::ImportResults;
@@ -48,6 +50,7 @@ pub fn export_partition(
         let credentials = export_bundle_credentials(vault, &active_project, partition_name)?;
         let auth_data =
             optional_auth_data(vault.export_auth_partition(&active_project, partition_name)?);
+        let signup_profiles = vault.export_signup_profiles(&active_project, partition_name)?;
         Ok(BundlePayload {
             partition: partition.name,
             description: partition.description,
@@ -55,12 +58,19 @@ pub fn export_partition(
             exported_at: Utc::now().to_rfc3339(),
             credentials,
             auth_data,
+            signup_profiles,
         })
     })?;
-    write_transport_payload(
+    write_versioned_transport_payload(
         BUNDLE_MAGIC,
         &payload,
-        payload.auth_data.is_some(),
+        if payload.signup_profiles.is_some() {
+            3
+        } else if payload.auth_data.is_some() {
+            2
+        } else {
+            1
+        },
         passphrase,
         output_path,
     )?;
@@ -75,7 +85,10 @@ pub fn import_partition(
 ) -> crate::core::Result<ImportResults> {
     let (payload, registered): (BundlePayload, _) =
         read_transport_payload(BUNDLE_MAGIC, bundle_path, passphrase)?;
-    validate_transport_format(registered, payload.auth_data.is_some())?;
+    validate_transport_format(
+        registered,
+        payload.auth_data.is_some() || payload.signup_profiles.is_some(),
+    )?;
     validate_bundle_auth_bindings(&payload.credentials, payload.auth_data.as_ref())?;
     let project_name = if payload.project.is_empty() {
         core::resolve_active_project()
@@ -99,6 +112,9 @@ pub fn import_partition(
             registered,
             &mut results,
         )?;
+        if let Some(profiles) = &payload.signup_profiles {
+            vault.import_signup_profiles(&project_name, &payload.partition, profiles, false)?;
+        }
         if let Some(auth_data) = &payload.auth_data {
             merge_auth_data(
                 vault,

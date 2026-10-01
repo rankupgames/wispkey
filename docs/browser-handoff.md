@@ -184,3 +184,8 @@ prompt and browser extension installation require a human check.
 Protocol references: [Chrome native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging),
 [Firefox native messaging](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/Native_messaging),
 [Windows desktop user verification](https://learn.microsoft.com/en-us/windows/win32/api/userconsentverifierinterop/nf-userconsentverifierinterop-iuserconsentverifierinterop-requestverificationforwindowasync).
+
+Reusable encrypted identities can be selected before generating a login; see
+[signup profile setup and regression suites](signup-profiles.md). Real macOS
+user-presence/native-host acceptance and the Cloud metadata relay remain separate
+work, as detailed there.

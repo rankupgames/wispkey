@@ -23,9 +23,9 @@ use super::{
     SIDECAR_CLOUD_MANIFESTS, SIDECAR_POLICIES, TABLE_ACCESS_REQUESTS, TABLE_AUDIT_LOG,
     TABLE_AUTH_BUNDLES, TABLE_AUTH_REGISTRY, TABLE_BOOTSTRAP_TOKENS, TABLE_CREDENTIALS,
     TABLE_INSTANCE_SCOPES, TABLE_INSTANCES, TABLE_OPERATION_AUDIT, TABLE_PARTITIONS,
-    TABLE_PROJECTS, TABLE_VAULT_META, VaultBackupPayload, dest_has_vault, insert_row,
-    inspect_payload, read_payload, recovery_limits, restore_sidecar_paths, schema_compatibility,
-    string_field, verify_payload, write_optional_b64, write_optional_text,
+    TABLE_PROJECTS, TABLE_SIGNUP_PROFILES, TABLE_VAULT_META, VaultBackupPayload, dest_has_vault,
+    insert_row, inspect_payload, read_payload, recovery_limits, restore_sidecar_paths,
+    schema_compatibility, string_field, verify_payload, write_optional_b64, write_optional_text,
 };
 use crate::core::{
     Result, Vault, VaultError, prepare_restored_instance_secrets,
@@ -300,6 +300,7 @@ struct SkipSet {
     projects: HashSet<String>,
     partitions: HashSet<String>,
     credentials: HashSet<String>,
+    signup_profiles: HashSet<String>,
     auth_records: HashSet<String>,
     auth_bundles: HashSet<(String, String)>,
     audits: HashSet<String>,
@@ -592,6 +593,34 @@ fn classify_auth_rows(
     imported: &mut BackupCounts,
     skipped: &mut BackupCounts,
 ) -> Result<()> {
+    let profiles = load_table_index(db, TABLE_SIGNUP_PROFILES, "id")?;
+    let profile_partitions = load_table_index(db, TABLE_PARTITIONS, "id")?;
+    let profile_projects = load_table_index(db, TABLE_PROJECTS, "id")?;
+    for row in &payload.contents.signup_profiles {
+        let id = string_field(row, "id").unwrap_or_default();
+        let partition_id = string_field(row, "partition_id").unwrap_or_default();
+        require_unchanged_auth_partition(
+            payload,
+            &partition_id,
+            &profile_partitions,
+            &profile_projects,
+            skip,
+        )?;
+        if let Some(existing) = profiles.get(&id) {
+            if existing != row {
+                return Err(auth_restore_conflict("signup profile differs"));
+            }
+            skip.signup_profiles.insert(id);
+            skipped.signup_profiles += 1;
+        } else {
+            if profiles.values().any(|p| {
+                p.get("partition_id") == row.get("partition_id") && p.get("name") == row.get("name")
+            }) {
+                return Err(auth_restore_conflict("signup profile name conflict"));
+            }
+            imported.signup_profiles += 1;
+        }
+    }
     let registry = load_table_index(db, TABLE_AUTH_REGISTRY, "credential_id")?;
     let auth_ids = load_table_index(db, TABLE_AUTH_REGISTRY, "auth_id")?;
     let credentials = load_table_index(db, TABLE_CREDENTIALS, "id")?;
@@ -1185,6 +1214,13 @@ fn insert_payload_tables(
         TABLE_CREDENTIALS,
         &payload.contents.credentials,
         &skip.credentials,
+        "id",
+    )?;
+    insert_table(
+        db,
+        TABLE_SIGNUP_PROFILES,
+        &payload.contents.signup_profiles,
+        &skip.signup_profiles,
         "id",
     )?;
     insert_table(

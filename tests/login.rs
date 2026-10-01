@@ -59,7 +59,8 @@ fn login_generate_stores_metadata_without_emitting_password() {
         "https://careers.example.com"
     );
     assert_eq!(generated["credential"]["lifecycle_state"], "pending");
-    assert_eq!(generated["username"], "user@example.com");
+    assert!(generated.get("username").is_none());
+    assert!(!generated.to_string().contains("user@example.com"));
     assert!(generated["credential"].get("password").is_none());
     assert!(generated["credential"].get("value").is_none());
 

@@ -363,6 +363,12 @@ enum Commands {
         command: CredentialCommands,
     },
 
+    /// Owner-managed encrypted signup identities (metadata-only output)
+    SignupProfile {
+        #[command(subcommand)]
+        command: SignupProfileCommands,
+    },
+
     /// Generate and manage website logins without exposing passwords
     Login {
         #[command(subcommand)]
@@ -817,6 +823,48 @@ enum AuthBundleCommands {
     },
 }
 
+#[derive(clap::Args)]
+struct SignupScope {
+    #[arg(long)]
+    project: String,
+    #[arg(long)]
+    partition: String,
+}
+#[derive(Subcommand)]
+enum SignupProfileCommands {
+    /// Read metadata only; identity is never returned
+    List {
+        #[command(flatten)]
+        scope: SignupScope,
+    },
+    /// Read {"email": "...", "username": null} from a file or stdin (-)
+    Create {
+        name: String,
+        #[command(flatten)]
+        scope: SignupScope,
+        #[arg(long)]
+        identity_file: String,
+    },
+    /// Replace identity only when the selected revision is current
+    Update {
+        id: String,
+        #[arg(long)]
+        revision: String,
+        #[command(flatten)]
+        scope: SignupScope,
+        #[arg(long)]
+        identity_file: String,
+    },
+    /// Remove profile; existing logins remain recoverable
+    Remove {
+        id: String,
+        #[arg(long)]
+        revision: String,
+        #[command(flatten)]
+        scope: SignupScope,
+    },
+}
+
 #[derive(Subcommand)]
 enum LoginCommands {
     /// Generate a unique website login and store it encrypted
@@ -824,8 +872,16 @@ enum LoginCommands {
         /// Credential name
         name: String,
         /// Username or email for the site
-        #[arg(long)]
-        username: String,
+        #[arg(long, conflicts_with = "profile", required_unless_present = "profile")]
+        username: Option<String>,
+        /// Explicit profile ID from signup-profile list
+        #[arg(long, requires_all = ["profile_revision", "project", "partition"])]
+        profile: Option<String>,
+        #[arg(long, requires = "profile")]
+        profile_revision: Option<String>,
+        /// Select the optional username instead of the email identity
+        #[arg(long, requires = "profile")]
+        profile_username: bool,
         /// Website URL (https only; stored as an exact origin)
         #[arg(long)]
         url: String,
@@ -1617,10 +1673,64 @@ async fn main() {
                 ),
             },
         },
+        Commands::SignupProfile { command } => match command {
+            SignupProfileCommands::List { scope } => cli::handle_signup(
+                "list",
+                &scope.project,
+                &scope.partition,
+                None,
+                None,
+                None,
+                None,
+            ),
+            SignupProfileCommands::Create {
+                name,
+                scope,
+                identity_file,
+            } => cli::handle_signup(
+                "create",
+                &scope.project,
+                &scope.partition,
+                Some(&name),
+                None,
+                None,
+                Some(&identity_file),
+            ),
+            SignupProfileCommands::Update {
+                id,
+                revision,
+                scope,
+                identity_file,
+            } => cli::handle_signup(
+                "update",
+                &scope.project,
+                &scope.partition,
+                None,
+                Some(&id),
+                Some(&revision),
+                Some(&identity_file),
+            ),
+            SignupProfileCommands::Remove {
+                id,
+                revision,
+                scope,
+            } => cli::handle_signup(
+                "remove",
+                &scope.project,
+                &scope.partition,
+                None,
+                Some(&id),
+                Some(&revision),
+                None,
+            ),
+        },
         Commands::Login { command } => match command {
             LoginCommands::Generate {
                 name,
                 username,
+                profile,
+                profile_revision,
+                profile_username,
                 url,
                 project,
                 partition,
@@ -1630,7 +1740,10 @@ async fn main() {
             } => {
                 cli::handle_generate(cli::GenerateLoginArgs {
                     name: &name,
-                    username: &username,
+                    username: username.as_deref(),
+                    profile: profile.as_deref(),
+                    profile_revision: profile_revision.as_deref(),
+                    profile_username,
                     url: &url,
                     project: project.as_deref(),
                     partition: partition.as_deref(),

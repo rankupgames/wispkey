@@ -15,6 +15,8 @@ pub(crate) struct Snapshot {
     pub credentials: Vec<SnapshotCredential>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_data: Option<AuthPartitionData>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signup_profiles: Option<Vec<signup::PortableProfile>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -162,13 +164,21 @@ impl Vault {
         let managed = self.auth_partition_managed(project, &partition.name)?;
         let auth_data = (managed || !auth_data.records.is_empty() || !auth_data.bundles.is_empty())
             .then_some(auth_data);
+        let signup_profiles = self.export_signup_profiles(project, &partition.name)?;
         let snapshot = Snapshot {
-            version: if auth_data.is_some() { 2 } else { 1 },
+            version: if signup_profiles.is_some() {
+                3
+            } else if auth_data.is_some() {
+                2
+            } else {
+                1
+            },
             project: project.to_owned(),
             partition: partition.name,
             description: partition.description,
             credentials,
             auth_data,
+            signup_profiles,
         };
         if let Some(transaction) = transaction {
             transaction.commit()?;
@@ -206,8 +216,12 @@ impl Vault {
         guard()?;
         let key = self.ensure_unlocked()?;
         if !matches!(
-            (snapshot.version, snapshot.auth_data.is_some()),
-            (1, false) | (2, true)
+            (
+                snapshot.version,
+                snapshot.auth_data.is_some(),
+                snapshot.signup_profiles.is_some()
+            ),
+            (1, false, false) | (2, true, false) | (3, _, true)
         ) || snapshot.project.is_empty()
             || snapshot.partition.is_empty()
         {
@@ -263,6 +277,15 @@ impl Vault {
         if hash.as_deref() != expected_hash {
             return Err(VaultError::InvalidBundle(
                 "local partition changed during sync".into(),
+            ));
+        }
+        if current
+            .as_ref()
+            .is_some_and(|s| s.signup_profiles.is_some())
+            && snapshot.signup_profiles.is_none()
+        {
+            return Err(VaultError::InvalidBundle(
+                "legacy snapshot cannot replace signup profiles".into(),
             ));
         }
         // Registration binds an identity to immutable secret material and its
@@ -364,6 +387,9 @@ impl Vault {
                 "DELETE FROM auth_bundles WHERE partition_id=?1",
                 [&partition.id],
             )?;
+        }
+        if let Some(profiles) = &snapshot.signup_profiles {
+            self.import_signup_profiles(&snapshot.project, &snapshot.partition, profiles, true)?;
         }
         if let Some(current) = current {
             for credential in &current.credentials {

@@ -30,6 +30,8 @@ mod projects;
 mod proxy;
 mod run;
 mod shared;
+mod signup;
+pub use signup::handle_signup;
 mod status;
 mod tray;
 mod vault;

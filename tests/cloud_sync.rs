@@ -1634,3 +1634,6 @@ mod foreground_watch {
         verify_secret(first.path(), "pending-local", "synthetic-pending-local");
     }
 }
+
+#[path = "cloud_sync/signup_profiles.rs"]
+mod signup_profiles;
