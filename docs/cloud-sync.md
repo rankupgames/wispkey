@@ -169,3 +169,9 @@ It does not enable automatic sync or enroll devices. See
 Experimental builds can opt into a time-bounded owner-run polling session with
 [`cloud watch`](foreground-sync-watch.md) after manual pairing. This is distinct
 from device enrollment and is unavailable in default builds.
+
+## Browser login
+
+Cloud authentication uses the opt-in public OAuth code + S256 PKCE contract in
+[Cloud CLI sign-in](cloud-login.md). Legacy raw callback sessions need a fresh
+login. Access tokens expire within 24 hours; no refresh token is requested.
