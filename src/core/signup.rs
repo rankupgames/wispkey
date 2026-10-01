@@ -844,4 +844,203 @@ mod tests {
         v.generate_website_login(req).unwrap();
         assert_eq!(payload(&v, "legacy").username, "legacy@example.test");
     }
+    #[test]
+    fn signup_last_profile_backup_restore_retains_history_and_rejects_legacy_snapshots() {
+        let source = vault();
+        let p = create(&source);
+        source.remove_signup_profile(selection(&p)).unwrap();
+        source
+            .db
+            .execute(
+                "INSERT INTO vault_meta VALUES ('version',?1)",
+                [CURRENT_SCHEMA_VERSION],
+            )
+            .unwrap();
+        source
+            .db
+            .execute(
+                "INSERT INTO vault_meta VALUES ('created_at','2026-01-01T00:00:00Z')",
+                [],
+            )
+            .unwrap();
+        source
+            .db
+            .execute(
+                "INSERT INTO vault_meta VALUES ('password_hash','synthetic-unused-hash')",
+                [],
+            )
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("deleted-profiles.wkbackup");
+        crate::backup::create_backup(
+            &source,
+            dir.path(),
+            PASSPHRASE,
+            archive.to_str().unwrap(),
+            &crate::backup::BackupScope::all_included(),
+        )
+        .unwrap();
+        crate::backup::restore_backup(
+            archive.to_str().unwrap(),
+            PASSPHRASE,
+            crate::backup::RestoreOptions {
+                target_dir: target.path(),
+                dry_run: false,
+                replace: false,
+                on_conflict: crate::backup::ConflictPolicy::Fail,
+            },
+        )
+        .unwrap();
+        let restored = Vault {
+            db: Connection::open(target.path().join("vault.db")).unwrap(),
+            master_key: Some([9; 32]),
+            session_timeout_override: None,
+        };
+        assert!(
+            restored
+                .list_signup_profiles("default", "personal")
+                .unwrap()
+                .is_empty()
+        );
+        let marker: String = restored
+            .db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key='signup_partition_v1:personal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(marker, "1");
+        let snapshot = restored
+            .cloud_snapshot("default", "personal")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.version, 3);
+        assert!(snapshot.signup_profiles.as_ref().unwrap().is_empty());
+        let before = hash(&restored);
+        let legacy_source = vault();
+        for has_login in [false, true] {
+            if has_login {
+                let mut req = request("legacy-login");
+                req.username = "legacy@example.test";
+                legacy_source.generate_website_login(req).unwrap();
+            }
+            let legacy = legacy_source
+                .cloud_snapshot("default", "personal")
+                .unwrap()
+                .unwrap();
+            assert_eq!(legacy.version, 1);
+            assert!(restored.cloud_apply(&legacy, Some(&before), None).is_err());
+            assert_eq!(hash(&restored), before);
+        }
+        assert_eq!(restored.credential_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn signup_two_connections_cannot_write_between_resolution_and_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent.db");
+        let seed = vault();
+        let p = create(&seed);
+        seed.db
+            .backup(rusqlite::DatabaseName::Main, &path, None)
+            .unwrap();
+        let open = || Vault {
+            db: Connection::open(&path).unwrap(),
+            master_key: Some([9; 32]),
+            session_timeout_override: None,
+        };
+        let first = open();
+        let second = open();
+        second.db.busy_timeout(std::time::Duration::ZERO).unwrap();
+        // This connection-local view pauses the actual encrypted-profile read.
+        // It shadows only first's table; the racing connection uses real tables
+        // and public update/generate/remove APIs. Moving resolution outside the
+        // write transaction would let a racer write and fail this regression.
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        first
+            .db
+            .create_scalar_function(
+                "profile_read_gate",
+                1,
+                rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+                move |ctx| {
+                    read_tx.send(()).unwrap();
+                    release_rx
+                        .recv_timeout(std::time::Duration::from_secs(30))
+                        .unwrap();
+                    ctx.get::<String>(0)
+                },
+            )
+            .unwrap();
+        first.db.execute_batch("CREATE TEMP VIEW signup_profiles AS SELECT id,name,revision,partition_id,profile_read_gate(encrypted_value) AS encrypted_value FROM main.signup_profiles").unwrap();
+        let selected = p.clone();
+        let racer = std::thread::spawn(move || {
+            read_rx
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .unwrap();
+            let errors = [
+                second
+                    .update_signup_profile(selection(&selected), identity())
+                    .unwrap_err(),
+                second
+                    .generate_signup_login(selection(&selected), request("racing"))
+                    .unwrap_err(),
+                second
+                    .remove_signup_profile(selection(&selected))
+                    .unwrap_err(),
+            ];
+            for error in errors {
+                assert!(
+                    matches!(error, VaultError::Database(rusqlite::Error::SqliteFailure(ref e, _)) if e.code == rusqlite::ErrorCode::DatabaseBusy)
+                );
+                assert!(!error.to_string().contains(EMAIL));
+                assert!(!error.to_string().contains(USERNAME));
+            }
+            release_tx.send(()).unwrap();
+            second
+        });
+        first
+            .generate_signup_login(selection(&p), request("saved"))
+            .unwrap();
+        let second = racer.join().unwrap();
+        first
+            .db
+            .execute_batch("DROP VIEW temp.signup_profiles")
+            .unwrap();
+        assert_eq!(payload(&second, "saved").username, EMAIL);
+        let updated = first
+            .update_signup_profile(
+                selection(&p),
+                SignupIdentity {
+                    email: "new@example.test".into(),
+                    username: None,
+                },
+            )
+            .unwrap();
+        assert!(
+            second
+                .generate_signup_login(selection(&p), request("stale"))
+                .is_err()
+        );
+        assert!(
+            second
+                .update_signup_profile(selection(&p), identity())
+                .is_err()
+        );
+        assert!(second.remove_signup_profile(selection(&p)).is_err());
+        second
+            .generate_signup_login(selection(&updated), request("current"))
+            .unwrap();
+        assert_eq!(payload(&first, "current").username, "new@example.test");
+        first.remove_signup_profile(selection(&updated)).unwrap();
+        assert!(
+            second
+                .generate_signup_login(selection(&updated), request("removed"))
+                .is_err()
+        );
+        assert_eq!(first.credential_count().unwrap(), 2);
+    }
 }

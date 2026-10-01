@@ -412,3 +412,68 @@ fn signup_backup_exclusion_and_merge_conflict_preserve_owner_state() {
     assert_eq!(created["scope"]["credentials"], false);
     assert!(created["counts"]["signup_profiles"].is_null());
 }
+
+#[test]
+fn signup_structured_errors_and_audit_never_contain_stored_identity_or_password() {
+    let temp = tempfile::tempdir().unwrap();
+    let p = setup(temp.path());
+    assert!(generate(temp.path(), &p, "saved").status.success());
+    // Read only this synthetic fixture through the existing owner-only export
+    // path so the canary assertion uses the actual generated password.
+    let template = temp.path().join("synthetic-login.template");
+    std::fs::write(&template, "{{ cred:saved }}").unwrap();
+    let clear = run_wispkey(
+        temp.path(),
+        &[
+            "inject",
+            "-i",
+            template.to_str().unwrap(),
+            "--stdout",
+            "--project",
+            "default",
+        ],
+    );
+    assert!(clear.status.success());
+    let secret: Value = serde_json::from_slice(&clear.stdout).unwrap();
+    let password = secret["password"].as_str().unwrap();
+    let base = json!({"name":"saved","profile":p["id"],"profile_revision":p["revision"],"project":"default","partition":"personal","url":"https://signup.example.test"});
+    for change in 0..4 {
+        let mut args = base.clone();
+        match change {
+            0 => {}
+            1 => args["profile_revision"] = json!("stale"),
+            2 => args["profile"] = json!(42),
+            _ => args["profile_username"] = json!("invalid-type"),
+        };
+        let result = mcp(temp.path(), "wispkey_generate_login", args);
+        assert_eq!(result["result"]["isError"], true);
+        assert!(!result.to_string().contains(password));
+    }
+    let audit = run_wispkey_json(temp.path(), &["--format", "json", "log", "--last", "100"]);
+    redact(&audit.to_string());
+    assert!(!audit.to_string().contains(password));
+    let db = rusqlite::Connection::open(temp.path().join("vault.db")).unwrap();
+    let rows = serde_json::to_string(&audit).unwrap();
+    assert!(!rows.contains("username"));
+    // Native stored audits, not just the rendering layer.
+    let mut stmt = db.prepare("SELECT * FROM audit_log").unwrap();
+    let count = stmt.column_count();
+    let raw = stmt
+        .query_map([], |row| {
+            Ok((0..count)
+                .map(|i| match row.get_ref(i).unwrap() {
+                    rusqlite::types::ValueRef::Text(value) => {
+                        String::from_utf8_lossy(value).into_owned()
+                    }
+                    other => format!("{other:?}"),
+                })
+                .collect::<Vec<_>>()
+                .join(" "))
+        })
+        .unwrap();
+    for row in raw {
+        let text = row.unwrap();
+        redact(&text);
+        assert!(!text.contains(password));
+    }
+}
