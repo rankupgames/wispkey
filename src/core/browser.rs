@@ -706,6 +706,112 @@ mod tests {
     }
 
     #[test]
+    fn native_approval_preserves_profile_snapshot_port_and_exact_expiry() {
+        use crate::core::auth::{AuthRegistration, ProviderExpiry};
+        use crate::core::signup::{ProfileSelection, SignupIdentity};
+        let vault = fixture();
+        let profile = vault
+            .create_signup_profile(
+                "default",
+                "personal",
+                "native-test",
+                SignupIdentity {
+                    email: "original@example.test".into(),
+                    username: None,
+                },
+            )
+            .unwrap();
+        let selection = ProfileSelection {
+            id: &profile.id,
+            revision: &profile.revision,
+            project: "default",
+            partition: "personal",
+            use_username: false,
+        };
+        let origin = "https://signup.example.test:8443";
+        vault
+            .generate_signup_login(
+                selection,
+                GenerateWebsiteLoginRequest {
+                    name: "profile-login",
+                    username: "",
+                    url: origin,
+                    project: Some("default"),
+                    partition: Some("personal"),
+                    review_at: None,
+                    length: None,
+                    symbols: true,
+                },
+            )
+            .unwrap();
+        vault
+            .register_auth(
+                "default",
+                "profile-login",
+                AuthRegistration {
+                    provider: "synthetic".into(),
+                    account: "synthetic".into(),
+                    origins: vec![origin.into()],
+                    provider_expiry: ProviderExpiry::NonExpiring,
+                    use_until: Some(Utc::now() + chrono::Duration::hours(1)),
+                },
+            )
+            .unwrap();
+        for wrong in [
+            "https://signup.example.test",
+            "https://signup.example.test:8444",
+        ] {
+            assert!(request(&vault, "profile-login", "default", wrong, "agent", "test").is_err());
+        }
+        let pending = request(&vault, "profile-login", "default", origin, "agent", "test").unwrap();
+        // A profile edit during the synthetic prompt does not replace the
+        // identity already encrypted into the generated credential.
+        vault
+            .update_signup_profile(
+                selection,
+                SignupIdentity {
+                    email: "edited@example.test".into(),
+                    username: None,
+                },
+            )
+            .unwrap();
+        // Feed only the internal result handler; this does not invoke or prove
+        // LocalAuthentication or physical user presence.
+        let released = crate::browser_host::finish_approval(&vault, &pending, Ok(true)).unwrap();
+        assert_eq!(released.username, "original@example.test");
+        assert!(crate::browser_host::finish_approval(&vault, &pending, Ok(true)).is_err());
+
+        let pending = request(
+            &vault,
+            "profile-login",
+            "default",
+            origin,
+            "agent",
+            "expiry",
+        )
+        .unwrap();
+        vault
+            .db()
+            .execute(
+                "UPDATE browser_fill_requests SET expires_at=expires_at+60 WHERE request_id=?1",
+                [&pending.request_id],
+            )
+            .unwrap();
+        assert!(crate::browser_host::finish_approval(&vault, &pending, Ok(true)).is_err());
+        assert_eq!(
+            status(&vault, &pending.request_id).unwrap().status,
+            "pending"
+        );
+        assert_eq!(
+            vault
+                .get_credential_in_project("default", "profile-login")
+                .unwrap()
+                .lifecycle_state,
+            "pending"
+        );
+    }
+
+    #[test]
     fn native_cancel_denial_and_unavailable_are_terminal_without_decryption() {
         // Synthetic OS outcomes exercise the production state transition, not
         // LocalAuthentication or physical user presence.

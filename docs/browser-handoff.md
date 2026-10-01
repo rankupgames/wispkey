@@ -244,6 +244,7 @@ Protocol references: [Chrome native messaging](https://developer.chrome.com/docs
 [Windows desktop user verification](https://learn.microsoft.com/en-us/windows/win32/api/userconsentverifierinterop/nf-userconsentverifierinterop-iuserconsentverifierinterop-requestverificationforwindowasync).
 
 Reusable encrypted identities can be selected before generating a login; see
-[signup profile setup and regression suites](signup-profiles.md). Real macOS
-user-presence/native-host acceptance and the Cloud metadata relay remain separate
-work, as detailed there.
+[signup profile setup and regression suites](signup-profiles.md). Native macOS
+setup and outstanding human acceptance are documented in
+[macOS browser approval](macos-browser-approval.md). The Cloud metadata relay
+remains separate work.

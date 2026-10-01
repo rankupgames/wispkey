@@ -1,8 +1,9 @@
 # macOS browser approval design and acceptance
 
 This is the macOS slice of #1/#43. It preserves the existing separate human
-browser profile and local plaintext boundary. Encrypted signup profiles and
-Cloud relay are independent work. There are no profile or transfer schema changes.
+browser profile and local plaintext boundary. Generated signup-profile logins
+use the same approval boundary; the saved identity remains a credential snapshot.
+This backend makes no profile or transfer schema changes. Cloud relay is separate.
 
 ## Trust boundary
 
@@ -57,6 +58,9 @@ there is no production configuration that selects a mock verifier. They do not
 invoke or prove physical user presence. On macOS the real Objective-C bridge is
 compiled and linked by Cargo. Python tests create only disposable installation
 fixtures and never execute the fixture host or write a real browser manifest.
+The combined profile/native regression covers a registered non-default HTTPS
+port, profile editing during a synthetic approval, unchanged saved identity,
+one-use release and rejection of a changed request expiry.
 Host validation covers the complete canonical ancestor chain, including ownership,
 entry replacement permissions and post-plan symlink substitution. Root/user-owned
 sticky shared ancestors protect the trusted child entries; other shared-writable
