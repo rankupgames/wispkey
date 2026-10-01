@@ -406,3 +406,147 @@ fn bundle_input_rejects_secret_fields_without_echoing_values() {
     assert_denied_without_tokens(&output);
     assert!(String::from_utf8_lossy(&output.stderr).contains("invalid auth bundle JSON"));
 }
+
+#[test]
+fn website_login_nondefault_port_registration_and_encrypted_roundtrip() {
+    let origin = "https://jobs.example.com:8443";
+    for state in ["active", "expired", "revoked"] {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        init_vault(source.path());
+        let generated = run_wispkey_json(
+            source.path(),
+            &[
+                "--format",
+                "json",
+                "login",
+                "generate",
+                "site-login",
+                "--username",
+                "synthetic-login-user",
+                "--url",
+                "https://Jobs.Example.com:8443/login",
+                "--project",
+                "default",
+            ],
+        );
+        assert_eq!(generated["credential"]["origin"], origin);
+        assert_eq!(
+            generated["credential"]["hosts"],
+            json!(["jobs.example.com:8443"])
+        );
+        let deadline = (Utc::now()
+            + if state == "expired" {
+                Duration::hours(-1)
+            } else {
+                Duration::hours(1)
+            })
+        .to_rfc3339();
+        let registered = run_wispkey_json(
+            source.path(),
+            &[
+                "--format",
+                "json",
+                "auth",
+                "register",
+                "site-login",
+                "--project",
+                "default",
+                "--provider",
+                "synthetic-provider",
+                "--account",
+                ACCOUNT,
+                "--origin",
+                origin,
+                "--provider-expiry",
+                "unknown",
+                "--use-until",
+                &deadline,
+            ],
+        );
+        assert_metadata_only(&registered, &generated["credential"]["wisp_token"]);
+        if state == "revoked" {
+            let output = run_wispkey(
+                source.path(),
+                &["auth", "revoke", "site-login", "--project", "default"],
+            );
+            assert!(output.status.success());
+        }
+        let inventory = run_wispkey_json(source.path(), &["--format", "json", "auth", "list"]);
+        let auth = &inventory["credentials"][0]["auth"];
+        set_bundle(
+            source.path(),
+            &bundle(json!([{"name":"browser", "members":[member(auth, "login")]}])),
+        );
+        let encrypted = source.path().join("login.wkbundle");
+        run_wispkey_bundle_json(
+            source.path(),
+            &[
+                "--format",
+                "json",
+                "project",
+                "export",
+                "default",
+                "--output",
+                encrypted.to_str().unwrap(),
+            ],
+        );
+        let bytes = std::fs::read(&encrypted).unwrap();
+        assert!(
+            !bytes
+                .windows("synthetic-login-user".len())
+                .any(|part| part == b"synthetic-login-user")
+        );
+        init_vault(destination.path());
+        run_wispkey_bundle_json(
+            destination.path(),
+            &[
+                "--format",
+                "json",
+                "project",
+                "import",
+                encrypted.to_str().unwrap(),
+            ],
+        );
+        let restored = run_wispkey_json(destination.path(), &["--format", "json", "auth", "list"]);
+        assert_eq!(restored, inventory);
+        let restored_credential = run_wispkey_json(
+            destination.path(),
+            &["--format", "json", "get", "site-login"],
+        );
+        assert_eq!(restored_credential["credential"]["origin"], origin);
+        assert_eq!(
+            restored_credential["credential"]["hosts"],
+            json!(["jobs.example.com:8443"])
+        );
+        for dir in [source.path(), destination.path()] {
+            let output = resolve(dir, "browser", ACCOUNT, origin);
+            if state == "active" {
+                assert!(
+                    output.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let resolved: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(resolved["members"].as_array().unwrap().len(), 1);
+                assert_eq!(resolved["members"][0]["credential_name"], "site-login");
+                assert!(
+                    resolved["members"][0]["wisp_token"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("wk_")
+                );
+                assert!(!resolved.to_string().contains("synthetic-login-user"));
+            } else {
+                assert_denied_without_tokens(&output);
+            }
+            for mismatch in [
+                "https://jobs.example.com",
+                "https://jobs.example.com:8444",
+                "https://other.example.com:8443",
+            ] {
+                assert_denied_without_tokens(&resolve(dir, "browser", ACCOUNT, mismatch));
+            }
+        }
+    }
+}

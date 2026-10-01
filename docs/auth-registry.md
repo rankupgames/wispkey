@@ -140,11 +140,12 @@ snapshots and does not execute credentials.
 
 ## Boundaries and next gates
 
-Compatibility limit: existing `website_login` credentials with a non-default
-HTTPS port cannot yet opt into the registry because their legacy host metadata
-includes the port. Registration is rejected safely; no secret is released. Generic
-API credential exact-origin/port checks are supported. Fixing that existing login
-representation is a separate browser-login compatibility slice.
+Existing `website_login` credentials can opt into the registry at their exact
+HTTPS origin, including a non-default port such as `https://jobs.example.com:8443`.
+Their stored host authority retains the port; registration does not rewrite or
+broaden it. A different port, the default HTTPS origin, or another host is not an
+alternative for that login. Generic API credential hostname/glob restrictions
+continue to be narrowed by the registered exact origins.
 
 Local expiry/revocation does not revoke the provider token, sign out a remote
 browser, or invalidate previously copied material. Provider-side revocation and
@@ -168,8 +169,10 @@ does not store login notes.
 ## Synthetic verification
 
 `cargo test --test auth_registry --test auth_release` exercises CLI contracts and
-actual proxy/process release denials. Core clock tests cover exact deadline
-boundaries without sleeps. Sharing/cloud and backup tests cover legacy round trips,
+actual proxy/process release denials. Website-login regressions cover non-default
+HTTPS-port registration, exact-origin mismatch rejection, encrypted project
+round trips, and actual browser release before and after expiry/revocation. Core
+clock tests cover exact deadline boundaries without sleeps. Sharing/cloud and backup tests cover legacy round trips,
 authenticated format downgrade rejection, stable portable references, atomic
 rollback, expired/revoked recovery, and stale-reference denial. Browser and operation
 tests exercise their existing release boundaries. No production secret, real OAuth
