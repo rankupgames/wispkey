@@ -83,7 +83,75 @@ pub(super) fn session_store() -> SessionFileStore {
     }
 }
 
+/// Serializes session replacement/revocation with the final value-update commit.
+/// Keep this lock file in place: unlinking it would split the lock domain.
+pub(super) struct SessionGuard(std::fs::File);
+impl Drop for SessionGuard {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
 impl SessionFileStore {
+    pub(super) fn save_locked(
+        &self,
+        key: &[u8; 32],
+        issued_at: DateTime<Utc>,
+        timeout_minutes: i64,
+    ) -> Result<()> {
+        match self.preferred_backend {
+            SessionBackend::MachineBound => {
+                self.save_machine_bound(key, issued_at, timeout_minutes)
+            }
+            SessionBackend::Plaintext => {
+                tracing::warn!(
+                    "{}=1 is enabled; writing legacy plaintext session key",
+                    SESSION_PLAINTEXT_ENV
+                );
+                self.save_plaintext(key, issued_at, timeout_minutes)
+            }
+        }
+    }
+
+    pub(super) fn lock(&self) -> Result<SessionGuard> {
+        let path = self.session_path.with_extension("lock");
+        secure_files::create_private(&path, b"")?;
+        let metadata = fs::symlink_metadata(&path)?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(VaultError::SessionInvalid);
+        }
+        secure_files::harden_existing_file(&path)?;
+        if secure_files::private_metadata_inspection_supported() {
+            secure_files::inspect_private_file(&path).map_err(|_| VaultError::SessionInvalid)?;
+        }
+        let file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(SessionGuard(file))
+    }
+
+    pub(super) fn load_locked(&self) -> Result<SessionRecord> {
+        if !self.session_path.exists() {
+            return Err(VaultError::Locked);
+        }
+
+        let session_data = fs::read_to_string(&self.session_path)?;
+        let record = if session_data.starts_with(SESSION_V2_MACHINE_HEADER) {
+            self.load_machine_bound(&session_data)
+        } else if is_version_header(session_data.lines().next().unwrap_or("")) {
+            Err(VaultError::SessionInvalid)
+        } else {
+            load_plaintext_record(&session_data)
+        };
+
+        match record {
+            Ok(record) => validate_session_record(record, self),
+            Err(error) => {
+                clear_invalid_session_file(&self.session_path)?;
+                Err(error)
+            }
+        }
+    }
+
     #[must_use]
     pub(super) fn should_upgrade(&self, record: &SessionRecord) -> bool {
         record.backend == SessionBackend::Plaintext
@@ -221,44 +289,17 @@ impl SessionFileStore {
 
 impl SessionStore for SessionFileStore {
     fn save(&self, key: &[u8; 32], issued_at: DateTime<Utc>, timeout_minutes: i64) -> Result<()> {
-        match self.preferred_backend {
-            SessionBackend::MachineBound => {
-                self.save_machine_bound(key, issued_at, timeout_minutes)
-            }
-            SessionBackend::Plaintext => {
-                tracing::warn!(
-                    "{}=1 is enabled; writing legacy plaintext session key",
-                    SESSION_PLAINTEXT_ENV
-                );
-                self.save_plaintext(key, issued_at, timeout_minutes)
-            }
-        }
+        let _guard = self.lock()?;
+        self.save_locked(key, issued_at, timeout_minutes)
     }
 
     fn load(&self) -> Result<SessionRecord> {
-        if !self.session_path.exists() {
-            return Err(VaultError::Locked);
-        }
-
-        let session_data = fs::read_to_string(&self.session_path)?;
-        let record = if session_data.starts_with(SESSION_V2_MACHINE_HEADER) {
-            self.load_machine_bound(&session_data)
-        } else if is_version_header(session_data.lines().next().unwrap_or("")) {
-            Err(VaultError::SessionInvalid)
-        } else {
-            load_plaintext_record(&session_data)
-        };
-
-        match record {
-            Ok(record) => validate_session_record(record, self),
-            Err(error) => {
-                self.clear()?;
-                Err(error)
-            }
-        }
+        let _guard = self.lock()?;
+        self.load_locked()
     }
 
     fn clear(&self) -> Result<()> {
+        let _guard = self.lock()?;
         clear_invalid_session_file(&self.session_path)
     }
 }
@@ -320,7 +361,7 @@ fn validate_session_record(
     store: &SessionFileStore,
 ) -> Result<SessionRecord> {
     if is_timeout_expired(record.issued_at, record.timeout_minutes) {
-        store.clear()?;
+        clear_invalid_session_file(&store.session_path)?;
         return Err(VaultError::SessionExpired);
     }
     Ok(record)
@@ -469,6 +510,44 @@ fn clear_invalid_session_file(session_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_update_guard_serializes_session_revocation_and_replacement() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        for replace in [false, true] {
+            let (_dir, store) = test_store(SessionBackend::MachineBound);
+            store.save(&[7; 32], Utc::now(), 30).unwrap();
+            let guard = store.lock().unwrap();
+            let other = SessionFileStore::new_for_test(
+                store.session_path.clone(),
+                store.device_seed_path.clone(),
+                SessionBackend::MachineBound,
+            );
+            let (started_tx, started_rx) = mpsc::channel();
+            let (done_tx, done_rx) = mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                started_tx.send(()).unwrap();
+                if replace {
+                    other.save(&[8; 32], Utc::now(), 30).unwrap();
+                } else {
+                    other.clear().unwrap();
+                }
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+            assert_eq!(store.load_locked().unwrap().key, [7; 32]);
+            drop(guard);
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            worker.join().unwrap();
+            if replace {
+                assert_eq!(store.load().unwrap().key, [8; 32]);
+            } else {
+                assert!(matches!(store.load(), Err(VaultError::Locked)));
+            }
+        }
+    }
 
     fn test_store(preferred_backend: SessionBackend) -> (tempfile::TempDir, SessionFileStore) {
         let dir = tempfile::tempdir().unwrap();
