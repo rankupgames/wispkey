@@ -33,6 +33,14 @@ impl OwnerServer {
         self.stop();
         String::from_utf8_lossy(&self.logs.lock().unwrap()).into_owned()
     }
+
+    fn report_phase_baseline(&mut self) {
+        self.stop();
+        let (_, report) = self.phases.lock().unwrap().snapshot_since(0);
+        if !report.is_empty() {
+            eprintln!("{report}");
+        }
+    }
 }
 
 impl Drop for OwnerServer {
@@ -158,6 +166,7 @@ async fn generated_website_login_requires_destination_and_returns_only_metadata(
     );
     let logs = server.captured_logs();
     assert!(!logs.contains("encrypted_value"));
+    server.report_phase_baseline();
 }
 
 #[tokio::test]
@@ -302,7 +311,7 @@ async fn owner_ipc_ovh_duplicate_rolls_back_all() {
 async fn owner_ipc_ovh_success_creates_three() {
     let dir = tempfile::tempdir().expect("vault dir");
     init_vault(dir.path());
-    let _server = start_owner_ipc(dir.path());
+    let mut server = start_owner_ipc(dir.path());
     let response = owner_call(
         dir.path(),
         json!({
@@ -340,6 +349,7 @@ async fn owner_ipc_ovh_success_creates_three() {
             "ovh-prod-consumer-key"
         ]
     );
+    server.report_phase_baseline();
 }
 
 #[tokio::test]

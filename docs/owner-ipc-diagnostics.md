@@ -39,6 +39,26 @@ incremental capture after cleanup. On Windows a deliberately nonresponding pipe
 peer also verifies the original five-second response deadline and fixed-method
 timeout diagnostics, including an unknown malicious method label.
 
+The two positive workflows previously seen timing out also print their bounded,
+parsed phase snapshots after their final assertions and server cleanup. This
+provides successful handler/write baseline timings in the contention job's
+`--nocapture` output without printing raw stderr or changing request timing.
+
+The Windows-only `controlled_pipe_delivery_after_delayed_application_read`
+experiment runs separately after the contention step, including when that step
+fails. Four synthetic cases compare small and large replies, each with immediate
+Tokio server-wrapper drop versus retention until application acknowledgement.
+The output buffer request is 1 KiB. Application consumption begins after a fixed
+100 ms regardless of whether the write has reported acceptance; this delay is
+included in the five-second response deadline. Mio may already have posted an
+OS read into its internal buffer, so this is not a claim of zero OS reads.
+All four delivery observations are printed before the final assertion, using
+fixed case labels, byte counts/validity and numeric timings only. A missing
+timing is `-1`. `not_yet_accepted` includes scheduling delay and is not by itself
+proof of kernel backpressure. Wrapper drop does not necessarily close an OS
+handle while Mio retains pending I/O. A failure in this larger controlled case
+does not by itself explain the original small-response intermittent timeout.
+
 Inspect all failed and successful stress iterations. Compare PID/connection
 sequences within a server; clocks across separate processes are not synchronized.
 Add more fine-grained handler diagnostics only if these boundaries justify it.

@@ -7,6 +7,7 @@ on:
       - 'src/owner_ipc/**'
       - 'src/core/**'
       - 'tests/owner_ipc.rs'
+      - 'tests/owner_ipc_diagnostics.rs'
       - 'tests/common/**'
       - 'scripts/test-owner-ipc-contention.ps1'
       - '.github/workflows/owner-ipc-contention.yml'
@@ -30,3 +31,6 @@ jobs:
       - name: Repeat bounded owner IPC checks under CPU contention
         shell: pwsh
         run: ./scripts/test-owner-ipc-contention.ps1
+      - name: Observe controlled pipe delivery separately from contention
+        if: always() && !cancelled()
+        run: cargo test --locked --test owner_ipc_diagnostics controlled_pipe_delivery_after_delayed_application_read -- --exact --nocapture
