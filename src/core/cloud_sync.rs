@@ -563,6 +563,54 @@ mod auth_transport_tests {
     }
 
     #[test]
+    fn cloud_apply_duration_deadline_at_commit_rolls_back_credentials_and_journal() {
+        let source = vault();
+        add(&source, "incoming", true);
+        let snapshot = source
+            .cloud_snapshot("default", "personal")
+            .unwrap()
+            .unwrap();
+        let target = vault();
+        add(&target, "existing", false);
+        let before = current_hash(&target);
+        let calls = std::cell::Cell::new(0);
+        let guard = || {
+            calls.set(calls.get() + 1);
+            if calls.get() == 2 {
+                Err(VaultError::WatchDurationElapsed)
+            } else {
+                Ok(())
+            }
+        };
+        assert!(
+            target
+                .cloud_apply_guarded(
+                    &snapshot,
+                    Some(&before),
+                    Some(("synthetic-watch-journal", serde_json::json!({}))),
+                    &guard
+                )
+                .is_err()
+        );
+        assert_eq!(calls.get(), 2);
+        assert_eq!(current_hash(&target), before);
+        let auth_rows: i64 = target
+            .db
+            .query_row("SELECT count(*) FROM auth_registry", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(auth_rows, 0);
+        let rows: i64 = target
+            .db
+            .query_row(
+                "SELECT count(*) FROM vault_meta WHERE key='synthetic-watch-journal'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+    }
+
+    #[test]
     fn auth_transport_cloud_preserves_identity_bundle_and_deadlines() {
         let source = vault();
         paired(&source);
