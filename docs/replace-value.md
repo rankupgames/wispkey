@@ -33,6 +33,10 @@ are rejected, and this command never extends their deadlines or revives them.
 Successful output is just a confirmation (`{"ok":true}` with `--format json`);
 value and token are absent from output and the audit event.
 
+Preserving the registry's provider and account fields preserves the owner's
+assertion of identity. An opaque replacement cannot verify that the new secret
+belongs to that provider or account; the owner must establish that separately.
+
 ## Concurrency and authorization
 
 A valid, finite unlocked owner session is required. WispKey captures a
@@ -52,3 +56,8 @@ session lock protocol. Database writes from older clients still invalidate the
 update ticket. Renames, moves, removals, token rotations, registry changes and
 competing replacements all fail closed. Ciphertext update and the redacted audit
 event commit together; audit failure rolls back the update.
+
+This does not make every session-renewal path race-free. The pre-existing
+`restore_or_refresh_session` path still loads and saves in separate lock intervals;
+a concurrent lock can occur between them. That separate renewal race is unchanged
+by this command.
