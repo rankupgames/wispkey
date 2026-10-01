@@ -130,6 +130,9 @@ SQLite regression pauses the encrypted profile read and checks that competing
 update/generate/remove operations cannot write before generation commits. Backup
 recovery also checks that deleting the last profile retains the managed-history
 marker and rejects legacy snapshots after restore. The integration
+between profile generation and auth registration also checks exact non-default
+HTTPS ports through encrypted project export/import and browser release, including
+wrong-port rejection and revocation. The CLI/MCP integration
 suite uses actual CLI/MCP subprocesses with synthetic temporary vaults to check
 setup, file/stdin input, metadata-only outputs, structured-error and stored-audit
 redaction, backup restoration, merge conflicts and exclusions. A synthetic HTTP

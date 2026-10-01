@@ -621,6 +621,97 @@ mod tests {
     }
 
     #[test]
+    fn signup_port_scoped_auth_survives_export_and_browser_release() {
+        use crate::core::auth::{AuthRegistration, ProviderExpiry};
+        let source = vault();
+        let profile = create(&source);
+        let origin = "https://signup.example.test:8443";
+        let mut req = request("saved");
+        req.url = "https://Signup.Example.Test:8443/register";
+        let login = source
+            .generate_signup_login(selection(&profile), req)
+            .unwrap();
+        assert_eq!(login.origin, origin);
+        assert_eq!(login.hosts, vec!["signup.example.test:8443"]);
+        let registration = AuthRegistration {
+            provider: "synthetic".into(),
+            account: "synthetic".into(),
+            origins: vec![origin.into()],
+            provider_expiry: ProviderExpiry::NonExpiring,
+            use_until: Some(Utc::now() + chrono::Duration::hours(1)),
+        };
+        source
+            .register_auth("default", "saved", registration.clone())
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("profile-auth.wkbundle");
+        let path = path.to_str().unwrap();
+        crate::sharing::export_project(&source, "default", PASSPHRASE, path).unwrap();
+        let mut restored = vault();
+        restored.master_key = Some([8; 32]);
+        crate::sharing::import_project(&restored, path, PASSPHRASE).unwrap();
+        assert_eq!(
+            restored
+                .list_signup_profiles("default", "personal")
+                .unwrap(),
+            vec![profile.clone()]
+        );
+        for denied in [
+            "https://signup.example.test",
+            "https://signup.example.test:443",
+            "https://signup.example.test:8444",
+        ] {
+            let mut wrong = registration.clone();
+            wrong.origins = vec![denied.into()];
+            assert!(restored.register_auth("default", "saved", wrong).is_err());
+            assert!(
+                browser::request(
+                    &restored,
+                    "saved",
+                    "default",
+                    denied,
+                    "test-agent",
+                    "port test"
+                )
+                .is_err()
+            );
+        }
+        // Profile edits still leave the saved, registered login independent.
+        restored
+            .update_signup_profile(
+                selection(&profile),
+                SignupIdentity {
+                    email: "edited@example.test".into(),
+                    username: None,
+                },
+            )
+            .unwrap();
+        let pending = browser::request(
+            &restored,
+            "saved",
+            "default",
+            origin,
+            "test-agent",
+            "port test",
+        )
+        .unwrap();
+        let released = browser::release(&restored, &pending).unwrap();
+        assert_eq!(released.username, EMAIL);
+        assert_eq!(released, payload(&source, "saved"));
+        let pending = browser::request(
+            &restored,
+            "saved",
+            "default",
+            origin,
+            "test-agent",
+            "revocation test",
+        )
+        .unwrap();
+        restored.revoke_auth("default", "saved").unwrap();
+        assert!(browser::release(&restored, &pending).is_err());
+    }
+
+    #[test]
     fn signup_sync_roundtrip_edits_deletion_and_legacy_replacement_rejection() {
         let source = vault();
         let p = create(&source);
