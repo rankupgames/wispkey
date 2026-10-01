@@ -86,6 +86,54 @@ fn proxy_stop_uses_management_api_and_removes_metadata() {
 }
 
 #[test]
+fn native_tls_startup_failure_does_not_publish_proxy_discovery() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let missing_roots = vault_dir.path().join("missing-native-roots.pem");
+
+    let mut child = wispkey_bin()
+        .args(["serve", "--random-port"])
+        .env("WISPKEY_VAULT_PATH", vault_dir.path())
+        .env("WISPKEY_PASSWORD", "test-password")
+        .env("SSL_CERT_FILE", &missing_roots)
+        .env_remove("SSL_CERT_DIR")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn proxy");
+    if wait_for_child_exit(&mut child, Duration::from_secs(5)).is_none() {
+        let _ = child.kill();
+        let _ = child.wait();
+        panic!("proxy should fail before publishing discovery metadata");
+    }
+
+    let output = child.wait_with_output().expect("proxy failure output");
+    assert!(
+        !output.status.success(),
+        "proxy should fail when native roots cannot initialize"
+    );
+    assert!(
+        !vault_dir.path().join("proxy.json").exists(),
+        "failed startup must not publish proxy.json"
+    );
+    assert!(
+        !vault_dir.path().join("proxy.pid").exists(),
+        "failed startup must not publish proxy.pid"
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Proxy error: native TLS roots unavailable"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("proxy startup requires the configured OS trust store"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("panicked at"), "{stderr}");
+}
+
+#[test]
 fn serve_reports_healthy_existing_proxy_instead_of_spawning_duplicate() {
     let vault_dir = tempfile::tempdir().expect("temp vault dir");
     init_vault(vault_dir.path());
