@@ -14,7 +14,9 @@ cargo test
 ### Prerequisites
 
 - Current stable **Rust** via [rustup](https://rustup.rs)
-- That's it -- SQLite is bundled via `rusqlite`
+- SQLite is bundled via `rusqlite`.
+- For the browser/tray UI, use **Node.js 24 LTS** (CI), or Node.js 22.12+.
+  CLI-only development does not require Node.js.
 
 ## Development Workflow
 
