@@ -54,6 +54,6 @@ jobs:
         with:
           shared-key: scheduled-audit
       - name: Install reviewed audit tool
-        run: cargo install cargo-audit --version 0.22.1 --locked
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit current lockfile against freshly fetched RustSec database
         run: python3 scripts/audit_dependencies.py audited/Cargo.lock
