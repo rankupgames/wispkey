@@ -143,6 +143,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store credential |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials (names only) |
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
+| `wispkey replace-value <name> --project P --partition P [--stdin]` | Owner whole-value replacement with hidden input and stale-change checks; see `docs/replace-value.md` |
 | `wispkey remove <name>` | Delete credential |
 | `wispkey rotate <name>` | Regenerate wisp token |
 | `wispkey signup-profile create/list/update/remove` | Manage encrypted reusable identities; owner input from file/stdin, metadata-only output |

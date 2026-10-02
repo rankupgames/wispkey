@@ -32,7 +32,9 @@ Registration can represent an already-expired credential for inventory/recovery.
 Expiry blocks use; it never deletes recovery material. `review_at` remains advisory
 and does not become an expiry deadline. Local revocation is terminal for that auth
 identity: re-registering or synchronizing older live metadata cannot clear it.
-Create a new credential for replacement secret material. Re-registration retains
+For owner-operated whole-value replacement with identity and policy preservation,
+use [`replace-value`](replace-value.md). It rejects revoked or expired registrations.
+Create a new credential when a new auth identity or policy is required. Re-registration retains
 the auth ID, changes its revision, and cannot change its provider/account identity.
 It invalidates existing bundle references until the owner explicitly updates them.
 
@@ -97,9 +99,10 @@ proof of current token validity. A successful resolution does not prove the
 upstream account or operation succeeded.
 
 Deleting a referenced credential fails until its bundles are explicitly updated.
-Registered credentials cannot be overwritten, moved between partitions, or moved
-implicitly by deleting their partition/project. Replace them using a new credential
-and reviewed bundle references instead of silently changing an identity.
+Generic overwrite APIs cannot overwrite registered credentials. They also cannot
+be moved between partitions or moved implicitly by deleting their partition/project.
+The explicit owner [`replace-value`](replace-value.md) interface preserves the
+registration and reviewed bundle references; it does not revive revoked/expired auth.
 
 ## Enforcement and recovery
 
