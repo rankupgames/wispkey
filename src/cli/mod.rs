@@ -13,6 +13,8 @@ mod backup;
 mod cloud;
 mod credential_sharing;
 mod credentials;
+mod value_update;
+pub use value_update::handle_replace_value;
 mod doctor;
 mod env;
 mod exec;

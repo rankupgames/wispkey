@@ -181,6 +181,20 @@ enum Commands {
     /// Add a credential to the vault
     Add(AddArgs),
 
+    /// Replace an existing whole value, preserving identity and metadata
+    ReplaceValue {
+        name: String,
+        /// Exact project (required; active project is never inferred)
+        #[arg(long)]
+        project: String,
+        /// Exact existing partition (required)
+        #[arg(long)]
+        partition: String,
+        /// Read exact UTF-8 bytes from stdin instead of a hidden confirmed prompt
+        #[arg(long)]
+        stdin: bool,
+    },
+
     /// List all credentials (names only, never values)
     List {
         /// Filter by partition
@@ -1326,6 +1340,14 @@ async fn main() {
                 project: project.as_deref(),
             })
             .await;
+        }
+        Commands::ReplaceValue {
+            name,
+            project,
+            partition,
+            stdin,
+        } => {
+            cli::handle_replace_value(&name, &project, &partition, stdin);
         }
         Commands::List {
             partition,
