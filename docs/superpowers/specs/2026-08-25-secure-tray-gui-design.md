@@ -3,9 +3,13 @@
 Date: 2026-08-25
 Issue: https://github.com/rankupgames/wispkey/issues/4
 
-## Goal
+This is the historical design reference for the implemented local tray. It is
+not a future product roadmap; [current tray usage](../../tray.md) documents
+operation and platform limits. The original design remains in Git history.
 
-Add an optional background tray application so an owner can add credentials through a native Svelte 5 dialog without using the terminal. The CLI remains the shared core. The tray is a desktop extension that talks to the vault through authenticated, current-user-only local IPC.
+## Implemented scope
+
+The optional background tray application lets an owner add credentials through a native Svelte 5 dialog without using the terminal. The CLI remains the shared core. The tray is a desktop extension that talks to the vault through authenticated, current-user-only local IPC.
 
 ## Non-goals
 
@@ -49,10 +53,10 @@ Add an optional background tray application so an owner can add credentials thro
 
 - Endpoint: owner-only Unix socket `owner.sock` under `WISPKEY_VAULT_PATH` / `~/.wispkey` on Unix; per-user named pipe on Windows.
 - Discovery file `owner.json` is owner-only and contains pid, protocol version, and endpoint. It does not contain secrets.
-- Unix connections must present the same UID as the server (`SO_PEERCRED`). Mismatched UID fails closed.
+- Unix connections must present the same UID as the server through OS peer credentials. Mismatched UID fails closed.
 - Socket file mode is `0600`.
 - JSON request/response. Methods: `status`, `unlock`, `lock`, `list_credentials`, `list_projects`, `list_partitions`, `add_credential`, `add_template`, `shutdown`.
-- Responses return names, types, tags, hosts, wisp tokens, and project/partition metadata. They never return plaintext secret values.
+- Responses return names and credential/project/partition metadata. They never return plaintext secret values.
 - Tracing/logs redact `value`, `password`, and template secret fields. Notifications never include secrets.
 - Locked vault, missing endpoint, malformed JSON, empty fields, duplicate names, and unauthorized peers fail closed.
 
@@ -62,7 +66,7 @@ Add an optional background tray application so an owner can add credentials thro
 - Add credential dialog: name, type, value (masked), description, tags, hosts, project, partition.
 - Compound path: OVH API template with three masked fields and a name prefix.
 - Reveal and copy are explicit actions. Form secret state clears on save, cancel, lock, timeout, and failure.
-- Settings include optional start-at-login.
+- Settings persist a start-at-login preference. Only Linux creates/removes an autostart entry; macOS and Windows currently store the preference without registering login startup.
 - List view shows names and metadata only.
 
 ## Testing
