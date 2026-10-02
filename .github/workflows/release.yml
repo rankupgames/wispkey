@@ -224,13 +224,20 @@ jobs:
           name: wispkey-${{ matrix.target }}
           path: dist
 
+      - name: Extract Windows ZIP with the native installer interface
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Expand-Archive -LiteralPath "dist/${{ matrix.archive }}" -DestinationPath dist
+
       - name: Run downloaded binary
         env:
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
           cd dist
-          tar -xf "${{ matrix.archive }}"
+          if [[ "${{ matrix.binary }}" != *.exe ]]; then
+            tar -xf "${{ matrix.archive }}"
+          fi
           test -f LICENSE
           test -f README.md
           test -f VERSION
