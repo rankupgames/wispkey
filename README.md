@@ -550,25 +550,20 @@ cargo build --release --target aarch64-apple-darwin
 | Database | `rusqlite` (bundled) | Zero-config credential store + audit log |
 | CLI | `clap` | Subcommand parsing |
 | Serialization | `serde` + `serde_json` + `toml` | Config, policy, and MCP protocol |
-| HTTP client | `reqwest` | Cloud API client groundwork (rustls-tls) |
+| HTTP client | `reqwest` | Cloud authentication and encrypted partition sync (rustls-tls) |
 | Logging | `tracing` | Structured logging with env filter |
 | Patterns | `glob-match` + `regex` | Host restriction globs, wisp token scanning |
 | Browser | `open` | Clerk login flow (opens default browser) |
 
-## Related Repositories
+## Local use and optional Cloud sync
 
-- **[WispKey Cloud](https://github.com/rankupgames/wispkey-cloud)** (private) -- Optional companion-service repository; CLI data sync is not implemented in this repository
-- **[WispKey Desktop](https://github.com/rankupgames/wispkey-desktop)** (private) -- Tauri + SvelteKit desktop companion app
-
-## WispKey Cloud Roadmap
-
-The open-source CLI works fully offline with no account. Cloud login/session groundwork exists, but CLI sync operations are not implemented yet. The optional Cloud companion is planned for encrypted sync and team workflows:
-
-| Planned tier | Price | Intended scope |
-|------|-------|--------------|
-| **Personal** | Free | Everything in this repo -- local vault, proxy, MCP, plugin |
-| **Cloud** | $1.99/mo ($1.49/mo annual) | Planned encrypted sync, up to 10 cloud partitions, 100 MB storage |
-| **Enterprise** | Contact us | Planned unlimited partitions, org management, SSO, and dedicated support |
+Local vault, proxy, MCP, injection, and encrypted backup/sharing workflows work
+offline without an account. Optional account-owned partition sync is implemented
+in the CLI; it requires a compatible, configured backend. See
+[encrypted sync and recovery](docs/cloud-sync.md) and
+[Cloud sign-in requirements](docs/cloud-login.md) for setup, compatibility and
+preview limits. Cloud sign-in does not unlock the local vault or authorize
+credential execution.
 
 ## Contributing
 
