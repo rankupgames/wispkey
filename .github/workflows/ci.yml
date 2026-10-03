@@ -145,10 +145,8 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --features experimental-browser-receiver -- -D warnings -W clippy::suspicious -W clippy::style -W clippy::perf -W clippy::complexity
 
-      - name: Default-off receiver guard
-        run: |
-          cargo test --lib core::browser_receiver::schema_tests
-          cargo test --lib backup::restore::tests::schema15_
+      - name: Default-off migration and receiver guards
+        run: cargo test --lib schema
 
       - name: Tests
         run: cargo test --features experimental-browser-receiver
