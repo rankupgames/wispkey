@@ -37,6 +37,20 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def write_checksum_manifest(path, content):
+    """Canonicalize record terminators only; filename bytes are never stripped."""
+    records = content.split(b"\n")
+    if len(records) < 2 or records[-1] != b"":
+        raise ValueError("checksum records must end with LF or CRLF")
+    lines = []
+    for record in records[:-1]:
+        line = record.removesuffix(b"\r")
+        if not re.fullmatch(rb"[0-9a-f]{64}  [^\x00\r\n]+", line):
+            raise ValueError("invalid checksum record")
+        lines.append(line)
+    Path(path).write_bytes(b"\n".join(lines) + b"\n")
+
+
 def commit(value):
     if not re.fullmatch(r"[0-9a-f]{40}", value):
         raise ValueError("invalid source commit")
@@ -240,7 +254,8 @@ def main():
         report = smoke(args.directory / ARCHIVE, args.extracted, args.commit)
         (args.directory / "smoke-report.json").write_text(json.dumps(report, indent=2) + "\n")
         names = [ARCHIVE, "smoke-report.json"]
-        (args.directory / "SHA256SUMS.txt").write_text("".join(f"{sha((args.directory / n).read_bytes())}  {n}\n" for n in names))
+        checksums = "".join(f"{sha((args.directory / n).read_bytes())}  {n}\n" for n in names)
+        write_checksum_manifest(args.directory / "SHA256SUMS.txt", checksums.encode("utf-8"))
 
 
 if __name__ == "__main__":
