@@ -1,0 +1,113 @@
+name: Compatible CLI and helper test artifacts
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/compatible-test-artifacts.yml'
+      - 'scripts/inspect_compatible_binaries.py'
+      - 'scripts/tests/test_compatible_binaries.py'
+      - 'tests/support/compatible_artifact_fixture.py'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/compatible-test-artifacts.yml'
+      - 'scripts/inspect_compatible_binaries.py'
+      - 'scripts/tests/test_compatible_binaries.py'
+      - 'tests/support/compatible_artifact_fixture.py'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: compatible-test-artifacts-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_INCREMENTAL: '0'
+  CARGO_BUILD_JOBS: '2'
+  CHECKED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    container:
+      image: rust@sha256:4673f78db88b71f09d5451bbc404734807918161241215ba0a50bbbe9b448117
+      options: --cpus 2 --memory 6g --pids-limit 512
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CHECKED_SHA }}
+          persist-credentials: false
+      - name: Install disposable build inspection prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 binutils
+          rustc --version | grep '^rustc 1.94.0 '
+          test "$(getconf GNU_LIBC_VERSION)" = 'glibc 2.36'
+          test "$(dpkg --print-architecture)" = amd64
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: bookworm-cli-helper-test
+      - name: Build CLI and restricted helper
+        run: |
+          cargo build --release --locked --target x86_64-unknown-linux-gnu --bin wispkey --bin wispkey-operation-helper
+          mkdir dist
+          cp target/x86_64-unknown-linux-gnu/release/wispkey target/x86_64-unknown-linux-gnu/release/wispkey-operation-helper dist/
+          dpkg-query -W > dist/build-packages.txt
+          cp LICENSE dist/
+          python3 scripts/inspect_compatible_binaries.py --directory dist --commit "$CHECKED_SHA"
+      - name: Upload unvalidated build inputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unvalidated-bookworm-cli-helper
+          path: dist/
+          retention-days: 1
+          if-no-files-found: error
+
+  validate:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.CHECKED_SHA }}
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: unvalidated-bookworm-cli-helper
+          path: dist
+      - name: Validate downloaded artifacts in independent Debian 12 userspace
+        run: |
+          (cd dist && sha256sum --check SHA256SUMS.txt)
+          python3 -B -m unittest discover -s scripts/tests -p 'test_compatible_binaries.py'
+          python3 tests/support/compatible_artifact_fixture.py --directory dist --commit "$CHECKED_SHA"
+          (cd dist && sha256sum wispkey wispkey-operation-helper LICENSE build-packages.txt build-report.json runtime-report.json > SHA256SUMS.txt)
+      - name: Upload verified test artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verified-bookworm-cli-helper-${{ env.CHECKED_SHA }}
+          path: dist/
+          retention-days: 7
+          if-no-files-found: error
+
+  provenance:
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: verified-bookworm-cli-helper-${{ env.CHECKED_SHA }}
+          path: dist
+      - uses: actions/attest-build-provenance@96278af6caaf10aea03fd8d33a09a777ca52d62f # v3.2.0
+        with:
+          subject-checksums: dist/SHA256SUMS.txt
