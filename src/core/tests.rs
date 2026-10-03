@@ -884,11 +884,29 @@ fn schema_v7_to_current_migration_adds_bootstrap_and_rotation_columns_without_to
 
 #[test]
 fn schema_v9_to_current_binds_only_unambiguous_legacy_credential_names() {
+    // Include the v9 scope tables: later migrations install authority-change
+    // guards on them even though this fixture only exercises name resolution.
     let db = Connection::open_in_memory().unwrap();
     db.execute_batch(
         "CREATE TABLE vault_meta (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL
+        );
+        CREATE TABLE projects (
+            id TEXT PRIMARY KEY,
+            name TEXT UNIQUE NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE partitions (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            project_id TEXT NOT NULL REFERENCES projects(id),
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(project_id, name)
         );
         CREATE TABLE credentials (
             id TEXT PRIMARY KEY,

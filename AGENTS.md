@@ -45,7 +45,7 @@ For repeated headless unlocks, prefer `wispkey unlock --remember --password-file
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v15 automatically. Encrypted signup profiles have explicit project/partition scope; see `docs/signup-profiles.md`. Browser fill requests are short-lived metadata, omitted from encrypted backups.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v16 automatically. Encrypted signup profiles have explicit project/partition scope; see `docs/signup-profiles.md`. Browser fill requests are short-lived metadata, omitted from encrypted backups.
 
 ```bash
 # Create a project
@@ -342,3 +342,7 @@ Workspace crate with an optional `wispkey-tray` GUI member. Default `cargo test`
 ## Auth registry foundation
 
 Use `wispkey auth register/list/revoke` and `auth bundle set/list/resolve` for opt-in lifecycle-managed credential references. The registry inventory never returns secret values or wisp tokens; explicit bundle resolution returns opaque capabilities. Read `docs/auth-registry.md` before changing policy or transfer code. All use paths must honor registered expiry/revocation and delegated local deadlines; only encrypted recovery helpers may bypass eligibility. Keep ciphertext markers, portable auth identities and policy data together atomically. This is not OAuth refresh, browser-session capture, or cloud execution.
+
+## Experimental browser receiver
+
+The default-off `experimental-browser-receiver` feature provides a local metadata bridge only. See `docs/browser-receiver.md`. No shipping transport, enrollment or CLI activation exists; never implement authentication by parsing caller-supplied identity or a verification boolean. Receiver requests still require the existing native owner approval. Schema16 prevents older clients ignoring the new release guard.
