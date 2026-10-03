@@ -249,7 +249,7 @@ Available local stdio MCP tools (11):
 - `wispkey_set` -- Create or update a credential (requires `overwrite: true` to replace)
 - `wispkey_signup_profile_list` -- List profile IDs, revisions and labels only; explicit project/partition scope required
 - `wispkey_generate_login` -- Generate and store an encrypted website login; return non-secret metadata, never the password
-- `wispkey_request_browser_fill` -- Request a five-minute one-use fill in a separate human-controlled browser profile; requires owner approval and Windows Hello
+- `wispkey_request_browser_fill` -- Request a five-minute one-use fill in a separate human-controlled browser profile; requires owner approval with Windows Hello or macOS Touch ID
 - `wispkey_browser_fill_status` -- Read metadata-only fill status; completed means filled, not submitted
 - `wispkey_delete` -- Delete a credential by name
 - `wispkey_issue_cert` -- Issue a leaf certificate from a vault-held CA key. Generating a leaf keypair returns its new private key; signing a supplied CSR returns no private key. The CA private key is never returned
