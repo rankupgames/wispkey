@@ -75,9 +75,17 @@ def exchange(command, attempt, phase=None, expired=False):
             if phase == "deliver":
                 delivery["credential_b64"] = base64.b64encode(CANARY).decode()
             payload = (json.dumps(delivery) + "\n").encode()
-        stdout, stderr = process.communicate(payload, timeout=15)
+        completion = b""
+        if payload:
+            # The production helper treats EOF as cancellation while its child
+            # runs. Keep stdin open until the helper acknowledges completion.
+            process.stdin.write(payload)
+            process.stdin.flush()
+            completion = first_line(process)
+            no_canary(completion)
+        stdout, stderr = process.communicate(timeout=15)
         no_canary(stdout + stderr)
-        result = [json.loads(line) for line in stdout.splitlines()]
+        result = [json.loads(line) for line in ([completion] if completion else []) + stdout.splitlines()]
         return ready, result
     finally:
         if process.poll() is None:
@@ -160,8 +168,9 @@ CMD ["/usr/sbin/sshd", "-D", "-e"]
             if not port.startswith("127.0.0.1:") or not port.split(":")[1].isdigit():
                 raise RuntimeError("SSH destination must bind IPv4 loopback only")
             public = run(["docker", "exec", container, "cat", "/etc/ssh/ssh_host_ed25519_key.pub"]).decode().strip()
-            write(scratch / "known_hosts", f"[{port.replace(':', ']:')} {public}\n")
-            write(scratch / "wrong_hosts", f"[{port.replace(':', ']:')} {(scratch / 'wrong-identity.pub').read_text()}")
+            endpoint = f"[127.0.0.1]:{port.split(':')[1]}"
+            write(scratch / "known_hosts", f"{endpoint} {public}\n")
+            write(scratch / "wrong_hosts", f"{endpoint} {(scratch / 'wrong-identity.pub').read_text()}")
 
             def command(key="identity", hosts="known_hosts"):
                 return ["ssh", "-F", "/dev/null", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes",
