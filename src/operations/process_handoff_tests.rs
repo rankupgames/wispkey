@@ -12,6 +12,7 @@ use std::{
 };
 
 pub(super) const CANARY: &str = "synthetic-process-handoff-selected-value";
+pub(super) const RUN_TIMEOUT: Duration = Duration::from_secs(180);
 const MASTER: &str = "synthetic-process-handoff-master";
 const MARKER: &str = "wispkey-process-handoff-v1";
 
@@ -20,14 +21,18 @@ pub(super) fn write(path: &Path, value: &Value) {
 }
 
 async fn read_when_ready(path: &Path) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    read_within(path, Duration::from_secs(60)).await
+}
+
+async fn read_within(path: &Path, timeout: Duration) -> Value {
+    let deadline = Instant::now() + timeout;
     loop {
         if let Ok(bytes) = std::fs::read(path)
             && let Ok(value) = serde_json::from_slice(&bytes)
         {
             return value;
         }
-        assert!(Instant::now() < deadline, "fixture readiness deadline");
+        assert!(Instant::now() < deadline, "fixture file deadline");
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
@@ -145,6 +150,7 @@ async fn separate_process_handoff_boundaries() {
             .as_str()
             .unwrap()
             .to_owned();
+        let name = name.to_owned();
         async move {
             let response = client
                 .post(format!(
@@ -154,7 +160,7 @@ async fn separate_process_handoff_boundaries() {
                 .header("x-wispkey-instance-secret", password)
                 .send()
                 .await
-                .unwrap();
+                .unwrap_or_else(|_| panic!("synthetic HTTP request failed for {name}"));
             let code = response.status().as_u16();
             for (name, value) in response.headers() {
                 private_output(name.as_str().as_bytes(), &forbidden);
@@ -455,7 +461,9 @@ fn executor_child() {
         let proxy = tokio::spawn(crate::proxy::start_proxy_with_listeners(vec![
             crate::proxy::transport::ListenConfig::new(crate::proxy::transport::ListenSpec::default_tcp(0),
                 crate::proxy::transport::IdentityRequirement::Require)],false));
-        read_when_ready(&root.join("finish.json")).await;
+        // The full request sequence includes repeated real password hashing.
+        // Startup readiness is not a suitable lifetime limit under CI contention.
+        read_within(&root.join("finish.json"), RUN_TIMEOUT).await;
         write(&root.join("audit.json"), &serde_json::to_value(grants::owner_audit(&vault,100).unwrap()).unwrap());
         let mut statement = vault.db().prepare("SELECT g.operation,a.state,a.secret_released,a.provider_released,a.old_password_released FROM operation_attempts a JOIN operation_grants g ON a.grant_id=g.id ORDER BY g.operation").unwrap();
         let rows: Vec<Value> = statement.query_map([], |row| Ok(json!({"operation":row.get::<_,String>(0)?,"state":row.get::<_,String>(1)?,

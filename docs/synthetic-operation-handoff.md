@@ -14,7 +14,9 @@ real operation route; only the executor releases the selected value over SSH.
 The destination records attempt IDs and delivery counts, never the received value.
 
 The parent concurrently invokes the same grant twice: exactly one succeeds and
-only one destination delivery occurs. A later HTTP replay is rejected by the
+only one destination delivery occurs. `join!` and a 150ms destination delay
+encourage overlap but do not provide a deterministic overlap barrier.
+A later HTTP replay is rejected by the
 executor. Separately, an owner-side test probe using the fixture SSH key replays
 that attempt directly and is rejected by the
 destination fixture's SQLite reservation, before the secret callback runs. This
@@ -33,15 +35,20 @@ case returns `outcome_unknown`; replay never releases again. HTTP header names,
 header values, bodies, captured child output, audit and destination replay-store
 bytes are scanned for raw/base64 selected-value and other specified canaries.
 Audit assertions check field names, requester/operation/credential identities,
-authorization/start/terminal/denial counts; internal attempt rows verify exactly
-one selected-value release per delivered operation and no provider/old-password
-release. Expected totals are seven attempts, five deliveries and one separately
+authorization/start/terminal/denial counts. Internal attempt rows assert selected-value,
+provider and old-password release flags; these are not independent release counters.
+Persistent destination counters separately verify deliveries and reservations.
+Expected totals are seven attempts, five deliveries and one separately
 rejected destination replay. Denied preflight requests create no attempts.
 
 Child processes receive a cleared environment, explicit disposable vault
 directories and private scratch files. Deadlines and child guards bound execution
 and terminate only fixture processes. These checks cover the specified raw and
 base64 canaries, not arbitrary encoding or host-level forensic guarantees.
+Startup readiness waits are bounded to 60 seconds. Each child has a separate
+three-minute lifetime watchdog to allow the full sequence of real authentication
+hashes under CI contention. HTTP requests remain bounded to 15 seconds, SSH
+operations to 10 seconds, and issued grants to 120 seconds.
 
 This exercises production HTTP routing, instance authentication, grant consumption,
 vault release and SSH transport. Grants are seeded through internal test APIs:

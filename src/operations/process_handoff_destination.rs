@@ -1,5 +1,5 @@
 //! Test-only persistent SSH peer. This is not the production restricted helper.
-use super::process_handoff_tests::{CANARY, write};
+use super::process_handoff_tests::{CANARY, RUN_TIMEOUT, write};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use russh::keys::{Algorithm, HashAlg, PrivateKey, PublicKey, ssh_key::LineEnding};
 use russh::{Channel, ChannelId, server};
@@ -201,7 +201,7 @@ pub(super) async fn run(root: &Path) {
         "helper_path":"/fixture/deliver","identity_file":key_path,"wrong_identity_file":wrong_path}),
     );
     let mut sessions = tokio::task::JoinSet::new();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let deadline = tokio::time::Instant::now() + RUN_TIMEOUT;
     loop {
         tokio::select! {
             accepted = listener.accept() => {
