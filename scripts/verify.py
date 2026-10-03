@@ -35,6 +35,13 @@ def suites(root=ROOT):
             (browser, ["npm", "run", "test:browser"]),
         ],
         "automation": [(root, [sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-v"])],
+        # Compiles the real platform backend, but never opens its OS prompt.
+        "native-host": [
+            (root, ["cargo", "test", "--locked", "--lib", "core::browser::tests"]),
+            (root, ["cargo", "test", "--locked", "--lib", "browser_host::tests"]),
+            (root, ["cargo", "test", "--locked", "--test", "browser_handoff"]),
+            (root, [sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-p", "test_browser_host_macos.py", "-v"]),
+        ],
         "tray": [*tray_build,
             (root, ["cargo", "clippy", "--locked", "-p", "wispkey-tray", "--all-targets", "--", "-D", "warnings"]),
             (root, ["cargo", "test", "--locked", "-p", "wispkey-tray"]),

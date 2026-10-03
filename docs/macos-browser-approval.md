@@ -1,0 +1,126 @@
+# macOS browser approval design and acceptance
+
+This is the macOS slice of #1/#43. It preserves the existing separate human
+browser profile and local plaintext boundary. Generated signup-profile logins
+use the same approval boundary; the saved identity remains a credential snapshot.
+This backend makes no profile or transfer schema changes. Cloud relay is separate.
+
+## Trust boundary
+
+The extension initiates a fill only from its own popup in the human profile.
+Its button starts OS verification; it cannot itself approve disclosure. The
+native host captures the pending request, closes the vault and invokes an
+in-process Objective-C bridge linked to Apple's AppKit/LocalAuthentication.
+A read-only, scrollable native window displays the full exact origin, project,
+credential name, request ID, expiry and explicitly unverified agent labels.
+Neither this window nor the extension provides an alternative approval button.
+
+Every attempt creates a new `LAContext`, sets
+`touchIDAuthenticationAllowableReuseDuration = 0`, hides the fallback button and
+uses only `LAPolicyDeviceOwnerAuthenticationWithBiometrics`. There is no
+`deviceOwnerAuthentication` password fallback, companion fallback, shell helper,
+reusable bearer approval, environment bypass or agent-supplied success value.
+Unavailable, unenrolled or locked-out Touch ID fails closed. Capability listing
+uses `canEvaluatePolicy` without opening a prompt; availability may change before
+verification and is checked again. Enrollment and hardware configuration are the
+user's responsibility, outside the installer.
+
+The reply block runs on Apple's private queue; a semaphore publishes its boolean
+result. A bounded main-thread event loop processes window close events. Cancellation,
+window close or timeout invalidates the context, and a late callback cannot change
+the returned denial. The maximum wait is 110 seconds, shortened to the request's
+remaining lifetime. The host then reopens the unlocked session and uses the
+existing transaction to compare every request field (including expiry), exact
+HTTPS origin, credential identity/revision, eligibility and pending one-use state
+before decrypting. OS approval does not override vault lock, expiration, revocation,
+changed metadata, form/navigation checks or a concurrent earlier release.
+
+Cancel, refusal and backend failure deny the pending request without decrypting;
+expiry may instead leave it failed. Audit events record existing bounded metadata,
+never OS error text, biometric data, requester/reason strings or login payloads.
+A failed audit prevents release. Neither cancellation nor fill failure removes or
+activates the saved login. Completion still means fields filled, never submitted.
+
+Same-owner malicious code can tamper with binaries/vault state or observe a
+controlled browser; this is not OS-account isolation or a cryptographic attestation
+of the webpage. Existing owner plaintext-egress tools are unchanged. Install only
+in a profile unavailable to the agent, and use OS-account/process isolation when
+needed. No process identity claim is inferred from native-messaging argv.
+
+## Automated suite and its limits
+
+`python3 scripts/verify.py --suite native-host` covers the real native framing and
+metadata-only protocol, origin mismatch, expired/denied/replayed requests,
+credential changes, full snapshot mutation, cancellation/backend errors, lock,
+audit redaction/failure and concurrent one-use release using synthetic vaults.
+The outcome tests feed synthetic verifier results to the internal state machine;
+there is no production configuration that selects a mock verifier. They do not
+invoke or prove physical user presence. On macOS the real Objective-C bridge is
+compiled and linked by Cargo. Python tests create only disposable installation
+fixtures and never execute the fixture host or write a real browser manifest.
+The combined profile/native regression covers a registered non-default HTTPS
+port, profile editing during a synthetic approval, unchanged saved identity,
+one-use release and rejection of a changed request expiry.
+Host validation covers the complete canonical ancestor chain, including ownership,
+entry replacement permissions and post-plan symlink substitution. Root/user-owned
+sticky shared ancestors protect the trusted child entries; other shared-writable
+ancestors fail closed. Original input aliases cannot redirect a manifest after
+canonicalization. Same-owner tampering remains outside this isolation boundary.
+
+POSIX mode bits alone do not establish this boundary on macOS: an extended ACL
+can grant another user write or delete access without changing those bits. The
+installer reads Darwin ACLs through `acl_get_fd_np` on a non-following, read-only
+descriptor, checks path/descriptor identity before and after inspection, and
+bounds enumeration to Darwin's 128-entry limit. It checks the host, every canonical
+ancestor, registration directories (including newly created ones), and the
+temporary manifest before publication. Planning checks existing directories
+without creating them. Missing APIs, unsupported ACLs and inspection errors fail
+closed; descriptor `ENOENT` denotes the absent ACL property in Apple's API.
+
+The policy preserves deny entries, including the common macOS deny-delete entry,
+and allow entries containing only read/search/execute, metadata-read or synchronize
+rights. It rejects every mutation-capable or unknown allow right, including
+inherited and inherit-only grants. This is deliberately conservative: even grants
+to the owner/root or grants preceded by a deny are refused; principal membership
+and ACE ordering are not inferred. The installer never removes or repairs ACLs.
+Manifest mode is 0600; an inherited read-only ACL may still permit reading this
+non-secret registration metadata. Tests exercise native ACLs allocated only in
+memory and synthetic reader failures; no test changes a filesystem ACL or proves
+physical user presence.
+
+ACL references: [Apple ACL permissions](https://raw.githubusercontent.com/apple-oss-distributions/file_cmds/main/chmod/chmod.1),
+[descriptor ACL reader](https://raw.githubusercontent.com/apple-oss-distributions/Libc/main/posix1e/acl_file.c),
+[absent ACL property](https://raw.githubusercontent.com/apple-oss-distributions/Libc/main/gen/filesec.c),
+[Darwin entry iteration](https://raw.githubusercontent.com/apple-oss-distributions/Libc/main/posix1e/acl_entry.c).
+
+## Required human acceptance — NOT RUN by automated suites
+
+Record commit, date, tester, macOS version, Mac/Touch ID hardware, browser/version,
+and pass/fail/not-run. Use disposable synthetic logins and a human-controlled
+profile. Do not record passwords, native-message payloads or prompt screenshots.
+
+| Check | Expected result | Status |
+| --- | --- | --- |
+| Chrome, Edge and Firefox manual registration | Exact extension allowlist; native listing works only after explicit setup | Not run |
+| Touch ID enrolled and available | Full metadata shown; successful biometric authorizes one fill | Not run |
+| No Touch ID / not enrolled / locked out | Fill unavailable/refused; no alternate approval route | Not run |
+| Recent biometric device unlock, then new request | Fresh biometric evaluation required, no cached unlock acceptance | Not run |
+| Cancel OS prompt or close metadata window | No fill; request denied; saved login remains pending | Not run |
+| Wait for timeout/expiry | Prompt dismissed; no fill; new request required | Not run |
+| Lock vault, edit credential or change request during prompt | No payload released after verification | Not run |
+| Navigate/change form during prompt | No fill into changed document/target | Not run |
+| Successful login/two-password signup fill | Same saved password, correct origin/fields; no submit or consent changes | Not run |
+| Replay completed/denied request | No second disclosure | Not run |
+| Reopen popup; inspect MCP status/audit | Metadata only; no login payload or untrusted labels in audit | Not run |
+| Remove selected manifest and extension | Native handoff no longer connects; no background service remains | Not run |
+
+Do not automate these OS dialogs or change permissions, enrollment, Gatekeeper,
+security settings or persistent access to pass acceptance. Release signing and
+browser-store distribution are not implemented by this source preview.
+
+Primary references: [Apple LAContext](https://developer.apple.com/documentation/localauthentication/lacontext),
+[biometric-only policy](https://developer.apple.com/documentation/localauthentication/lapolicy/deviceownerauthenticationwithbiometrics),
+[unlock reuse interval](https://developer.apple.com/documentation/localauthentication/lacontext/touchidauthenticationallowablereuseduration),
+[Chrome native messaging](https://developer.chrome.com/docs/extensions/develop/concepts/native-messaging),
+[Firefox native messaging](https://developer.mozilla.org/en-US/docs/Mozilla/Add-ons/WebExtensions/Native_messaging),
+[Edge native messaging](https://learn.microsoft.com/en-us/microsoft-edge/extensions/developer-guide/native-messaging).

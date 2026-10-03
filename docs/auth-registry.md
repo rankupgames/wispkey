@@ -141,7 +141,7 @@ and recreating identities is a recovery operation, not a global revocation ledge
 review recovered policy before reconnecting consumers. Cloud stores encrypted
 snapshots and does not execute credentials.
 
-## Boundaries and next gates
+## Current boundaries
 
 Existing `website_login` credentials can opt into the registry at their exact
 HTTPS origin, including a non-default port such as `https://jobs.example.com:8443`.
@@ -155,19 +155,10 @@ browser, or invalidate previously copied material. Provider-side revocation and
 verification require separate provider integrations. Browser validity is distinct
 from provider token expiry and WispKey's local deadline.
 
-OAuth needs issuer/resource binding, PKCE, expiry-aware serialized refresh,
-rotation ownership, and reconnect handling. Browser-session reuse needs explicit
-account/site/destination consent, cookie-attribute preservation, a trusted execution
-boundary and response handling. The current reverse proxy forwards upstream
-response headers and bodies, so it is not a hidden browser-session broker. Neither
-capability, nor universal provider compatibility, is implemented here.
-
-Custom per-auth login notes are a separate next slice: encrypted human-authored
-instructions, strict size limits, explicit owner-controlled access, and encrypted
-round-trip coverage. Notes must stay separate from account identity, origin/scope
-policy and approvals. They must never become executable instructions or policy
-authority, and must not appear in default inventory/MCP metadata. This foundation
-does not store login notes.
+OAuth refresh, browser-session reuse and per-auth login notes are not implemented
+by this registry. The current reverse proxy forwards upstream response headers
+and bodies, so it is not a hidden browser-session broker. Neither universal
+provider compatibility nor provider-side revocation is established here.
 
 ## Synthetic verification
 

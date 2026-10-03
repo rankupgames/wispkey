@@ -1,7 +1,7 @@
 # Encrypted partition synchronization
 
 Cloud sync requires a backend implementing conditional partition revisions and
-payload download ([backend PR #1](https://github.com/rankupgames/wispkey-cloud/pull/1)).
+payload download.
 Deploy its reviewed database migration before enabling the new Worker. An older
 backend is incompatible; the CLI does not fall back to unconditional uploads.
 Local vault, proxy, injection, and sharing commands continue to work offline.

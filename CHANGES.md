@@ -2,18 +2,25 @@
 
 ## Unreleased
 
+### macOS native browser approval preview
+
+- Added in-process biometric-only LocalAuthentication with a fresh context, zero device-unlock reuse, bounded cancellation and no password/button fallback. Missing, unenrolled or locked-out Touch ID fails closed.
+- Added an explicit per-user macOS native-host manifest installer for Chrome, Edge and Firefox; it defaults to a read-only plan and refuses broad IDs, insecure paths and overwrites.
+- Bound approval to unchanged request expiry as well as origin, credential revision and existing request metadata. Added cancellation, mutation, audit-redaction and installer regressions plus a reusable native-host suite.
+- Actual Touch ID and installed-browser acceptance remain user-assisted gates; see `docs/macos-browser-approval.md`. This does not implement signup profiles or Cloud relay.
+
 ### Opt-in auth registry and reusable bundles
 
 - Added schema-v14 metadata-only auth inventory with explicit provider expiry, separate local deadlines, exact HTTPS origins and terminal local revocation. Unknown expiry requires a bounded local deadline; legacy unregistered credentials retain their existing behavior.
 - Added `auth register/list/revoke` and explicit project/account/alternative bundle selection with pinned portable member references and all-or-nothing resolution.
 - Enforced registered policy at proxy, owner process, approved browser, MCP certificate and one-use operation release boundaries. Registered ciphertext fails closed in older readers; imports/sync/backup preserve restrictions atomically.
-- Added synthetic expiry, revision, scope, redaction and encrypted recovery coverage. OAuth refresh, browser-session reuse and cloud credential execution remain future gates; see `docs/auth-registry.md`.
+- Added synthetic expiry, revision, scope, redaction and encrypted recovery coverage. OAuth refresh, browser-session reuse and cloud credential execution are not included; see `docs/auth-registry.md`.
 
 ### Conservative signup form mapping
 
 - Browser handoff recognizes explicitly declared username/email purposes, including supported section/contact prefixes, and form-associated controls outside the form element.
 - Unrelated profile/OTP fields and consent controls stay untouched. Ambiguous identity mappings and unsupported password purposes are refused; two explicit new-password fields still receive the same saved password.
-- Changed form targets, purposes, and submission destinations during approval require a fresh request. Added Node and browser-engine fixtures; reusable profile storage, macOS approval, and Cloud relay remain separate work under #43.
+- Changed form targets, purposes, and submission destinations during approval require a fresh request. Added Node and browser-engine fixtures; reusable profile storage and Cloud relay remain separate work under #43.
 
 ### Local diagnostics and owner IPC reliability
 

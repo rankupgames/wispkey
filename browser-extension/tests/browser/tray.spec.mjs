@@ -1,6 +1,6 @@
 // Real built Svelte UI with synthetic, mocked owner IPC; not OS authentication.
 import { test, expect } from "@playwright/test";
-import { readFile } from "node:fs/promises";
+import { readFile, readdir } from "node:fs/promises";
 
 const html = await readFile(new URL("../../../crates/wispkey-tray/ui-dist/index.html", import.meta.url), "utf8");
 
@@ -21,6 +21,22 @@ async function fixture(page, view, ok = true, transport = "available") {
   await page.route("https://tray.test/**", (route) => route.fulfill({ contentType: "text/html", body: html.replaceAll("WISPKEY_INITIAL_VIEW", view) }));
   await page.goto("https://tray.test/");
 }
+
+test("embedded tray bootstraps from one HTML file without external assets", async ({ page }) => {
+  const requests = [];
+  const errors = [];
+  page.on("request", (request) => requests.push(request.url()));
+  page.on("pageerror", (error) => errors.push(error.message));
+  // Only fixture()'s HTML navigation may succeed. A split JS/CSS chunk or a
+  // remote runtime dependency must not be masked by a development server.
+  await page.route("**/*", (route) => route.abort());
+  await fixture(page, "unlock");
+  await expect(page.getByLabel("Master password")).toBeVisible();
+  await expect(page.locator("script[src], link[rel=stylesheet], link[rel=modulepreload]")).toHaveCount(0);
+  expect(await readdir(new URL("../../../crates/wispkey-tray/ui-dist/", import.meta.url))).toEqual(["index.html"]);
+  expect(requests).toEqual(["https://tray.test/"]);
+  expect(errors).toEqual([]);
+});
 
 test("generated login requires current destination confirmation and sends metadata only", async ({ page }) => {
   await fixture(page, "login");

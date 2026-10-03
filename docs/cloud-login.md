@@ -28,7 +28,7 @@ issuer's exact `/oauth/authorize` and `/oauth/token` endpoints. Cross-origin
 endpoints and redirects fail closed. The legacy `WISPKEY_CLOUD_SIGN_IN_URL`
 override is removed.
 
-This draft depends on the paired [Cloud OAuth preview](https://github.com/rankupgames/wispkey-cloud/pull/6).
+This preview requires a compatible backend implementing the deployment contract above.
 The public config endpoint is disabled by default. Clerk's official Frontend API
 specifies `resource` on both authorization and token exchange; exchange requires
 an exact match to the original authorization grant. Before enabling this preview,

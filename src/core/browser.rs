@@ -284,6 +284,7 @@ pub(crate) fn release(vault: &Vault, approved: &FillRequest) -> Result<WebsiteLo
         || current.name != approved.name
         || current.requester != approved.requester
         || current.reason != approved.reason
+        || current.expires_at != approved.expires_at
     {
         return Err("request changed after approval");
     }
@@ -702,5 +703,238 @@ mod tests {
             status(&vault, &request.request_id).unwrap().status,
             "pending"
         );
+    }
+
+    #[test]
+    fn native_approval_preserves_profile_snapshot_port_and_exact_expiry() {
+        use crate::core::auth::{AuthRegistration, ProviderExpiry};
+        use crate::core::signup::{ProfileSelection, SignupIdentity};
+        let vault = fixture();
+        let profile = vault
+            .create_signup_profile(
+                "default",
+                "personal",
+                "native-test",
+                SignupIdentity {
+                    email: "original@example.test".into(),
+                    username: None,
+                },
+            )
+            .unwrap();
+        let selection = ProfileSelection {
+            id: &profile.id,
+            revision: &profile.revision,
+            project: "default",
+            partition: "personal",
+            use_username: false,
+        };
+        let origin = "https://signup.example.test:8443";
+        vault
+            .generate_signup_login(
+                selection,
+                GenerateWebsiteLoginRequest {
+                    name: "profile-login",
+                    username: "",
+                    url: origin,
+                    project: Some("default"),
+                    partition: Some("personal"),
+                    review_at: None,
+                    length: None,
+                    symbols: true,
+                },
+            )
+            .unwrap();
+        vault
+            .register_auth(
+                "default",
+                "profile-login",
+                AuthRegistration {
+                    provider: "synthetic".into(),
+                    account: "synthetic".into(),
+                    origins: vec![origin.into()],
+                    provider_expiry: ProviderExpiry::NonExpiring,
+                    use_until: Some(Utc::now() + chrono::Duration::hours(1)),
+                },
+            )
+            .unwrap();
+        for wrong in [
+            "https://signup.example.test",
+            "https://signup.example.test:8444",
+        ] {
+            assert!(request(&vault, "profile-login", "default", wrong, "agent", "test").is_err());
+        }
+        let pending = request(&vault, "profile-login", "default", origin, "agent", "test").unwrap();
+        // A profile edit during the synthetic prompt does not replace the
+        // identity already encrypted into the generated credential.
+        vault
+            .update_signup_profile(
+                selection,
+                SignupIdentity {
+                    email: "edited@example.test".into(),
+                    username: None,
+                },
+            )
+            .unwrap();
+        // Feed only the internal result handler; this does not invoke or prove
+        // LocalAuthentication or physical user presence.
+        let released = crate::browser_host::finish_approval(&vault, &pending, Ok(true)).unwrap();
+        assert_eq!(released.username, "original@example.test");
+        assert!(crate::browser_host::finish_approval(&vault, &pending, Ok(true)).is_err());
+
+        let pending = request(
+            &vault,
+            "profile-login",
+            "default",
+            origin,
+            "agent",
+            "expiry",
+        )
+        .unwrap();
+        vault
+            .db()
+            .execute(
+                "UPDATE browser_fill_requests SET expires_at=expires_at+60 WHERE request_id=?1",
+                [&pending.request_id],
+            )
+            .unwrap();
+        assert!(crate::browser_host::finish_approval(&vault, &pending, Ok(true)).is_err());
+        assert_eq!(
+            status(&vault, &pending.request_id).unwrap().status,
+            "pending"
+        );
+        assert_eq!(
+            vault
+                .get_credential_in_project("default", "profile-login")
+                .unwrap()
+                .lifecycle_state,
+            "pending"
+        );
+    }
+
+    #[test]
+    fn native_cancel_denial_and_unavailable_are_terminal_without_decryption() {
+        // Synthetic OS outcomes exercise the production state transition, not
+        // LocalAuthentication or physical user presence.
+        for outcome in [Ok(false), Err("OS verification unavailable")] {
+            let mut vault = fixture();
+            let request = enqueue(&vault);
+            vault.master_key = None;
+            assert!(crate::browser_host::finish_approval(&vault, &request, outcome).is_err());
+            assert_eq!(
+                status(&vault, &request.request_id).unwrap().status,
+                "denied"
+            );
+            vault.master_key = Some([7; 32]);
+            assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_err());
+            assert_eq!(
+                vault
+                    .get_credential_in_project("default", "careers")
+                    .unwrap()
+                    .lifecycle_state,
+                "pending"
+            );
+        }
+    }
+
+    #[test]
+    fn approval_binds_every_request_field_including_deadline() {
+        for column in [
+            "name",
+            "project",
+            "origin",
+            "requester",
+            "reason",
+            "credential_id",
+            "revision",
+            "expires_at",
+        ] {
+            let vault = fixture();
+            let request = enqueue(&vault);
+            let value = if column == "expires_at" {
+                (request.expires_at + 60).to_string()
+            } else {
+                "changed-after-prompt".into()
+            };
+            vault
+                .db()
+                .execute(
+                    &format!("UPDATE browser_fill_requests SET {column}=?1 WHERE request_id=?2"),
+                    params![value, request.request_id],
+                )
+                .unwrap();
+            assert!(
+                crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_err(),
+                "{column}"
+            );
+            let approved: i64 = vault
+                .db()
+                .query_row(
+                    "SELECT count(*) FROM audit_log WHERE event_type='BrowserFillApproved'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(approved, 0, "{column}");
+        }
+    }
+
+    #[test]
+    fn approved_snapshot_cannot_release_after_lock_or_replay() {
+        let mut vault = fixture();
+        let request = enqueue(&vault);
+        vault.master_key = None;
+        assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_err());
+        assert_eq!(
+            status(&vault, &request.request_id).unwrap().status,
+            "pending"
+        );
+        vault.master_key = Some([7; 32]);
+        assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_ok());
+        assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_err());
+    }
+
+    #[test]
+    fn native_outcome_audit_redacts_payload_and_untrusted_labels() {
+        let vault = fixture();
+        let request = request(
+            &vault,
+            "careers",
+            "default",
+            "https://jobs.example.com",
+            "private-agent-label",
+            "private-reason-label",
+        )
+        .unwrap();
+        let login = crate::browser_host::finish_approval(&vault, &request, Ok(true)).unwrap();
+        let denied = enqueue(&vault);
+        assert!(crate::browser_host::finish_approval(&vault, &denied, Ok(false)).is_err());
+        let mut statement = vault.db().prepare("SELECT * FROM audit_log").unwrap();
+        let columns = statement.column_count();
+        let rows = statement
+            .query_map([], |row| {
+                Ok((0..columns)
+                    .filter_map(|index| {
+                        row.get_ref(index)
+                            .ok()
+                            .and_then(|v| v.as_str().ok())
+                            .map(str::to_owned)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" "))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join(" ");
+        for private in [
+            login.password.as_str(),
+            "test@example.com",
+            "private-agent-label",
+            "private-reason-label",
+        ] {
+            assert!(!rows.contains(private));
+        }
+        assert!(rows.contains("BrowserFillApproved"));
+        assert!(rows.contains("BrowserFillDenied"));
     }
 }

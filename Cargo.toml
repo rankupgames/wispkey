@@ -112,6 +112,9 @@ tempfile = "3"
 # SQLite read barrier for deterministic two-connection profile race regression.
 rusqlite = { version = "0.32", features = ["functions"] }
 
+[build-dependencies]
+cc = "1"
+
 [profile.release]
 lto = true
 strip = true
