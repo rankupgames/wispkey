@@ -1,12 +1,22 @@
-# Secure Tray GUI Implementation Plan
+# Secure Tray GUI Implementation Record
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+Historical implementation record for the August 25, 2026 tray work. The local
+tray and owner IPC are implemented; this file is not an outstanding task list.
+See [current tray usage and platform limits](../../tray.md) for operation.
+The original implementation plan remains in Git history.
 
-**Goal:** Ship an optional WispKey tray that can securely add single and OVH-template credentials over authenticated local IPC.
+## Implemented components
 
-**Architecture:** Keep CLI as the core binary. Expose a library with vault atomic writes plus owner IPC. Add `wispkey tray --ipc-only` for headless tests and a `wispkey-tray` crate with tray-icon plus Svelte 5 webview.
+| Component | Source | Current behavior |
+| --- | --- | --- |
+| Vault and OVH template | `src/core/mod.rs`, `src/core/templates.rs` | Input validation, atomic credential addition and compound OVH saves. |
+| Library and owner IPC | `src/lib.rs`, `src/owner_ipc/mod.rs`, `src/main.rs` | Local lock/unlock and authenticated owner IPC, including headless `wispkey tray --ipc-only`. |
+| Optional tray | `crates/wispkey-tray/`, `crates/wispkey-tray/ui/` | Tray menu, credential/list/settings dialogs and masked secret input; closing a dialog does not quit. |
+| Default build boundary | Root `Cargo.toml` | Workspace `default-members = ["."]` excludes the optional GUI from default tests. |
 
-**Tech Stack:** Rust, rusqlite, tokio Unix sockets / Windows named pipes, Svelte 5, tray-icon, wry.
+The start-at-login preference is stored on all supported platforms, but only
+Linux registers/removes an autostart entry. Saving the setting on macOS or
+Windows does not register the application to start at login.
 
 ## Global Constraints
 
@@ -17,50 +27,10 @@
 - Default `cargo test` must pass without GUI system libraries.
 - Existing CLI and proxy behavior stays intact except empty-value rejection and new lock/tray commands.
 
----
 
-### Task 1: Vault validation, atomic add, lock, OVH template
+## Existing verification surfaces
 
-**Files:**
-- Modify: `src/core/mod.rs`
-- Modify: `src/core/session.rs`
-- Create: `src/core/templates.rs`
-- Test: `src/core/tests.rs`
-
-- [ ] Write failing unit tests for empty value, atomic rollback, OVH expansion
-- [ ] Implement validation, `add_credentials_atomic`, `lock`, OVH template
-- [ ] Run `cargo test --lib core::tests` until green
-- [ ] Commit
-
-### Task 2: Library surface and owner IPC
-
-**Files:**
-- Create: `src/lib.rs`
-- Create: `src/owner_ipc/mod.rs`
-- Modify: `src/main.rs`
-- Test: `src/owner_ipc/mod.rs` unit tests and `tests/owner_ipc.rs`
-
-- [ ] Convert package to lib+bin
-- [ ] Implement JSON IPC with same-user auth and redaction
-- [ ] Add `wispkey lock` and `wispkey tray --ipc-only`
-- [ ] Integration tests for save, rollback, locked vault, duplicate, unauthorized, redaction
-- [ ] Commit
-
-### Task 3: Optional tray GUI
-
-**Files:**
-- Create: `crates/wispkey-tray/`
-- Create: Svelte 5 UI under `crates/wispkey-tray/ui`
-- Modify: root `Cargo.toml` workspace `default-members = ["."]`
-
-- [ ] Tray menu, add/list/settings dialogs, masked secrets, start-at-login setting
-- [ ] Closing dialogs does not quit
-- [ ] Commit
-
-### Task 4: Docs and PR
-
-**Files:** `README.md`, `AGENTS.md`, `docs/security-model.md`, `CHANGES.md`, `docs/tray.md`
-
-- [ ] Document tray, IPC, OVH template, and security boundary
-- [ ] `cargo fmt`, clippy, test
-- [ ] Open PR
+Vault tests are in `src/core/tests.rs`; owner IPC unit/integration coverage is in
+`src/owner_ipc/mod.rs` and `tests/owner_ipc.rs`. Current operating and security
+guidance lives in `docs/tray.md`, `docs/security-model.md` and `AGENTS.md`.
+This record does not claim a new test run or cross-platform autostart acceptance.

@@ -27,6 +27,14 @@ Tray menu:
 
 The tooltip shows locked or unlocked status. Secret fields are masked by default, with explicit reveal and copy actions. Idle timeout, save, cancel, lock, and failure clear secret form state.
 
+## Start-at-login platform limits
+
+The Settings dialog stores the `start_at_login` preference in the owner-only
+`tray.json` file. On Linux, saving it also creates or removes
+`autostart/wispkey-tray.desktop` under the user's configuration directory.
+On macOS and Windows, the preference is stored but no login-startup registration
+is created. A successful save on those platforms does not enable autostart.
+
 ## Owner IPC
 
 The server listens on an owner-only Unix socket (`~/.wispkey/owner.sock`, or `$WISPKEY_VAULT_PATH/owner.sock`) and writes `owner.json` for discovery. Unix connections must present the same UID as the server. Socket and metadata files are mode `0600`.
