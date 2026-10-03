@@ -361,5 +361,66 @@
         ]
       ]
     ]
+  },
+  "windows-receiver-test-artifact.yml": {
+    "events": [
+      "on:\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n    paths:\n      - '.github/workflows/windows-receiver-test-artifact.yml'\n      - 'scripts/windows_receiver_artifact.py'\n      - 'scripts/tests/test_windows_receiver_artifact.py'\n      - 'docs/windows-receiver-test-artifact.md'\n  push:\n    branches: [main]\n    paths:\n      - '.github/workflows/windows-receiver-test-artifact.yml'\n      - 'scripts/windows_receiver_artifact.py'\n      - 'scripts/tests/test_windows_receiver_artifact.py'\n      - 'docs/windows-receiver-test-artifact.md'"
+    ],
+    "permissions": [
+      "permissions:\n  contents: read",
+      "permissions:\n  contents: read\n  id-token: write\n  attestations: write"
+    ],
+    "environment": [
+      "env:\n  CARGO_INCREMENTAL: '0'\n  CHECKED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
+    ],
+    "job_gates": [
+      "    needs: build",
+      "    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'",
+      "    needs: validate"
+    ],
+    "action_inputs": [
+      [
+        "actions/checkout",
+        [
+          "with:\n  ref: ${{ env.CHECKED_SHA }}\n  persist-credentials: false"
+        ]
+      ],
+      [
+        "Swatinem/rust-cache",
+        [
+          "with:\n  shared-key: windows-receiver-test"
+        ]
+      ],
+      [
+        "actions/upload-artifact",
+        [
+          "with:\n  name: unvalidated-windows-receiver-${{ env.CHECKED_SHA }}\n  path: dist/wispkey-windows-x64-receiver-test.zip\n  retention-days: 1\n  if-no-files-found: error"
+        ]
+      ],
+      [
+        "actions/checkout",
+        [
+          "with:\n  ref: ${{ env.CHECKED_SHA }}\n  persist-credentials: false"
+        ]
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  name: unvalidated-windows-receiver-${{ env.CHECKED_SHA }}\n  path: dist"
+        ]
+      ],
+      [
+        "actions/upload-artifact",
+        [
+          "with:\n  name: verified-windows-receiver-${{ env.CHECKED_SHA }}\n  path: |\n    dist/wispkey-windows-x64-receiver-test.zip\n    dist/smoke-report.json\n    dist/SHA256SUMS.txt\n  retention-days: 7\n  if-no-files-found: error"
+        ]
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  name: verified-windows-receiver-${{ env.CHECKED_SHA }}\n  path: dist"
+        ]
+      ]
+    ]
   }
 }
