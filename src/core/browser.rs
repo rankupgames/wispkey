@@ -23,9 +23,11 @@ pub struct FillRequest {
     pub status: String,
     pub expires_at: i64,
     #[serde(skip)]
-    credential_id: String,
+    pub(super) credential_id: String,
     #[serde(skip)]
-    revision: String,
+    pub(super) revision: String,
+    #[serde(skip)]
+    pub(super) receiver_binding: Option<String>,
 }
 
 pub(crate) fn create_schema(db: &Connection) -> rusqlite::Result<()> {
@@ -35,7 +37,7 @@ pub(crate) fn create_schema(db: &Connection) -> rusqlite::Result<()> {
         name TEXT NOT NULL, project TEXT NOT NULL, origin TEXT NOT NULL,
         requester TEXT NOT NULL, reason TEXT NOT NULL,
         status TEXT NOT NULL CHECK(status IN ('pending','approved','denied','completed','failed')),
-        expires_at INTEGER NOT NULL, credential_id TEXT NOT NULL, revision TEXT NOT NULL
+        expires_at INTEGER NOT NULL, credential_id TEXT NOT NULL, revision TEXT NOT NULL, receiver_binding TEXT
     );",
     )
 }
@@ -50,7 +52,7 @@ fn metadata_text(text: &str, max: usize) -> bool {
         })
 }
 
-fn revision(vault: &Vault, id: &str) -> Result<String> {
+pub(super) fn revision(vault: &Vault, id: &str) -> Result<String> {
     let encoded: String = vault
         .db()
         .query_row(
@@ -94,6 +96,7 @@ fn expire(vault: &Vault) -> Result<()> {
     )?;
     for request in expired {
         log(vault, &request, "BrowserFillFailed")?;
+        super::browser_receiver::expired(vault, &request)?;
     }
     db.execute("UPDATE browser_fill_requests SET status='failed' WHERE status IN ('pending','approved') AND expires_at <= ?1", [now])
         .map_err(|_| "browser request store unavailable")?;
@@ -118,6 +121,7 @@ fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<FillRequest> {
         expires_at: row.get("expires_at")?,
         credential_id: row.get("credential_id")?,
         revision: row.get("revision")?,
+        receiver_binding: row.get("receiver_binding")?,
     })
 }
 
@@ -193,28 +197,19 @@ pub fn request(
         expires_at: Utc::now().timestamp() + TTL_SECONDS,
         revision: revision(vault, &credential.id)?,
         credential_id: credential.id,
+        receiver_binding: None,
     };
-    vault
-        .db()
-        .execute(
-            "INSERT INTO browser_fill_requests VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9)",
-            params![
-                request.request_id,
-                request.name,
-                request.project,
-                request.origin,
-                request.requester,
-                request.reason,
-                request.expires_at,
-                request.credential_id,
-                request.revision
-            ],
-        )
-        .map_err(|_| "browser request store unavailable")?;
-    log(vault, &request, "BrowserFillRequested")?;
+    insert_request(vault, &request)?;
     tx.commit()
         .map_err(|_| "browser request store unavailable")?;
     Ok(request)
+}
+
+pub(super) fn insert_request(vault: &Vault, request: &FillRequest) -> Result<()> {
+    vault.db().execute("INSERT INTO browser_fill_requests (request_id,name,project,origin,requester,reason,status,expires_at,credential_id,revision,receiver_binding) VALUES (?1,?2,?3,?4,?5,?6,'pending',?7,?8,?9,?10)",
+        params![request.request_id,request.name,request.project,request.origin,request.requester,request.reason,request.expires_at,request.credential_id,request.revision,request.receiver_binding])
+        .map_err(|_| "browser request store unavailable")?;
+    log(vault, request, "BrowserFillRequested")
 }
 
 pub fn status(vault: &Vault, id: &str) -> Result<FillRequest> {
@@ -250,6 +245,7 @@ pub(crate) fn deny(vault: &Vault, id: &str) -> Result<()> {
         .map_err(|_| "browser request store unavailable")?;
     let request = load(vault, id)?;
     transition(vault, &request, "pending", "denied", "BrowserFillDenied")?;
+    super::browser_receiver::finish(vault, &request, false)?;
     tx.commit().map_err(|_| "browser request store unavailable")
 }
 
@@ -285,9 +281,11 @@ pub(crate) fn release(vault: &Vault, approved: &FillRequest) -> Result<WebsiteLo
         || current.requester != approved.requester
         || current.reason != approved.reason
         || current.expires_at != approved.expires_at
+        || current.receiver_binding != approved.receiver_binding
     {
         return Err("request changed after approval");
     }
+    let _receiver_guard = super::browser_receiver::release_guard(vault, &current)?;
     let credential = vault
         .get_credential_in_project(&current.project, &current.name)
         .map_err(|_| "login unavailable")?;
@@ -316,6 +314,7 @@ pub(crate) fn release(vault: &Vault, approved: &FillRequest) -> Result<WebsiteLo
     vault
         .ensure_auth_usable(&credential.id, true, Some(&current.origin))
         .map_err(|_| "auth unavailable")?;
+    super::browser_receiver::released(vault, &current)?;
     tx.commit()
         .map_err(|_| "browser request store unavailable")?;
     Ok(payload)
@@ -334,6 +333,7 @@ pub(crate) fn finish(vault: &Vault, id: &str, completed: bool) -> Result<()> {
         ("failed", "BrowserFillFailed")
     };
     transition(vault, &request, "approved", status, event)?;
+    super::browser_receiver::finish(vault, &request, completed)?;
     tx.commit().map_err(|_| "browser request store unavailable")
 }
 

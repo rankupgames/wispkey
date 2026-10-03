@@ -1,7 +1,7 @@
 use crate::core::browser::{FillRequest, Result};
 
 #[cfg(not(any(windows, target_os = "macos")))]
-pub(super) fn verify(_: &FillRequest) -> Result<bool> {
+pub(super) fn verify(_: &FillRequest, _: &str) -> Result<bool> {
     Err("this platform has no browser approval backend yet")
 }
 
@@ -24,7 +24,7 @@ unsafe extern "C" {
 }
 
 #[cfg(target_os = "macos")]
-pub(super) fn verify(request: &FillRequest) -> Result<bool> {
+pub(super) fn verify(request: &FillRequest, receiver_details: &str) -> Result<bool> {
     use std::ffi::CString;
 
     let remaining = request
@@ -36,7 +36,7 @@ pub(super) fn verify(request: &FillRequest) -> Result<bool> {
     let reason = CString::new(format!("Fill saved login only at {}", request.origin))
         .map_err(|_| "invalid approval metadata")?;
     let details = CString::new(format!(
-        "Fill only at {}\nLogin: {} / {}\nRequest: {}\nExpires (UTC epoch): {}\n\nAgent label (unverified): {}\nReason (unverified): {}\n\nVerify with Touch ID in the macOS prompt. Closing this window cancels. WispKey never submits the form.",
+        "{receiver_details}Fill only at {}\nLogin: {} / {}\nRequest: {}\nExpires (UTC epoch): {}\n\nAgent label (unverified): {}\nReason (unverified): {}\n\nVerify with Touch ID in the macOS prompt. Closing this window cancels. WispKey never submits the form.",
         request.origin, request.project, request.name, request.request_id,
         request.expires_at, request.requester, request.reason,
     ))
@@ -54,7 +54,7 @@ pub(super) fn verify(request: &FillRequest) -> Result<bool> {
 }
 
 #[cfg(windows)]
-pub(super) fn verify(request: &FillRequest) -> Result<bool> {
+pub(super) fn verify(request: &FillRequest, receiver_details: &str) -> Result<bool> {
     use windows::Security::Credentials::UI::{UserConsentVerificationResult, UserConsentVerifier};
     use windows::Win32::System::WinRT::{
         IUserConsentVerifierInterop, RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize,
@@ -107,7 +107,7 @@ pub(super) fn verify(request: &FillRequest) -> Result<bool> {
         }
         let window = Window(window);
         let prompt = HSTRING::from(format!(
-            "Fill only at {}\nLogin: {} / {}\nAgent label (unverified): {}\nReason (unverified): {}",
+            "{receiver_details}Fill only at {}\nLogin: {} / {}\nAgent label (unverified): {}\nReason (unverified): {}",
             request.origin, request.project, request.name, request.requester, request.reason,
         ));
         unsafe {

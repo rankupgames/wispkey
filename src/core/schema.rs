@@ -550,21 +550,36 @@ impl Vault {
             let tx = db.unchecked_transaction()?;
             super::auth::create_schema(&tx)?;
             super::signup::create_schema(&tx)?;
-            tx.execute(
-                "UPDATE vault_meta SET value=?1 WHERE key='version'",
-                [CURRENT_SCHEMA_VERSION],
-            )?;
+            tx.execute("UPDATE vault_meta SET value=?1 WHERE key='version'", ["15"])?;
             tx.commit()?;
         } else if version == "14" {
             let tx = db.unchecked_transaction()?;
             super::signup::create_schema(&tx)?;
+            tx.execute("UPDATE vault_meta SET value=?1 WHERE key='version'", ["15"])?;
+            tx.commit()?;
+        } else if version != "15" && version != CURRENT_SCHEMA_VERSION {
+            return Err(VaultError::AuthRejected("unsupported vault schema"));
+        }
+
+        let version: String = db.query_row(
+            "SELECT value FROM vault_meta WHERE key='version'",
+            [],
+            |r| r.get(0),
+        )?;
+        if version == "15" {
+            let tx = db.unchecked_transaction()?;
+            if !table_has_column(&tx, "browser_fill_requests", "receiver_binding")? {
+                tx.execute(
+                    "ALTER TABLE browser_fill_requests ADD COLUMN receiver_binding TEXT",
+                    [],
+                )?;
+            }
+            super::browser_receiver::create_schema(&tx)?;
             tx.execute(
                 "UPDATE vault_meta SET value=?1 WHERE key='version'",
                 [CURRENT_SCHEMA_VERSION],
             )?;
             tx.commit()?;
-        } else if version != CURRENT_SCHEMA_VERSION {
-            return Err(VaultError::AuthRejected("unsupported vault schema"));
         }
 
         // Older releases stored reusable capability tokens in audit rows. Remove
@@ -647,6 +662,7 @@ impl Vault {
         super::operation_grants::create_schema(db)?;
         super::auth::create_schema(db)?;
         super::signup::create_schema(db)?;
+        super::browser_receiver::create_schema(db)?;
         Ok(())
     }
 }

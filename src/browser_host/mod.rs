@@ -69,10 +69,12 @@ fn handle(message: &Value, released: &mut HashSet<String>) -> browser::Result<Va
             if request.status != "pending" || request.origin != field(message, "origin")? {
                 return Err("request expired, already decided or origin mismatch");
             }
+            let receiver_details =
+                crate::core::browser_receiver::approval_details(&vault, &request)?;
             // Close the vault while the user decides; do not hold a DB transaction
             // or an unlocked session across the potentially long approval prompt.
             drop(vault);
-            let verification = consent::verify(&request);
+            let verification = consent::verify(&request, &receiver_details);
             let vault = if verification == Ok(true) {
                 Vault::open_with_session()
                     .map_err(|_| "vault locked during approval; unlock and retry")?
