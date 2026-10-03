@@ -142,9 +142,13 @@ impl Vault {
 
     pub(super) fn load_session(&mut self) -> Result<()> {
         let store = session_store();
-        let record = match store.load() {
+        // Keep legacy-format upgrades in the same lock interval as the read so
+        // an intervening lock cannot be undone by rewriting an old session.
+        let guard = store.lock()?;
+        let record = match store.load_locked() {
             Ok(record) => record,
             Err(VaultError::SessionExpired) => {
+                drop(guard);
                 audit::log_event(
                     &self.db,
                     "SessionExpired",
@@ -164,7 +168,7 @@ impl Vault {
         };
         self.master_key = Some(record.key);
         if store.should_upgrade(&record) {
-            store.save(&record.key, record.issued_at, record.timeout_minutes)?;
+            store.save_locked(&record.key, record.issued_at, record.timeout_minutes)?;
         }
         Ok(())
     }

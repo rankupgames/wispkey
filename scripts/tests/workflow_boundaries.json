@@ -1,0 +1,304 @@
+{
+  "release.yml": {
+    "events": [
+      "on:\n  push:\n    tags: [\"v*\"]\n  workflow_dispatch:\n    inputs:\n      dry_run:\n        description: \"Build, test, sign, and package without publishing\"\n        type: boolean\n        default: true"
+    ],
+    "permissions": [
+      "permissions:\n  contents: read",
+      "permissions:\n  contents: read",
+      "permissions:\n  contents: read\n  id-token: write\n  attestations: write",
+      "permissions:\n  contents: read",
+      "permissions:\n  contents: write",
+      "permissions:\n  contents: read",
+      "permissions:\n  contents: read"
+    ],
+    "environment": [
+      "env:\n  CARGO_TERM_COLOR: always\n  CARGO_INCREMENTAL: 0",
+      "env:\n  VERSION: ${{ needs.verify.outputs.version }}",
+      "env:\n  VERSION: ${{ needs.verify.outputs.version }}",
+      "env:\n  VERSION: ${{ needs.verify.outputs.version }}",
+      "env:\n  VERSION: ${{ needs.verify.outputs.version }}",
+      "env:\n  CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}",
+      "env:\n  VERSION: ${{ needs.verify.outputs.version }}",
+      "env:\n  CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}",
+      "env:\n  VERSION: ${{ needs.verify.outputs.version }}"
+    ],
+    "job_gates": [
+      "    needs: verify",
+      "    needs: [verify, build]",
+      "    needs: [verify, smoke]",
+      "    needs: [verify, smoke, homebrew-local]",
+      "    needs: [verify, provenance]",
+      "    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}",
+      "    needs: [verify, provenance, publication-preflight]",
+      "    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}",
+      "    needs: [verify, publish-github]",
+      "    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}",
+      "    needs: [verify, homebrew-release, publication-preflight]",
+      "    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}",
+      "    needs: [verify, publish-crates]",
+      "    if: ${{ startsWith(github.ref, 'refs/tags/v') && (github.event_name == 'push' || inputs.dry_run == false) }}"
+    ],
+    "action_inputs": [
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "Swatinem/rust-cache",
+        [
+          "with:\n  shared-key: release-verify"
+        ]
+      ],
+      [
+        "actions/upload-artifact",
+        [
+          "with:\n  name: sbom\n  path: wispkey.cyclonedx.json\n  if-no-files-found: error"
+        ]
+      ],
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "Swatinem/rust-cache",
+        [
+          "with:\n  shared-key: release-${{ matrix.target }}"
+        ]
+      ],
+      [
+        "actions/upload-artifact",
+        [
+          "with:\n  name: wispkey-${{ matrix.target }}\n  path: dist/wispkey-${{ matrix.target }}.*\n  if-no-files-found: error"
+        ]
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  name: wispkey-${{ matrix.target }}\n  path: dist"
+        ]
+      ],
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  name: wispkey-aarch64-apple-darwin\n  path: dist"
+        ]
+      ],
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  pattern: wispkey-*\n  path: dist\n  merge-multiple: true"
+        ]
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  name: sbom\n  path: dist"
+        ]
+      ],
+      [
+        "actions/upload-artifact",
+        [
+          "with:\n  name: release-metadata\n  path: |\n    dist/SHA256SUMS.txt\n    dist/SHA256SUMS.txt.sigstore.json\n    dist/wispkey.rb\n    dist/wispkey.cyclonedx.json\n  if-no-files-found: error"
+        ]
+      ],
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  pattern: wispkey-*\n  path: dist\n  merge-multiple: true"
+        ]
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  name: release-metadata\n  path: dist"
+        ]
+      ],
+      [
+        "actions/checkout",
+        []
+      ]
+    ]
+  },
+  "automation-tests.yml": {
+    "events": [
+      "on:\n  pull_request:\n    branches: [main, development, release]\n  push:\n    branches: [main, development, release]"
+    ],
+    "permissions": [
+      "permissions:\n  contents: read"
+    ],
+    "environment": [],
+    "job_gates": [],
+    "action_inputs": [
+      [
+        "actions/checkout",
+        []
+      ]
+    ]
+  },
+  "owner-ipc-contention.yml": {
+    "events": [
+      "on:\n  workflow_dispatch:\n  pull_request:\n    paths:\n      - 'src/owner_ipc/**'\n      - 'src/core/**'\n      - 'tests/owner_ipc.rs'\n      - 'tests/owner_ipc_diagnostics.rs'\n      - 'tests/common/**'\n      - 'scripts/test-owner-ipc-contention.ps1'\n      - '.github/workflows/owner-ipc-contention.yml'\n  schedule:\n    - cron: '37 8 * * 1'"
+    ],
+    "permissions": [
+      "permissions:\n  contents: read"
+    ],
+    "environment": [],
+    "job_gates": [],
+    "action_inputs": [
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "Swatinem/rust-cache",
+        []
+      ]
+    ]
+  },
+  "cross-node-acceptance.yml": {
+    "events": [
+      "on:\n  workflow_dispatch:\n  pull_request:\n    branches: [main, development]\n    paths:\n      - 'src/operations/**'\n      - 'tests/support/cross_node_fixture.py'\n      - '.github/workflows/cross-node-acceptance.yml'"
+    ],
+    "permissions": [
+      "permissions:\n  contents: read"
+    ],
+    "environment": [
+      "env:\n  CARGO_BUILD_JOBS: '2'"
+    ],
+    "job_gates": [],
+    "action_inputs": [
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "Swatinem/rust-cache",
+        []
+      ]
+    ]
+  },
+  "promote.yml": {
+    "events": [
+      "on:\n  schedule:\n    - cron: '0 4 * * 5'\n  workflow_dispatch:\n    inputs:\n      dry_run:\n        description: 'Compare branches without creating pull requests'\n        required: true\n        default: true\n        type: boolean"
+    ],
+    "permissions": [
+      "permissions:\n  contents: read\n  pull-requests: write"
+    ],
+    "environment": [
+      "env:\n  GH_TOKEN: ${{ github.token }}\n  GH_REPO: ${{ github.repository }}\n  DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}"
+    ],
+    "job_gates": [],
+    "action_inputs": [
+      [
+        "actions/checkout",
+        []
+      ]
+    ]
+  },
+  "ci.yml": {
+    "events": [
+      "on:\n  push:\n    branches: [development, main]\n  pull_request:\n    branches: [development, main, release]"
+    ],
+    "permissions": [
+      "permissions:\n  contents: read"
+    ],
+    "environment": [],
+    "job_gates": [],
+    "action_inputs": [
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "Swatinem/rust-cache",
+        [
+          "with:\n  shared-key: cli-vsock"
+        ]
+      ],
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "Swatinem/rust-cache",
+        [
+          "with:\n  shared-key: native-tray"
+        ]
+      ],
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "actions/upload-artifact",
+        [
+          "with:\n  name: wispkey-browser-extensions\n  path: browser-extension/dist/"
+        ]
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  name: wispkey-browser-extensions\n  path: ${{ runner.temp }}/wispkey-browser-extensions"
+        ]
+      ],
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "Swatinem/rust-cache",
+        []
+      ]
+    ]
+  },
+  "dependency-audit.yml": {
+    "events": [
+      "on:\n  schedule:\n    - cron: '17 7 * * *'\n  workflow_dispatch:\n  pull_request:\n    paths:\n      - '.github/workflows/dependency-audit.yml'\n      - 'scripts/audit_dependencies.py'\n      - 'scripts/tests/test_audit_dependencies.py'"
+    ],
+    "permissions": [
+      "permissions:\n  contents: read"
+    ],
+    "environment": [],
+    "job_gates": [
+      "    if: github.event_name != 'pull_request'",
+      "    needs: fixtures"
+    ],
+    "action_inputs": [
+      [
+        "actions/checkout",
+        []
+      ],
+      [
+        "actions/checkout",
+        [
+          "with:\n  ref: ${{ github.event.repository.default_branch }}"
+        ]
+      ],
+      [
+        "actions/checkout",
+        [
+          "with:\n  ref: ${{ matrix.branch }}\n  path: audited\n  persist-credentials: false"
+        ]
+      ],
+      [
+        "Swatinem/rust-cache",
+        [
+          "with:\n  shared-key: scheduled-audit"
+        ]
+      ]
+    ]
+  }
+}

@@ -67,6 +67,7 @@ features should add a regression at the public interface and update this map.
 | Vault initialization, encryption, schema migration, secure files (`src/core`, `src/secure_files.rs`) | Core/secure-file unit tests; `tests/smoke.rs`, `tests/unlock.rs` | Native credential-store availability differs by OS |
 | Unlock TTL, remembered protector, lock/forget | Session/protector unit tests; `tests/unlock.rs`, owner IPC tests | OS credential-store interaction on each release platform |
 | Credential add/get/list/remove/rotate and all credential types | Core tests; `tests/cli_contracts.rs`, `tests/projects.rs`, `tests/proxy.rs`, `tests/mcp.rs` | Values remain synthetic in tests; output must never expose plaintext |
+| Owner whole-value replacement | `tests/value_update.rs`, input/session-lock unit tests; POSIX hidden-input checks: `python3 scripts/test_replace_value_prompt.py /absolute/path/to/wispkey` | Synthetic vaults only; opaque JSON is replaced whole; `website_login` rejected |
 | Projects and active-project isolation | `tests/projects.rs`, `tests/cli_contracts.rs`, MCP and proxy tests | Same names in separate projects must stay isolated |
 | Partition create/list/assign/delete and scoped lookup | `tests/cli_contracts.rs`, `tests/projects.rs`, bundle tests | Deletion must preserve credentials in personal partition |
 | Legacy import and selective env discovery/attach | Migrate unit tests; `tests/env_files.rs`, `tests/cli_contracts.rs` | Attach only values consumed through token substitution or explicit injection |

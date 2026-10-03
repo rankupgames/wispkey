@@ -32,7 +32,9 @@ Registration can represent an already-expired credential for inventory/recovery.
 Expiry blocks use; it never deletes recovery material. `review_at` remains advisory
 and does not become an expiry deadline. Local revocation is terminal for that auth
 identity: re-registering or synchronizing older live metadata cannot clear it.
-Create a new credential for replacement secret material. Re-registration retains
+For owner-operated whole-value replacement with identity and policy preservation,
+use [`replace-value`](replace-value.md). It rejects revoked or expired registrations.
+Create a new credential when a new auth identity or policy is required. Re-registration retains
 the auth ID, changes its revision, and cannot change its provider/account identity.
 It invalidates existing bundle references until the owner explicitly updates them.
 
@@ -97,9 +99,10 @@ proof of current token validity. A successful resolution does not prove the
 upstream account or operation succeeded.
 
 Deleting a referenced credential fails until its bundles are explicitly updated.
-Registered credentials cannot be overwritten, moved between partitions, or moved
-implicitly by deleting their partition/project. Replace them using a new credential
-and reviewed bundle references instead of silently changing an identity.
+Generic overwrite APIs cannot overwrite registered credentials. They also cannot
+be moved between partitions or moved implicitly by deleting their partition/project.
+The explicit owner [`replace-value`](replace-value.md) interface preserves the
+registration and reviewed bundle references; it does not revive revoked/expired auth.
 
 ## Enforcement and recovery
 
@@ -138,7 +141,7 @@ and recreating identities is a recovery operation, not a global revocation ledge
 review recovered policy before reconnecting consumers. Cloud stores encrypted
 snapshots and does not execute credentials.
 
-## Boundaries and next gates
+## Current boundaries
 
 Existing `website_login` credentials can opt into the registry at their exact
 HTTPS origin, including a non-default port such as `https://jobs.example.com:8443`.
@@ -152,19 +155,10 @@ browser, or invalidate previously copied material. Provider-side revocation and
 verification require separate provider integrations. Browser validity is distinct
 from provider token expiry and WispKey's local deadline.
 
-OAuth needs issuer/resource binding, PKCE, expiry-aware serialized refresh,
-rotation ownership, and reconnect handling. Browser-session reuse needs explicit
-account/site/destination consent, cookie-attribute preservation, a trusted execution
-boundary and response handling. The current reverse proxy forwards upstream
-response headers and bodies, so it is not a hidden browser-session broker. Neither
-capability, nor universal provider compatibility, is implemented here.
-
-Custom per-auth login notes are a separate next slice: encrypted human-authored
-instructions, strict size limits, explicit owner-controlled access, and encrypted
-round-trip coverage. Notes must stay separate from account identity, origin/scope
-policy and approvals. They must never become executable instructions or policy
-authority, and must not appear in default inventory/MCP metadata. This foundation
-does not store login notes.
+OAuth refresh, browser-session reuse and per-auth login notes are not implemented
+by this registry. The current reverse proxy forwards upstream response headers
+and bodies, so it is not a hidden browser-session broker. Neither universal
+provider compatibility nor provider-side revocation is established here.
 
 ## Synthetic verification
 

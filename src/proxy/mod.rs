@@ -48,6 +48,10 @@ type HttpsClient = Client<
     hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
     Full<Bytes>,
 >;
+type HttpsBuilderWithSchemes =
+    hyper_rustls::HttpsConnectorBuilder<hyper_rustls::builderstates::WantsSchemes>;
+type NativeRootsResult = std::io::Result<HttpsBuilderWithSchemes>;
+type NativeRootsLoader = fn() -> NativeRootsResult;
 type ProxyActionResult<T> = Result<T, Box<Response<Full<Bytes>>>>;
 
 const MAX_PROXY_BODY_BYTES: usize = 10 * 1024 * 1024;
@@ -58,6 +62,17 @@ const INSTANCE_SECRET_HEADER: &str = "x-wispkey-instance-secret";
 pub enum StartProxyOutcome {
     AlreadyRunning(ProxyMetadata),
     Stopped { port: u16 },
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ProxyStartupError {
+    #[error(
+        "native TLS roots unavailable; proxy startup requires the configured OS trust store: {source}"
+    )]
+    NativeTlsRootsUnavailable {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 #[derive(Clone)]
@@ -145,15 +160,6 @@ pub async fn start_proxy_with_listeners(
         Arc::new(Some(core::resolve_active_project()))
     };
     let management_token = Arc::new(crate::random::alphanumeric(48, false)?);
-    let metadata = Arc::new(ProxyMetadata::new(
-        primary_port,
-        primary_address,
-        project_scope.as_ref().clone(),
-        management_token.as_ref().clone(),
-        listener_metadata.clone(),
-    ));
-    lifecycle::write_metadata(&metadata)?;
-
     let policy_engine = Arc::new(PolicyEngine::load());
     let policy_count = policy_engine.policies().len();
     if policy_count > 0 {
@@ -165,17 +171,17 @@ pub async fn start_proxy_with_listeners(
     }
 
     let shared_http: Arc<HttpClient> = Arc::new(Client::builder(TokioExecutor::new()).build_http());
-
-    let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
-        .with_native_roots()
-        .expect("native TLS roots")
-        .https_or_http()
-        .enable_http1()
-        .enable_http2()
-        .build();
-    let shared_https: Arc<HttpsClient> =
-        Arc::new(Client::builder(TokioExecutor::new()).build(https_connector));
+    let shared_https: Arc<HttpsClient> = Arc::new(build_https_client()?);
     let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<String>(4);
+    let metadata = Arc::new(ProxyMetadata::new(
+        primary_port,
+        primary_address,
+        project_scope.as_ref().clone(),
+        management_token.as_ref().clone(),
+        listener_metadata.clone(),
+    ));
+    lifecycle::write_metadata(&metadata)?;
+
     let runtime = ProxyRuntime {
         wisp_pattern,
         project_scope,
@@ -214,6 +220,27 @@ pub async fn start_proxy_with_listeners(
             Ok(StartProxyOutcome::Stopped { port: primary_port })
         }
     }
+}
+
+fn load_native_roots() -> NativeRootsResult {
+    hyper_rustls::HttpsConnectorBuilder::new().with_native_roots()
+}
+
+fn build_https_client() -> Result<HttpsClient, ProxyStartupError> {
+    build_https_client_with_native_roots(load_native_roots)
+}
+
+fn build_https_client_with_native_roots(
+    native_roots: NativeRootsLoader,
+) -> Result<HttpsClient, ProxyStartupError> {
+    let tls_builder =
+        native_roots().map_err(|source| ProxyStartupError::NativeTlsRootsUnavailable { source })?;
+    let https_connector = tls_builder
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    Ok(Client::builder(TokioExecutor::new()).build(https_connector))
 }
 
 async fn serve_listener(listener: BoundTransport, runtime: ProxyRuntime) {
