@@ -1,5 +1,4 @@
 //! Process-isolated disposable vaults. No production authentication or presence.
-use super::enabled::*;
 use super::*;
 use crate::core::{
     GenerateWebsiteLoginRequest,
@@ -116,12 +115,24 @@ fn state(v: &Vault, b: &Binding, id: &str) -> State {
 fn no_canary(raw: &[u8]) {
     use base64::Engine;
     let text = String::from_utf8_lossy(raw);
-    for s in [USER, "receiver-synthetic-password-canary"] {
+    for s in [USER, "receiver-synthetic-password-canary+/&?"] {
         assert!(!text.contains(s), "plaintext canary leaked");
         assert!(
             !text.contains(&base64::engine::general_purpose::STANDARD.encode(s)),
             "encoded canary leaked"
         );
+        assert!(
+            !text.contains(&base64::engine::general_purpose::URL_SAFE.encode(s)),
+            "URL-safe canary leaked"
+        );
+        assert!(
+            !text.contains(urlencoding::encode(s).as_ref()),
+            "percent-encoded canary leaked"
+        );
+        let encoded = url::form_urlencoded::Serializer::new(String::new())
+            .append_pair("", s)
+            .finish();
+        assert!(!text.contains(&encoded[1..]), "form-encoded canary leaked");
     }
     assert!(!text.contains("wk_"), "capability leaked");
 }
@@ -152,7 +163,7 @@ fn fixture() -> Vault {
         .commit(
             &crate::core::ExistingLoginInput::new(
                 USER.into(),
-                "receiver-synthetic-password-canary".into(),
+                "receiver-synthetic-password-canary+/&?".into(),
             )
             .unwrap(),
         )
@@ -162,7 +173,7 @@ fn fixture() -> Vault {
 fn approved(v: &Vault, r: &FillRequest) {
     let value = crate::browser_host::finish_approval(v, r, Ok(true)).unwrap();
     assert!(
-        value.username == USER && value.password == "receiver-synthetic-password-canary",
+        value.username == USER && value.password == "receiver-synthetic-password-canary+/&?",
         "wrong disposable payload"
     );
 }

@@ -24,7 +24,12 @@ pub(crate) fn create_schema(db: &Connection) -> rusqlite::Result<()> {
             UNIQUE(binding_id,job_id));
         CREATE TABLE IF NOT EXISTS browser_receiver_outbox (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT, binding_id TEXT NOT NULL,
-            job_id TEXT NOT NULL, state TEXT NOT NULL);",
+            job_id TEXT NOT NULL, state TEXT NOT NULL);
+        CREATE TRIGGER IF NOT EXISTS receiver_binding_immutable BEFORE UPDATE OF id,metadata
+            ON browser_receiver_bindings BEGIN SELECT RAISE(ABORT,'receiver binding immutable'); END;
+        CREATE TRIGGER IF NOT EXISTS receiver_revocation_monotonic BEFORE UPDATE OF revoked
+            ON browser_receiver_bindings WHEN OLD.revoked<>0 AND NEW.revoked<>OLD.revoked
+            BEGIN SELECT RAISE(ABORT,'receiver revocation is final'); END;",
     )?;
     // Deliberately conservative: all credential/auth/scope writes invalidate a
     // prepared local binding, including ABA and changes through another process.

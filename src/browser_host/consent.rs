@@ -36,7 +36,7 @@ pub(super) fn verify(request: &FillRequest, receiver_details: &str) -> Result<bo
     let reason = CString::new(format!("Fill saved login only at {}", request.origin))
         .map_err(|_| "invalid approval metadata")?;
     let details = CString::new(format!(
-        "{receiver_details}Fill only at {}\nLogin: {} / {}\nRequest: {}\nExpires (UTC epoch): {}\n\nAgent label (unverified): {}\nReason (unverified): {}\n\nVerify with Touch ID in the macOS prompt. Closing this window cancels. WispKey never submits the form.",
+        "Fill only at {}\nLogin: {} / {}\n{receiver_details}Request: {}\nExpires (UTC epoch): {}\n\nAgent label (unverified): {}\nReason (unverified): {}\n\nVerify with Touch ID in the macOS prompt. Closing this window cancels. WispKey never submits the form.",
         request.origin, request.project, request.name, request.request_id,
         request.expires_at, request.requester, request.reason,
     ))
@@ -60,9 +60,10 @@ pub(super) fn verify(request: &FillRequest, receiver_details: &str) -> Result<bo
         IUserConsentVerifierInterop, RO_INIT_MULTITHREADED, RoInitialize, RoUninitialize,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        CW_USEDEFAULT, CreateWindowExW, DestroyWindow, DispatchMessageW, IsWindow, MSG, PM_REMOVE,
-        PeekMessageW, SetForegroundWindow, TranslateMessage, WINDOW_EX_STYLE, WS_CHILD,
-        WS_OVERLAPPEDWINDOW, WS_VISIBLE,
+        CW_USEDEFAULT, CreateWindowExW, DestroyWindow, DispatchMessageW, ES_AUTOVSCROLL,
+        ES_MULTILINE, ES_READONLY, IsWindow, MSG, PM_REMOVE, PeekMessageW, SetForegroundWindow,
+        TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WS_CHILD, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+        WS_VISIBLE, WS_VSCROLL,
     };
     use windows::core::{HSTRING, PCWSTR, factory, w};
 
@@ -107,17 +108,22 @@ pub(super) fn verify(request: &FillRequest, receiver_details: &str) -> Result<bo
         }
         let window = Window(window);
         let prompt = HSTRING::from(format!(
-            "{receiver_details}Fill only at {}\nLogin: {} / {}\nAgent label (unverified): {}\nReason (unverified): {}",
+            "Fill only at {}\nLogin: {} / {}\n{receiver_details}Agent label (unverified): {}\nReason (unverified): {}",
             request.origin, request.project, request.name, request.requester, request.reason,
         ));
         unsafe {
             // Display full metadata separately from the potentially compact OS
-            // prompt. This window has no approval button or credential input.
+            // prompt. A read-only scrolling control keeps long receiver details
+            // available; this window has no approval button or credential input.
             CreateWindowExW(
                 WINDOW_EX_STYLE::default(),
-                w!("STATIC"),
+                w!("EDIT"),
                 PCWSTR(prompt.as_ptr()),
-                WS_CHILD | WS_VISIBLE,
+                WS_CHILD
+                    | WS_VISIBLE
+                    | WS_VSCROLL
+                    | WS_TABSTOP
+                    | WINDOW_STYLE((ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32),
                 20,
                 20,
                 620,
@@ -130,8 +136,9 @@ pub(super) fn verify(request: &FillRequest, receiver_details: &str) -> Result<bo
             let _ = SetForegroundWindow(window.0);
         }
         let verifier = factory::<UserConsentVerifier, IUserConsentVerifierInterop>()?;
+        let reason = HSTRING::from(format!("Fill saved login only at {}", request.origin));
         let operation: windows_future::IAsyncOperation<UserConsentVerificationResult> =
-            unsafe { verifier.RequestVerificationForWindowAsync(window.0, &prompt)? };
+            unsafe { verifier.RequestVerificationForWindowAsync(window.0, &reason)? };
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(110);
         while operation.Status()? == windows_future::AsyncStatus::Started {
             let mut message = MSG::default();
