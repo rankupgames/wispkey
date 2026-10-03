@@ -145,11 +145,11 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --features experimental-browser-receiver -- -D warnings -W clippy::suspicious -W clippy::style -W clippy::perf -W clippy::complexity
 
-      - name: Tests
-        run: cargo test --features experimental-browser-receiver
-
       - name: Default-off receiver guard
         run: cargo test --lib core::browser_receiver::schema_tests
+
+      - name: Tests
+        run: cargo test --features experimental-browser-receiver
 
       - name: PostgreSQL TLS rotation and revocation fixture
         if: matrix.os == 'ubuntu-latest'

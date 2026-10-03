@@ -69,6 +69,7 @@ pub(super) fn credential_from_row(row: &Row<'_>) -> rusqlite::Result<Credential>
 pub(super) fn table_has_column(db: &Connection, table: &str, column: &str) -> Result<bool> {
     let query = match table {
         "audit_log" => "PRAGMA table_info(audit_log)",
+        "browser_fill_requests" => "PRAGMA table_info(browser_fill_requests)",
         "credentials" => "PRAGMA table_info(credentials)",
         "partitions" => "PRAGMA table_info(partitions)",
         "instances" => "PRAGMA table_info(instances)",
