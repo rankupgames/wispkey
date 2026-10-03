@@ -879,8 +879,29 @@ enum SignupProfileCommands {
     },
 }
 
+#[derive(Args)]
+struct ExistingLoginArgs {
+    name: String,
+    /// Existing project; never inferred or created
+    #[arg(long)]
+    project: String,
+    /// Existing partition; never inferred or created
+    #[arg(long)]
+    partition: String,
+    /// Exact HTTPS origin, without path, query or userinfo
+    #[arg(long)]
+    origin: String,
+    /// Read a bounded username/password JSON object from a pipe instead of hidden prompts
+    #[arg(long)]
+    stdin: bool,
+}
+
 #[derive(Subcommand)]
 enum LoginCommands {
+    /// Store an existing account using hidden owner input; refuses duplicates
+    AddExisting(ExistingLoginArgs),
+    /// Replace both login fields using hidden owner input; preserves identity and metadata
+    UpdateExisting(ExistingLoginArgs),
     /// Generate a unique website login and store it encrypted
     Generate {
         /// Credential name
@@ -1747,6 +1768,22 @@ async fn main() {
             ),
         },
         Commands::Login { command } => match command {
+            LoginCommands::AddExisting(args) => cli::handle_existing_login(
+                &args.name,
+                &args.project,
+                &args.partition,
+                &args.origin,
+                args.stdin,
+                wispkey::core::ExistingLoginMode::Create,
+            ),
+            LoginCommands::UpdateExisting(args) => cli::handle_existing_login(
+                &args.name,
+                &args.project,
+                &args.partition,
+                &args.origin,
+                args.stdin,
+                wispkey::core::ExistingLoginMode::Update,
+            ),
             LoginCommands::Generate {
                 name,
                 username,

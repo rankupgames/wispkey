@@ -148,6 +148,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey rotate <name>` | Regenerate wisp token |
 | `wispkey signup-profile create/list/update/remove` | Manage encrypted reusable identities; owner input from file/stdin, metadata-only output |
 | `wispkey login generate <name> --username U --url HTTPS [--project P] [--partition P] [--review-after 180d]` | Generate and store a unique website login (password never printed) |
+| `wispkey login add-existing/update-existing <name> --project P --partition P --origin HTTPS [--stdin]` | Owner typed existing-login input; see `docs/existing-website-login.md` |
 | `wispkey login list/archive/restore/activate` | Website-login metadata and lifecycle; review dates never auto-delete |
 | `wispkey exec --credential <name> [--project P] [--stdin] [--env VAR]... [--askpass] -- <command> [args...]` | Audited child-process secret injection |
 | `wispkey run [--manifest PATH] [--project P] -- <command> [args...]` | Manifest-defined child-only environment injection |
@@ -185,7 +186,7 @@ wispkey inject -i .env.template -o .env.local
 | Basic Auth | `basic_auth` | `user:pass` format |
 | Custom Header | `custom_header` | Requires `--header-name` |
 | Query Param | `query_param` | Requires `--param-name` |
-| Website Login | `website_login` | Generated only via `wispkey login generate`; username+password encrypted together |
+| Website Login | `website_login` | Generated via `login generate` or entered by owner via `login add-existing`; username+password encrypted together |
 
 WispKey stores arbitrary encrypted secret values, not only API keys. Use `api_key` as the generic opaque type for passwords, database URLs, SSH/private-key files via `--value-file`, webhook secrets, OAuth tokens, service-account JSON, and other secret material. The credential type controls proxy injection behavior, not what can be stored.
 

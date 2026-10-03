@@ -114,6 +114,8 @@ required after denial or unavailable verification. The prompt is bounded by the
 request deadline and at most 110 seconds. The host invalidates its LAContext on
 every exit and reopens the vault session only after successful verification.
 
+For an existing account, use the owner-only [typed existing-login entry/update](existing-website-login.md) commands. They preserve the supplied password; do not generate a replacement for an existing account unless a password change is intended.
+
 ## Generate, request, approve, fill
 
 Unlock WispKey normally. Use **Generate website login** in the optional desktop

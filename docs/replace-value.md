@@ -61,3 +61,5 @@ This does not make every session-renewal path race-free. The pre-existing
 `restore_or_refresh_session` path still loads and saves in separate lock intervals;
 a concurrent lock can occur between them. That separate renewal race is unchanged
 by this command.
+
+For a typed existing website login, use [`login add-existing` / `login update-existing`](existing-website-login.md). The generic whole-value command continues to reject `WebsiteLogin`.

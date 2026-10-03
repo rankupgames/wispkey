@@ -24,11 +24,15 @@ use crate::secure_files;
 pub mod auth;
 pub(crate) mod cloud_sync;
 mod crypto;
+mod existing_login;
 mod instances;
 pub(crate) mod operation_grants;
 mod operation_session;
 mod protector;
 mod rows;
+pub use existing_login::{
+    ExistingLoginInput, ExistingLoginMode, MAX_EXISTING_LOGIN_INPUT_BYTES, PreparedExistingLogin,
+};
 mod value_update;
 pub use value_update::{MAX_REPLACEMENT_VALUE_BYTES, PreparedValueUpdate};
 mod schema;
