@@ -7,7 +7,7 @@
 - Added schema-v14 metadata-only auth inventory with explicit provider expiry, separate local deadlines, exact HTTPS origins and terminal local revocation. Unknown expiry requires a bounded local deadline; legacy unregistered credentials retain their existing behavior.
 - Added `auth register/list/revoke` and explicit project/account/alternative bundle selection with pinned portable member references and all-or-nothing resolution.
 - Enforced registered policy at proxy, owner process, approved browser, MCP certificate and one-use operation release boundaries. Registered ciphertext fails closed in older readers; imports/sync/backup preserve restrictions atomically.
-- Added synthetic expiry, revision, scope, redaction and encrypted recovery coverage. OAuth refresh, browser-session reuse and cloud credential execution remain future gates; see `docs/auth-registry.md`.
+- Added synthetic expiry, revision, scope, redaction and encrypted recovery coverage. OAuth refresh, browser-session reuse and cloud credential execution are not included; see `docs/auth-registry.md`.
 
 ### Conservative signup form mapping
 

@@ -1,9 +1,7 @@
 # Experimental realtime sync coordinator
 
-This is a scheduling foundation for [#48](https://github.com/rankupgames/wispkey/issues/48),
-with fail-closed admission states for the future
-[access policy](https://github.com/rankupgames/wispkey/issues/49) and
-[device enrollment](https://github.com/rankupgames/wispkey-cloud/issues/5) adapters.
+This scheduling foundation has fail-closed admission states for access policy
+and device identity; it does not implement device enrollment.
 The coordinator itself is a metadata-only module behind `--features experimental-sync`;
 default builds exclude it. The separately documented foreground watch is its first
 CLI caller. Compiling the feature does not start a daemon, enable network activity
@@ -24,7 +22,7 @@ Duplicates coalesce, and there is one pending cursor rather than an unbounded
 queue. Reordered hints can cause an extra reconciliation, never choose which
 snapshot wins. The contract assumes an authenticated account-scoped feed and a
 full authenticated current-revision reconciliation; it is unsuitable for delta
-application or treating lexical cursor order as server order. A future transport
+application or treating lexical cursor order as server order. Transport integrations
 must bound wire bodies before deserializing them.
 
 The adapter borrows the coordinator through a single-use attempt while reconciling.
@@ -51,7 +49,7 @@ until the adapter reports explicit reviewed resolution through `conflict_resolve
 
 The `Admission` enum is a trusted adapter input, **not an authorization evaluator**.
 No wire field, account sign-in, client label or arbitrary boolean may establish
-`Ready`. The future adapter must check all of the following at dispatch and again
+`Ready`. An adapter must check all of the following at dispatch and again
 before applying a result:
 
 - Explicit current project/partition opt-in
@@ -66,27 +64,17 @@ before applying a result:
 Do not use a cached `Vault::is_unlocked()` result as current owner authority: the
 object can retain a key after an external lock or session expiry. Likewise,
 `CloudClient::synchronize_partition` currently resolves the active project when it
-executes; a future adapter needs explicit scope through dispatch and commit rather
+executes; an adapter needs explicit scope through dispatch and commit rather
 than silently following a changed active project. Device identity is a binding,
 not proof of enrollment. Restoring metadata never restores an approval.
 
-## Remaining acceptance criteria
+## Current limits
 
-The coordinator and foreground adapter do not complete #48, #49 or Cloud #5.
-Outstanding enrolled-device/background work includes:
-
-1. Review ring policy names, defaults, format, shared enforcement, one-use step-up,
-   and the freshness budget; no ring names or grant semantics are finalized here
-2. Review enrollment pairing, user comparison, key wrapping/rotation and recovery;
-   implement neither unsigned key transfer nor server key custody
-3. Implement an authenticated bounded server feed or polling contract, admission
-   adapter, explicit opt-in UI/CLI, durable checkpoint storage and local key access
-4. Integrate existing encrypted transactions with cancellation/revalidation and
-   explicit conflict resolution, including policy and revocation conflicts
-5. Expose actual pending/offline/locked/conflict/stale-policy/last-acknowledged
-   runtime status and measure healthy-online propagation
-6. Run two-device synthetic end-to-end tests for edit/delete/revoke, missed and
-   reordered hints, account switch, corrupt snapshots, network failure and locks
+The coordinator and foreground adapter do not implement enrolled-device background
+sync, a device trust/ring policy, automatic key transfer or an authenticated server
+notification feed. Coordinator tests do not establish two-device background runtime
+acceptance or a measured propagation SLO. Manual foreground polling has its own
+bounded contract below.
 
 Previously copied plaintext and keys cannot be remotely erased. This planner
 neither expands existing access nor changes owner-only recovery semantics.

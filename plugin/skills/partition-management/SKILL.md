@@ -110,4 +110,4 @@ Prepare a standard partition (for example `new-hire-dev`) with non-production ke
 
 - `wispkey add` with `--partition` when creating credentials inside a partition
 - `wispkey list --partition "<name>"` to list credentials in one partition
-- Cloud sync commands are reserved but currently return `coming soon`; use encrypted project, partition, or credential bundles today
+- `wispkey cloud push`, `pull`, and `sync` transfer account-owned partitions through a compatible backend; see [sync setup and limits](../../../docs/cloud-sync.md). Use encrypted project, partition, or credential bundles for selected sharing.
