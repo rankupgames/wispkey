@@ -86,11 +86,8 @@ if [[ "$binary_name" == *.exe ]]; then
   archive="wispkey-${target}.zip"
   (
     cd "$stage"
-    if command -v tar.exe >/dev/null 2>&1; then
-      tar.exe -a -c -f "$out_dir/$archive" "$binary_name" LICENSE README.md VERSION
-    else
-      tar -a -c -f "$out_dir/$archive" "$binary_name" LICENSE README.md VERSION
-    fi
+    # tar -a may create a tar container despite the .zip suffix (GNU tar).
+    python3 -m zipfile --create "$out_dir/$archive" "$binary_name" LICENSE README.md VERSION
   )
 else
   archive="wispkey-${target}.tar.gz"
