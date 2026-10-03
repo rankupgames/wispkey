@@ -300,5 +300,66 @@
         ]
       ]
     ]
+  },
+  "compatible-test-artifacts.yml": {
+    "events": [
+      "on:\n  workflow_dispatch:\n  pull_request:\n    branches: [main]\n    paths:\n      - '.github/workflows/compatible-test-artifacts.yml'\n      - 'scripts/inspect_compatible_binaries.py'\n      - 'scripts/tests/test_compatible_binaries.py'\n      - 'tests/support/compatible_artifact_fixture.py'\n  push:\n    branches: [main]\n    paths:\n      - '.github/workflows/compatible-test-artifacts.yml'\n      - 'scripts/inspect_compatible_binaries.py'\n      - 'scripts/tests/test_compatible_binaries.py'\n      - 'tests/support/compatible_artifact_fixture.py'"
+    ],
+    "permissions": [
+      "permissions:\n  contents: read",
+      "permissions:\n  contents: read\n  id-token: write\n  attestations: write"
+    ],
+    "environment": [
+      "env:\n  CARGO_INCREMENTAL: '0'\n  CARGO_BUILD_JOBS: '2'\n  CHECKED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
+    ],
+    "job_gates": [
+      "    needs: build",
+      "    if: github.event_name != 'pull_request'",
+      "    needs: validate"
+    ],
+    "action_inputs": [
+      [
+        "actions/checkout",
+        [
+          "with:\n  ref: ${{ env.CHECKED_SHA }}\n  persist-credentials: false"
+        ]
+      ],
+      [
+        "Swatinem/rust-cache",
+        [
+          "with:\n  shared-key: bookworm-cli-helper-test"
+        ]
+      ],
+      [
+        "actions/upload-artifact",
+        [
+          "with:\n  name: unvalidated-bookworm-cli-helper\n  path: dist/\n  retention-days: 1\n  if-no-files-found: error"
+        ]
+      ],
+      [
+        "actions/checkout",
+        [
+          "with:\n  ref: ${{ env.CHECKED_SHA }}\n  persist-credentials: false"
+        ]
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  name: unvalidated-bookworm-cli-helper\n  path: dist"
+        ]
+      ],
+      [
+        "actions/upload-artifact",
+        [
+          "with:\n  name: verified-bookworm-cli-helper-${{ env.CHECKED_SHA }}\n  path: dist/\n  retention-days: 7\n  if-no-files-found: error"
+        ]
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  name: verified-bookworm-cli-helper-${{ env.CHECKED_SHA }}\n  path: dist"
+        ]
+      ]
+    ]
   }
 }
