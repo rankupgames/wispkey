@@ -11,6 +11,41 @@ use crate::secure_files;
 use super::rows::table_has_column;
 use super::{CURRENT_SCHEMA_VERSION, Result, Vault, VaultError};
 
+// A savepoint composes with backup restore's existing transaction. Releasing
+// it never commits the caller's transaction; errors/unwinds roll back this step.
+// rusqlite's public Savepoint constructor requires &mut Connection, while the
+// migration API intentionally accepts the shared connection owned by restore.
+struct MigrationSavepoint<'a> {
+    db: &'a Connection,
+    released: bool,
+}
+
+impl<'a> MigrationSavepoint<'a> {
+    fn begin(db: &'a Connection) -> rusqlite::Result<Self> {
+        db.execute_batch("SAVEPOINT wispkey_schema_migration")?;
+        Ok(Self {
+            db,
+            released: false,
+        })
+    }
+
+    fn commit(mut self) -> rusqlite::Result<()> {
+        self.db.execute_batch("RELEASE wispkey_schema_migration")?;
+        self.released = true;
+        Ok(())
+    }
+}
+
+impl Drop for MigrationSavepoint<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.db.execute_batch(
+                "ROLLBACK TO wispkey_schema_migration; RELEASE wispkey_schema_migration",
+            );
+        }
+    }
+}
+
 impl Vault {
     pub fn vault_dir() -> PathBuf {
         if let Ok(path) = std::env::var("WISPKEY_VAULT_PATH") {
@@ -532,13 +567,13 @@ impl Vault {
             |row| row.get(0),
         )?;
         if version == "12" {
-            let tx = db.unchecked_transaction()?;
-            super::operation_grants::create_schema(&tx)?;
-            tx.execute(
+            let migration = MigrationSavepoint::begin(db)?;
+            super::operation_grants::create_schema(db)?;
+            db.execute(
                 "UPDATE vault_meta SET value = ?1 WHERE key = 'version'",
                 ["13"],
             )?;
-            tx.commit()?;
+            migration.commit()?;
         }
 
         let version: String = db.query_row(
@@ -547,16 +582,16 @@ impl Vault {
             |row| row.get(0),
         )?;
         if version == "13" {
-            let tx = db.unchecked_transaction()?;
-            super::auth::create_schema(&tx)?;
-            super::signup::create_schema(&tx)?;
-            tx.execute("UPDATE vault_meta SET value=?1 WHERE key='version'", ["15"])?;
-            tx.commit()?;
+            let migration = MigrationSavepoint::begin(db)?;
+            super::auth::create_schema(db)?;
+            super::signup::create_schema(db)?;
+            db.execute("UPDATE vault_meta SET value=?1 WHERE key='version'", ["15"])?;
+            migration.commit()?;
         } else if version == "14" {
-            let tx = db.unchecked_transaction()?;
-            super::signup::create_schema(&tx)?;
-            tx.execute("UPDATE vault_meta SET value=?1 WHERE key='version'", ["15"])?;
-            tx.commit()?;
+            let migration = MigrationSavepoint::begin(db)?;
+            super::signup::create_schema(db)?;
+            db.execute("UPDATE vault_meta SET value=?1 WHERE key='version'", ["15"])?;
+            migration.commit()?;
         } else if version != "15" && version != CURRENT_SCHEMA_VERSION {
             return Err(VaultError::AuthRejected("unsupported vault schema"));
         }
@@ -567,19 +602,19 @@ impl Vault {
             |r| r.get(0),
         )?;
         if version == "15" {
-            let tx = db.unchecked_transaction()?;
-            if !table_has_column(&tx, "browser_fill_requests", "receiver_binding")? {
-                tx.execute(
+            let migration = MigrationSavepoint::begin(db)?;
+            if !table_has_column(db, "browser_fill_requests", "receiver_binding")? {
+                db.execute(
                     "ALTER TABLE browser_fill_requests ADD COLUMN receiver_binding TEXT",
                     [],
                 )?;
             }
-            super::browser_receiver::create_schema(&tx)?;
-            tx.execute(
+            super::browser_receiver::create_schema(db)?;
+            db.execute(
                 "UPDATE vault_meta SET value=?1 WHERE key='version'",
                 [CURRENT_SCHEMA_VERSION],
             )?;
-            tx.commit()?;
+            migration.commit()?;
         }
 
         // Older releases stored reusable capability tokens in audit rows. Remove

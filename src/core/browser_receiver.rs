@@ -139,8 +139,15 @@ mod schema_tests {
     #[test]
     fn schema_15_migrates_receiver_guard_atomically() {
         let db = Connection::open_in_memory().unwrap();
-        Vault::create_schema(&db).unwrap();
-        db.execute_batch("ALTER TABLE browser_fill_requests DROP COLUMN receiver_binding; INSERT INTO vault_meta VALUES('version','15');").unwrap();
+        db.execute_batch(include_str!("../../tests/fixtures/schema15.sql"))
+            .unwrap();
+        db.execute("INSERT INTO vault_meta VALUES('version','15')", [])
+            .unwrap();
+        assert!(
+            db.prepare("SELECT receiver_binding FROM browser_fill_requests")
+                .is_err()
+        );
+        assert!(db.prepare("SELECT * FROM browser_receiver_jobs").is_err());
         Vault::migrate_schema(&db).unwrap();
         let version: String = db
             .query_row(
@@ -156,6 +163,51 @@ mod schema_tests {
             .unwrap();
         assert!(Vault::migrate_schema(&db).is_err());
     }
+    #[test]
+    fn schema_15_migration_failure_rolls_back_ddl_inside_or_outside_outer_transaction() {
+        for nested in [false, true] {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(include_str!("../../tests/fixtures/schema15.sql"))
+                .unwrap();
+            db.execute_batch("INSERT INTO vault_meta VALUES('version','15');
+                CREATE TRIGGER reject_upgrade BEFORE UPDATE OF value ON vault_meta
+                WHEN NEW.key='version' BEGIN SELECT RAISE(ABORT,'synthetic migration failure'); END;").unwrap();
+            if nested {
+                db.execute_batch(
+                    "BEGIN IMMEDIATE; INSERT INTO vault_meta VALUES('caller-work','preserve');",
+                )
+                .unwrap();
+            }
+            assert!(Vault::migrate_schema(&db).is_err());
+            assert_eq!(db.is_autocommit(), !nested);
+            let version: String = db
+                .query_row(
+                    "SELECT value FROM vault_meta WHERE key='version'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(version, "15");
+            assert!(
+                db.prepare("SELECT receiver_binding FROM browser_fill_requests")
+                    .is_err()
+            );
+            let objects: i64 = db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'browser_receiver_%' OR name LIKE 'receiver_%'", [], |r| r.get(0)).unwrap();
+            assert_eq!(objects, 0);
+            if nested {
+                db.execute_batch("COMMIT").unwrap();
+                let caller: String = db
+                    .query_row(
+                        "SELECT value FROM vault_meta WHERE key='caller-work'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(caller, "preserve");
+            }
+        }
+    }
+
     #[cfg(not(feature = "experimental-browser-receiver"))]
     #[test]
     fn default_build_refuses_bound_or_inconsistently_marked_release() {

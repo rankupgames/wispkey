@@ -1658,6 +1658,189 @@ fn meta_values_equal(left: &Map<String, Value>, right: &Map<String, Value>) -> b
 mod tests {
     use super::*;
 
+    // Independent schema15 DDL, with existing ciphertext/IDs/tokens, registry,
+    // profile, audit and browser metadata. No current schema builder is called.
+    fn populated_schema15(target: &Path) -> (Connection, VaultBackupPayload) {
+        let db = Connection::open(target.join("vault.db")).unwrap();
+        db.execute_batch(include_str!("../../tests/fixtures/schema15.sql"))
+            .unwrap();
+        let mut payload = super::super::tests::auth_payload();
+        payload.source_schema_version = "15".into();
+        for row in &mut payload.contents.vault_meta {
+            if string_field(row, "key").as_deref() == Some("version") {
+                row.insert("value".into(), Value::String("15".into()));
+            }
+        }
+        insert_payload_tables(&db, &payload, &SkipSet::default()).unwrap();
+        db.execute_batch("INSERT INTO signup_profiles VALUES('d24f6a3c-9e62-4ce7-b453-d2957a393202','profile','2e711d62-77d9-476f-9499-6ef5a3b245a3','personal','QUFBQQ==');
+            INSERT INTO audit_log(timestamp,event_type,credential_name) VALUES('2026-10-03T00:00:00Z','SyntheticExisting','auth-key');
+            INSERT INTO browser_fill_requests VALUES('request','auth-key','default','https://synthetic.invalid','owner','synthetic','pending',0,'credential-auth','revision');").unwrap();
+        for (id, name, token) in [
+            ("incoming-one", "incoming-one", "wk_synthetic_one"),
+            ("incoming-two", "incoming-two", "wk_synthetic_two"),
+        ] {
+            let mut row = payload.contents.credentials[0].clone();
+            for (key, value) in [
+                ("id", id),
+                ("name", name),
+                ("wisp_token", token),
+                ("encrypted_value", "synthetic-ciphertext"),
+            ] {
+                row.insert(key.into(), Value::String(value.into()));
+            }
+            payload.contents.credentials.push(row);
+        }
+        payload.sidecars.policies_toml = Some("# synthetic merged policy\n".into());
+        payload.integrity = super::super::compute_integrity(&payload).unwrap();
+        assert!(verify_payload(&payload).ok);
+        (db, payload)
+    }
+
+    fn schema15_archive(payload: &VaultBackupPayload, path: &Path) {
+        crate::bundle::write_encrypted_payload_with_limit(
+            super::super::VAULT_BACKUP_MAGIC,
+            payload,
+            "synthetic-backup-passphrase",
+            path.to_str().unwrap(),
+            super::super::MAX_VAULT_BACKUP_BYTES,
+        )
+        .unwrap();
+    }
+
+    fn snapshot_schema_and_rows(db: &Connection) -> Value {
+        let mut result = serde_json::Map::new();
+        let mut stmt = db
+            .prepare("SELECT name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
+            .unwrap();
+        let schema: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        result.insert("schema".into(), serde_json::to_value(schema).unwrap());
+        for table in [
+            TABLE_VAULT_META,
+            TABLE_PROJECTS,
+            TABLE_PARTITIONS,
+            TABLE_CREDENTIALS,
+            TABLE_AUTH_REGISTRY,
+            TABLE_AUTH_BUNDLES,
+            TABLE_SIGNUP_PROFILES,
+            TABLE_AUDIT_LOG,
+            "browser_fill_requests",
+        ] {
+            let mut rows = super::super::dump_table(db, table).unwrap();
+            rows.sort_by_key(|r| serde_json::to_string(r).unwrap());
+            result.insert(table.into(), serde_json::to_value(rows).unwrap());
+        }
+        Value::Object(result)
+    }
+
+    #[test]
+    fn schema15_backup_merge_migrates_populated_destination_and_preserves_existing_rows() {
+        let target = tempfile::tempdir().unwrap();
+        let (db, payload) = populated_schema15(target.path());
+        let bundle = tempfile::tempdir().unwrap();
+        let archive = bundle.path().join("synthetic.wkbackup");
+        schema15_archive(&payload, &archive);
+        let before = snapshot_schema_and_rows(&db);
+        let options = |dry_run| RestoreOptions {
+            target_dir: target.path(),
+            dry_run,
+            replace: false,
+            on_conflict: ConflictPolicy::Fail,
+        };
+        let preview = restore_backup(
+            archive.to_str().unwrap(),
+            "synthetic-backup-passphrase",
+            options(true),
+        )
+        .unwrap();
+        assert_eq!(preview.imported.credentials, 2);
+        assert!(
+            snapshot_schema_and_rows(&db) == before,
+            "dry-run must not upgrade the destination"
+        );
+        let report = restore_backup(
+            archive.to_str().unwrap(),
+            "synthetic-backup-passphrase",
+            options(false),
+        )
+        .unwrap();
+        assert_eq!(report.imported.credentials, 2);
+        let after = snapshot_schema_and_rows(&db);
+        for table in [
+            TABLE_PROJECTS,
+            TABLE_PARTITIONS,
+            TABLE_AUTH_REGISTRY,
+            TABLE_AUTH_BUNDLES,
+            TABLE_SIGNUP_PROFILES,
+            TABLE_AUDIT_LOG,
+        ] {
+            assert!(
+                after[table] == before[table],
+                "existing rows changed in {table}"
+            );
+        }
+        let existing = after[TABLE_CREDENTIALS]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["id"] == "credential-auth")
+            .unwrap();
+        assert!(
+            existing == &before[TABLE_CREDENTIALS][0],
+            "existing credential changed"
+        );
+        let mut request = after["browser_fill_requests"][0]
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(request.remove("receiver_binding"), Some(Value::Null));
+        assert!(
+            Value::Object(request) == before["browser_fill_requests"][0],
+            "existing browser request changed"
+        );
+        let version: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key='version'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, crate::core::CURRENT_SCHEMA_VERSION);
+        let guards: i64 = db.query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='trigger' AND name GLOB 'receiver_*'", [], |r| r.get(0)).unwrap();
+        assert_eq!(guards, 15);
+        assert!(target.path().join(SIDECAR_POLICIES).exists());
+    }
+
+    #[test]
+    fn schema15_backup_merge_failure_rolls_back_migration_and_partial_import() {
+        let target = tempfile::tempdir().unwrap();
+        let (db, payload) = populated_schema15(target.path());
+        db.execute_batch("CREATE TRIGGER reject_second_import BEFORE INSERT ON credentials WHEN NEW.id='incoming-two' BEGIN SELECT RAISE(ABORT,'synthetic import failure'); END;").unwrap();
+        let bundle = tempfile::tempdir().unwrap();
+        let archive = bundle.path().join("synthetic.wkbackup");
+        schema15_archive(&payload, &archive);
+        let before = snapshot_schema_and_rows(&db);
+        let result = restore_backup(
+            archive.to_str().unwrap(),
+            "synthetic-backup-passphrase",
+            RestoreOptions {
+                target_dir: target.path(),
+                dry_run: false,
+                replace: false,
+                on_conflict: ConflictPolicy::Fail,
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            snapshot_schema_and_rows(&db) == before,
+            "outer rollback must restore schema15 and all original rows"
+        );
+        assert!(!target.path().join(SIDECAR_POLICIES).exists());
+    }
+
     #[test]
     fn empty_auth_partition_history_marker_survives_backup_snapshot_and_restore() {
         let mut payload = super::super::tests::auth_payload();
