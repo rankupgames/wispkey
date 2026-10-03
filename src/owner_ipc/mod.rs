@@ -21,6 +21,10 @@ use crate::core::{
 };
 use crate::secure_files;
 
+#[cfg(any(windows, test))]
+#[cfg_attr(not(windows), allow(dead_code))]
+mod diagnostics;
+
 const PROTOCOL_VERSION: u8 = 1;
 const OWNER_SOCK_NAME: &str = "owner.sock";
 const OWNER_META_NAME: &str = "owner.json";
@@ -780,6 +784,7 @@ mod windows {
     use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
+    use super::diagnostics::{Method, Phase, Phases};
     use super::{OwnerIpcError, cleanup_endpoint, handle_request, write_line, write_metadata};
 
     pub(super) fn pipe_name(path: &Path) -> String {
@@ -815,20 +820,30 @@ mod windows {
         let mut server = create_server(&name, true)?;
         write_metadata(path)?;
         tracing::info!(pipe = %name, "owner ipc listening");
+        let mut phases = Phases::new();
         loop {
+            phases.next_connection();
+            phases.record(Method::Pending, Phase::ConnectWait);
             server.connect().await?;
+            phases.record(Method::Pending, Phase::Connected);
             let mut reader = BufReader::new(server);
             let mut line = String::new();
             line.clear();
+            phases.record(Method::Pending, Phase::ReadWait);
             let read = reader.read_line(&mut line).await?;
+            phases.record(Method::Pending, Phase::ReadComplete);
             if read == 0 {
+                phases.record(Method::Pending, Phase::ReadEmpty);
                 drop(reader);
                 server = create_server(&name, false)?;
+                phases.record(Method::Pending, Phase::InstanceReady);
                 continue;
             }
             let request = match serde_json::from_str::<Value>(line.trim()) {
                 Ok(request) => request,
                 Err(error) => {
+                    phases.record(Method::Unknown, Phase::InvalidRequest);
+                    phases.record(Method::Unknown, Phase::WriteStart);
                     write_line(
                         reader.get_mut(),
                         &serde_json::json!({
@@ -837,24 +852,33 @@ mod windows {
                         }),
                     )
                     .await?;
+                    phases.record(Method::Unknown, Phase::WriteAccepted);
                     drop(reader);
                     server = create_server(&name, false)?;
+                    phases.record(Method::Pending, Phase::InstanceReady);
                     continue;
                 }
             };
             let shutdown = request.get("method").and_then(Value::as_str) == Some("shutdown");
+            let method = Method::from_request(&request);
+            phases.record(method, Phase::HandlerStart);
             let response = handle_request(request);
+            phases.record(method, Phase::HandlerComplete);
+            phases.record(method, Phase::WriteStart);
             write_line(reader.get_mut(), &response).await?;
+            phases.record(method, Phase::WriteAccepted);
             if shutdown {
                 cleanup_endpoint(path);
                 return Ok(());
             }
             drop(reader);
             server = create_server(&name, false)?;
+            phases.record(Method::Pending, Phase::InstanceReady);
         }
     }
 
     pub(super) async fn call(path: &Path, request: Value) -> Result<Value, OwnerIpcError> {
+        let method = Method::from_request(&request).label();
         let name = pipe_name(path);
         let started = tokio::time::Instant::now();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -867,9 +891,9 @@ mod windows {
                         || error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) =>
                 {
                     if tokio::time::Instant::now() >= deadline {
-                        return Err(OwnerIpcError::Protocol(
-                            "connection phase timed out after 5000 ms".into(),
-                        ));
+                        return Err(OwnerIpcError::Protocol(format!(
+                            "connection phase timed out after 5000 ms (method={method})"
+                        )));
                     }
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
@@ -881,7 +905,7 @@ mod windows {
             .await
             .map_err(|_| {
                 OwnerIpcError::Protocol(format!(
-                    "request_write phase timed out after 5000 ms (connection: {connected_ms} ms)"
+                    "request_write phase timed out after 5000 ms (method={method}; connection: {connected_ms} ms)"
                 ))
             })??;
         let written_ms = started.elapsed().as_millis();
@@ -889,7 +913,7 @@ mod windows {
         let mut line = String::new();
         tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
             .await
-            .map_err(|_| OwnerIpcError::Protocol(format!("response_read phase timed out after 5000 ms (connection: {connected_ms} ms; request write: {} ms)", written_ms - connected_ms)))??;
+            .map_err(|_| OwnerIpcError::Protocol(format!("response_read phase timed out after 5000 ms (method={method}; connection: {connected_ms} ms; request write: {} ms)", written_ms - connected_ms)))??;
         serde_json::from_str(line.trim())
             .map_err(|error| OwnerIpcError::Protocol(error.to_string()))
     }
