@@ -6,6 +6,10 @@ mod identity;
 #[cfg(all(test, unix))]
 mod live_tests;
 pub(crate) mod postgres;
+#[cfg(all(test, unix))]
+mod process_handoff_destination;
+#[cfg(all(test, unix))]
+mod process_handoff_tests;
 pub(crate) mod runtime;
 pub(crate) mod ssh;
 pub(crate) use identity::read_private_catalog as read_private_identity;
