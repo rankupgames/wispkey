@@ -41,6 +41,45 @@ def payload():
 
 
 class WindowsReceiverArtifactTests(unittest.TestCase):
+    def test_smoke_command_writes_lf_checksum_subject_names(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            (directory / a.ARCHIVE).write_bytes(b"synthetic archive")
+            argv = ["artifact", "smoke", "--directory", root, "--extracted", root, "--commit", SHA]
+            with patch.object(sys, "argv", argv), patch.object(a, "smoke", return_value={"synthetic": True}):
+                a.main()
+            content = (directory / "SHA256SUMS.txt").read_bytes()
+            self.assertNotIn(b"\r", content)
+            lines = content.split(b"\n")
+            self.assertEqual(lines[-1], b"")
+            self.assertEqual([line[66:] for line in lines[:-1]], [a.ARCHIVE.encode(), b"smoke-report.json"])
+            for line in lines[:-1]:
+                self.assertEqual(line[:64].decode(), a.sha((directory / line[66:].decode()).read_bytes()))
+
+    def test_checksum_lf_crlf_preserve_exact_filename_bytes(self):
+        names = [b"package.zip", b"name with spaces.zip", b" leading and trailing .zip "]
+        lines = [b"a" * 64 + b"  " + name for name in names]
+        expected = b"\n".join(lines) + b"\n"
+        for endings in ((b"\n",) * 3, (b"\r\n",) * 3, (b"\r\n", b"\n", b"\r\n")):
+            with self.subTest(endings=endings), tempfile.TemporaryDirectory() as root:
+                path = Path(root) / "SHA256SUMS.txt"
+                a.write_checksum_manifest(path, b"".join(line + end for line, end in zip(lines, endings)))
+                self.assertEqual(path.read_bytes(), expected)
+                self.assertEqual([line[66:] for line in path.read_bytes().split(b"\n")[:-1]], names)
+
+    def test_invalid_checksum_records_do_not_rewrite_manifest(self):
+        good = b"a" * 64 + b"  package.zip\n"
+        invalid = [b"", good[:-1], good.replace(b"\n", b"\r"), good.replace(b"\n", b"\r\r\n"), good + b"\n",
+                   b"a" * 64 + b" package.zip\n", b"a" * 64 + b"  \n",
+                   good.replace(b"package", b"bad\rname"), good.replace(b"package", b"bad\x00name")]
+        for content in invalid:
+            with self.subTest(content=content), tempfile.TemporaryDirectory() as root:
+                path = Path(root) / "SHA256SUMS.txt"
+                path.write_bytes(good)
+                with self.assertRaises(ValueError):
+                    a.write_checksum_manifest(path, content)
+                self.assertEqual(path.read_bytes(), good)
+
     def archive(self, root, files):
         path = Path(root) / a.ARCHIVE
         with zipfile.ZipFile(path, "w") as archive:
