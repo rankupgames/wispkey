@@ -57,7 +57,7 @@ fn handle(message: &Value, released: &mut HashSet<String>) -> browser::Result<Va
                 return Err("an exact HTTPS origin is required");
             }
             Ok(
-                json!({ "requests": browser::pending(&vault, origin)?, "approval_available": cfg!(windows) }),
+                json!({ "requests": browser::pending(&vault, origin)?, "approval_available": consent::available() }),
             )
         }
         "deny" => {
@@ -72,14 +72,14 @@ fn handle(message: &Value, released: &mut HashSet<String>) -> browser::Result<Va
             // Close the vault while the user decides; do not hold a DB transaction
             // or an unlocked session across the potentially long approval prompt.
             drop(vault);
-            if !consent::verify(&request)? {
-                let vault = Vault::open().map_err(|_| "vault unavailable")?;
-                browser::deny(&vault, &request.request_id)?;
-                return Err("user denied browser fill");
-            }
-            let vault = Vault::open_with_session()
-                .map_err(|_| "vault locked during approval; unlock and retry")?;
-            let login = browser::release(&vault, &request)?;
+            let verification = consent::verify(&request);
+            let vault = if verification == Ok(true) {
+                Vault::open_with_session()
+                    .map_err(|_| "vault locked during approval; unlock and retry")?
+            } else {
+                Vault::open().map_err(|_| "vault unavailable")?
+            };
+            let login = finish_approval(&vault, &request, verification)?;
             released.insert(request.request_id.clone());
             Ok(
                 json!({ "request_id": request.request_id, "origin": request.origin, "login": login }),
@@ -100,6 +100,23 @@ fn handle(message: &Value, released: &mut HashSet<String>) -> browser::Result<Va
         }
         _ => Err("unsupported native method"),
     }
+}
+
+/// Internal state-machine seam, not an externally callable approval endpoint.
+/// Only OS verification supplies the result in production. Unit tests supply
+/// synthetic outcomes to test release/cancellation; they do not prove presence.
+pub(crate) fn finish_approval(
+    vault: &Vault,
+    request: &browser::FillRequest,
+    verification: browser::Result<bool>,
+) -> browser::Result<crate::core::WebsiteLoginPayload> {
+    if verification != Ok(true) {
+        browser::deny(vault, &request.request_id)?;
+        return Err(verification
+            .err()
+            .unwrap_or("user cancelled or denied browser fill"));
+    }
+    browser::release(vault, request)
 }
 
 /// Dedicated binary entry point. Never initialize logging or echo input/errors.

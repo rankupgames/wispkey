@@ -48,3 +48,33 @@ test("background accepts only its own popup and serializes approvals", async () 
   assert.equal(nativeCalls, 1);
   releaseFill("Filled");
 });
+
+test("unavailable OS verification refuses fill and closes native connection", async () => {
+  let listener;
+  let closed = false;
+  const api = {
+    runtime: {
+      id: "extension", getURL: (path) => `chrome-extension://extension/${path}`,
+      onMessage: { addListener(fn) { listener = fn; } },
+    },
+    tabs: { query: async () => [{ id: 1, url: "https://example.com" }] },
+  };
+  vm.runInContext(source, vm.createContext({
+    chrome: api,
+    WispKeyFlow: {
+      httpsOrigin: () => "https://example.com",
+      nativeClient: () => ({
+        request: async () => ({ approval_available: false, requests: [{ request_id: "request" }] }),
+        close() { closed = true; },
+      }),
+      fill: () => assert.fail("unavailable verification must never start fill"),
+    },
+  }));
+  const response = await new Promise((resolve) => listener(
+    { method: "fill", request_id: "request" },
+    { id: "extension", url: "chrome-extension://extension/popup.html" }, resolve,
+  ));
+  assert.equal(response.ok, false);
+  assert.match(response.error, /no browser approval backend/);
+  assert.equal(closed, true);
+});

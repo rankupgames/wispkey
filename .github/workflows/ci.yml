@@ -92,7 +92,7 @@ jobs:
           npx playwright install --with-deps chromium firefox
           npm run test:browser
       - name: Test validation runner
-        run: python3 -m unittest discover -s scripts/tests -p 'test_verify.py' -v
+        run: python3 -m unittest discover -s scripts/tests -v
       - name: Upload unpacked extensions
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -123,6 +123,10 @@ jobs:
         with:
           toolchain: stable
           components: clippy, rustfmt
+
+      - name: macOS native-host installer and ACL fixtures
+        if: runner.os == 'macOS'
+        run: python3 -B -m unittest discover -s scripts/tests -p test_browser_host_macos.py -v
 
       - name: Rust cache
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2

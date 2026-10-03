@@ -35,6 +35,10 @@ Additional suites require their own prerequisites:
 # Native tray: OS GUI libraries, plus the Rust and Node prerequisites above.
 python scripts/verify.py --suite tray
 
+# Native-host protocol/approval state machine and macOS installer fixtures.
+# Compiles the real backend on macOS; never opens an OS verification prompt.
+python scripts/verify.py --suite native-host
+
 # Linux/macOS with Docker and Bash (Windows: run inside configured WSL).
 # Creates and removes a loopback-only disposable PostgreSQL container.
 python scripts/verify.py --suite postgres
@@ -82,12 +86,13 @@ features should add a regression at the public interface and update this map.
 | CA-held leaf certificate issuance and CSR/key constraints | `src/pki/mod.rs` unit tests plus MCP coverage | Real CA material is never used by tests |
 | Exact-origin website-login auth registration, including non-default HTTPS ports | Core auth/browser unit tests; `tests/auth_registry.rs` encrypted round trips and mismatch/expiry/revocation checks | Provider-side sessions and revocation require provider integrations |
 | Website login generation/lifecycle/review dates | Login/core unit tests; `tests/login.rs`, `tests/mcp.rs`, `tests/browser_handoff.rs` | Review dates never auto-delete; signup completion is a human decision |
-| Browser native framing, one-use handoff, revision/origin binding | `tests/browser_handoff.rs`, `src/browser_host.rs` tests; extension Node tests | Windows Hello and installed native-host registration require human validation |
+| Browser native framing, one-use handoff, revision/origin binding | `tests/browser_handoff.rs`, `src/browser_host/mod.rs` and `src/core/browser.rs` tests; extension Node tests | Windows Hello/macOS Touch ID and installed native-host registration require human validation |
 | Browser identity-purpose mapping, external form ownership, changed-target rejection, navigation, no submission, popup approval gate | `browser-extension/tests/browser/handoff.spec.mjs` in Chromium and Firefox | Browser fixtures mock transport, not human approval |
 | Owner IPC authentication, framing, concurrency, log pressure | `tests/owner_ipc.rs`, owner IPC unit tests | Historical timeout monitoring described below |
 | Tray UI destination confirmation, generated-login metadata, clearing secrets and IPC errors | `browser-extension/tests/browser/tray.spec.mjs`, native tray build/lint checks | Mocked bridge tests complement actual native tray acceptance |
 | Cloud sessions, encrypted push/pull/sync, conflicts and recovery | `src/cloud/mod.rs` tests, `tests/cloud_sync.rs`, `tests/cli_contracts.rs`, `tests/smoke.rs` | Requires the compatible backend migration; production Clerk/deployment acceptance remains external |
 | Release assets, installers, Homebrew and packaging | `tests/release_packaging.rs`, `.github/workflows/release.yml` | Signing, registry authentication, and public downloads run in release workflow |
+| macOS per-user native host installer | `scripts/tests/test_browser_host_macos.py`: browser allowlists, full host ancestor trust, post-plan path substitution, permissions, symlinks, no overwrite | Plan is read-only; real registration is explicit user action |
 | Validation runner | `scripts/tests/test_verify.py` | Missing tools and failed subprocesses must produce failure, never a false pass |
 
 ## Ignored tests and pending backlog
@@ -130,7 +135,7 @@ values or native-message payloads. Record commit, OS, browser/version or target
 identifier, date, tester, expected/actual outcome, and pass/fail/not-run.
 
 For each installed browser family in a separate human-controlled profile, follow
-[`browser-handoff.md`](browser-handoff.md): verify Hello approve and cancel,
+[`browser-handoff.md`](browser-handoff.md): verify Windows Hello/Touch ID approve and cancel,
 navigation and vault lock during approval, login and two-password signup fill,
 no automatic submission, no second use of the request, and metadata-only status.
 Real approval/cancellation must be performed by the human; fixtures cannot sign
@@ -143,3 +148,7 @@ destination-side result, reject reuse and changed posture, and inspect sanitized
 audit metadata. Record rollback/cleanup of disposable resources. PostgreSQL's
 Docker fixture verifies TLS, rotation, revocation, and expiry locally; repeat
 destination-specific acceptance where deployment configuration differs.
+
+For macOS hardware/enrollment, timeout and zero-reuse acceptance, use the explicit
+[macOS acceptance checklist](macos-browser-approval.md). Mocked verification
+outcomes prove only the Rust release state machine, never physical presence.

@@ -110,12 +110,26 @@ test("popup escapes request text and requires profile acknowledgement", async ({
   });
   const family = testInfo.project.name === "firefox" ? "firefox" : "chromium";
   await page.goto(new URL(`../../dist/${family}/popup.html`, import.meta.url).href);
-  await expect(page.getByRole("button", { name: "Approve with Windows Hello" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Verify with OS approval" })).toBeDisabled();
   await expect(page.locator("article img")).toHaveCount(0);
   await expect(page.locator("article")).toContainText('<img src=x onerror="alert(1)">');
   await page.getByRole("checkbox").check();
-  await expect(page.getByRole("button", { name: "Approve with Windows Hello" })).toBeEnabled();
+  await expect(page.getByRole("button", { name: "Verify with OS approval" })).toBeEnabled();
   await page.screenshot({ path: testInfo.outputPath("popup.png") });
+});
+
+test("popup never enables fill when OS verification is unavailable", async ({ page }, testInfo) => {
+  await page.addInitScript(() => {
+    globalThis.browser = { runtime: { sendMessage: async () => ({ ok: true, result: {
+      origin: "https://example.test", approval_available: false,
+      requests: [{ request_id: "synthetic", project: "default", name: "careers", origin: "https://example.test",
+        requester: "test-agent", reason: "synthetic", expires_at: 2000000000 }],
+    } }) } };
+  });
+  const family = testInfo.project.name === "firefox" ? "firefox" : "chromium";
+  await page.goto(new URL(`../../dist/${family}/popup.html`, import.meta.url).href);
+  await page.getByRole("checkbox").check();
+  await expect(page.getByRole("button", { name: "Verify with OS approval" })).toBeDisabled();
 });
 
 async function deliverSyntheticLogin(page, mutate) {
