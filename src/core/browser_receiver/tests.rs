@@ -262,6 +262,29 @@ fn synthetic_child() {
             )
             .unwrap();
             assert!(outbox(&v, &b).unwrap().is_empty());
+            receive(
+                &v,
+                &b,
+                &SyntheticTransport,
+                &bytes(&b, principal(), Command::Acknowledge { sequence: last }),
+            )
+            .unwrap();
+            assert!(
+                v.db()
+                    .execute(
+                        "UPDATE browser_receiver_bindings SET metadata='{}' WHERE id=?1",
+                        [b.id()]
+                    )
+                    .is_err()
+            );
+            assert!(
+                v.db()
+                    .execute(
+                        "UPDATE browser_receiver_jobs SET job_id='changed' WHERE request_id=?1",
+                        [&r.request_id]
+                    )
+                    .is_err()
+            );
             assert!(
                 receive(
                     &v,
@@ -433,7 +456,7 @@ fn synthetic_child() {
                 .collect();
             let successes = workers
                 .into_iter()
-                .filter_map(|t| t.join().ok())
+                .map(|t| t.join().unwrap())
                 .filter(|ok| *ok)
                 .count();
             assert!(successes >= 1);
@@ -604,21 +627,24 @@ fn synthetic_child() {
             v.db()
                 .execute_batch("DROP TRIGGER change_during_release")
                 .unwrap();
-            let now = Utc::now().timestamp();
-            v.db()
-                .execute(
-                    "UPDATE browser_fill_requests SET expires_at=?1 WHERE request_id=?2",
-                    rusqlite::params![now, r.request_id],
+            let expiring = Uuid::new_v4().to_string();
+            let mut c = command(&b, &expiring);
+            if let Command::Request { expires_at, .. } = &mut c {
+                *expires_at = Utc::now().timestamp() + 1;
+            }
+            receive(&v, &b, &SyntheticTransport, &bytes(&b, principal(), c)).unwrap();
+            let id: String = v
+                .db()
+                .query_row(
+                    "SELECT request_id FROM browser_receiver_jobs WHERE job_id=?1",
+                    [&expiring],
+                    |r| r.get(0),
                 )
                 .unwrap();
-            v.db()
-                .execute(
-                    "UPDATE browser_receiver_jobs SET expires_at=?1 WHERE request_id=?2",
-                    rusqlite::params![now, r.request_id],
-                )
-                .unwrap();
+            let r = crate::core::browser::status(&v, &id).unwrap();
+            std::thread::sleep(std::time::Duration::from_secs(2));
             assert!(crate::browser_host::finish_approval(&v, &r, Ok(true)).is_err());
-            assert_eq!(state(&v, &b, &job), State::Expired);
+            assert_eq!(state(&v, &b, &expiring), State::Expired);
         }
         _ => panic!("unknown synthetic case"),
     }

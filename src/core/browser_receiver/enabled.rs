@@ -499,14 +499,28 @@ pub fn receive(
             })
         }
         Command::Acknowledge { sequence } => {
-            let exists: bool = db(vault.db().query_row("SELECT EXISTS(SELECT 1 FROM browser_receiver_outbox WHERE binding_id=?1 AND sequence=?2)", params![handle.id,sequence], |r| r.get(0)))?;
-            if !exists {
-                return Err("receiver acknowledgement unavailable");
+            if *sequence <= 0 {
+                return Err("invalid receiver acknowledgement");
             }
-            db(vault.db().execute(
-                "DELETE FROM browser_receiver_outbox WHERE binding_id=?1 AND sequence<=?2",
-                params![handle.id, sequence],
+            let previous: i64 = db(vault.db().query_row(
+                "SELECT acknowledged FROM browser_receiver_bindings WHERE id=?1",
+                [&handle.id],
+                |r| r.get(0),
             ))?;
+            if *sequence > previous {
+                let exists: bool = db(vault.db().query_row("SELECT EXISTS(SELECT 1 FROM browser_receiver_outbox WHERE binding_id=?1 AND sequence=?2)", params![handle.id,sequence], |r| r.get(0)))?;
+                if !exists {
+                    return Err("receiver acknowledgement unavailable");
+                }
+                db(vault.db().execute(
+                    "DELETE FROM browser_receiver_outbox WHERE binding_id=?1 AND sequence<=?2",
+                    params![handle.id, sequence],
+                ))?;
+                db(vault.db().execute(
+                    "UPDATE browser_receiver_bindings SET acknowledged=?1 WHERE id=?2",
+                    params![sequence, handle.id],
+                ))?;
+            }
             Receipt::Acknowledged
         }
     };

@@ -17,7 +17,7 @@ pub(crate) fn create_schema(db: &Connection) -> rusqlite::Result<()> {
             id INTEGER PRIMARY KEY CHECK(id=1), revision INTEGER NOT NULL);
         INSERT OR IGNORE INTO browser_receiver_generation VALUES(1,0);
         CREATE TABLE IF NOT EXISTS browser_receiver_bindings (
-            id TEXT PRIMARY KEY, metadata TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0);
+            id TEXT PRIMARY KEY, metadata TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, acknowledged INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS browser_receiver_jobs (
             request_id TEXT PRIMARY KEY, binding_id TEXT NOT NULL, job_id TEXT NOT NULL,
             envelope TEXT NOT NULL, state TEXT NOT NULL, expires_at INTEGER NOT NULL,
@@ -25,6 +25,8 @@ pub(crate) fn create_schema(db: &Connection) -> rusqlite::Result<()> {
         CREATE TABLE IF NOT EXISTS browser_receiver_outbox (
             sequence INTEGER PRIMARY KEY AUTOINCREMENT, binding_id TEXT NOT NULL,
             job_id TEXT NOT NULL, state TEXT NOT NULL);
+        CREATE TRIGGER IF NOT EXISTS receiver_job_immutable BEFORE UPDATE OF request_id,binding_id,job_id,envelope,expires_at
+            ON browser_receiver_jobs BEGIN SELECT RAISE(ABORT,'receiver job immutable'); END;
         CREATE TRIGGER IF NOT EXISTS receiver_binding_immutable BEFORE UPDATE OF id,metadata
             ON browser_receiver_bindings BEGIN SELECT RAISE(ABORT,'receiver binding immutable'); END;
         CREATE TRIGGER IF NOT EXISTS receiver_revocation_monotonic BEFORE UPDATE OF revoked
