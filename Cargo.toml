@@ -26,6 +26,8 @@ path = "src/lib.rs"
 default = []
 # Scheduling contract only; no background worker or device/key enrollment.
 experimental-sync = []
+# Local bridge only; no shipping ingress, device enrollment or transport activation.
+experimental-browser-receiver = []
 vsock = ["dep:tokio-vsock"]
 
 [dependencies]

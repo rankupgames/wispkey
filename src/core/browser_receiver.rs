@@ -4,6 +4,13 @@ use rusqlite::{Connection, OptionalExtension};
 use super::Vault;
 use super::browser::{FillRequest, Result};
 
+#[cfg(feature = "experimental-browser-receiver")]
+mod enabled;
+#[cfg(feature = "experimental-browser-receiver")]
+pub use enabled::*;
+#[cfg(all(test, feature = "experimental-browser-receiver"))]
+mod tests;
+
 pub(crate) fn create_schema(db: &Connection) -> rusqlite::Result<()> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS browser_receiver_generation (
@@ -57,6 +64,9 @@ pub(super) fn release_guard(
     if !is_bound(vault, request)? {
         return Ok(None);
     }
+    #[cfg(feature = "experimental-browser-receiver")]
+    return enabled::release_guard(vault, request).map(Some);
+    #[cfg(not(feature = "experimental-browser-receiver"))]
     {
         let _ = vault;
         Err("browser receiver is disabled")
@@ -67,6 +77,9 @@ pub(super) fn released(vault: &Vault, request: &FillRequest) -> Result<()> {
     if !is_bound(vault, request)? {
         return Ok(());
     }
+    #[cfg(feature = "experimental-browser-receiver")]
+    return enabled::released(vault, request);
+    #[cfg(not(feature = "experimental-browser-receiver"))]
     {
         let _ = vault;
         Err("browser receiver is disabled")
@@ -77,6 +90,9 @@ pub(super) fn finish(vault: &Vault, request: &FillRequest, completed: bool) -> R
     if !is_bound(vault, request)? {
         return Ok(());
     }
+    #[cfg(feature = "experimental-browser-receiver")]
+    return enabled::finished(vault, request, completed);
+    #[cfg(not(feature = "experimental-browser-receiver"))]
     {
         let _ = (vault, completed);
         Err("browser receiver is disabled")
@@ -87,6 +103,9 @@ pub(super) fn expired(vault: &Vault, request: &FillRequest) -> Result<()> {
     if !is_bound(vault, request)? {
         return Ok(());
     }
+    #[cfg(feature = "experimental-browser-receiver")]
+    return enabled::expired(vault, request);
+    #[cfg(not(feature = "experimental-browser-receiver"))]
     {
         let _ = vault;
         Ok(()) // Disabled clients may expire requests, but never release them.
@@ -98,6 +117,9 @@ pub(crate) fn approval_details(vault: &Vault, request: &FillRequest) -> Result<S
     if !is_bound(vault, request)? {
         return Ok(String::new());
     }
+    #[cfg(feature = "experimental-browser-receiver")]
+    return enabled::approval_details(vault, request);
+    #[cfg(not(feature = "experimental-browser-receiver"))]
     {
         let _ = vault;
         Err("browser receiver is disabled")
@@ -127,6 +149,7 @@ mod schema_tests {
             .unwrap();
         assert!(Vault::migrate_schema(&db).is_err());
     }
+    #[cfg(not(feature = "experimental-browser-receiver"))]
     #[test]
     fn default_build_refuses_bound_or_inconsistently_marked_release() {
         let db = Connection::open_in_memory().unwrap();

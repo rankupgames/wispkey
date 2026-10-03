@@ -24,9 +24,9 @@ jobs:
         with:
           shared-key: cli-vsock
       - name: Lint feature-enabled CLI and tests
-        run: cargo clippy --locked --all-targets --features vsock,experimental-sync -- -D warnings
+        run: cargo clippy --locked --all-targets --features vsock,experimental-sync,experimental-browser-receiver -- -D warnings
       - name: Feature-enabled tests (no AF_VSOCK device required)
-        run: cargo test --locked --features vsock,experimental-sync
+        run: cargo test --locked --features vsock,experimental-sync,experimental-browser-receiver
 
   tray:
     name: Native tray (${{ matrix.os }})
@@ -143,10 +143,13 @@ jobs:
         run: cargo audit
 
       - name: Clippy
-        run: cargo clippy -- -D warnings -W clippy::suspicious -W clippy::style -W clippy::perf -W clippy::complexity
+        run: cargo clippy --all-targets --features experimental-browser-receiver -- -D warnings -W clippy::suspicious -W clippy::style -W clippy::perf -W clippy::complexity
 
       - name: Tests
-        run: cargo test
+        run: cargo test --features experimental-browser-receiver
+
+      - name: Default-off receiver guard
+        run: cargo test --lib core::browser_receiver::schema_tests
 
       - name: PostgreSQL TLS rotation and revocation fixture
         if: matrix.os == 'ubuntu-latest'
