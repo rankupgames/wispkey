@@ -62,7 +62,7 @@ def compiler_binaries(log):
         path = Path(row["executable"])
         if path.name not in BINARIES:
             continue
-        if sorted(row["features"]) != FEATURES or row["profile"]["test"] or str(row["profile"]["opt_level"]) != "3":
+        if sorted(row["features"]) != FEATURES or row["profile"]["test"] or str(row["profile"]["opt_level"]) != "z":
             raise ValueError("wrong executable compiler features/profile")
         if TARGET not in path.parts:
             raise ValueError("wrong compiler target path")

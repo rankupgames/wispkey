@@ -108,7 +108,7 @@ class WindowsReceiverArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             log = Path(root) / "cargo.json"
             rows = [{"reason": "compiler-artifact", "executable": str(Path(root) / a.TARGET / "release" / name),
-                     "features": a.FEATURES, "profile": {"test": False, "opt_level": "3"}} for name in sorted(a.BINARIES)]
+                     "features": a.FEATURES, "profile": {"test": False, "opt_level": "z"}} for name in sorted(a.BINARIES)]
             log.write_text("\n".join(map(json.dumps, rows)))
             self.assertEqual(set(a.compiler_binaries(log)), a.BINARIES)
             rows[0]["features"] = []
