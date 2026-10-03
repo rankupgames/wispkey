@@ -49,6 +49,11 @@ cargo test --all-features --lib operation
 cargo test --all-features --test operations --test operation_auth --test instance_policy_identity
 ```
 
+The [separate-process handoff fixture](synthetic-operation-handoff.md) also drives
+the real HTTP operation route and pinned SSH transport across requester,
+executor and destination processes. It remains synthetic local coverage, not
+deployment acceptance or proof of human grant approval.
+
 On Linux with Docker, also run:
 
 ```console
