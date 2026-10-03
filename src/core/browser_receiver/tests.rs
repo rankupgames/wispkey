@@ -7,7 +7,9 @@ use crate::core::{
 use chrono::Utc;
 use ring::hmac;
 use serde::{Deserialize, Serialize};
-use std::process::{Command as Process, Stdio};
+use std::io::{Read, Seek, SeekFrom};
+use std::process::{Child, Command as Process, Output, Stdio};
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 const USER: &str = "receiver-synthetic-user-canary";
@@ -177,6 +179,76 @@ fn approved(v: &Vault, r: &FillRequest) {
         "wrong disposable payload"
     );
 }
+struct ChildGuard(Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn run_case(case: &str, timeout: Duration) -> (Output, bool) {
+    let dir = tempfile::tempdir().unwrap();
+    // Files avoid a full pipe blocking a child before the deadline can be polled.
+    let mut stdout = tempfile::tempfile().unwrap();
+    let mut stderr = tempfile::tempfile().unwrap();
+    let mut child = ChildGuard(
+        Process::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "core::browser_receiver::tests::synthetic_child",
+                "--nocapture",
+            ])
+            .env("WISPKEY_RECEIVER_TEST_CASE", case)
+            .env("WISPKEY_VAULT_PATH", dir.path())
+            .env("WISPKEY_PROTECTOR", "file")
+            .env("WISPKEY_SESSION_TIMEOUT", "30")
+            .env_remove("WISPKEY_PASSWORD")
+            .env_remove("WISPKEY_SESSION_PLAINTEXT")
+            .stdin(Stdio::null())
+            .stdout(stdout.try_clone().unwrap())
+            .stderr(stderr.try_clone().unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + timeout;
+    let (status, timed_out) = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break (status, false);
+        }
+        if Instant::now() >= deadline {
+            child.0.kill().unwrap();
+            break (child.0.wait().unwrap(), true);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let read = |file: &mut std::fs::File| {
+        file.seek(SeekFrom::Start(0)).unwrap();
+        let mut bytes = Vec::new();
+        file.take(65537).read_to_end(&mut bytes).unwrap();
+        assert!(bytes.len() <= 65536, "receiver child output exceeded bound");
+        no_canary(&bytes);
+        bytes
+    };
+    (
+        Output {
+            status,
+            stdout: read(&mut stdout),
+            stderr: read(&mut stderr),
+        },
+        timed_out,
+    )
+}
+
+#[test]
+fn receiver_child_timeout_kills_and_reaps() {
+    let started = Instant::now();
+    let (output, timed_out) = run_case("hang", Duration::from_secs(2));
+    assert!(timed_out);
+    assert!(!output.status.success());
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
 #[test]
 fn disposable_process_matrix() {
     for case in [
@@ -192,29 +264,14 @@ fn disposable_process_matrix() {
         "restart",
         "atomicity",
     ] {
-        let dir = tempfile::tempdir().unwrap();
-        let output = Process::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "core::browser_receiver::tests::synthetic_child",
-                "--nocapture",
-            ])
-            .env("WISPKEY_RECEIVER_TEST_CASE", case)
-            .env("WISPKEY_VAULT_PATH", dir.path())
-            .env("WISPKEY_PROTECTOR", "file")
-            .env("WISPKEY_SESSION_TIMEOUT", "30")
-            .env_remove("WISPKEY_PASSWORD")
-            .env_remove("WISPKEY_SESSION_PLAINTEXT")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap();
-        no_canary(&output.stdout);
-        no_canary(&output.stderr);
+        let (output, timed_out) = run_case(case, Duration::from_secs(60));
+        assert!(
+            !timed_out,
+            "receiver case {case} exceeded deadline and was killed"
+        );
         assert!(
             output.status.success(),
-            "receiver case {case} failed: {} {}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
+            "receiver case {case} failed; captured output omitted"
         );
     }
 }
@@ -223,6 +280,11 @@ fn synthetic_child() {
     let Ok(case) = std::env::var("WISPKEY_RECEIVER_TEST_CASE") else {
         return;
     };
+    if case == "hang" {
+        loop {
+            std::thread::park();
+        }
+    }
     let v = fixture();
     match case.as_str() {
         "lifecycle" => {
@@ -542,6 +604,8 @@ fn synthetic_child() {
             let job = Uuid::new_v4().to_string();
             let r = request(&v, &b, &job);
             approved(&v, &r);
+            // Orderly second-connection reopen/reconciliation, not process death
+            // or power-loss recovery evidence.
             let reopened = Vault::open_with_session().unwrap();
             let restored = restore_local_binding(&reopened, b.id()).unwrap();
             reconcile_after_restart(&reopened, &restored).unwrap();
