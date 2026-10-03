@@ -23,8 +23,14 @@ impl Vault {
     /// disk. An in-memory master key by itself is insufficient: lock or session
     /// replacement in another process must invalidate an outstanding grant.
     pub(crate) fn operation_session_binding(&self) -> Result<OperationSessionBinding> {
+        self.operation_session_binding_from_record(session_store().load()?)
+    }
+
+    pub(super) fn operation_session_binding_from_record(
+        &self,
+        record: super::session_store::SessionRecord,
+    ) -> Result<OperationSessionBinding> {
         let loaded_key = self.ensure_unlocked()?;
-        let record = session_store().load()?;
         let expected = hmac::sign(
             &hmac::Key::new(hmac::HMAC_SHA256, loaded_key),
             KEY_CHECK_DOMAIN,

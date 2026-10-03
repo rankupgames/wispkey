@@ -5,6 +5,7 @@ use super::*;
 use crate::core::CredentialType;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use std::io;
 
 #[cfg(not(all(target_os = "linux", feature = "vsock")))]
 #[tokio::test]
@@ -66,6 +67,33 @@ fn listener_identity_defaults_are_transport_specific() {
         );
         assert!(unix.require_identity);
     }
+}
+
+fn failing_native_roots() -> NativeRootsResult {
+    Err(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "synthetic native root failure",
+    ))
+}
+
+#[test]
+fn native_tls_root_failure_is_structured() {
+    let error = match build_https_client_with_native_roots(failing_native_roots) {
+        Ok(_) => panic!("native-root failure should prevent HTTPS client construction"),
+        Err(error) => error,
+    };
+
+    match &error {
+        ProxyStartupError::NativeTlsRootsUnavailable { source } => {
+            assert_eq!(source.kind(), io::ErrorKind::PermissionDenied);
+            assert_eq!(source.to_string(), "synthetic native root failure");
+        }
+    }
+    assert!(
+        error
+            .to_string()
+            .starts_with("native TLS roots unavailable; proxy startup requires")
+    );
 }
 
 #[test]

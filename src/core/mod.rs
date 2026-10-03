@@ -29,6 +29,8 @@ pub(crate) mod operation_grants;
 mod operation_session;
 mod protector;
 mod rows;
+mod value_update;
+pub use value_update::{MAX_REPLACEMENT_VALUE_BYTES, PreparedValueUpdate};
 mod schema;
 mod session;
 mod session_store;
