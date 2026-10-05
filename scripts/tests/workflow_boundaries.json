@@ -422,5 +422,67 @@
         ]
       ]
     ]
+  },
+  "macos-staging-artifact.yml": {
+    "events": [
+      "on:\n  workflow_dispatch:\n    inputs:\n      expected_commit:\n        description: 'Reviewed 40-character commit; must equal the selected workflow ref'\n        required: true\n        type: string"
+    ],
+    "permissions": [
+      "permissions:\n  contents: read",
+      "permissions:\n  contents: read\n  id-token: write\n  attestations: write"
+    ],
+    "environment": [
+      "env:\n  CARGO_INCREMENTAL: '0'\n  CHECKED_SHA: ${{ github.sha }}",
+      "env:\n  EXPECTED_COMMIT: ${{ inputs.expected_commit }}"
+    ],
+    "job_gates": [
+      "    needs: build",
+      "    if: github.ref == 'refs/heads/main'",
+      "    needs: validate"
+    ],
+    "action_inputs": [
+      [
+        "actions/checkout",
+        [
+          "with:\n  ref: ${{ env.CHECKED_SHA }}\n  persist-credentials: false"
+        ]
+      ],
+      [
+        "Swatinem/rust-cache",
+        [
+          "with:\n  shared-key: macos-staging-default-off"
+        ]
+      ],
+      [
+        "actions/upload-artifact",
+        [
+          "with:\n  name: unvalidated-macos-staging-${{ env.CHECKED_SHA }}\n  path: dist/wispkey-macos-arm64-staging.zip\n  retention-days: 1\n  if-no-files-found: error"
+        ]
+      ],
+      [
+        "actions/checkout",
+        [
+          "with:\n  ref: ${{ env.CHECKED_SHA }}\n  persist-credentials: false"
+        ]
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  name: unvalidated-macos-staging-${{ env.CHECKED_SHA }}\n  path: dist"
+        ]
+      ],
+      [
+        "actions/upload-artifact",
+        [
+          "with:\n  name: verified-macos-staging-${{ env.CHECKED_SHA }}\n  path: |\n    dist/wispkey-macos-arm64-staging.zip\n    dist/smoke-report.json\n    dist/SHA256SUMS.txt\n  retention-days: 7\n  if-no-files-found: error"
+        ]
+      ],
+      [
+        "actions/download-artifact",
+        [
+          "with:\n  name: verified-macos-staging-${{ env.CHECKED_SHA }}\n  path: dist"
+        ]
+      ]
+    ]
   }
 }
