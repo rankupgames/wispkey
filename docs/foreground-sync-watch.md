@@ -43,10 +43,11 @@ decryption, upload journaling, upload acknowledgement and atomic import commit.
 The import commit check is inside the SQLite write transaction so a denial rolls
 back both credentials and acknowledgement.
 
-Polling is at most once per second after each completed attempt. Network failures
-use the coordinator's bounded exponential backoff (2–300 seconds). Only transient
-network failures retry. Authentication, corruption, policy/import errors and
-revision conflicts stop the command; it never picks a conflict winner or invokes
+Polling is at most once per second after each completed attempt. Transport,
+timeout, and HTTP 500/502/503/504 failures use the coordinator's bounded
+exponential backoff (2–300 seconds). Authentication, rate limits, corruption,
+protocol, policy/import errors and revision conflicts stop the command; it never
+picks a conflict winner or invokes
 resolve/recover. Concurrent changes retain the existing explicit-recovery workflow.
 
 The requested deadline and Ctrl-C cancel pending asynchronous work. CPU-bound

@@ -314,34 +314,53 @@ mod tests {
     }
 
     #[test]
-    fn network_failure_keeps_reconciliation_pending_without_acknowledgement() {
-        let mut coordinator = Coordinator::restore(
-            Binding {
-                endpoint: "https://synthetic.invalid".into(),
-                account: "account".into(),
-                device: "device".into(),
-                project: "project".into(),
-                partition: "partition".into(),
-            },
-            None,
-        )
-        .unwrap();
-        coordinator.set_admission(Admission::Ready);
-        coordinator.request_reconciliation();
-        let prior = coordinator.checkpoint().clone();
-        let attempt = coordinator.begin(0).unwrap();
-        let mut progress = report();
-        record_transfer(
-            Err(CloudError::Network("unavailable".into())),
-            attempt,
-            0,
-            &|| panic!("failed transfer must not be acknowledged"),
-            &mut progress,
-        )
-        .unwrap();
-        assert_eq!(coordinator.checkpoint(), &prior);
-        assert!(coordinator.begin(0).is_none()); // Bounded retry backoff remains active.
-        assert_eq!(progress.successful_attempts, 3);
-        assert!(progress.reconciliation_required);
+    fn failure_policy_keeps_reconciliation_pending_without_acknowledgement() {
+        for (error, retryable) in [
+            (CloudError::Network("unavailable".into()), true),
+            (CloudError::Network("request_timed_out".into()), true),
+            (CloudError::Network("service_unavailable".into()), true),
+            (CloudError::NotAuthenticated, false),
+            (CloudError::TierLimit("denied".into()), false),
+            (CloudError::ApiError("rate_limited".into()), false),
+            (
+                CloudError::ApiError("backend_missing_revision_contract".into()),
+                false,
+            ),
+            (
+                CloudError::SyncConflict("partition".into(), "conflict".into()),
+                false,
+            ),
+        ] {
+            let mut coordinator = Coordinator::restore(
+                Binding {
+                    endpoint: "https://synthetic.invalid".into(),
+                    account: "account".into(),
+                    device: "device".into(),
+                    project: "project".into(),
+                    partition: "partition".into(),
+                },
+                None,
+            )
+            .unwrap();
+            coordinator.set_admission(Admission::Ready);
+            coordinator.request_reconciliation();
+            let prior = coordinator.checkpoint().clone();
+            let attempt = coordinator.begin(0).unwrap();
+            let mut progress = report();
+            let result = record_transfer(
+                Err(error),
+                attempt,
+                0,
+                &|| panic!("failed transfer must not be acknowledged"),
+                &mut progress,
+            );
+            assert_eq!(result.is_ok(), retryable);
+            assert_eq!(coordinator.checkpoint(), &prior);
+            if retryable {
+                assert!(coordinator.begin(0).is_none()); // Bounded retry backoff remains active.
+            }
+            assert_eq!(progress.successful_attempts, 3);
+            assert!(progress.reconciliation_required);
+        }
     }
 }
