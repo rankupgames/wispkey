@@ -175,3 +175,106 @@ from device enrollment and is unavailable in default builds.
 Cloud authentication uses the opt-in public OAuth code + S256 PKCE contract in
 [Cloud CLI sign-in](cloud-login.md). Legacy raw callback sessions need a fresh
 login. Access tokens expire within 24 hours; no refresh token is requested.
+
+## Manifest and conflict contract
+
+This table records the current conditional-sync contract for RUG-218. Review
+approval remains a release gate; this document does not introduce a new wire
+format or authorize a schema migration. RUG-5 owns sync implementation. The
+project maintainer owns contract review and must review changes to identity,
+revision handling, encryption, storage or conflict decisions.
+
+| Field / identity | Current meaning |
+| --- | --- |
+| Endpoint and authenticated account | Define a separate journal scope; changing either cannot reuse another scope's acknowledgement |
+| Project and partition names | Exact names bind both the opaque remote ID and authenticated encrypted snapshot; a rename requires explicit migration |
+| Remote `id`, `revision` | Remote ID must match the requested record. Revisions are opaque 32/36-character hexadecimal/hyphen tokens; compare for equality, never lexical or time order |
+| Remote `content_hash`, `size_bytes`, `last_mutation_id` | Bind downloaded ciphertext and acknowledge the exact mutation; payload limit is 6 MiB |
+| Local `revision`, `local_hash` | Last acknowledged remote revision and keyed local snapshot fingerprint, not the current remote state or a plaintext secret hash |
+| Local `last_success`, `last_error`, `conflict_revision` | Success time, fixed error category and observed conflict marker; an error never advances acknowledgement |
+| Local `pending` | Exact encrypted upload, mutation ID, expected revision and local fingerprint, persisted before dispatch |
+| Result `outcome`, `local_changes_pending`, `recovery_path` | Uploaded/downloaded/unchanged result, edits still awaiting sync and optional encrypted recovery artifact; an acknowledgement can coexist with later local edits |
+
+A fresh empty partition has no credentials and no signup-profile state.
+There is no remote ancestry graph. The acknowledged revision is the comparison
+base; an opaque unequal revision has no inferable ancestor/descendant order.
+A pending upload reconciles its exact mutation before an ordinary new decision.
+
+| Local versus acknowledged fingerprint | Remote versus acknowledged revision | Ordinary `sync` decision |
+| --- | --- | --- |
+| Equal | Equal | No-op; preserve both sides |
+| Changed | Equal | Conditional upload against the acknowledged revision |
+| Equal | Changed | Authenticate and atomically import the remote snapshot |
+| Changed | Changed | Conflict; preserve both sides and require an explicit choice |
+| No acknowledgement; local missing or fresh empty | Remote exists | First pull may create/import the partition atomically |
+| No acknowledgement; local populated | Remote absent | First push uses `If-None-Match: *` |
+| No acknowledgement; local populated | Remote exists | Conflict; no implicit winner |
+| Invalid metadata, ciphertext, scope or local import | Any | Fail without importing or claiming acknowledgement |
+
+Explicit `push` refuses changed remote state; explicit `pull` refuses local
+changes except a fresh empty partition without signup-profile state. Resolve
+requires the exact observed
+remote revision, or `absent` after observing absence. It preserves the discarded
+side in an owner-only encrypted recovery file before replacement. A changed
+revision, malformed receipt, invalid bundle or concurrent local edit stops the
+operation. Import and acknowledgement commit together. Uncertain uploads must
+be reconciled before offline recovery; recovery never acknowledges remote state.
+
+The journal identity prefix is `cloud_sync_v1` and the remote ID derivation is
+`wispkey-partition-v1`. Encrypted `WKCS` snapshots currently accept versions
+1 through 3. These are separate contracts, not interchangeable version numbers.
+An older backend without conditional revisions is incompatible; HTTP 428 fails
+closed. Unsupported snapshot versions fail authentication/scope validation.
+There is no unconditional-upload fallback, automatic identity migration or
+silent format downgrade. A future format change needs approved migration and
+fixture updates before an old format can be deprecated.
+
+Representative fixtures in `tests/cloud_sync.rs` cover no-op equality,
+interrupted acknowledgement with identical ciphertext/mutation, concurrent
+changes, explicit local/remote choices, edits during download, corrupt or wrong
+passphrase input and rollback of a later invalid row. Preserve these fixture
+scenarios across any version change; synthetic fixture success does not approve
+a new schema or certify production storage.
+
+## Offline behavior contract
+
+This table records existing behavior for RUG-228. RUG-5 owns implementation and
+RUG-84 owns the trust-boundary proof sequence. The project maintainer owns the
+contract and reviews startup, identity, storage, sync and retry changes.
+The [Personal proof PR](https://github.com/rankupgames/wispkey/pull/77) supplies
+the independent denied-network procedure; approval of this table remains a
+release review gate.
+
+| State / event | Local behavior and safe next action |
+| --- | --- |
+| Personal, no account or network | Local vault/credential operations remain available; proxy upstreams must be locally reachable |
+| Cloud configured, network unavailable | Local commands remain available. Explicit network operations fail; local status reads the journal and does not claim remote verification |
+| Missing or expired local Cloud session | Network requests reject locally; sign in again to the same account. No offline access expansion |
+| Upload journaled, response lost | Exact encrypted request stays pending. A new process retries it with the same mutation and base revision; do not delete the journal |
+| Offline local edits after uncertain upload | Preserve the edits; receipt recovery acknowledges the prior snapshot and reports current edits as still pending |
+| Download interrupted or invalid | Preserve the current local partition and acknowledgement; retry only after the failure cause is resolved |
+| Reconnection reveals concurrent changes | Report conflict and require observed-revision resolution; reconnect never chooses a winner |
+| Vault locked | Local status reports unknown local-change state. Network sync/import still requires local unlock and existing authorization |
+| Offline encrypted recovery | Restore atomically in the original project using the separate bundle passphrase; uncertain uploads block recovery first |
+| Experimental foreground watch interrupted | Transient network errors use bounded backoff. Authority loss or conflict stops the run; restart requires fresh explicit owner opt-in |
+
+Default builds do not queue a background sync job or acquire keys on reconnect.
+The durable queue is the encrypted pending upload for an explicitly attempted
+operation, not a promise that later local changes will upload automatically.
+Foreground watch is feature-gated and process-local; see
+[its authority and cancellation contract](foreground-sync-watch.md).
+The safe recovery sequence is local status, restored connectivity, remote
+status, retry/reconciliation, then explicit resolution if needed. Do not erase
+journals, recovery files or account bindings to clear an error. No failure,
+retry or status output may include provider response bodies, credentials,
+passphrases or bearer tokens.
+
+Acceptance scenarios are deterministic: remove the acknowledgement after a
+stored upload and compare retry bytes; edit locally while a download is in
+flight and require rollback; alter remote revision before resolution and
+require rejection; deny network with no account configuration and verify local
+operations; stop watch at authority/deadline boundaries and retain pending
+reconciliation. Existing sync/watch fixtures cover the Cloud scenarios, and
+PR #77 adds the independent Personal network-denial scenario. Rerun after the
+review triggers above and before release acceptance. Actual live session and
+deployment acceptance remain with RUG-220 and RUG-83.
