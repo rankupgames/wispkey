@@ -103,6 +103,24 @@ After authentication, WispKey checks instance scope before injecting a vault cre
 
 Each instance secret is 48 uniformly generated mixed-alphanumeric characters, approximately 286 bits of entropy, and only an Argon2id hash is stored. `instance rotate-secret` supports `--if-older-than` for idempotent periodic jobs and `--grace` for rollout overlap. A request authenticated with the new secret clears the previous hash immediately; otherwise the previous hash expires at the recorded deadline. Revocation and rotation races use conditional active-state/hash updates and fail closed. After a vault restore, instances are marked `needs_reenrollment` because plaintext secrets were never stored; `rotate-secret` mints a new secret and returns the instance to `active`.
 
+## Cloud Ciphertext Boundary
+
+The sync CLI encrypts vault snapshots locally with a separate bundle passphrase.
+Cloud receives encrypted bytes and non-secret account/partition/revision metadata;
+it does not need the vault master key or bundle passphrase. OAuth bearers and
+service authentication keys remain separate credentials and must stay out of
+application data, responses and logs.
+
+The private [independent ciphertext proof](https://github.com/rankupgames/wispkey-cloud/pull/23)
+runs the real CLI against disposable service handlers and D1/R2, scanning accepted
+bodies, application tables/objects, errors and encrypted conflict recovery for
+synthetic canaries. It verifies recovered local values by digest. This supports
+the compliant client boundary; server framing checks cannot determine whether an
+arbitrary caller actually encrypted bytes or placed a secret in visible metadata.
+Production Clerk/TLS, infrastructure logs, provider-internal tables and
+administrative exports remain outside the proof. They require separate acceptance;
+the runtime proof does not establish production readiness or total key custody.
+
 ## Vault Backup Boundary
 
 `wispkey backup` writes a versioned, authenticated AES-256-GCM archive (`WKVB`) encrypted with a dedicated backup passphrase, not the vault master password. The archive contains vault tables and selected sidecars. Credential values remain encrypted under the original master key. Inspect, verify, and dry-run output omit plaintext secrets, encrypted blobs, password hashes, instance secret hashes, bootstrap token hashes, wisp tokens, and cloud session tokens.
