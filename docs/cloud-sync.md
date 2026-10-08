@@ -75,6 +75,48 @@ unknown local-change state instead of claiming the partition is unchanged.
 Status does not expose bundle contents, passphrases, bearer tokens, or a pending
 upload body.
 
+## Failures and retry policy
+
+Manual `push`, `pull`, and `sync` make one transfer attempt per partition. They
+never loop automatically. Each HTTP request has a 30-second timeout. A failed
+transfer leaves its acknowledged revision unchanged; an uncertain upload keeps
+its encrypted payload and mutation ID so repeating the same command can reconcile
+or resend that exact upload. A successful receipt is required before acknowledgement.
+
+| Failure | Local `last_error` | Foreground watch | Recovery |
+| --- | --- | --- | --- |
+| Transport interruption | `network_interrupted` | Bounded retry | Check connectivity, then repeat the same command. |
+| Request timeout or HTTP 408 | `request_timed_out` | Bounded retry | Repeat after the connection or service recovers. |
+| HTTP 500, 502, 503, 504 | `service_unavailable` | Bounded retry | Inspect service health before repeated manual attempts. |
+| HTTP 401 | `authentication_expired` | Stops | Run `cloud login`, then inspect status and retry. |
+| HTTP 403 | `permission_denied` | Stops | Check account permissions and plan; retry does not grant access. |
+| HTTP 429 | `rate_limited` | Stops | Wait for the service limit to reset before a new manual attempt. |
+| HTTP 409 or 412 | `conflict` | Stops | Inspect the remote revision and explicitly resolve the conflict. |
+| Unsupported response or revision contract | `protocol_rejected` | Stops | Check CLI/backend compatibility; do not force an upload. |
+| Invalid payload, local guard, or vault failure | `sync_failed` or a local error | Stops | Correct the reported condition; local data remains unchanged. |
+
+The default-off [foreground watch](foreground-sync-watch.md) uses the same
+conditional transfers. It waits 2, 4, 8, 16, 32, 64, 128, 256, then 300 seconds
+between consecutive transient failures. The delay stays capped at 300 seconds;
+a successful reconciliation resets it. The requested duration (at most 3,600
+seconds) and existing vault-session expiry bound the whole run, including in-flight
+requests. There is no retry after an authorization, rate-limit, protocol, conflict,
+or local guard failure. Watch startup account verification also fails immediately;
+it does not start an unverified watch or retry login.
+
+Errors and journal categories use fixed text. Provider response bodies, URLs,
+bearer tokens, and plaintext credentials are not copied into them. After a cancelled
+or expired watch, run manual sync to reconcile a possibly pending upload. Never
+choose a conflict winner solely to clear a service error. If service failures
+continue across bounded runs, stop restarting watch and have the Cloud operator
+check availability and protocol compatibility.
+
+The sync maintainers own this policy in `src/cloud/sync.rs` and the watch coordinator.
+Rerun `cloud_sync` and the Cloud watch/coordinator unit tests when request handling,
+status mapping, backend revisions, or retry limits change. The lost-acknowledgement
+fixture covers transport, service, authorization, rate-limit, and protocol failures;
+the watch fixture checks retry admission and unchanged acknowledgement state.
+
 ## Conflicts and recovery
 
 Inspect `cloud status --remote --format json`, then supply the **observed**
