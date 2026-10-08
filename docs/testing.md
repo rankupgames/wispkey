@@ -32,6 +32,9 @@ artifact whenever the tray UI changes.
 Additional suites require their own prerequisites:
 
 ```sh
+# Linux/WSL with ip, unshare and strace; synthetic, loopback-only runtime proof.
+python scripts/verify.py --suite offline
+
 # Native tray: OS GUI libraries, plus the Rust and Node prerequisites above.
 python scripts/verify.py --suite tray
 
@@ -93,6 +96,7 @@ features should add a regression at the public interface and update this map.
 | Cloud sessions, encrypted push/pull/sync, conflicts and recovery | `src/cloud/mod.rs` tests, `tests/cloud_sync.rs`, `tests/cli_contracts.rs`, `tests/smoke.rs` | Requires the compatible backend migration; production Clerk/deployment acceptance remains external |
 | Release assets, installers, Homebrew and packaging | `tests/release_packaging.rs`, `.github/workflows/release.yml` | Signing, registry authentication, and public downloads run in release workflow |
 | macOS per-user native host installer | `scripts/tests/test_browser_host_macos.py`: browser allowlists, full host ancestor trust, post-plan path substitution, permissions, symlinks, no overwrite | Plan is read-only; real registration is explicit user action |
+| Personal accountless and offline runtime | [Denied-network proof](personal-offline.md): traced smoke/proxy/audit/MCP suites; lifecycle canary and trace-policy checks | Linux/WSL runtime proof; native platform approval and Cloud acceptance remain separate |
 | Validation runner | `scripts/tests/test_verify.py` | Missing tools and failed subprocesses must produce failure, never a false pass |
 
 ## Ignored tests and pending backlog
@@ -131,7 +135,9 @@ tests must be assessed on the required OS/device. An ignored result is not a pas
 ## Human acceptance record
 
 Use only disposable accounts/resources and record metadata, never credential
-values or native-message payloads. Record commit, OS, browser/version or target
+values or native-message payloads. For Personal / Local GA and the local-independence
+gate of Cloud MVP, include the [offline proof](personal-offline.md) JSON and its
+scoped result. Record commit, OS, browser/version or target
 identifier, date, tester, expected/actual outcome, and pass/fail/not-run.
 
 For each installed browser family in a separate human-controlled profile, follow
