@@ -39,7 +39,7 @@ struct ServerState {
     api_origin: String,
     uploads: Vec<Value>,
     requests: Vec<(String, String)>,
-    lose_ack: bool,
+    upload_failure: Option<u16>,
     expired: bool,
     corrupt: bool,
     before_download: Option<Box<dyn FnOnce() + Send>>,
@@ -246,9 +246,11 @@ async fn handle(
         if let Some(callback) = state.before_upload_ack.take() {
             callback();
         }
-        if state.lose_ack {
-            state.lose_ack = false;
-            return Err(std::io::Error::other("synthetic lost acknowledgement"));
+        if let Some(status) = state.upload_failure.take() {
+            if status == 0 {
+                return Err(std::io::Error::other("synthetic lost acknowledgement"));
+            }
+            return reply(status, format!("{SECRET} {SESSION}").as_bytes(), None);
         }
         reply(
             200,
@@ -442,51 +444,83 @@ fn encrypted_roundtrip_preserves_tokens_and_repeated_operations_are_noops() {
 
 #[test]
 fn interrupted_upload_retries_identical_ciphertext_without_advancing_revision() {
-    let server = Server::new();
-    let dir = tempfile::tempdir().unwrap();
-    init_vault(dir.path());
-    server.configure(dir.path());
-    add(dir.path(), "cloud-key", SECRET, "personal");
-    server.state.lock().unwrap().lose_ack = true;
-    let failed = run_wispkey_bundle(
-        dir.path(),
-        &["--format", "json", "cloud", "push", "personal"],
-    );
-    assert!(!failed.status.success());
-    assert_eq!(
-        status(dir.path())["partitions"][0]["upload_pending"],
-        true,
-        "failed upload: {}",
-        String::from_utf8_lossy(&failed.stdout)
-    );
-    let revision = server
-        .state
-        .lock()
-        .unwrap()
-        .records
-        .values()
-        .next()
-        .unwrap()
-        .metadata["revision"]
-        .clone();
-    let retry = transfer(dir.path(), "push");
-    assert_eq!(retry["partitions"][0]["remote_revision"], revision);
-    let state = server.state.lock().unwrap();
-    assert_eq!(state.uploads.len(), 2);
-    assert_eq!(state.uploads[0], state.uploads[1]);
-    drop(state);
-    assert_eq!(status(dir.path())["partitions"][0]["upload_pending"], false);
-    let db = rusqlite::Connection::open(dir.path().join("vault.db")).unwrap();
-    let journal: String = db
-        .query_row(
-            "SELECT value FROM vault_meta WHERE key LIKE 'cloud_sync_v1:%'",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(!journal.contains(SECRET));
-    assert!(!journal.contains(SESSION));
-    assert!(!journal.contains("test-password"));
+    for (failure, category) in [
+        (0, "network_interrupted"),
+        (408, "request_timed_out"),
+        (500, "service_unavailable"),
+        (502, "service_unavailable"),
+        (503, "service_unavailable"),
+        (504, "service_unavailable"),
+        (429, "rate_limited"),
+        (401, "authentication_expired"),
+        (403, "permission_denied"),
+        (428, "protocol_rejected"),
+        (501, "protocol_rejected"),
+    ] {
+        let server = Server::new();
+        let dir = tempfile::tempdir().unwrap();
+        init_vault(dir.path());
+        server.configure(dir.path());
+        add(dir.path(), "cloud-key", SECRET, "personal");
+        server.state.lock().unwrap().upload_failure = Some(failure);
+        let failed = run_wispkey_bundle(
+            dir.path(),
+            &["--format", "json", "cloud", "push", "personal"],
+        );
+        assert!(!failed.status.success());
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&failed.stdout),
+            String::from_utf8_lossy(&failed.stderr)
+        );
+        assert!(!output.contains(SECRET));
+        assert!(!output.contains(SESSION));
+        let local = run_wispkey_json(dir.path(), &["--format", "json", "cloud", "status"]);
+        assert_eq!(
+            local["partitions"][0]["last_error"], category,
+            "HTTP {failure}"
+        );
+        assert!(local["partitions"][0]["acknowledged_revision"].is_null());
+        assert_eq!(
+            server.state.lock().unwrap().uploads.len(),
+            1,
+            "manual command must not retry automatically"
+        );
+        assert_eq!(
+            status(dir.path())["partitions"][0]["upload_pending"],
+            true,
+            "failed upload: {}",
+            String::from_utf8_lossy(&failed.stdout)
+        );
+        let revision = server
+            .state
+            .lock()
+            .unwrap()
+            .records
+            .values()
+            .next()
+            .unwrap()
+            .metadata["revision"]
+            .clone();
+        let retry = transfer(dir.path(), "push");
+        assert_eq!(retry["partitions"][0]["remote_revision"], revision);
+        let state = server.state.lock().unwrap();
+        assert_eq!(state.uploads.len(), 2);
+        assert_eq!(state.uploads[0], state.uploads[1]);
+        drop(state);
+        assert_eq!(status(dir.path())["partitions"][0]["upload_pending"], false);
+        let db = rusqlite::Connection::open(dir.path().join("vault.db")).unwrap();
+        let journal: String = db
+            .query_row(
+                "SELECT value FROM vault_meta WHERE key LIKE 'cloud_sync_v1:%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!journal.contains(SECRET));
+        assert!(!journal.contains(SESSION));
+        assert!(!journal.contains("test-password"));
+    }
 }
 
 #[test]
