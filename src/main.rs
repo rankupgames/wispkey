@@ -564,6 +564,15 @@ fn read_bootstrap_token_source(
 
 #[derive(Subcommand)]
 enum AuditCommands {
+    /// Write a protected sanitized copy of an offline legacy fallback JSONL file
+    RemediateFallback {
+        /// Owner-only source snapshot (preserved unchanged; maximum 16 MiB)
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// New output file in an existing owner-only directory (never overwritten)
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
     /// Export all matching audit events
     Export {
         /// Include events at or after this timestamp or date
@@ -1541,6 +1550,18 @@ async fn main() {
             cli::handle_log(last, credential.as_deref(), since.as_deref()).await;
         }
         Commands::Audit { command } => match command {
+            AuditCommands::RemediateFallback { input, output } => {
+                match wispkey::audit::remediation::remediate_fallback(&input, &output) {
+                    Ok(report) => println!(
+                        "{}",
+                        serde_json::to_string(&report).expect("report serialization")
+                    ),
+                    Err(error) => {
+                        eprintln!("Error: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             AuditCommands::Export {
                 since,
                 until,

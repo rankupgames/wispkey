@@ -126,3 +126,13 @@ the runtime proof does not establish production readiness or total key custody.
 `wispkey backup` writes a versioned, authenticated AES-256-GCM archive (`WKVB`) encrypted with a dedicated backup passphrase, not the vault master password. The archive contains vault tables and selected sidecars. Credential values remain encrypted under the original master key. Inspect, verify, and dry-run output omit plaintext secrets, encrypted blobs, password hashes, instance secret hashes, bootstrap token hashes, wisp tokens, and cloud session tokens.
 
 Session files and remembered protectors are excluded and will not unlock a restored vault on another machine. Instance bearer secrets and bootstrap tokens cannot be restored; workers must receive newly minted secrets. A lost master password or lost backup passphrase is unrecoverable. See [`docs/vault-backup.md`](vault-backup.md).
+
+## Legacy fallback audit remediation
+
+`wispkey audit remediate-fallback` writes a bounded, owner-only sanitized copy of
+an offline legacy JSONL snapshot without modifying its source. It rejects unsafe
+file types, links, broad permissions, malformed records, and existing output
+paths; unsupported private-file verification fails closed. It removes legacy
+token fields and unknown fields and never echoes input diagnostics. Original
+files remain sensitive evidence; this is not erasure or capability revocation.
+See [operator guidance](audit-remediation.md) for retention and rotation steps.
