@@ -1,5 +1,7 @@
 //! Offline, non-destructive remediation of legacy fallback audit snapshots.
+#[cfg(not(windows))]
 use std::fs::{self, OpenOptions};
+#[cfg(not(windows))]
 use std::io::Read;
 use std::path::Path;
 
@@ -9,7 +11,11 @@ use super::{
     FallbackAuditEntry, FallbackAuditLine, redact_capabilities, redact_required,
     stored_token_fingerprint,
 };
+#[cfg(not(windows))]
 use crate::secure_files;
+
+#[cfg(windows)]
+mod windows;
 
 const MAX_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 
@@ -23,6 +29,7 @@ pub struct RemediationReport {
 
 /// Produce a sanitized, owner-only JSONL copy. Never overwrite either file.
 /// Unrecognized fields are deliberately omitted, not copied to the new sink.
+#[cfg(not(windows))]
 pub fn remediate_fallback(input: &Path, output: &Path) -> Result<RemediationReport, String> {
     if !secure_files::private_metadata_inspection_supported() {
         return Err("private-file verification is unsupported on this platform".into());
@@ -153,9 +160,14 @@ fn create_output(parent: &std::fs::File, output: &Path, bytes: &[u8]) -> Result<
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn create_output(_parent: &std::fs::File, _output: &Path, _bytes: &[u8]) -> Result<(), String> {
     Err("private-file verification is unsupported on this platform".into())
+}
+
+#[cfg(windows)]
+pub fn remediate_fallback(input: &Path, output: &Path) -> Result<RemediationReport, String> {
+    windows::remediate(input, output)
 }
 
 fn sanitize(text: &str) -> Result<(Vec<u8>, RemediationReport), String> {
@@ -216,7 +228,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn legacy() -> String {
+    pub(super) fn legacy() -> String {
         json!({"timestamp":"2026-10-15T00:00:00Z", "event_type":"Use wk_event_secret", "credential_name":"wk_name_secret", "wisp_token":"wk_actual_secret", "token_fingerprint":"hmac-sha256:wk_forged_secret", "target_host":"wk_host_secret", "target_path":"/wk_path_secret", "http_method":"wk_method_secret", "response_status":200, "denied":false, "deny_reason":"wk_reason_secret", "project_name":"wk_project_secret", "sink":"wk_sink_secret", "unknown":{"wk_key_secret":"wk_unknown_secret"}}).to_string()
     }
 

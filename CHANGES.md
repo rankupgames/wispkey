@@ -8,6 +8,11 @@
 - Runtime `run` resolves fresh vault values with partition/lifecycle checks. Nonsecret worktree and CLI overrides follow a bound allowlist; relative SQLite paths remain isolated unless shared storage is explicitly enabled.
 - Inside Git, implicit `run` now requires a binding; use `--manifest wispkey.toml` for the previous manual behavior. Production selection, plaintext export and database copying remain explicit separate workflows. See `docs/worktree-environments.md`.
 
+### Windows protected fallback audit remediation
+
+- Added Windows support for offline `audit remediate-fallback`: verified private source/parent handles, pinned non-reparse local paths, bounded reading, and owner-only exclusive output creation. Existing ACLs and source contents remain unchanged.
+- Added synthetic Windows ACL, junction, hard-link, malformed-input and concurrent rename/creation tests. Unsupported namespaces and filesystems fail closed; see `docs/audit-remediation.md` for platform limits.
+
 ### macOS native browser approval preview
 
 - Added in-process biometric-only LocalAuthentication with a fresh context, zero device-unlock reuse, bounded cancellation and no password/button fallback. Missing, unenrolled or locked-out Touch ID fails closed.
