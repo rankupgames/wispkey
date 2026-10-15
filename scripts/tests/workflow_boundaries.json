@@ -134,7 +134,7 @@
   },
   "automation-tests.yml": {
     "events": [
-      "on:\n  pull_request:\n    branches: [main, development, release]\n  push:\n    branches: [main, development, release]"
+      "on:\n  pull_request: {}\n  push:\n    branches: [main, development, release]"
     ],
     "permissions": [
       "permissions:\n  contents: read"
@@ -210,7 +210,7 @@
   },
   "ci.yml": {
     "events": [
-      "on:\n  push:\n    branches: [development, main]\n  pull_request:\n    branches: [development, main, release]"
+      "on:\n  push:\n    branches: [development, main]\n  pull_request: {}"
     ],
     "permissions": [
       "permissions:\n  contents: read"
