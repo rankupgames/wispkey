@@ -108,8 +108,8 @@ jobs:
   check:
     name: Rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # Cold Windows builds need room for the full suite, release build and cache cleanup.
-    timeout-minutes: 40
+    # Windows logs exceeded 40 minutes after passing tests, during release/cache work.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 40 }}
     strategy:
       fail-fast: false
       matrix:
@@ -146,6 +146,14 @@ jobs:
 
       - name: Default-off migration and receiver guards
         run: cargo test --lib schema
+
+      - name: Windows protected audit remediation fixtures
+        if: runner.os == 'Windows'
+        run: cargo test --locked --lib audit::remediation
+
+      - name: Windows private identity ACL fixtures
+        if: runner.os == 'Windows'
+        run: cargo test --locked --lib operations::identity
 
       - name: Tests
         run: cargo test --features experimental-browser-receiver

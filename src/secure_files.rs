@@ -381,7 +381,7 @@ pub(crate) mod windows_acl {
         Ok(sid)
     }
 
-    fn security_descriptor_from_sddl(sddl: &str) -> Result<SecurityDescriptor> {
+    pub(crate) fn security_descriptor_from_sddl(sddl: &str) -> Result<SecurityDescriptor> {
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
         let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
         let converted = unsafe {
@@ -426,6 +426,13 @@ pub(crate) mod windows_acl {
         security_descriptor_from_sddl(&format!("D:P(A;;GA;;;{sid})"))
     }
 
+    /// Explicit owner avoids an elevated token defaulting ownership to Administrators.
+    pub(crate) fn current_user_owned_security_descriptor() -> Result<SecurityDescriptor> {
+        let sid = super::windows_private::current_sid_string()
+            .map_err(|message| VaultError::Io(std::io::Error::other(message)))?;
+        security_descriptor_from_sddl(&format!("O:{sid}D:P(A;;GA;;;{sid})"))
+    }
+
     pub(crate) struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
 
     impl SecurityDescriptor {
@@ -442,3 +449,6 @@ pub(crate) mod windows_acl {
         }
     }
 }
+
+#[cfg(windows)]
+pub(crate) mod windows_private;

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Windows protected fallback audit remediation
+
+- Added Windows support for offline `audit remediate-fallback`: verified private source/parent handles, pinned non-reparse local paths, bounded reading, and owner-only exclusive output creation. Existing ACLs and source contents remain unchanged.
+- Added synthetic Windows ACL, junction, hard-link, malformed-input and concurrent rename/creation tests. Unsupported namespaces and filesystems fail closed; see `docs/audit-remediation.md` for platform limits.
+
 ### macOS native browser approval preview
 
 - Added in-process biometric-only LocalAuthentication with a fresh context, zero device-unlock reuse, bounded cancellation and no password/button fallback. Missing, unenrolled or locked-out Touch ID fails closed.
