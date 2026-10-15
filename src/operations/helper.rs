@@ -791,8 +791,14 @@ mod tests {
     #[tokio::test]
     async fn timeout_kills_child_group_and_persists_uncertain_outcome() {
         const ID: &str = "726f3ec9-e50d-4bd4-a59c-944a76f713c6";
-        let (_dir, config, store) = fixture();
-        std::fs::write(&config.program, b"#!/bin/sh\n/bin/sleep 5\n").unwrap();
+        let (dir, mut config, store) = fixture();
+        let started = dir.path().join("child-started");
+        config.args = vec![started.to_str().unwrap().to_owned()];
+        std::fs::write(
+            &config.program,
+            b"#!/bin/sh\nprintf started > \"$1\"\n/bin/sleep 30\n",
+        )
+        .unwrap();
         let (caller, helper) = tokio::io::duplex(4096);
         let (helper_input, helper_output) = tokio::io::split(helper);
         let task = tokio::spawn({
@@ -802,7 +808,7 @@ mod tests {
         let (caller_input, mut caller_output) = tokio::io::split(caller);
         let mut caller_input = BufReader::new(caller_input);
         caller_output
-            .write_all(hello(ID, 150).as_bytes())
+            .write_all(hello(ID, 5000).as_bytes())
             .await
             .unwrap();
         let mut ready = String::new();
@@ -814,12 +820,15 @@ mod tests {
         );
         caller_output.write_all(delivery.as_bytes()).await.unwrap();
         let mut result = String::new();
-        tokio::time::timeout(Duration::from_secs(2), caller_input.read_line(&mut result))
+        tokio::time::timeout(Duration::from_secs(10), caller_input.read_line(&mut result))
             .await
             .unwrap()
             .unwrap();
         assert!(result.is_empty() || result.contains("\"outcome_unknown\""));
         assert_eq!(task.await.unwrap(), 1);
+        // The timeout must exercise a dispatched child, not an expired handshake.
+        // A 150 ms whole-handshake budget raced fixture setup on busy CI runners.
+        assert_eq!(std::fs::read(&started).unwrap(), b"started");
         let db = Connection::open(&store).unwrap();
         let state: String = db
             .query_row(
