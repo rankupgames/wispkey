@@ -183,3 +183,85 @@ fn preflight_failures_never_echo_catalog_values_or_paths() {
     assert!(!String::from_utf8_lossy(&output.stderr).contains(CANARY));
     assert!(!vault.exists());
 }
+
+#[test]
+fn runtime_preflight_remains_metadata_only_without_credentials_or_identity_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let vault = root.join("no-vault");
+    let identity = principal(&vault);
+    let raw = catalog(&identity)
+        .replace("version = 1", "version = 2")
+        .replace(&identity, "instance:5af05c13-1c0a-4394-a7a3-7f457ff74a40");
+    let path = write_catalog(&root, &identity, &raw);
+    let before = std::fs::read(&path).unwrap();
+    let output = check(&vault, &path, Some("maintenance"));
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["configuration_valid"], true);
+    assert_eq!(report["execution_available"], true);
+    for key in [
+        "credential_verified",
+        "live_target_verified",
+        "execution_authorized",
+        "requester_authenticated",
+    ] {
+        assert_eq!(report[key], false);
+    }
+    assert_eq!(before, std::fs::read(&path).unwrap());
+    assert!(!vault.exists());
+}
+
+// RUG-447's read-operation contract is a proposal, not permission to reinterpret
+// a v1/v2 credential-delivery entry or return arbitrary remote output.
+#[test]
+fn unapproved_read_catalogs_fail_closed_without_state_changes_or_echo() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let vault = root.join("no-vault");
+    let identity = principal(&vault);
+    for version in [1, 2] {
+        let mut raw = catalog(&identity).replace("version = 1", &format!("version = {version}"));
+        if version == 2 {
+            raw = raw.replace(&identity, "instance:5af05c13-1c0a-4394-a7a3-7f457ff74a40");
+        }
+        let credential = "credential_id = \"5af05c13-1c0a-4394-a7a3-7f457ff74a40\"\n";
+        for invalid in [
+            raw.replace(credential, ""),
+            raw.replace(credential, "credential_id = \"\"\n"),
+            raw.replace(credential, "credential_id = \"none\"\n"),
+            raw.replace(
+                credential,
+                "credential_id = \"00000000-0000-0000-0000-000000000000\"\n",
+            ),
+            raw.replace("kind = \"ssh-helper\"", "kind = \"ssh-read\""),
+            raw.replace("kind = \"ssh-helper\"", "kind = \"ssh-read\"")
+                .replace(credential, ""),
+            raw.replace("[operation.ssh]", "credential_free = true\n[operation.ssh]"),
+            raw.replace("[operation.ssh]", "return_stdout = true\n[operation.ssh]"),
+            raw.replace(
+                "[operation.ssh]",
+                &format!("output_schema = \"{CANARY}\"\n[operation.ssh]"),
+            ),
+            raw.replace(&format!("version = {version}"), "version = 3"),
+            raw.replace(
+                "[operation.ssh]",
+                &format!("[operation.result]\nvalue = \"{CANARY}\"\n[operation.ssh]"),
+            ),
+        ] {
+            let path = write_catalog(&root, &identity, &invalid);
+            let before = std::fs::read(&path).unwrap();
+            let output = check(&vault, &path, Some("maintenance"));
+            assert!(!output.status.success());
+            let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["configuration_valid"], false);
+            assert_eq!(report["execution_available"], false);
+            for bytes in [&output.stdout, &output.stderr] {
+                assert!(!String::from_utf8_lossy(bytes).contains(CANARY));
+                assert!(!String::from_utf8_lossy(bytes).contains(path.to_str().unwrap()));
+            }
+            assert_eq!(before, std::fs::read(&path).unwrap());
+            assert!(!vault.exists());
+        }
+    }
+}
