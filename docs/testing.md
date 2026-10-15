@@ -59,6 +59,29 @@ the actual system tray, autostart, and OS consent dialogs still need acceptance.
 Linux `--all-features` compiles AF_VSOCK but a host
 without a usable vsock device cannot establish guest/host connectivity.
 
+## Socket-free owner IPC protocol checks
+
+When a sandbox prohibits Unix socket creation, run the production Unix client's
+post-connect byte-stream exchange against an in-memory Tokio duplex transport:
+
+```sh
+cargo test --locked --lib owner_ipc::simulated_transport
+```
+
+These tests cover one-byte backpressure, fragmented UTF-8 and JSON, newline
+framing, multiple response frames, empty/truncated EOF, invalid JSON/UTF-8,
+disconnected writes, and cancellation during a partial response. They preserve
+the current acceptance of complete JSON at EOF without a final newline. The
+bounded test harness is not a new production timeout: Unix owner IPC currently
+has no built-in request/response deadline.
+
+This simulation does not exercise Unix connection setup, filesystem permissions,
+peer credentials, endpoint cleanup, server dispatch, or Windows named pipes.
+The existing real-socket `tests/owner_ipc.rs` suite and Linux/macOS CI remain
+required; do not replace them with this simulation or treat a sandbox-denied
+socket test as passed. CI's default and feature-enabled library test runs include
+the simulation automatically, without a special skip or alternate security mode.
+
 ## Feature-to-test map
 
 Paths below identify executable tests, including module-local unit tests. This

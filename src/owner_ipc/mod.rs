@@ -698,6 +698,28 @@ async fn write_line<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+// Only the byte-stream exchange is transport-independent. Connection setup and
+// peer authorization stay in the platform-specific implementations below.
+#[cfg(any(unix, test))]
+async fn call_connected<S>(stream: S, request: Value) -> Result<Value, OwnerIpcError>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::{AsyncBufReadExt, BufReader};
+
+    let (reader, mut writer) = tokio::io::split(stream);
+    write_line(&mut writer, &request).await?;
+    let mut lines = BufReader::new(reader).lines();
+    let line = lines
+        .next_line()
+        .await?
+        .ok_or_else(|| OwnerIpcError::Protocol("empty owner IPC response".into()))?;
+    serde_json::from_str(&line).map_err(|error| OwnerIpcError::Protocol(error.to_string()))
+}
+
+#[cfg(test)]
+mod simulated_transport;
+
 #[cfg(unix)]
 mod unix {
     use std::os::unix::fs::PermissionsExt;
@@ -761,14 +783,7 @@ mod unix {
 
     pub(super) async fn call(path: &Path, request: Value) -> Result<Value, OwnerIpcError> {
         let stream = UnixStream::connect(path).await?;
-        let (reader, mut writer) = stream.into_split();
-        write_line(&mut writer, &request).await?;
-        let mut lines = BufReader::new(reader).lines();
-        let line = lines
-            .next_line()
-            .await?
-            .ok_or_else(|| OwnerIpcError::Protocol("empty owner IPC response".into()))?;
-        serde_json::from_str(&line).map_err(|error| OwnerIpcError::Protocol(error.to_string()))
+        super::call_connected(stream, request).await
     }
 }
 
