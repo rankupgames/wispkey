@@ -346,3 +346,10 @@ Use `wispkey auth register/list/revoke` and `auth bundle set/list/resolve` for o
 ## Experimental browser receiver
 
 The default-off `experimental-browser-receiver` feature provides a local metadata bridge only. See `docs/browser-receiver.md`. No shipping transport, enrollment or CLI activation exists; never implement authentication by parsing caller-supplied identity or a verification boolean. Receiver requests still require the existing native owner approval. Schema16 prevents older clients ignoring the new release guard.
+
+## Legacy fallback audit remediation
+
+Use `wispkey audit remediate-fallback --input PATH --output PATH` only on an offline
+snapshot. It creates a new owner-only sanitized copy and preserves the source;
+never describe it as erasure or revocation. See `docs/audit-remediation.md` for
+platform limits, strict permissions, and separate operator retention/rotation steps.

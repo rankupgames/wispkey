@@ -152,3 +152,66 @@ fn audit_export_json_array_writes_output_file_and_tail_prints_jsonl() {
     let entry: Value = serde_json::from_str(first_line).expect("tail jsonl");
     assert_eq!(entry["credential_name"], "tail-key");
 }
+
+#[cfg(unix)]
+#[test]
+fn audit_remediation_cli_is_offline_metadata_only_and_non_destructive() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let source = directory.path().join("original.jsonl");
+    let destination = directory.path().join("redacted.jsonl");
+    let contents = serde_json::json!({
+        "timestamp":"2026-10-15T00:00:00Z", "event_type":"Use",
+        "wisp_token":"wk_legacy_secret", "denied":false,
+        "target_path":"/wk_legacy_secret", "unknown":"wk_other_secret"
+    })
+    .to_string();
+    std::fs::write(&source, &contents).unwrap();
+    std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let args = [
+        "audit",
+        "remediate-fallback",
+        "--input",
+        source.to_str().unwrap(),
+        "--output",
+        destination.to_str().unwrap(),
+    ];
+    // Deliberately no init: this must not open, unlock, or mutate a vault.
+    let result = run_wispkey(directory.path(), &args);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let report: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(report["records_written"], 1);
+    assert_eq!(report["legacy_token_fields_removed"], 1);
+    assert_eq!(report["source_preserved"], true);
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("wk_"));
+    assert!(!String::from_utf8_lossy(&result.stderr).contains("wk_"));
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), contents);
+    let safe = std::fs::read_to_string(&destination).unwrap();
+    assert!(!safe.contains("wk_"));
+    assert!(!directory.path().join("vault.db").exists());
+    let duplicate = run_wispkey(directory.path(), &args);
+    assert!(!duplicate.status.success());
+    assert_eq!(std::fs::read_to_string(&destination).unwrap(), safe);
+}
+
+#[test]
+fn malformed_fallback_reader_never_echoes_secret_in_parser_diagnostics() {
+    let directory = tempfile::tempdir().unwrap();
+    let malformed = serde_json::json!({
+        "timestamp":"2026-10-15T00:00:00Z", "event_type":"Use",
+        "denied":"wk_parser_diagnostic_secret"
+    })
+    .to_string();
+    std::fs::write(directory.path().join("sideload-audit.jsonl"), malformed).unwrap();
+    let result = run_wispkey(directory.path(), &["audit", "export"]);
+    assert!(result.status.success());
+    assert!(!String::from_utf8_lossy(&result.stdout).contains("wk_parser_diagnostic_secret"));
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!stderr.contains("wk_parser_diagnostic_secret"));
+    assert!(stderr.contains("Failed to parse fallback audit log line"));
+}

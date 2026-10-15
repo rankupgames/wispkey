@@ -206,3 +206,12 @@
 ## 0.1.0
 
 - Initial local-first WispKey CLI release with encrypted vault storage, wisp tokens, HTTP proxy mode, MCP tools, partitions, policies, audit logging, and encrypted bundle import/export.
+
+### Protected legacy audit remediation (RUG-10)
+
+- Added `audit remediate-fallback --input PATH --output PATH` for non-destructive,
+  protected migration of offline legacy fallback JSONL snapshots.
+- Added bounded, fail-closed input validation, private output creation, metadata-only
+  reporting, and explicit evidence-retention/capability-rotation guidance.
+- Tightened audit readers to reject malformed fingerprint strings, redact timestamp
+  capabilities, and avoid echoing secret-bearing JSON parser diagnostics.

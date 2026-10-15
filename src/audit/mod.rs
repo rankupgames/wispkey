@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use crate::core::Vault;
 use crate::secure_files;
 
+pub mod remediation;
+
 pub const SIDELOAD_FALLBACK_AUDIT_FILE: &str = "sideload-audit.jsonl";
 const AUDIT_FINGERPRINT_KEY_FILE: &str = "audit-fingerprint.key";
 const AUDIT_FINGERPRINT_KEY_LEN: usize = 32;
@@ -54,7 +56,11 @@ fn token_fingerprint(token: &str, key_material: &[u8]) -> String {
 }
 
 fn stored_token_fingerprint(value: Option<String>) -> Option<String> {
-    value.filter(|value| value.starts_with("hmac-sha256:"))
+    value.filter(|value| {
+        value.strip_prefix("hmac-sha256:").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    })
 }
 
 fn database_fingerprint_key(db: &Connection) -> Option<String> {
@@ -469,7 +475,7 @@ pub fn query_log(
     let rows = match stmt.query_map(params_ref.as_slice(), |row| {
         Ok(AuditEntry {
             id: row.get(0)?,
-            timestamp: row.get(1)?,
+            timestamp: redact_required(&row.get::<_, String>(1)?),
             event_type: redact_required(&row.get::<_, String>(2)?),
             credential_name: redact_capabilities(row.get::<_, Option<String>>(3)?.as_deref()),
             token_fingerprint: stored_token_fingerprint(row.get(4)?),
@@ -634,8 +640,9 @@ fn query_fallback_log_from_path(
 
         let row = match serde_json::from_str::<FallbackAuditLine>(&line) {
             Ok(row) => row,
-            Err(error) => {
-                tracing::error!("Failed to parse fallback audit log line: {}", error);
+            Err(_) => {
+                // Serde errors can include the offending (possibly secret) value.
+                tracing::error!("Failed to parse fallback audit log line {}", line_index + 1);
                 continue;
             }
         };
@@ -648,8 +655,7 @@ fn query_fallback_log_from_path(
         let token_fingerprint = if row.wisp_token.is_some() {
             None
         } else {
-            row.token_fingerprint
-                .filter(|value| value.starts_with("hmac-sha256:"))
+            stored_token_fingerprint(row.token_fingerprint)
         };
         let event_type = redact_required(&row.event_type);
         let credential_name = redact_capabilities(row.credential_name.as_deref());
@@ -661,7 +667,7 @@ fn query_fallback_log_from_path(
         let source = redact_required(row.sink.as_deref().unwrap_or("sideload-fallback-jsonl"));
         entries.push(AuditEntry {
             id: -((line_index as i64) + 1),
-            timestamp: row.timestamp,
+            timestamp: redact_required(&row.timestamp),
             event_type,
             credential_name,
             token_fingerprint,
@@ -706,7 +712,7 @@ fn read_audit_rows(
     let rows = match stmt.query_map(params_ref, |row| {
         Ok(AuditEntry {
             id: row.get(0)?,
-            timestamp: row.get(1)?,
+            timestamp: redact_required(&row.get::<_, String>(1)?),
             event_type: redact_required(&row.get::<_, String>(2)?),
             credential_name: redact_capabilities(row.get::<_, Option<String>>(3)?.as_deref()),
             token_fingerprint: stored_token_fingerprint(row.get(4)?),
@@ -1078,5 +1084,24 @@ mod tests {
         let serialized = serde_json::to_string(&entries).unwrap();
         assert!(!serialized.contains("wk_env_openai"));
         assert!(!serialized.contains("sideload-secret"));
+    }
+    #[test]
+    fn fallback_reader_redacts_timestamp_and_rejects_forged_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.jsonl");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "timestamp": "wk_timestamp_secret",
+                "event_type": "Use", "denied": false,
+                "token_fingerprint": "hmac-sha256:wk_fingerprint_secret"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let rows = query_fallback_log_from_path(&path, 10, None, None);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].token_fingerprint.is_none());
+        assert!(!serde_json::to_string(&rows).unwrap().contains("wk_"));
     }
 }
