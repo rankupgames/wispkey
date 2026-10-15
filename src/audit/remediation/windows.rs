@@ -12,8 +12,8 @@ use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_TYPE_DISK, GetDriveTypeW,
-    GetFileInformationByHandle, GetFileType, OPEN_EXISTING, READ_CONTROL,
+    FILE_SHARE_READ, FILE_TYPE_DISK, GetDriveTypeW, GetFileInformationByHandle, GetFileType,
+    OPEN_EXISTING, READ_CONTROL,
 };
 
 use super::{MAX_INPUT_BYTES, RemediationReport, sanitize};
@@ -153,9 +153,12 @@ impl PinnedParent {
             if matches!(part, Component::Prefix(_)) {
                 continue;
             }
+            // Metadata-only access does not participate in Windows share-access
+            // checks. Request directory data/list access so denial of write and
+            // delete sharing really prevents reparse mutation and renames.
             let file = open(
                 &prefix,
-                READ_CONTROL | FILE_READ_ATTRIBUTES,
+                GENERIC_READ | READ_CONTROL,
                 FILE_SHARE_READ,
                 OPEN_EXISTING,
                 None,

@@ -28,7 +28,8 @@ credential, or rotates a token. It works without an initialized or unlocked vaul
 - On Windows, only ordinary local fixed-drive paths are supported. UNC/network,
   device/verbatim namespaces, drive-relative paths, alternate data streams,
   reserved device names and reparse points (including junctions) are rejected.
-  Every source/output ancestor is opened without write/delete sharing and checked
+  Every source/output ancestor is opened with directory read/list access (needed
+  to enforce sharing exclusions), without write/delete sharing, and checked
   for reparse points before opening its child. These handles remain alive through
   output completion, preventing directory renames and writable reparse changes.
   The source is opened without write/delete sharing, must have one hard link,

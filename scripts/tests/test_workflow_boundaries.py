@@ -77,6 +77,22 @@ class WorkflowBoundaryTests(unittest.TestCase):
             self.assertRegex(step, r"(?m)^          package-manager-cache: false$")
             self.assertNotRegex(step, r"(?m)^          cache:")
 
+    def test_windows_private_file_fixtures_fail_independently(self):
+        # PowerShell reports the last native command's exit code. Keep these
+        # security gates separate so a passing identity test cannot hide a
+        # remediation failure.
+        text = (ROOT / ".github/workflows/ci.yml").read_text()
+        steps = re.split(r"(?m)^      - ", text)[1:]
+        for name, command in [
+            ("Windows protected audit remediation fixtures", "audit::remediation"),
+            ("Windows private identity ACL fixtures", "operations::identity"),
+        ]:
+            matching = [step for step in steps if step.startswith("name: " + name + "\n")]
+            self.assertEqual(len(matching), 1)
+            step = matching[0]
+            self.assertIn("if: runner.os == 'Windows'", step)
+            self.assertEqual(blocks(step, "run"), ["run: cargo test --locked --lib " + command])
+
     def test_contract_detects_privilege_and_artifact_drift(self):
         text = (ROOT / ".github/workflows/ci.yml").read_text()
         for before, after in [
