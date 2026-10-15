@@ -147,6 +147,12 @@ jobs:
       - name: Default-off migration and receiver guards
         run: cargo test --lib schema
 
+      - name: Windows protected audit remediation fixtures
+        if: runner.os == 'Windows'
+        run: |
+          cargo test --locked --lib audit::remediation
+          cargo test --locked --lib operations::identity
+
       - name: Tests
         run: cargo test --features experimental-browser-receiver
 
