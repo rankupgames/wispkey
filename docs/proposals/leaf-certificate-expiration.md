@@ -9,7 +9,7 @@ and its unresolved authenticated owner and actual relying-party boundary.
 
 At baseline `398caa488dacf32f7e7cbbc614c227a5d6b7cb44`,
 [`src/pki/mod.rs`](../../src/pki/mod.rs) checks issuer CA validity before issuance
-and caps requested leaf validity to the issuer lifetime. Its CA check rejects
+and rejects requested leaf validity beyond the issuer lifetime. Its CA check rejects
 `not_before > now` and `not_after <= now`. This is not leaf enforcement at a
 relying party. Existing external consumers of exported leaf material remain
 responsible for their own verification. Inventory timestamps alone cannot enforce
