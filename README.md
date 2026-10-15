@@ -586,3 +586,7 @@ Apache-2.0 -- see [LICENSE](LICENSE) for details.
 ### Authentication registry and reusable bundles
 
 Opt existing credentials into explicit provider expiry, local use deadlines and local revocation with `wispkey auth register`. Use `auth list` for metadata-only inventory and `auth bundle` for explicitly chosen account/project-scoped alternatives. See [the auth registry guide](docs/auth-registry.md) for safe registration, atomic encrypted recovery and the boundaries of this foundation. OAuth refresh, browser-session reuse and cloud credential execution are not included.
+
+### Shared development environments across worktrees
+
+Bind a repository once with `wispkey env bind --project P --environment development --manifest wispkey.toml`, then use `wispkey run -- <command>` from its registered worktrees. Credentials stay in the vault; worktree-specific port, origin and relative database settings have an explicit allowlist. See [worktree environments](docs/worktree-environments.md) for setup, precedence and isolation guarantees.

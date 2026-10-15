@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Development environment inheritance across Git worktrees
+
+- Added explicit `env bind` repository/project/development-partition bindings, discovered through registered Git worktrees and local common-directory identity. Independent repositories cannot inherit by remote URL, copied marker or reused checkout path.
+- Runtime `run` resolves fresh vault values with partition/lifecycle checks. Nonsecret worktree and CLI overrides follow a bound allowlist; relative SQLite paths remain isolated unless shared storage is explicitly enabled.
+- Inside Git, implicit `run` now requires a binding; use `--manifest wispkey.toml` for the previous manual behavior. Production selection, plaintext export and database copying remain explicit separate workflows. See `docs/worktree-environments.md`.
+
 ### macOS native browser approval preview
 
 - Added in-process biometric-only LocalAuthentication with a fresh context, zero device-unlock reuse, bounded cancellation and no password/button fallback. Missing, unenrolled or locked-out Touch ID fails closed.

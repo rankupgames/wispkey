@@ -243,11 +243,14 @@ enum Commands {
 
     /// Run a child process with manifest-defined child-only environment variables
     Run {
-        /// Manifest path (default: wispkey.toml in the current directory)
+        /// Override a declared worktree setting (NAME=VALUE); repeat as needed
+        #[arg(long = "env")]
+        overrides: Vec<String>,
+        /// Explicit manifest; otherwise discover the repository binding (or local manifest outside Git)
         #[arg(long)]
         manifest: Option<String>,
 
-        /// Project override (default: active project)
+        /// Project (must match binding; explicit manifests default to active project)
         #[arg(long)]
         project: Option<String>,
 
@@ -488,6 +491,20 @@ enum OperationCommands {
 
 #[derive(Subcommand)]
 enum EnvCommands {
+    /// Bind this Git repository and all registered worktrees to a development environment
+    Bind {
+        #[arg(long)]
+        project: String,
+        /// Existing development partition (development, dev, local, or test)
+        #[arg(long)]
+        environment: String,
+        /// Manifest containing credential references, nonsecret defaults and override allowlist
+        #[arg(long)]
+        manifest: String,
+        /// Explicitly replace an existing binding
+        #[arg(long)]
+        replace: bool,
+    },
     /// Recursively list attachable .env files without reading their contents
     List {
         /// Directory to scan (default: current directory)
@@ -1434,11 +1451,13 @@ async fn main() {
             }
         },
         Commands::Run {
+            overrides,
             manifest,
             project,
             command,
         } => {
             cli::handle_run(cli::RunArgs {
+                overrides: &overrides,
                 manifest: manifest.as_deref(),
                 project: project.as_deref(),
                 command: &command,
@@ -1497,6 +1516,14 @@ async fn main() {
             .await;
         }
         Commands::Env { command } => match command {
+            EnvCommands::Bind {
+                project,
+                environment,
+                manifest,
+                replace,
+            } => {
+                cli::handle_env_bind(&project, &environment, &manifest, replace);
+            }
             EnvCommands::List { directory } => cli::handle_env_list(&directory).await,
             EnvCommands::Attach {
                 path,
