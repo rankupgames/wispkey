@@ -1,8 +1,7 @@
 name: Automation fixtures
 
 on:
-  pull_request:
-    branches: [main, development, release]
+  pull_request: {}
   push:
     branches: [main, development, release]
 
