@@ -499,6 +499,19 @@ mod tests {
     const CHANNEL_CANARY: &str = "synthetic-helper-channel-canary";
 
     #[cfg(unix)]
+    fn synthetic_output_representations(input: &[u8]) -> Vec<String> {
+        let text = String::from_utf8(input.to_vec()).unwrap();
+        vec![
+            text.clone(),
+            STANDARD.encode(input),
+            input.iter().map(|byte| format!("%{byte:02X}")).collect(),
+            input.iter().map(|byte| format!("\\u{byte:04x}")).collect(),
+            format!("+ child --value '{text}'"),
+            serde_json::json!({"error": {"detail": text}}).to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
     #[test]
     #[ignore = "launched only by stdin_only_child_keeps_canaries_out_of_output_and_store"]
     fn channel_probe_child() {
@@ -533,7 +546,14 @@ mod tests {
             std::io::stdout().flush().unwrap();
             std::io::stderr().write_all(chunk).unwrap();
         }
-        eprintln!("{}", STANDARD.encode(&input));
+        for representation in synthetic_output_representations(&input) {
+            for chunk in representation.as_bytes().chunks(2) {
+                std::io::stdout().write_all(chunk).unwrap();
+                std::io::stdout().flush().unwrap();
+                std::io::stderr().write_all(chunk).unwrap();
+                std::io::stderr().flush().unwrap();
+            }
+        }
         std::process::exit(42);
     }
 
@@ -584,7 +604,7 @@ mod tests {
         // argv and environment-isolation assertions actually ran successfully.
         assert_eq!(completion["exit_code"], 42);
         assert_eq!(completion["outcome"], "failed_child");
-        for forbidden in [CHANNEL_CANARY.to_owned(), STANDARD.encode(CHANNEL_CANARY)] {
+        for forbidden in synthetic_output_representations(CHANNEL_CANARY.as_bytes()) {
             assert!(!ready.contains(&forbidden) && !output.contains(&forbidden));
             for entry in std::fs::read_dir(dir.path()).unwrap() {
                 let bytes = std::fs::read(entry.unwrap().path()).unwrap();
