@@ -83,6 +83,7 @@ features should add a regression at the public interface and update this map.
 | Bootstrap TTL, revocation, max uses, concurrent joins | `tests/bootstrap.rs` and core tests | Real fleet distribution of bootstrap secrets is outside the test runner |
 | Policy check/test/explain, host/agent/instance scope | Policy unit tests; `tests/policy.rs`, `tests/instance_policy_identity.rs` | Unknown identity must fail closed; labels cannot authenticate a caller |
 | Owner-approved SSH/Kubernetes/PostgreSQL operations | `src/operations` unit/adapter tests; `tests/operation_auth.rs`, `tests/operations.rs`; PostgreSQL Docker suite | Actual destination posture/RBAC/host keys and owner approvals need target-specific acceptance; see #32 below |
+| Repository/worktree development inheritance | `tests/worktree_run.rs` (real Git worktrees), `tests/run_manifest.rs` | Owner-only runtime use; live application and database migrations remain project acceptance |
 | Child-only exec/run/inject and askpass | `tests/exec.rs`, `tests/run.rs`, `tests/inject.rs` | OS/application consumers beyond the fixture children need acceptance |
 | Audit export/tail/filter and secret-safe diagnostics | Audit tests; `tests/audit.rs`, `tests/doctor.rs` | Operational log retention/export destinations are outside this repo |
 | MCP tools, env sideloads, client config, shell/plugin guards | `tests/mcp.rs`, `tests/env_sideload.rs`, `tests/integrate.rs`, `tests/plugin_hooks.rs` | Actual IDE/client installation is separate from config/stdio contracts |

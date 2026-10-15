@@ -155,6 +155,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey inject -i <infile|-> [-o <outfile>] [--project P] [--stdout]` | Render `{{ cred:<name> }}` references to owner-only file output or explicit stdout |
 | `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start proxy; `SPEC` supports TCP, Unix sockets, feature-gated Linux AF_VSOCK, and Firecracker UDS-backed vsock |
 | `wispkey proxy status/stop/cleanup` | Inspect and manage local proxy lifecycle state |
+| `wispkey env bind --project P --environment development --manifest PATH [--replace]` | Bind a repository and registered worktrees to a runtime development environment; see `docs/worktree-environments.md` |
 | `wispkey env list [directory]` | Discover attachable `.env*` files; supports global `--format json` output |
 | `wispkey env attach <path> --project P --key NAME... [--environment E]` | Attach selected secrets to a project/environment and tokenize them in-place |
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Legacy whole-file import that writes `.env.wispkey` |

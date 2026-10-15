@@ -1,12 +1,12 @@
-use std::fs;
 use std::process::Command;
 
 use crate::audit;
-use crate::core::{self, Vault};
+use crate::core::Vault;
 
 use super::exec::{exit_code, open_unlocked_vault};
 
 pub struct RunArgs<'a> {
+    pub overrides: &'a [String],
     pub manifest: Option<&'a str>,
     pub project: Option<&'a str>,
     pub command: &'a [String],
@@ -18,14 +18,41 @@ pub async fn handle_run(args: RunArgs<'_>) {
         std::process::exit(1);
     }
 
-    let manifest_path = args.manifest.unwrap_or("wispkey.toml");
-    let manifest = read_manifest(manifest_path);
-    let project = args
-        .project
-        .map(String::from)
-        .unwrap_or_else(core::resolve_active_project);
+    // Parse manual config before opening a vault, preserving fail-closed preflight.
+    let manual = match super::worktree::manual_manifest(args.manifest, args.overrides) {
+        Ok(manifest) => manifest,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
     let vault = open_unlocked_vault();
-    let (env_vars, credential_names) = resolve_manifest_env(&vault, &project, &manifest);
+    let transaction = match vault.db().unchecked_transaction() {
+        Ok(transaction) => transaction,
+        Err(_) => {
+            eprintln!("Error: cannot read a consistent vault snapshot");
+            std::process::exit(1);
+        }
+    };
+    let selection = match super::worktree::select(&vault, manual, args.project, args.overrides) {
+        Ok(selection) => selection,
+        Err(error) => {
+            eprintln!("Error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let project = selection.project;
+    let (env_vars, credential_names) = resolve_manifest_env(
+        &vault,
+        &project,
+        &selection.manifest,
+        selection.partition_id.as_deref(),
+    );
+
+    if transaction.commit().is_err() {
+        eprintln!("Error: cannot finish vault snapshot");
+        std::process::exit(1);
+    }
 
     let mut command = Command::new(&args.command[0]);
     command.args(&args.command[1..]);
@@ -59,45 +86,17 @@ pub async fn handle_run(args: RunArgs<'_>) {
     std::process::exit(code);
 }
 
-fn read_manifest(path: &str) -> toml::Value {
-    let raw = match fs::read_to_string(path) {
-        Ok(raw) => raw,
-        Err(e) => {
-            eprintln!("Error: failed to read manifest {}: {}", path, e);
-            std::process::exit(1);
-        }
-    };
-    match toml::from_str(&raw) {
-        Ok(value) => value,
-        Err(_) => {
-            eprintln!("Error: failed to parse manifest {}: invalid TOML", path);
-            std::process::exit(1);
-        }
-    }
-}
-
 fn resolve_manifest_env(
     vault: &Vault,
     project: &str,
-    manifest: &toml::Value,
+    manifest: &super::worktree::Manifest,
+    partition_id: Option<&str>,
 ) -> (Vec<(String, String)>, Vec<String>) {
-    let Some(env) = manifest.get("env").and_then(toml::Value::as_table) else {
-        eprintln!("Error: manifest must contain a non-empty [env] table");
-        std::process::exit(1);
-    };
-    if env.is_empty() {
-        eprintln!("Error: manifest must contain a non-empty [env] table");
-        std::process::exit(1);
-    }
-
+    let env = &manifest.env;
     let mut env_vars = Vec::with_capacity(env.len());
     let mut credential_names = Vec::new();
     for (env_name, value) in env {
-        let Some(raw_value) = value.as_str() else {
-            eprintln!("Error: [env].{} must be a string", env_name);
-            std::process::exit(1);
-        };
-
+        let raw_value = value.as_str();
         if let Some(credential_name) = raw_value.strip_prefix("cred:") {
             if credential_name.is_empty() {
                 eprintln!(
@@ -106,13 +105,26 @@ fn resolve_manifest_env(
                 );
                 std::process::exit(1);
             }
+            if let Some(partition) = partition_id {
+                let in_scope = vault
+                    .get_credential_in_project(project, credential_name)
+                    .is_ok_and(|credential| credential.partition_id.as_deref() == Some(partition));
+                if !in_scope {
+                    eprintln!("Error: credential is outside the bound development environment");
+                    std::process::exit(1);
+                }
+            }
             let secret = match vault.decrypt_credential_value_in_project(project, credential_name) {
                 Ok(value) => value,
-                Err(e) => {
-                    eprintln!("Error: {}", e);
+                Err(_) => {
+                    eprintln!("Error: referenced credential is unavailable for use");
                     std::process::exit(1);
                 }
             };
+            if secret.contains('\0') {
+                eprintln!("Error: credential cannot be used as an environment value");
+                std::process::exit(1);
+            }
             env_vars.push((env_name.clone(), secret));
             credential_names.push(credential_name.to_string());
         } else {

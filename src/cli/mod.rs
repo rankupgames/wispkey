@@ -33,6 +33,8 @@ mod policy;
 mod projects;
 mod proxy;
 mod run;
+mod worktree;
+pub use worktree::handle_env_bind;
 mod shared;
 mod signup;
 pub use signup::handle_signup;
