@@ -9,6 +9,19 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github/workflows/ci.yml"
 
 
 class CiTriggerTests(unittest.TestCase):
+    def test_only_windows_gets_additional_full_verification_time(self):
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        check = workflow.split("\n  check:\n", 1)[1]
+        self.assertIn(
+            "    timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 40 }}",
+            check,
+        )
+        self.assertIn("        os: [ubuntu-latest, macos-latest, windows-latest]", check)
+        self.assertIn("      fail-fast: false", check)
+        self.assertEqual(workflow.count("timeout-minutes:"), 4)
+        for step in ["Clippy", "Tests", "Build release"]:
+            self.assertIn("      - name: " + step + "\n", check)
+
     def test_main_and_development_pushes_run_full_ci_without_path_filters(self):
         workflow = WORKFLOW.read_text(encoding="utf-8")
         # This intentionally checks the small, explicit trigger contract rather
