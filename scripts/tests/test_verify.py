@@ -10,6 +10,9 @@ import unittest
 spec = importlib.util.spec_from_file_location("verify", Path(__file__).parents[1] / "verify.py")
 verify = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(verify)
+offline_spec = importlib.util.spec_from_file_location("offline", Path(__file__).parents[1] / "verify_personal_offline.py")
+offline = importlib.util.module_from_spec(offline_spec)
+offline_spec.loader.exec_module(offline)
 
 
 class VerifyTests(unittest.TestCase):
@@ -58,6 +61,27 @@ class VerifyTests(unittest.TestCase):
             code, _ = self.run_quietly(["fixture"], {"fixture": [(path, [sys.executable, str(script), "literal spaces & symbols"])]})
             self.assertEqual(code, 1)
             self.assertEqual((path / "ran.txt").read_text(), "literal spaces & symbols")
+
+    def test_offline_trace_accepts_only_decoded_loopback_connections_and_connected_writes(self):
+        trace = '\n'.join([
+            'connect(3, {sa_family=AF_INET, sin_port=htons(7700), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS',
+            'bind(4, {sa_family=AF_INET6, inet_pton(AF_INET6, "::1", &sin6_addr)}, 28) = 0',
+            'sendto(0x3, 0xabc, 0x20, 0x4000, 0, 0) = 0x20',
+        ])
+        self.assertEqual(offline.inspect_trace(trace), 1)
+
+    def test_offline_trace_rejects_failed_external_unix_and_unknown_egress(self):
+        for trace in [
+            'connect(3, {sa_family=AF_INET, sin_addr=inet_addr("192.0.2.1")}, 16) = -1 ENETUNREACH',
+            'connect(3, {sa_family=AF_INET6, inet_pton(AF_INET6, "2001:db8::1", &sin6_addr)}, 28) = -1 ENETUNREACH',
+            'connect(3, {sa_family=AF_UNIX, sun_path=""...}, 110) = -1 ENOENT',
+            'connect(3, 0xabc, 16) = -1 EFAULT',
+            'sendto(0x3, 0xabc, 0x20, 0, 0xdef, 0x10) = -1 ENETUNREACH',
+            'sendmsg(0x3, 0xabc, 0) = -1 ENETUNREACH',
+            'sendmmsg(0x3, 0xabc, 0x1, 0) = -1 ENETUNREACH',
+        ]:
+            with self.subTest(trace=trace), self.assertRaises(ValueError):
+                offline.inspect_trace(trace)
 
     def test_cargo_tests_get_a_temporary_vault_removed_even_on_failure(self):
         paths = []

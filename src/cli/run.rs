@@ -69,8 +69,8 @@ fn read_manifest(path: &str) -> toml::Value {
     };
     match toml::from_str(&raw) {
         Ok(value) => value,
-        Err(e) => {
-            eprintln!("Error: failed to parse manifest {}: {}", path, e);
+        Err(_) => {
+            eprintln!("Error: failed to parse manifest {}: invalid TOML", path);
             std::process::exit(1);
         }
     }

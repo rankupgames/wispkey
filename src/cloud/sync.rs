@@ -77,6 +77,17 @@ fn invalid(code: &str) -> CloudError {
     CloudError::ApiError(code.to_owned())
 }
 
+fn network_error(error: reqwest::Error, interrupted: &str) -> CloudError {
+    CloudError::Network(
+        if error.is_timeout() {
+            "request_timed_out"
+        } else {
+            interrupted
+        }
+        .into(),
+    )
+}
+
 struct SyncLock(std::fs::File);
 impl SyncLock {
     fn acquire() -> CloudResult<Self> {
@@ -181,7 +192,7 @@ impl CloudClient {
             .request(reqwest::Method::GET, "/api/v1/billing/status")?
             .send()
             .await
-            .map_err(|_| CloudError::Network("account_verification_failed".into()))?;
+            .map_err(|error| network_error(error, "account_verification_failed"))?;
         Self::check_response(&response)?;
         let envelope: serde_json::Value =
             serde_json::from_slice(&Self::response_bytes(response, 65536).await?)
@@ -382,7 +393,7 @@ impl CloudClient {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|_| CloudError::Network("response_interrupted".into()))?
+            .map_err(|error| network_error(error, "response_interrupted"))?
         {
             if bytes.len().saturating_add(chunk.len()) > max {
                 return Err(invalid("response_too_large"));
@@ -399,8 +410,11 @@ impl CloudClient {
             403 => Err(CloudError::TierLimit(
                 "remote plan or permission denied".into(),
             )),
+            408 => Err(CloudError::Network("request_timed_out".into())),
             409 | 412 => Err(invalid("revision_conflict")),
             428 => Err(invalid("backend_missing_revision_contract")),
+            429 => Err(invalid("rate_limited")),
+            500 | 502 | 503 | 504 => Err(CloudError::Network("service_unavailable".into())),
             _ => Err(invalid("remote_request_failed")),
         }
     }
@@ -410,7 +424,7 @@ impl CloudClient {
             .request(reqwest::Method::GET, &format!("/api/v1/partitions/{id}"))?
             .send()
             .await
-            .map_err(|_| CloudError::Network("request_failed".into()))?;
+            .map_err(|error| network_error(error, "request_failed"))?;
         if response.status() == 404 {
             return Ok(None);
         }
@@ -447,7 +461,7 @@ impl CloudClient {
             )
             .send()
             .await
-            .map_err(|_| CloudError::Network("request_failed".into()))?;
+            .map_err(|error| network_error(error, "request_failed"))?;
         Self::check_response(&response)?;
         if response
             .headers()
@@ -498,9 +512,10 @@ impl CloudClient {
             None => request.header(reqwest::header::IF_NONE_MATCH, "*"),
         };
         guard()?;
-        let response = request.send().await.map_err(|_| {
-            CloudError::Network("upload_interrupted; retry the same command".into())
-        })?;
+        let response = request
+            .send()
+            .await
+            .map_err(|error| network_error(error, "upload_interrupted; retry the same command"))?;
         Self::check_response(&response)?;
         let receipt: Envelope<RemotePartition> =
             serde_json::from_slice(&Self::response_bytes(response, 32768).await?)
@@ -582,7 +597,24 @@ impl CloudClient {
             state.last_error = Some(
                 match error {
                     CloudError::NotAuthenticated => "authentication_expired",
+                    CloudError::TierLimit(_) => "permission_denied",
+                    CloudError::Network(code) if code == "request_timed_out" => "request_timed_out",
+                    CloudError::Network(code) if code == "service_unavailable" => {
+                        "service_unavailable"
+                    }
                     CloudError::Network(_) => "network_interrupted",
+                    CloudError::ApiError(code) if code == "rate_limited" => "rate_limited",
+                    CloudError::ApiError(code)
+                        if matches!(
+                            code.as_str(),
+                            "backend_missing_revision_contract"
+                                | "remote_request_failed"
+                                | "invalid_remote_metadata"
+                                | "invalid_upload_receipt"
+                        ) =>
+                    {
+                        "protocol_rejected"
+                    }
                     CloudError::SyncConflict(_, _) => "conflict",
                     _ => "sync_failed",
                 }
@@ -808,7 +840,7 @@ impl CloudClient {
                 .request(reqwest::Method::GET, "/api/v1/partitions")?
                 .send()
                 .await
-                .map_err(|_| CloudError::Network("request_failed".into()))?;
+                .map_err(|error| network_error(error, "request_failed"))?;
             Self::check_response(&response)?;
             let rows: Envelope<Vec<RemotePartition>> =
                 serde_json::from_slice(&Self::response_bytes(response, 1024 * 1024).await?)

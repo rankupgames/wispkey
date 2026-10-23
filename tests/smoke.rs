@@ -145,3 +145,116 @@ fn format_flag_is_global_after_subcommands() {
         );
     }
 }
+
+#[test]
+fn personal_credential_lifecycle_is_accountless_and_redacted() {
+    use base64::Engine;
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let vault = tempfile::tempdir().unwrap();
+    let canary = "synthetic-offline-secret-never-agent-output";
+    let encoded = base64::engine::general_purpose::STANDARD.encode(canary);
+    let command = |args: &[&str]| {
+        let mut child = wispkey_bin();
+        child
+            .args(["--format", "json"])
+            .args(args)
+            .env("WISPKEY_VAULT_PATH", vault.path())
+            .env("WISPKEY_PASSWORD", "test-password")
+            .env("WISPKEY_PROTECTOR", "file")
+            .env_remove("WISPKEY_PROJECT");
+        child
+    };
+    let safe = |output: &std::process::Output| {
+        for bytes in [&output.stdout, &output.stderr] {
+            for value in [canary.as_bytes(), encoded.as_bytes()] {
+                assert!(
+                    !bytes.windows(value.len()).any(|part| part == value),
+                    "plaintext reached CLI output"
+                );
+            }
+        }
+    };
+    let run = |args: &[&str]| {
+        let output = command(args).output().unwrap();
+        safe(&output);
+        assert!(output.status.success(), "accountless local command failed");
+        output
+    };
+    let json =
+        |args: &[&str]| serde_json::from_slice::<serde_json::Value>(&run(args).stdout).unwrap();
+    run(&["init"]);
+    run(&["project", "create", "offline"]);
+    run(&["project", "use", "offline"]);
+    run(&["partition", "create", "environment"]);
+    let mut add = command(&[
+        "add",
+        "offline-key",
+        "--partition",
+        "environment",
+        "--hosts",
+        "127.0.0.1",
+        "--value-file",
+        "-",
+    ])
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    add.stdin
+        .take()
+        .unwrap()
+        .write_all(canary.as_bytes())
+        .unwrap();
+    let added = add.wait_with_output().unwrap();
+    safe(&added);
+    assert!(
+        added.status.success(),
+        "accountless credential input failed"
+    );
+    let original =
+        json(&["get", "offline-key", "--show-token"])["credential"]["wisp_token"].clone();
+    let rotated = json(&["rotate", "offline-key"])["wisp_token"].clone();
+    assert!(original.as_str().unwrap().starts_with("wk_"));
+    assert!(rotated.as_str().unwrap().starts_with("wk_"));
+    assert_ne!(original, rotated);
+    run(&["list"]);
+    run(&["lock"]);
+    let locked = command(&["get", "offline-key"])
+        .env_remove("WISPKEY_PASSWORD")
+        .output()
+        .unwrap();
+    safe(&locked);
+    assert!(
+        !locked.status.success(),
+        "locked vault unexpectedly released metadata"
+    );
+    run(&["unlock"]);
+    assert_eq!(
+        json(&["get", "offline-key", "--show-token"])["credential"]["wisp_token"],
+        rotated
+    );
+    run(&["audit", "export", "--encoding", "json"]);
+    for entry in std::fs::read_dir(vault.path()).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            let bytes = std::fs::read(path).unwrap();
+            for value in [canary.as_bytes(), encoded.as_bytes()] {
+                assert!(
+                    !bytes.windows(value.len()).any(|part| part == value),
+                    "plaintext reached persisted local state"
+                );
+            }
+        }
+    }
+    assert!(!vault.path().join("cloud.json").exists());
+    run(&["remove", "offline-key"]);
+    assert!(
+        json(&["list"])["credentials"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

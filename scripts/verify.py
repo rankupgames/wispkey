@@ -47,6 +47,7 @@ def suites(root=ROOT):
             (root, ["cargo", "test", "--locked", "-p", "wispkey-tray"]),
             (root, ["cargo", "build", "--locked", "-p", "wispkey-tray"]),
         ],
+        "offline": [(root, [sys.executable, "scripts/verify_personal_offline.py"])],
         "postgres": [(root, ["bash", "tests/support/postgres_operation_fixture.sh"])],
         "cross-node": [(root, [sys.executable, "tests/support/cross_node_fixture.py"])],
     }

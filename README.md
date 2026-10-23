@@ -572,7 +572,8 @@ in the CLI; it requires a compatible, configured backend. See
 [encrypted sync and recovery](docs/cloud-sync.md) and
 [Cloud sign-in requirements](docs/cloud-login.md) for setup, compatibility and
 preview limits. Cloud sign-in does not unlock the local vault or authorize
-credential execution.
+credential execution. See the [accountless and denied-network proof](docs/personal-offline.md)
+for the tested local boundary, release acceptance and repeat procedure.
 
 ## Contributing
 

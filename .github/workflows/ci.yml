@@ -151,6 +151,14 @@ jobs:
       - name: Tests
         run: cargo test --features experimental-browser-receiver
 
+      - name: Install offline trace tool
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get install -y strace
+
+      - name: Personal accountless and denied-network proof
+        if: matrix.os == 'ubuntu-latest'
+        run: python3 scripts/verify_personal_offline.py --sudo
+
       - name: PostgreSQL TLS rotation and revocation fixture
         if: matrix.os == 'ubuntu-latest'
         run: bash tests/support/postgres_operation_fixture.sh
