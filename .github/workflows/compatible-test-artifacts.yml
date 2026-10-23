@@ -25,6 +25,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  RUSTC_WRAPPER: ''
   CARGO_INCREMENTAL: '0'
   CARGO_BUILD_JOBS: '2'
   CHECKED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}

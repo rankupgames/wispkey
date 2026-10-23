@@ -17,6 +17,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTC_WRAPPER: ''
+
 jobs:
   contention:
     name: Three runs, one CPU, fourteen test threads
