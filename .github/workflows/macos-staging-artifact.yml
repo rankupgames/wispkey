@@ -16,6 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  RUSTC_WRAPPER: ''
   CARGO_INCREMENTAL: '0'
   CHECKED_SHA: ${{ github.sha }}
 
