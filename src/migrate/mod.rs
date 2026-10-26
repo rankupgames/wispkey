@@ -75,10 +75,10 @@ struct EnvEntry {
 }
 
 #[derive(Debug)]
-struct SelectedEnvEntry {
-    key: String,
-    value: String,
-    value_range: Range<usize>,
+pub(crate) struct SelectedEnvEntry {
+    pub(crate) key: String,
+    pub(crate) value: String,
+    pub(crate) value_range: Range<usize>,
 }
 
 struct AttachPlan {
@@ -596,7 +596,7 @@ fn normalize_scope_component(value: &str) -> String {
     normalized.trim_matches('-').to_string()
 }
 
-fn selected_env_entries(
+pub(crate) fn selected_env_entries(
     content: &str,
     keys: &[String],
 ) -> crate::core::Result<Vec<SelectedEnvEntry>> {
@@ -797,7 +797,11 @@ fn decode_double_quoted_value(value: &str) -> String {
     decoded
 }
 
-fn replace_env_file(path: &Path, original: &[u8], attached: &[u8]) -> crate::core::Result<()> {
+pub(crate) fn replace_env_file(
+    path: &Path,
+    original: &[u8],
+    attached: &[u8],
+) -> crate::core::Result<()> {
     if fs::read(path)? != original {
         return Err(VaultError::InvalidEnvFile(format!(
             "{} changed while it was being attached; retry",
