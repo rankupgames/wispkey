@@ -3,6 +3,7 @@ name: Windows owner IPC contention
 on:
   workflow_dispatch:
   pull_request:
+    branches-ignore: ['0.7']
     paths:
       - 'src/owner_ipc/**'
       - 'src/core/**'

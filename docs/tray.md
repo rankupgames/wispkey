@@ -5,35 +5,42 @@ The optional tray application is a desktop extension of the WispKey CLI. The CLI
 ## Quick start
 
 ```bash
-wispkey init
 wispkey tray --ipc-only          # headless owner IPC for tests and desktop hosts
 cargo build -p wispkey-tray      # optional GUI binary
-wispkey-tray                     # tray icon + Svelte 5 dialogs
+wispkey-tray                     # tray icon + local Svelte 5 popout
 ```
 
 `wispkey tray` starts owner IPC. If `wispkey-tray` is on `PATH` or next to the CLI binary, it also launches the GUI.
 
-Closing a dialog does not quit the tray. Use **Quit** in the tray menu.
+The popout can create a new vault or unlock the existing CLI vault. The optional
+GUI has no separate credential store. Default workspace builds remain CLI-only.
+
+Click the tray icon to toggle the dark 460px popout. Escape or closing it destroys
+form state and cancels staged imports. Moving focus away clears private form
+state and returns to Intake, so files can be dragged from another application.
+These actions do not lock the shared vault. The header lock control locks immediately. Native file
+pickers keep the popout open until selection or cancellation. On Linux, use
+**Open WispKey** in the tray menu because the tray backend emits no click events.
+Use **Quit** to exit the GUI; the shared owner IPC server remains running.
 
 Tray menu:
 
-- Add credential
-- Generate website login
-- List credentials
-- Unlock vault
+- Open WispKey
 - Lock vault
-- Open settings
 - Quit
 
-The tooltip shows locked or unlocked status. Secret fields are masked by default, with explicit reveal and copy actions. Idle timeout, save, cancel, lock, and failure clear secret form state.
+The hamburger menu opens Intake or Credentials. The gear opens local settings.
+Secret fields are masked. Idle timeout, save, cancel, lock, and failure clear
+secret form state. Copy actions copy opaque WispKey tokens only. All, Recent and
+By project filter credential metadata without revealing stored values.
 
 ## Start-at-login platform limits
 
 The Settings dialog stores the `start_at_login` preference in the owner-only
 `tray.json` file. On Linux, saving it also creates or removes
 `autostart/wispkey-tray.desktop` under the user's configuration directory.
-On macOS and Windows, the preference is stored but no login-startup registration
-is created. A successful save on those platforms does not enable autostart.
+On macOS and Windows, the control is disabled and saving returns `unsupported`;
+no login-startup registration is created.
 
 ## Owner IPC
 
@@ -41,21 +48,57 @@ The server listens on an owner-only Unix socket (`~/.wispkey/owner.sock`, or `$W
 
 Newline-delimited JSON methods:
 
-- `status`, `unlock`, `lock`
+- `status`, `initialize`, `unlock`, `lock`
 - `list_credentials`, `list_projects`, `list_partitions`
+- `create_project`, `create_partition`
 - `add_credential`, `add_template`, `generate_login`
+- `get_token`, `rotate_credential`, `remove_credential`
+- `import_preview`, `import_review`, `import_commit`, `import_cancel`
 - `get_settings`, `set_settings`
 - `shutdown`
 
-Responses include names and metadata only. They never include plaintext secret values. Known secret fields are redacted from logs.
+Responses never contain stored plaintext values. Inventory and import review
+return metadata only. `get_token` returns an opaque token to the native host for
+clipboard copy; the renderer cannot call it or receive that token. The native
+bridge supplies file pickers, drop paths, clipboard import and window sizing.
+Request bodies are not logged, including malformed clipboard/configuration text.
 
 `generate_login` accepts `name`, `username`, an HTTPS `url`, optional `project` /
 `partition`, and `destination_confirmed: true`. It saves a strong unique password
 without displaying it, sets lifecycle `pending`, and schedules a review in 180
-days. The job application preset uses `career-ops` / `job-applications`; the
-confirmed project and partition are created if needed. Use the
+days. The confirmed project and partition are created if needed. Use the
 [browser handoff preview](browser-handoff.md) to approve a fill separately; owner
 IPC has no browser-fill or password-reveal endpoint.
+
+## Local import
+
+Drop files, choose a project folder, or select **Clipboard import** in the drop
+zone. Project import reuses CLI `.env*` discovery and skips symlinks. Selected
+files support `.env*`, flat JSON objects of nonempty string values, and opaque
+`.pem`, `.key` and `.secret` files. Clipboard supports the same env/JSON text or
+one named secret. Nested JSON and malformed or duplicate keys fail closed.
+Other configuration formats are not parsed.
+
+The owner process stages values for at most five minutes, bounded by the current
+finite unlock session. Review returns key names, source paths, environments and
+duplicate status. Values, tokens and secret fingerprints never enter review.
+Limits are 64 files, 1 MiB per source, 8 MiB total and 256 items. Lock, session
+replacement, changed source files or changed vault state invalidate the plan.
+
+Confirm the destination and selected items before saving. New projects,
+partitions, credentials and audit entries commit in one vault transaction.
+Keep, replace or skip a duplicate explicitly; replacement preserves its stored
+identity, token and restrictions. Scope conflicts cannot move a credential.
+
+**Store only** leaves source files intact. **Replace HTTP values with tokens** is
+an explicit `.env` operation and requires bounded allowed hosts. Database URLs,
+key files and other non-HTTP consumers remain store-only; use CLI `run`, `exec`
+or `inject` for plaintext at their process boundary. Vault saving completes
+before source replacement. A failed source write reports **Not changed** while
+keeping the saved credentials. A failed source update does not roll back the vault.
+
+Account access, service adapters and Cloud synchronization are separate work.
+This flow is local-only. The approved frames are linked in [design.md](design.md).
 
 ## OVH API template
 

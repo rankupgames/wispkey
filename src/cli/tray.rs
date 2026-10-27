@@ -1,15 +1,10 @@
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use crate::core::{Vault, VaultError};
 use crate::owner_ipc;
 
 /// Starts the owner IPC server, optionally spawning the tray UI binary.
 pub async fn handle_tray(ipc_only: bool) {
-    if !Vault::exists() {
-        eprintln!("Error: {}", VaultError::NotFound);
-        std::process::exit(1);
-    }
     if !ipc_only && owner_ipc::is_live().await {
         spawn_tray_ui();
         return;

@@ -26,6 +26,7 @@ pub(crate) mod cloud_sync;
 mod crypto;
 mod existing_login;
 mod instances;
+mod local_import;
 pub(crate) mod operation_grants;
 mod operation_session;
 mod protector;
