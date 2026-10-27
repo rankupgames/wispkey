@@ -20,6 +20,7 @@ pub mod core;
 pub mod doctor;
 pub mod env_sideload;
 pub mod integrate;
+pub mod local_import;
 pub mod mcp;
 pub mod migrate;
 pub(crate) mod operations;

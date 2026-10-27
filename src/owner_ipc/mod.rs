@@ -21,6 +21,8 @@ use crate::core::{
 };
 use crate::secure_files;
 
+mod desktop;
+
 #[cfg(any(windows, test))]
 #[cfg_attr(not(windows), allow(dead_code))]
 mod diagnostics;
@@ -28,6 +30,7 @@ mod diagnostics;
 const PROTOCOL_VERSION: u8 = 1;
 const OWNER_SOCK_NAME: &str = "owner.sock";
 const OWNER_META_NAME: &str = "owner.json";
+const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const SECRET_FIELD_NAMES: &[&str] = &[
     "value",
     "password",
@@ -106,7 +109,15 @@ pub async fn serve() -> Result<(), OwnerIpcError> {
 pub async fn serve_at(path: &Path) -> Result<(), OwnerIpcError> {
     let _lease = acquire_server_lease(path)?;
     cleanup_endpoint(path);
+    let expiry = tokio::spawn(async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+        loop {
+            tick.tick().await;
+            desktop::expire_imports();
+        }
+    });
     let result = serve_platform(path).await;
+    expiry.abort();
     cleanup_endpoint(path);
     result
 }
@@ -154,14 +165,18 @@ pub async fn is_live_at(path: &Path, metadata_path: &Path) -> bool {
 }
 
 /// Sends one JSON request to the owner endpoint and returns the response object.
-pub async fn call(path: &Path, request: Value) -> Result<Value, OwnerIpcError> {
+pub async fn call(path: &Path, mut request: Value) -> Result<Value, OwnerIpcError> {
     #[cfg(unix)]
     {
-        unix::call(path, request).await
+        let result = unix::call(path, &request).await;
+        clear_request_values(&mut request);
+        result
     }
     #[cfg(windows)]
     {
-        windows::call(path, request).await
+        let result = windows::call(path, &request).await;
+        clear_request_values(&mut request);
+        result
     }
 }
 
@@ -218,7 +233,7 @@ fn cleanup_endpoint(path: &Path) {
     let _ = std::fs::remove_file(metadata_path());
 }
 
-fn handle_request(request: Value) -> Value {
+fn handle_request(mut request: Value) -> Value {
     let started = std::time::Instant::now();
     let id = request
         .get("id")
@@ -230,31 +245,35 @@ fn handle_request(request: Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    let params = request.get("params").cloned().unwrap_or_else(|| json!({}));
-    tracing::info!(
-        method = method.as_str(),
-        request = %redact_json(&request),
-        "owner ipc request"
-    );
+    let empty = json!({});
+    let params = request.get("params").unwrap_or(&empty);
+    // Input may contain clipboard/configuration text. Log method metadata only,
+    // before any renderer, telemetry or persistent log can see request values.
+    tracing::info!("owner ipc request");
 
     let result = match method.as_str() {
         "status" => status_response(),
-        "unlock" => unlock_response(&params),
-        "lock" => lock_response(),
-        "list_credentials" => list_credentials_response(&params),
+        "unlock" => unlock_response(params),
+        "lock" => {
+            desktop::clear_imports();
+            lock_response()
+        }
+        "list_credentials" => list_credentials_response(params),
         "list_projects" => list_projects_response(),
-        "list_partitions" => list_partitions_response(&params),
-        "add_credential" => add_credential_response(&params),
-        "add_template" => add_template_response(&params),
-        "generate_login" => generate_login_response(&params),
-        "get_settings" => Ok(json!({ "start_at_login": read_start_at_login() })),
-        "set_settings" => set_settings_response(&params),
+        "list_partitions" => list_partitions_response(params),
+        "add_credential" => add_credential_response(params),
+        "add_template" => add_template_response(params),
+        "generate_login" => generate_login_response(params),
+        "initialize" | "create_project" | "create_partition" | "get_token"
+        | "rotate_credential" | "remove_credential" | "import_preview" | "import_review"
+        | "import_commit" | "import_cancel" => desktop::handle(&method, params),
+        "get_settings" => Ok(
+            json!({ "start_at_login": read_start_at_login(), "start_at_login_supported": cfg!(target_os = "linux") }),
+        ),
+        "set_settings" => set_settings_response(params),
         "shutdown" => Ok(json!({ "ok": true, "shutdown": true })),
         "" => Err(error_body("invalid_input", "method is required")),
-        other => Err(error_body(
-            "invalid_input",
-            &format!("unknown method '{other}'"),
-        )),
+        _ => Err(error_body("invalid_input", "unknown owner action")),
     };
 
     tracing::info!(
@@ -263,13 +282,25 @@ fn handle_request(request: Value) -> Value {
         succeeded = result.is_ok(),
         "owner ipc request completed"
     );
+    clear_request_values(&mut request);
     match result {
         Ok(value) => json!({ "id": id, "ok": true, "result": value }),
         Err(error) => json!({ "id": id, "ok": false, "error": error }),
     }
 }
 
+fn clear_request_values(value: &mut Value) {
+    use zeroize::Zeroize;
+    match value {
+        Value::String(text) => text.zeroize(),
+        Value::Array(items) => items.iter_mut().for_each(clear_request_values),
+        Value::Object(fields) => fields.values_mut().for_each(clear_request_values),
+        _ => {}
+    }
+}
+
 fn status_response() -> Result<Value, Value> {
+    desktop::expire_imports();
     if !Vault::exists() {
         return Ok(json!({
             "initialized": false,
@@ -284,25 +315,40 @@ fn status_response() -> Result<Value, Value> {
     }
     let vault = Vault::open().map_err(vault_error)?;
     let session_active = Vault::open_with_session().is_ok();
+    if !session_active {
+        desktop::clear_imports();
+    }
     Ok(json!({
         "initialized": true,
         "session_active": session_active,
         "session_protection": Vault::session_protection_label(),
         "vault_path": Vault::vault_dir().to_string_lossy(),
         "active_project": core::resolve_active_project(),
-        "credential_count": vault.credential_count().unwrap_or(0),
-        "created_at": vault.vault_created_at().ok(),
+        "credential_count": vault.credential_count().map_err(vault_error)?,
+        "created_at": vault.vault_created_at().map_err(vault_error)?,
         "owner_pid": std::process::id(),
         "protocol_version": PROTOCOL_VERSION,
     }))
 }
 
 fn unlock_response(params: &Value) -> Result<Value, Value> {
-    let password = required_string(params, "password")?;
+    if params
+        .get("remember")
+        .is_some_and(|value| !value.is_boolean())
+    {
+        return Err(error_body("invalid_input", "remember must be a boolean"));
+    }
+    let password = zeroize::Zeroizing::new(required_string(params, "password")?);
     let mut vault = Vault::open().map_err(vault_error)?;
     vault
         .unlock_with_timeout(&password, None)
         .map_err(vault_error)?;
+    if params.get("remember").and_then(Value::as_bool) == Some(true) {
+        if let Err(error) = vault.remember_protector(None) {
+            vault.lock().map_err(vault_error)?;
+            return Err(vault_error(error));
+        }
+    }
     audit::log_event(
         vault.db(),
         "VaultUnlocked",
@@ -343,9 +389,20 @@ fn list_credentials_response(params: &Value) -> Result<Value, Value> {
             .list_credentials_in_project(&project)
             .map_err(vault_error)?
     };
+    let partitions = vault.list_partitions().map_err(vault_error)?;
+    let projects = vault.list_projects().map_err(vault_error)?;
     Ok(json!({
-        "project": if all_projects { "*".to_string() } else { project },
-        "credentials": credentials.iter().map(credential_metadata).collect::<Vec<_>>(),
+        "project": if all_projects { "*".to_string() } else { project.clone() },
+        "credentials": credentials.iter().map(|credential| {
+            let mut metadata = credential_metadata(credential);
+            let partition = partitions.iter().find(|partition| Some(&partition.id) == credential.partition_id.as_ref())
+                .ok_or_else(|| error_body("unavailable", "credential partition is unavailable"))?;
+            let project = projects.iter().find(|project| project.id == partition.project_id)
+                .ok_or_else(|| error_body("unavailable", "credential project is unavailable"))?;
+            metadata["partition"] = json!(partition.name);
+            metadata["project"] = json!(project.name);
+            Ok(metadata)
+        }).collect::<Result<Vec<_>, Value>>()?,
     }))
 }
 
@@ -355,13 +412,13 @@ fn list_projects_response() -> Result<Value, Value> {
     let projects = vault.list_projects().map_err(vault_error)?;
     Ok(json!({
         "projects": projects.iter().map(|project| {
-            json!({
+            Ok(json!({
                 "name": project.name,
                 "description": project.description,
                 "active": project.name == active,
-                "partition_count": vault.project_partition_count(&project.id).unwrap_or(0),
-            })
-        }).collect::<Vec<_>>(),
+                "partition_count": vault.project_partition_count(&project.id).map_err(vault_error)?,
+            }))
+        }).collect::<Result<Vec<_>, Value>>()?,
     }))
 }
 
@@ -378,12 +435,12 @@ fn list_partitions_response(params: &Value) -> Result<Value, Value> {
     Ok(json!({
         "project": project,
         "partitions": partitions.iter().map(|partition| {
-            json!({
+            Ok(json!({
                 "name": partition.name,
                 "description": partition.description,
-                "credential_count": vault.partition_credential_count(&partition.id).unwrap_or(0),
-            })
-        }).collect::<Vec<_>>(),
+                "credential_count": vault.partition_credential_count(&partition.id).map_err(vault_error)?,
+            }))
+        }).collect::<Result<Vec<_>, Value>>()?,
     }))
 }
 
@@ -500,6 +557,12 @@ fn add_template_response(params: &Value) -> Result<Value, Value> {
 }
 
 fn set_settings_response(params: &Value) -> Result<Value, Value> {
+    if !cfg!(target_os = "linux") {
+        return Err(error_body(
+            "unsupported",
+            "start at login is not supported on this platform",
+        ));
+    }
     let start_at_login = params
         .get("start_at_login")
         .and_then(Value::as_bool)
@@ -572,6 +635,7 @@ fn generate_login_response(params: &Value) -> Result<Value, Value> {
 
 fn credential_metadata(credential: &core::Credential) -> Value {
     json!({
+        "id": credential.id,
         "name": credential.name,
         "description": credential.description,
         "type": credential.credential_type.display_name(),
@@ -580,6 +644,7 @@ fn credential_metadata(credential: &core::Credential) -> Value {
         "partition_id": credential.partition_id,
         "created_at": credential.created_at.to_rfc3339(),
         "updated_at": credential.updated_at.to_rfc3339(),
+        "last_used_at": credential.last_used_at.map(|date| date.to_rfc3339()),
     })
 }
 
@@ -690,12 +755,32 @@ async fn write_line<W: AsyncWriteExt + Unpin>(
     writer: &mut W,
     value: &Value,
 ) -> Result<(), OwnerIpcError> {
-    let mut encoded =
-        serde_json::to_vec(value).map_err(|error| OwnerIpcError::Protocol(error.to_string()))?;
+    let mut encoded = zeroize::Zeroizing::new(
+        serde_json::to_vec(value)
+            .map_err(|_| OwnerIpcError::Protocol("could not encode owner request".into()))?,
+    );
     encoded.push(b'\n');
     writer.write_all(&encoded).await?;
     writer.flush().await?;
     Ok(())
+}
+
+async fn read_request_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut encoded = zeroize::Zeroizing::new(Vec::new());
+    let read = reader
+        .take(MAX_REQUEST_BYTES as u64 + 1)
+        .read_until(b'\n', &mut encoded)
+        .await?;
+    if encoded.len() > MAX_REQUEST_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "owner request exceeds the size limit",
+        ));
+    }
+    Ok((read != 0).then_some(encoded))
 }
 
 #[cfg(unix)]
@@ -709,7 +794,7 @@ mod unix {
 
     use super::{
         OwnerIpcError, authorize_peer_uid, cleanup_endpoint, current_uid, handle_request,
-        write_line, write_metadata,
+        read_request_line, write_line, write_metadata,
     };
 
     pub(super) async fn serve(path: &Path) -> Result<(), OwnerIpcError> {
@@ -729,19 +814,27 @@ mod unix {
                 continue;
             }
             let (reader, mut writer) = stream.into_split();
-            let mut lines = BufReader::new(reader).lines();
-            while let Some(line) = lines.next_line().await? {
-                if line.trim().is_empty() {
+            let mut reader = BufReader::new(reader);
+            loop {
+                let line = match read_request_line(&mut reader).await {
+                    Ok(Some(line)) => line,
+                    Ok(None) => break,
+                    Err(_) => {
+                        write_line(&mut writer, &serde_json::json!({"ok":false,"error":{"code":"invalid_input","message":"owner request is invalid or exceeds the size limit"}})).await?;
+                        break;
+                    }
+                };
+                if line.iter().all(u8::is_ascii_whitespace) {
                     continue;
                 }
-                let request = match serde_json::from_str::<Value>(&line) {
+                let request = match serde_json::from_slice::<Value>(&line) {
                     Ok(request) => request,
-                    Err(error) => {
+                    Err(_) => {
                         write_line(
                             &mut writer,
                             &serde_json::json!({
                                 "ok": false,
-                                "error": { "code": "invalid_input", "message": error.to_string() }
+                                "error": { "code": "invalid_input", "message": "owner request is invalid" }
                             }),
                         )
                         .await?;
@@ -759,10 +852,10 @@ mod unix {
         }
     }
 
-    pub(super) async fn call(path: &Path, request: Value) -> Result<Value, OwnerIpcError> {
+    pub(super) async fn call(path: &Path, request: &Value) -> Result<Value, OwnerIpcError> {
         let stream = UnixStream::connect(path).await?;
         let (reader, mut writer) = stream.into_split();
-        write_line(&mut writer, &request).await?;
+        write_line(&mut writer, request).await?;
         let mut lines = BufReader::new(reader).lines();
         let line = lines
             .next_line()
@@ -785,7 +878,10 @@ mod windows {
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 
     use super::diagnostics::{Method, Phase, Phases};
-    use super::{OwnerIpcError, cleanup_endpoint, handle_request, write_line, write_metadata};
+    use super::{
+        OwnerIpcError, cleanup_endpoint, handle_request, read_request_line, write_line,
+        write_metadata,
+    };
 
     pub(super) fn pipe_name(path: &Path) -> String {
         let raw = path.to_string_lossy().replace(['\\', '/', ':', ' '], "_");
@@ -827,28 +923,36 @@ mod windows {
             server.connect().await?;
             phases.record(Method::Pending, Phase::Connected);
             let mut reader = BufReader::new(server);
-            let mut line = String::new();
-            line.clear();
             phases.record(Method::Pending, Phase::ReadWait);
-            let read = reader.read_line(&mut line).await?;
+            let line = match read_request_line(&mut reader).await {
+                Ok(line) => line,
+                Err(_) => {
+                    phases.record(Method::Unknown, Phase::InvalidRequest);
+                    write_line(reader.get_mut(), &serde_json::json!({"ok":false,"error":{"code":"invalid_input","message":"owner request is invalid or exceeds the size limit"}})).await?;
+                    drop(reader);
+                    server = create_server(&name, false)?;
+                    phases.record(Method::Pending, Phase::InstanceReady);
+                    continue;
+                }
+            };
             phases.record(Method::Pending, Phase::ReadComplete);
-            if read == 0 {
+            let Some(line) = line else {
                 phases.record(Method::Pending, Phase::ReadEmpty);
                 drop(reader);
                 server = create_server(&name, false)?;
                 phases.record(Method::Pending, Phase::InstanceReady);
                 continue;
-            }
-            let request = match serde_json::from_str::<Value>(line.trim()) {
+            };
+            let request = match serde_json::from_slice::<Value>(&line) {
                 Ok(request) => request,
-                Err(error) => {
+                Err(_) => {
                     phases.record(Method::Unknown, Phase::InvalidRequest);
                     phases.record(Method::Unknown, Phase::WriteStart);
                     write_line(
                         reader.get_mut(),
                         &serde_json::json!({
                             "ok": false,
-                            "error": { "code": "invalid_input", "message": error.to_string() }
+                            "error": { "code": "invalid_input", "message": "owner request is invalid" }
                         }),
                     )
                     .await?;
@@ -877,8 +981,8 @@ mod windows {
         }
     }
 
-    pub(super) async fn call(path: &Path, request: Value) -> Result<Value, OwnerIpcError> {
-        let method = Method::from_request(&request).label();
+    pub(super) async fn call(path: &Path, request: &Value) -> Result<Value, OwnerIpcError> {
+        let method = Method::from_request(request).label();
         let name = pipe_name(path);
         let started = tokio::time::Instant::now();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -901,7 +1005,7 @@ mod windows {
             }
         };
         let connected_ms = started.elapsed().as_millis();
-        tokio::time::timeout(Duration::from_secs(5), write_line(&mut client, &request))
+        tokio::time::timeout(Duration::from_secs(5), write_line(&mut client, request))
             .await
             .map_err(|_| {
                 OwnerIpcError::Protocol(format!(
@@ -923,6 +1027,50 @@ mod windows {
 mod tests {
     use super::{authorize_peer_uid, redact_json};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn request_framing_is_bounded_and_keeps_the_next_line() {
+        let mut reader = tokio::io::BufReader::new(b"first\nsecond\n".as_slice());
+        assert_eq!(
+            &**super::read_request_line(&mut reader)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"first\n"
+        );
+        assert_eq!(
+            &**super::read_request_line(&mut reader)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"second\n"
+        );
+        assert!(
+            super::read_request_line(&mut reader)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        let boundary = vec![b'x'; super::MAX_REQUEST_BYTES];
+        let mut reader = tokio::io::BufReader::new(boundary.as_slice());
+        assert_eq!(
+            super::read_request_line(&mut reader)
+                .await
+                .unwrap()
+                .unwrap()
+                .len(),
+            super::MAX_REQUEST_BYTES
+        );
+        let oversized = vec![b'x'; super::MAX_REQUEST_BYTES + 1];
+        let mut reader = tokio::io::BufReader::new(oversized.as_slice());
+        assert_eq!(
+            super::read_request_line(&mut reader)
+                .await
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::InvalidData
+        );
+    }
 
     #[test]
     fn peer_uid_mismatch_is_unauthorized() {

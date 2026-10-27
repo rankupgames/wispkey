@@ -19,6 +19,35 @@ pub(crate) struct OperationSessionBinding {
 }
 
 impl Vault {
+    /// Runs an owner-reviewed write while the current session is pinned. Database
+    /// and session lock ordering matches guarded whole-value replacement.
+    pub(crate) fn with_current_operation_session<T>(
+        &self,
+        revision: &str,
+        action: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.db,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        let store = session_store();
+        let _guard = store.lock()?;
+        let binding = self.operation_session_binding_from_record(store.load_locked()?)?;
+        if binding.revision != revision {
+            return Err(VaultError::AuthRejected(
+                "owner session changed after import review",
+            ));
+        }
+        let result = action()?;
+        if self.operation_session_binding_from_record(store.load_locked()?)? != binding {
+            return Err(VaultError::AuthRejected(
+                "owner session changed during import",
+            ));
+        }
+        transaction.commit()?;
+        Ok(result)
+    }
+
     /// Binds an operation grant to the authenticated session file currently on
     /// disk. An in-memory master key by itself is insufficient: lock or session
     /// replacement in another process must invalidate an outstanding grant.
