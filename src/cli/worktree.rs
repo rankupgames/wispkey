@@ -130,19 +130,42 @@ fn binding_path(identity: &str) -> PathBuf {
         .join(format!("{identity}.json"))
 }
 
-fn read_config(path: &Path) -> Result<String> {
+fn read_config(path: &Path, reject_symlinks: bool) -> Result<String> {
     let mut options = fs::OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         // Do not block opening a FIFO substituted for an override file.
-        options.custom_flags(libc::O_NONBLOCK);
+        let flags = if reject_symlinks {
+            libc::O_NONBLOCK | libc::O_NOFOLLOW
+        } else {
+            libc::O_NONBLOCK
+        };
+        options.custom_flags(flags);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        if reject_symlinks {
+            options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+        }
     }
     let file = options
         .open(path)
         .map_err(|_| "configuration is missing or unreadable")?;
     let metadata = file.metadata().map_err(|_| "configuration is unreadable")?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if reject_symlinks
+            && metadata.file_attributes()
+                & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
+                != 0
+        {
+            return Err("worktree override file must not be a reparse point");
+        }
+    }
     if !metadata.is_file() || metadata.len() > MAX_CONFIG_BYTES {
         return Err("configuration must be a regular file smaller than 64 KiB");
     }
@@ -157,7 +180,7 @@ fn read_config(path: &Path) -> Result<String> {
 }
 
 pub(super) fn read_manifest(path: &Path) -> Result<Manifest> {
-    let manifest: Manifest = toml::from_str(&read_config(path)?).map_err(
+    let manifest: Manifest = toml::from_str(&read_config(path, false)?).map_err(
         |_| "failed to parse manifest: expected [env] strings and optional [worktree] settings",
     )?;
     validate_manifest(&manifest)?;
@@ -324,7 +347,7 @@ pub(super) fn select(
             struct Overrides {
                 env: BTreeMap<String, String>,
             }
-            let local: Overrides = toml::from_str(&read_config(&local_path)?)
+            let local: Overrides = toml::from_str(&read_config(&local_path, true)?)
                 .map_err(|_| "invalid worktree override file")?;
             for (name, value) in local.env {
                 apply_override(&mut manifest, &name, &value)?;

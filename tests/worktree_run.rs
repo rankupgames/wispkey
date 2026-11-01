@@ -542,6 +542,24 @@ fn oversized_and_nonregular_configuration_fails_before_launch() {
     fs::create_dir(&local).unwrap();
     f.denied(&f.worktree(), &[]);
     fs::remove_dir(&local).unwrap();
+    let linked = f.dir.path().join("linked-override.toml");
+    fs::write(&linked, "[env]\nPORT = '4000'\n").unwrap();
+    std::os::unix::fs::symlink(&linked, &local).unwrap();
+    f.denied(&f.worktree(), &[]);
+    // Explicit owner-selected manifests keep their existing symlink behavior.
+    assert_ok(f.run(
+        &f.worktree(),
+        &[
+            "run",
+            "--manifest",
+            local.to_str().unwrap(),
+            "--",
+            "sh",
+            "-c",
+            "test \"$PORT\" = 4000",
+        ],
+    ));
+    fs::remove_file(&local).unwrap();
     let path = std::ffi::CString::new(local.as_os_str().as_encoded_bytes()).unwrap();
     // A FIFO must be rejected without waiting for a writer.
     assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
