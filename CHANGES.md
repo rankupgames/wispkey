@@ -8,6 +8,15 @@
 - Runtime `run` resolves fresh vault values with partition/lifecycle checks. Nonsecret worktree and CLI overrides follow a bound allowlist; relative SQLite paths remain isolated unless shared storage is explicitly enabled.
 - Inside Git, implicit `run` now requires a binding; use `--manifest wispkey.toml` for the previous manual behavior. Production selection, plaintext export and database copying remain explicit separate workflows. See `docs/worktree-environments.md`.
 
+### Protected legacy audit remediation (RUG-10)
+
+- Added `audit remediate-fallback --input PATH --output PATH` for non-destructive,
+  protected migration of offline legacy fallback JSONL snapshots.
+- Added bounded, fail-closed input validation, private output creation, metadata-only
+  reporting, and explicit evidence-retention/capability-rotation guidance.
+- Tightened audit readers to reject malformed fingerprint strings, redact timestamp
+  capabilities, and avoid echoing secret-bearing JSON parser diagnostics.
+
 ### Windows protected fallback audit remediation
 
 - Added Windows support for offline `audit remediate-fallback`: verified private source/parent handles, pinned non-reparse local paths, bounded reading, and owner-only exclusive output creation. Existing ACLs and source contents remain unchanged.
@@ -217,12 +226,3 @@
 ## 0.1.0
 
 - Initial local-first WispKey CLI release with encrypted vault storage, wisp tokens, HTTP proxy mode, MCP tools, partitions, policies, audit logging, and encrypted bundle import/export.
-
-### Protected legacy audit remediation (RUG-10)
-
-- Added `audit remediate-fallback --input PATH --output PATH` for non-destructive,
-  protected migration of offline legacy fallback JSONL snapshots.
-- Added bounded, fail-closed input validation, private output creation, metadata-only
-  reporting, and explicit evidence-retention/capability-rotation guidance.
-- Tightened audit readers to reject malformed fingerprint strings, redact timestamp
-  capabilities, and avoid echoing secret-bearing JSON parser diagnostics.

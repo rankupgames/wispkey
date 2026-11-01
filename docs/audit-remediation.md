@@ -32,6 +32,10 @@ credential, or rotates a token. It works without an initialized or unlocked vaul
   to enforce sharing exclusions), without write/delete sharing, and checked
   for reparse points before opening its child. These handles remain alive through
   output completion, preventing directory renames and writable reparse changes.
+  This strict policy includes the drive root and every ancestor: conflicting
+  existing write handles make remediation fail, and new write/delete opens on
+  those directories are denied until it finishes. Use a controlled offline window;
+  native Windows sharing and reparse acceptance remain required.
   The source is opened without write/delete sharing, must have one hard link,
   and is bounded to 16 MiB. Its owner must be the current account and its DACL
   must pass the same conservative policy as private operation catalogs: grants
@@ -40,6 +44,9 @@ credential, or rotates a token. It works without an initialized or unlocked vaul
   The new file receives an explicit current-user owner and protected user-only
   DACL in the exclusive CREATE_NEW call, before any bytes are written. Its
   protection is checked on the returned handle. No existing ACL is changed.
+  Inputs or parents created by an elevated process can be owned by Administrators
+  and are rejected when the owner is not the current user; a permissive DACL does
+  not bypass this owner check. New remediation output uses an explicit user owner.
   File contents are flushed; portable directory-fsync durability is not promised.
   Filesystems without these ACL/handle semantics fail closed; ordinary Windows
   path-length limits apply. Privileged OS administrators and same-account code
