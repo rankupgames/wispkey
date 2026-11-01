@@ -70,7 +70,7 @@ Firecracker UDS bridge.
 
 See [`docs/tray.md`](docs/tray.md) for owner IPC and tray usage.
 
-Jenkins runs the Linux gates through `Jenkinsfile`, one lane per job: `bash ci/jenkins/check.sh rust|tray|browser|postgres`. The lanes check exact tool versions and fail when a worker tool is missing; they do not install worker packages. `python3 ci/jenkins/request.py --branch <branch> --source-sha <sha> --lane <lane>` prints the typed dispatch request and never submits a build. Windows-native and macOS jobs stay on hosted CI; Jenkins does not cover them.
+`Jenkinsfile` defines the Linux gates, one lane per job: `bash ci/jenkins/check.sh rust|tray|browser|postgres`. The lanes check exact tool versions and fail when a worker tool is missing; they do not install worker packages. `python3 ci/jenkins/request.py --branch <branch> --source-sha <sha> --lane <lane>` prints the typed dispatch request and never submits a build. These Linux lanes do not provide Windows-native or macOS evidence. Preserve legacy required checks until replacement acceptance and an authorized cutover.
 
 4. Open a PR against `main`
 

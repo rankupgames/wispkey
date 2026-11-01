@@ -24,7 +24,7 @@ if (!(branch ==~ /[A-Za-z0-9][A-Za-z0-9._\/-]{0,127}/) ||
 
 // JOB_BASE_NAME selects one lane. Each lane runs its gates in order on the Linux worker.
 // Timeouts match each lane's registered runTimeoutSeconds.
-def laneTimeoutMinutes = [rust: 120, tray: 60, browser: 60, postgres: 60]
+def laneTimeoutMinutes = [rust: 60, tray: 60, browser: 60, postgres: 60]
 if (!laneTimeoutMinutes.containsKey(env.JOB_BASE_NAME)) {
     error('wispkey_ci_lane_unknown')
 }
