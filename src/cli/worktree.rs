@@ -148,7 +148,9 @@ fn read_config(path: &Path, reject_symlinks: bool) -> Result<String> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         if reject_symlinks {
-            options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+            options.custom_flags(
+                windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+            );
         }
     }
     let file = options
@@ -383,11 +385,10 @@ pub fn handle_env_bind(project: &str, environment: &str, manifest: &str, replace
 }
 
 fn bind(project: &str, environment: &str, manifest: &str, replace: bool) -> Result<()> {
-    let repo = repository(true)?;
     let vault = open_unlocked_vault();
-    let binding = Binding {
+    let mut binding = Binding {
         version: 1,
-        repository: repo.identity.clone(),
+        repository: String::new(),
         project: project.to_string(),
         project_id: vault
             .get_project(project)
@@ -410,6 +411,9 @@ fn bind(project: &str, environment: &str, manifest: &str, replace: bool) -> Resu
                 .map_err(|_| "bound credential is unavailable for use")?;
         }
     }
+    // Establish local Git identity only after unlock and scope/reference validation.
+    let repo = repository(true)?;
+    binding.repository = repo.identity.clone();
     let bytes = serde_json::to_vec(&binding).map_err(|_| "cannot serialize binding")?;
     if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err("binding exceeds size limit");

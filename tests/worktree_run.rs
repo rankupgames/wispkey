@@ -283,6 +283,14 @@ fn unrelated_repositories_missing_bindings_and_scope_overrides_fail_before_launc
 #[test]
 fn invalid_local_config_missing_credentials_and_cross_partition_credentials_fail_closed() {
     let f = Fixture::new();
+    fs::write(
+        f.repo().join("wispkey.toml"),
+        MANIFEST.replace("cred:development-secret", "cred:missing"),
+    )
+    .unwrap();
+    assert!(!f.bind().status.success());
+    assert!(!f.repo().join(".git/wispkey-repository-id").exists());
+    fs::write(f.repo().join("wispkey.toml"), MANIFEST).unwrap();
     assert_ok(f.bind());
     let local = f.worktree().join("wispkey.local.toml");
     for content in [

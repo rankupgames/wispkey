@@ -68,7 +68,9 @@ Precedence: binding defaults, then the root's `wispkey.local.toml`, then repeate
 CLI `--env NAME=VALUE` settings (last occurrence wins). These override inherited
 parent-process values. Only names in the bound allowlist can be overridden, and
 credential references cannot be replaced or introduced by overrides. Invalid
-local settings are errors even if a CLI override would cover them. No unrelated
+local settings are errors even if a CLI override would cover them. The local
+override file must be a regular file, not a symlink or Windows reparse point.
+Explicit owner-selected manifests retain their existing symlink behavior. No unrelated
 keys are imported automatically.
 
 `--project` must match the bound project. `WISPKEY_PROJECT` and the active project
@@ -87,7 +89,9 @@ vault. No machine-specific path is committed. Independent clones, even with the
 same remote or a copied marker, do not inherit. Recreating a repository at the
 same path without its marker does not inherit. Moving a checkout or restoring a
 vault on another machine requires binding there again. Bindings are local state,
-not part of encrypted vault backup/sync. Deleting a project/partition and creating
+not part of encrypted vault backup/sync. Scope and credential validation precede
+marker creation. A later binding-storage failure can leave the private identity
+marker; the marker alone grants no credential access. Deleting a project/partition and creating
 the same name again invalidates its binding. Missing, expired, revoked or
 out-of-partition credentials stop launch; errors do not echo config values.
 
@@ -96,7 +100,10 @@ resolve there, never relative to the original manifest or main checkout. Launch
 from the worktree root for a database at that root. By default bound DATABASE_URL
 must be a relative `file:` or `sqlite:` URL, without parent traversal, authority,
 query strings or encoded paths. Each worktree therefore gets its own database
-path. Existing symlinks remain the owner's responsibility. For a deliberately
+path. This check applies only to `DATABASE_URL`; it does not infer database
+settings from `PG*`, `*_DATABASE_URL` or other variable names. Review other
+connection settings before running concurrent worktrees. Existing database-path
+symlinks remain the owner's responsibility. For a deliberately
 shared database (including network or credential-backed URLs), set
 `allow_shared_database = true` in `[worktree]` and explicitly rebind. This may let
 concurrent branches alter the same data and schema.
