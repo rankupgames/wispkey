@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
 # Disposable, loopback-only PostgreSQL fixture for the ignored issuer test.
 # WISPKEY_CONTAINER_ENGINE selects a Docker-compatible CLI (default: docker).
+# WISPKEY_FIXTURE_CONTAINER_NAME selects an exact container name for CI cleanup
+# checks. The run fails without removal when that name already exists.
 set -euo pipefail
 
 engine="${WISPKEY_CONTAINER_ENGINE:-docker}"
-name="wkpg-operation-$$-$RANDOM"
+name="${WISPKEY_FIXTURE_CONTAINER_NAME:-wkpg-operation-$$-$RANDOM}"
+if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
+    echo 'invalid fixture container name' >&2
+    exit 2
+fi
 scratch="$(mktemp -d)"
 created=0
 cleanup() {
