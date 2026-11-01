@@ -16,12 +16,14 @@ def emit(*args):
 
 class JenkinsRequestTests(unittest.TestCase):
     def test_valid_request_contains_only_dispatch_fields(self):
-        result = emit("--lane", "browser", "--branch", "0.7", "--source-sha", SHA)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout), {
-            "version": 1, "repository": "https://github.com/rankupgames/wispkey.git",
-            "branch": "0.7", "sourceSha": SHA, "lane": "browser",
-        })
+        for lane in ("rust", "tray", "browser", "postgres"):
+            with self.subTest(lane):
+                result = emit("--lane", lane, "--branch", "0.7", "--source-sha", SHA)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(json.loads(result.stdout), {
+                    "version": 1, "repository": "https://github.com/rankupgames/wispkey.git",
+                    "branch": "0.7", "sourceSha": SHA, "lane": lane,
+                })
 
     def test_invalid_arguments_are_blocked_without_output(self):
         cases = {

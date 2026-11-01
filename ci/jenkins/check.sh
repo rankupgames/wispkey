@@ -3,7 +3,7 @@
 set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
-lane="${1:?usage: check.sh rust|tray|browser}"
+lane="${1:?usage: check.sh rust|tray|browser|postgres}"
 lane_root="$PWD/target/jenkins"
 
 need_rust() {
@@ -40,7 +40,6 @@ rust)
     cargo test --locked --features experimental-browser-receiver
     cargo test --locked --features vsock,experimental-sync,experimental-browser-receiver
     python3 scripts/verify_personal_offline.py
-    WISPKEY_CONTAINER_ENGINE=podman bash tests/support/postgres_operation_fixture.sh
     cargo publish --dry-run --locked
     cargo build --locked --release
     ;;
@@ -53,6 +52,13 @@ tray)
     build_tray_ui
     cargo build --locked -p wispkey-tray
     cargo test --locked -p wispkey-tray
+    ;;
+postgres)
+    # The registry declares this exact name as the lane's only owned container.
+    need_rust
+    export CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0
+    WISPKEY_CONTAINER_ENGINE=docker WISPKEY_FIXTURE_CONTAINER_NAME=wispkey-postgres-fixture \
+        bash tests/support/postgres_operation_fixture.sh
     ;;
 browser)
     need_node

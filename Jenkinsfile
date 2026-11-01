@@ -23,6 +23,11 @@ if (!(branch ==~ /[A-Za-z0-9][A-Za-z0-9._\/-]{0,127}/) ||
 }
 
 // JOB_BASE_NAME selects one lane. Each lane runs its gates in order on the Linux worker.
+// Timeouts match each lane's registered runTimeoutSeconds.
+def laneTimeoutMinutes = [rust: 120, tray: 60, browser: 60, postgres: 60]
+if (!laneTimeoutMinutes.containsKey(env.JOB_BASE_NAME)) {
+    error('wispkey_ci_lane_unknown')
+}
 homelabPipeline(
     agentLabel: 'homelab-dev3-linux',
     branch: branch,
@@ -31,9 +36,10 @@ homelabPipeline(
     sourceRevisionParameter: 'SOURCE_SHA',
     scriptPath: 'Jenkinsfile',
     pipelineRevision: revision,
-    timeoutMinutes: 120,
+    timeoutMinutes: laneTimeoutMinutes[env.JOB_BASE_NAME],
     lanes: [
         rust: [os: 'linux', queueProfile: 'small-web', checkCommand: 'bash ci/jenkins/check.sh rust'],
         tray: [os: 'linux', queueProfile: 'small-web', checkCommand: 'bash ci/jenkins/check.sh tray'],
         browser: [os: 'linux', queueProfile: 'small-web', checkCommand: 'bash ci/jenkins/check.sh browser'],
+        postgres: [os: 'linux', queueProfile: 'default-4', checkCommand: 'bash ci/jenkins/check.sh postgres'],
     ])
