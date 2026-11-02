@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -42,8 +43,18 @@ def main():
     for tool in [kind, "docker", "ssh-keygen", "ssh", "cargo"]:
         if not shutil.which(tool):
             raise RuntimeError(f"missing fixture prerequisite: {tool}")
-    suffix = uuid.uuid4().hex[:12]
+    # CI registries declare exact owned containers, so they pin the suffix; local runs stay random.
+    suffix = os.environ.get("WISPKEY_CROSS_NODE_SUFFIX") or uuid.uuid4().hex[:12]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", suffix):
+        raise RuntimeError("WISPKEY_CROSS_NODE_SUFFIX must be 1-32 lowercase letters, digits or hyphens")
     cluster, ssh_name, image = f"wk-accept-{suffix}", f"wk-ssh-{suffix}", f"wk-ssh-fixture:{suffix}"
+    # Ownership comes from proving each name absent before creation; never remove a pre-existing resource.
+    for argv in [["docker", "container", "inspect", ssh_name], ["docker", "container", "inspect", cluster + "-control-plane"],
+                 ["docker", "image", "inspect", image]]:
+        if subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+            raise RuntimeError(f"fixture resource already exists: {argv[-1]}")
+    if cluster in run([kind, "get", "clusters"]).decode().split():
+        raise RuntimeError(f"fixture resource already exists: {cluster}")
     owned_cluster = owned_ssh = owned_image = False
     with tempfile.TemporaryDirectory(prefix="wk-cross-node-") as directory:
         scratch = Path(directory)
