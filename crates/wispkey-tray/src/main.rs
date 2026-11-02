@@ -664,7 +664,19 @@ mod tests {
             (460.0, 600.0),
             8.0,
         );
-        assert_eq!(top, (-468.0, 32.0));
+        assert_eq!(top, (-476.0, 32.0));
+        let right_edge = popout_position(
+            Anchor {
+                x: -24.0,
+                y: 0.0,
+                width: 24.0,
+                height: 24.0,
+            },
+            monitor,
+            (460.0, 600.0),
+            8.0,
+        );
+        assert_eq!(right_edge, (-468.0, 32.0));
         let bottom = popout_position(
             Anchor {
                 x: -1900.0,
