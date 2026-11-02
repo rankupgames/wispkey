@@ -17,7 +17,7 @@ The configured `api_url` must be an HTTPS origin, without a path, query, fragmen
 or credentials. `GET /api/v1/auth/cli-config` must return:
 
 ```json
-{"success":true,"data":{"issuer":"https://clerk.example.com","clientId":"registered-public-client","resource":"https://api.example.com/api/v1","scopes":["wispkey:sync"],"tokenFormat":"opaque"}}
+{"success":true,"data":{"issuer":"https://clerk.example.com","clientId":"registered-public-client","resource":"https://api.example.com/api/v1","scopes":["openid"],"tokenFormat":"opaque"}}
 ```
 
 The resource is exactly the configured API origin plus `/api/v1`. The issuer is
@@ -37,10 +37,17 @@ flow, exact resource audience, online verification response and revocation.
 Synthetic fixtures do not establish deployed settings or real-provider behavior.
 
 Operator setup must register `http://127.0.0.1/callback`, enable Public and Require
-PKCE, enable the `wispkey:sync` custom scope, select **opaque access tokens**, and
+PKCE, assign the built-in `openid` scope, select **opaque access tokens**, and
 retain the consent screen. Clerk accepts a dynamically assigned port for this
 literal loopback redirect. No client secret belongs in the CLI or its config.
 This code neither creates OAuth applications nor enables deployed settings.
+
+The CLI requests only `openid`. This scope establishes sign-in and does not grant
+sync access. The API checks the dedicated client and exact resource audience,
+then reads the current user's administrator-managed `cloud_sync` feature or
+Cloud/Enterprise plan before allowing partition transfers. No custom scope
+catalog entry is required. The client and API must use this contract together;
+the former `wispkey:sync` scope is rejected.
 
 ## Browser and token boundaries
 
@@ -59,12 +66,12 @@ URLs, state and PKCE challenges are not printed. If the system browser cannot
 be launched, the attempt ends; run login on a computer with a browser.
 
 The CLI accepts only a bounded opaque `oat_` bearer with `expires_in` no greater
-than 24 hours. It rejects JWT/ID tokens and any extra granted scope. There is no
-`offline_access` request, refresh-token storage, or automatic refresh. Clerk may
-include a refresh token in its response; the CLI immediately zeroizes and
-discards it without persisting, logging, transmitting or using it. Only the
-resource-bound access token is retained. Expiry requires `wispkey cloud login`
-again.
+than 24 hours. It rejects JWT/ID tokens as access bearers and any extra granted
+scope. There is no `offline_access` request, refresh-token storage, or automatic
+refresh. OIDC may return an ID token, and Clerk may include a refresh token. The CLI immediately
+zeroizes and discards both without persisting, logging, transmitting or using
+them. Only the resource-bound opaque access token authenticates API requests.
+Expiry requires `wispkey cloud login` again.
 
 An opaque token has no locally readable identity. Before saving anything, the
 pinned Cloud API verifies it online with Clerk, enforces the dedicated client,
@@ -130,7 +137,7 @@ migration, redaction, persistence races and logout outcomes. No real Clerk
 account, consent grant, token, deployment or billing operation is needed.
 
 Before enabling this preview, check the paired Cloud deployment, public
-application, exact resource/audience and custom scope, loopback redirect,
+application, exact resource/audience and singleton `openid` scope, loopback redirect,
 consent, opaque token format/lifetime, entitlement mapping, and browser
 login/logout on each supported OS. Synthetic tests do not replace that acceptance.
 
