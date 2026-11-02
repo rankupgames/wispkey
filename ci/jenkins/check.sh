@@ -83,6 +83,13 @@ browser)
     build_tray_ui
     (cd browser-extension && npx playwright install chromium firefox && npm run test:browser)
     python3 -m unittest discover -s scripts/tests -v
+    # Pack the extensions as the lane artifact, unpack them as a consumer, and require identical trees.
+    artifact="$lane_root/artifacts"
+    rm -rf -- "$artifact"
+    mkdir -p "$artifact/downloaded"
+    tar --create --file "$artifact/wispkey-browser-extensions.tar" -C browser-extension/dist .
+    tar --extract --file "$artifact/wispkey-browser-extensions.tar" -C "$artifact/downloaded"
+    python3 scripts/verify_artifact_tree.py browser-extension/dist/ "$artifact/downloaded"
     ;;
 *)
     echo "unknown lane: $lane" >&2
