@@ -343,11 +343,11 @@ fn unlock_response(params: &Value) -> Result<Value, Value> {
     vault
         .unlock_with_timeout(&password, None)
         .map_err(vault_error)?;
-    if params.get("remember").and_then(Value::as_bool) == Some(true) {
-        if let Err(error) = vault.remember_protector(None) {
-            vault.lock().map_err(vault_error)?;
-            return Err(vault_error(error));
-        }
+    if params.get("remember").and_then(Value::as_bool) == Some(true)
+        && let Err(error) = vault.remember_protector(None)
+    {
+        vault.lock().map_err(vault_error)?;
+        return Err(vault_error(error));
     }
     audit::log_event(
         vault.db(),
