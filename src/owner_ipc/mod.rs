@@ -397,7 +397,7 @@ fn list_credentials_response(params: &Value) -> Result<Value, Value> {
             let mut metadata = credential_metadata(credential);
             let partition = partitions.iter().find(|partition| Some(&partition.id) == credential.partition_id.as_ref())
                 .ok_or_else(|| error_body("unavailable", "credential partition is unavailable"))?;
-            let project = projects.iter().find(|project| project.id == partition.project_id)
+            let project = projects.iter().find(|project| Some(&project.id) == partition.project_id.as_ref())
                 .ok_or_else(|| error_body("unavailable", "credential project is unavailable"))?;
             metadata["partition"] = json!(partition.name);
             metadata["project"] = json!(project.name);
