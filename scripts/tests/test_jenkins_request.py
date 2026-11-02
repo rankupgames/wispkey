@@ -16,7 +16,7 @@ def emit(*args):
 
 class JenkinsRequestTests(unittest.TestCase):
     def test_valid_request_contains_only_dispatch_fields(self):
-        for lane in ("rust", "tray", "browser", "postgres"):
+        for lane in ("rust", "tray", "browser", "postgres", "cross-node"):
             with self.subTest(lane):
                 result = emit("--lane", lane, "--branch", "0.7", "--source-sha", SHA)
                 self.assertEqual(result.returncode, 0, result.stderr)

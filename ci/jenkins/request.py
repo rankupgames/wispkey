@@ -5,9 +5,9 @@ import re
 import sys
 
 REPOSITORY = "https://github.com/rankupgames/wispkey.git"
-LANES = ("rust", "tray", "browser", "postgres")
+LANES = ("rust", "tray", "browser", "postgres", "cross-node")
 FLAGS = ("--branch", "--source-sha", "--lane")
-USAGE = "Use --branch <approved-branch> --source-sha <40-hex-commit> --lane rust|tray|browser|postgres."
+USAGE = "Use --branch <approved-branch> --source-sha <40-hex-commit> --lane rust|tray|browser|postgres|cross-node."
 
 
 def valid_branch(branch):

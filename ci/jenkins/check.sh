@@ -3,7 +3,7 @@
 set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
-lane="${1:?usage: check.sh rust|tray|browser|postgres}"
+lane="${1:?usage: check.sh rust|tray|browser|postgres|cross-node}"
 lane_root="$PWD/target/jenkins"
 
 need_rust() {
@@ -59,6 +59,21 @@ postgres)
     export CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0
     WISPKEY_CONTAINER_ENGINE=docker WISPKEY_FIXTURE_CONTAINER_NAME=wispkey-postgres-fixture \
         bash tests/support/postgres_operation_fixture.sh
+    ;;
+cross-node)
+    # The registry declares wk-ssh-jenkins and wk-accept-jenkins-control-plane as owned containers.
+    need_rust
+    for tool in docker ssh ssh-keygen curl sha256sum; do
+        command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 1; }
+    done
+    mkdir -p "$lane_root/tools/kind"
+    curl --fail --location --silent --show-error --output "$lane_root/tools/kind/kind" \
+        https://github.com/kubernetes-sigs/kind/releases/download/v0.33.0/kind-linux-amd64
+    echo 'aee6151561422756b764a4ae28e7f44cda5af5a9eead3cc9985112b1de8d8e0d  kind' > "$lane_root/tools/kind/kind.sha256"
+    (cd "$lane_root/tools/kind" && sha256sum --check --quiet kind.sha256)
+    chmod 700 "$lane_root/tools/kind/kind"
+    KIND="$lane_root/tools/kind/kind" CARGO_BUILD_JOBS=2 WISPKEY_CROSS_NODE_SUFFIX=jenkins \
+        python3 scripts/verify.py --suite cross-node
     ;;
 browser)
     need_node
