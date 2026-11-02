@@ -30,6 +30,24 @@ def run(argv, *, data=None, env=None, visible=False):
     return result.stdout or b""
 
 
+def docker_id(path):
+    """Return the ID Docker wrote after it created a resource, or None when it created nothing."""
+    value = path.read_text().strip() if path.exists() else ""
+    return value if re.fullmatch(r"(sha256:)?[a-f0-9]{64}", value) else None
+
+
+def kind_nodes(cluster, mount):
+    """Return kind node IDs whose bind mount proves this run created them; same-named nodes stay."""
+    listed = subprocess.run(["docker", "ps", "-a", "-q", "--no-trunc", "--filter", "label=io.x-k8s.kind.cluster=" + cluster],
+                            capture_output=True)
+    owned = []
+    for container in listed.stdout.decode().split() if listed.returncode == 0 else []:
+        mounts = subprocess.run(["docker", "container", "inspect", "--format", "{{json .Mounts}}", container], capture_output=True)
+        if mounts.returncode == 0 and any(entry.get("Source") == mount for entry in json.loads(mounts.stdout or b"[]")):
+            owned.append(container)
+    return owned
+
+
 def write(path, data, mode=0o600):
     path.write_bytes(data.encode() if isinstance(data, str) else data)
     path.chmod(mode)
@@ -44,18 +62,17 @@ def main():
         if not shutil.which(tool):
             raise RuntimeError(f"missing fixture prerequisite: {tool}")
     # CI registries declare exact owned containers, so they pin the suffix; local runs stay random.
-    suffix = os.environ.get("WISPKEY_CROSS_NODE_SUFFIX") or uuid.uuid4().hex[:12]
+    suffix = os.environ.get("WISPKEY_CROSS_NODE_SUFFIX")
+    if suffix is None:
+        suffix = uuid.uuid4().hex[:12]
     if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", suffix):
         raise RuntimeError("WISPKEY_CROSS_NODE_SUFFIX must be 1-32 lowercase letters, digits or hyphens")
-    cluster, ssh_name, image = f"wk-accept-{suffix}", f"wk-ssh-{suffix}", f"wk-ssh-fixture:{suffix}"
-    # Ownership comes from proving each name absent before creation; never remove a pre-existing resource.
-    for argv in [["docker", "container", "inspect", ssh_name], ["docker", "container", "inspect", cluster + "-control-plane"],
-                 ["docker", "image", "inspect", image]]:
-        if subprocess.run(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-            raise RuntimeError(f"fixture resource already exists: {argv[-1]}")
-    if cluster in run([kind, "get", "clusters"]).decode().split():
-        raise RuntimeError(f"fixture resource already exists: {cluster}")
-    owned_cluster = owned_ssh = owned_image = False
+    cluster, ssh_name = f"wk-accept-{suffix}", f"wk-ssh-{suffix}"
+    # Budgeted CI requires engine-created containers in its slice. kind cannot place its node containers.
+    budget = os.environ.get("CI_BUDGET_CGROUP")
+    if budget is not None and not re.fullmatch(r"/[A-Za-z0-9_.-]+\.slice", budget):
+        raise RuntimeError("CI_BUDGET_CGROUP must name a systemd slice")
+    placement = ["--cgroup-parent", budget[1:]] if budget else []
     with tempfile.TemporaryDirectory(prefix="wk-cross-node-") as directory:
         scratch = Path(directory)
         try:
@@ -90,11 +107,15 @@ RUN touch /var/lib/wispkey-helper/attempts.db && chmod 600 /var/lib/wispkey-help
 CMD ["/usr/sbin/sshd", "-D", "-e"]
 ''')
             print("Starting loopback-only OpenSSH with a forced helper...", flush=True)
-            owned_image = True
-            run(["docker", "build", "-q", "-t", image, str(scratch)])
-            owned_ssh = True
-            run(["docker", "run", "-d", "--name", ssh_name, "--label", "wispkey.acceptance=" + suffix,
-                 "-p", "127.0.0.1::22", image])
+            # Docker writes these ID files only after it creates the resource; cleanup removes only those IDs.
+            run(["docker", "buildx", "build", "--provenance=false", "--load", "-q", "--iidfile", str(scratch / "image.id"),
+                 "--label", "wispkey.acceptance=" + suffix, str(scratch)])
+            image = docker_id(scratch / "image.id")
+            if image is None:
+                raise RuntimeError("SSH fixture image ID is missing")
+            run(["docker", "create", "--cidfile", str(scratch / "ssh.cid"), "--name", ssh_name, *placement,
+                 "--label", "wispkey.acceptance=" + suffix, "-p", "127.0.0.1::22", image])
+            run(["docker", "start", ssh_name])
             port = run(["docker", "port", ssh_name, "22/tcp"]).decode().strip()
             if not port.startswith("127.0.0.1:"):
                 raise RuntimeError("SSH fixture did not bind loopback")
@@ -138,7 +159,6 @@ apiServer:
                       "nodes":[{"role":"control-plane", "kubeadmConfigPatches":[patch], "extraMounts":[{
                           "hostPath":str(scratch / "encryption.json"), "containerPath":"/etc/kubernetes/wispkey-encryption.json", "readOnly":True}]}]}
             write(scratch / "kind.json", json.dumps(config))
-            owned_cluster = True
             run([kind, "create", "cluster", "--name", cluster, "--config", str(scratch / "kind.json"),
                  "--kubeconfig", str(scratch / "kubeconfig"), "--wait", "120s"], visible=True)
             node = cluster + "-control-plane"
@@ -192,12 +212,13 @@ apiServer:
                     raise RuntimeError("synthetic credential appeared in container logs")
             print("PASS: pinned SSH, replay rejection, signed Kubernetes delivery/revocation, narrow RBAC, encrypted etcd.", flush=True)
         finally:
-            if owned_cluster:
-                subprocess.run([kind,"delete","cluster","--name",cluster], check=False)
-            if owned_ssh:
-                subprocess.run(["docker","rm","-f","-v",ssh_name], stdout=subprocess.DEVNULL, check=False)
-            if owned_image:
-                subprocess.run(["docker","image","rm",image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            # Partial kind creation can leave nodes; remove each proven node, never the cluster by name.
+            for node_id in kind_nodes(cluster, str(scratch / "encryption.json")):
+                subprocess.run(["docker","rm","-f","-v",node_id], stdout=subprocess.DEVNULL, check=False)
+            if container := docker_id(scratch / "ssh.cid"):
+                subprocess.run(["docker","rm","-f","-v",container], stdout=subprocess.DEVNULL, check=False)
+            if image_id := docker_id(scratch / "image.id"):
+                subprocess.run(["docker","image","rm",image_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
 if __name__ == "__main__":
