@@ -11,6 +11,15 @@ if [[ ! "$name" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$ ]]; then
     echo 'invalid fixture container name' >&2
     exit 2
 fi
+# Budgeted CI requires engine-created containers in its slice.
+placement=()
+if [[ -n "${CI_BUDGET_CGROUP+set}" ]]; then
+    if [[ ! "$CI_BUDGET_CGROUP" =~ ^/[A-Za-z0-9_.-]+\.slice$ ]]; then
+        echo 'CI_BUDGET_CGROUP must name a systemd slice' >&2
+        exit 2
+    fi
+    placement=(--cgroup-parent "${CI_BUDGET_CGROUP#/}")
+fi
 scratch="$(mktemp -d)"
 created=0
 cleanup() {
@@ -23,7 +32,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-"$engine" run -d --name "$name" -p 127.0.0.1::5432 \
+"$engine" run -d --name "$name" ${placement[@]+"${placement[@]}"} -p 127.0.0.1::5432 \
     -e POSTGRES_PASSWORD=synthetic_admin_password_9214 \
     docker.io/library/postgres@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722 >/dev/null
 created=1
