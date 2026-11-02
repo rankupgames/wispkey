@@ -561,11 +561,9 @@ mod tests {
     #[tokio::test]
     async fn stdin_only_child_keeps_canaries_out_of_output_and_store() {
         let (dir, mut config, store) = fixture();
-        config.program = std::env::current_exe()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
+        // Jenkins build paths can contain characters the fixed-program policy rejects.
+        // Run the same probe binary from the existing private fixture path.
+        std::fs::copy(std::env::current_exe().unwrap(), &config.program).unwrap();
         config.args = vec![
             "--exact".into(),
             "operations::helper::tests::channel_probe_child".into(),
