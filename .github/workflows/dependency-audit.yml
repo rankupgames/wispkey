@@ -17,6 +17,9 @@ concurrency:
   group: dependency-audit-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  RUSTC_WRAPPER: ''
+
 jobs:
   fixtures:
     name: Audit reporting fixtures

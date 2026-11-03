@@ -13,7 +13,7 @@
       "permissions:\n  contents: read"
     ],
     "environment": [
-      "env:\n  CARGO_TERM_COLOR: always\n  CARGO_INCREMENTAL: 0",
+      "env:\n  RUSTC_WRAPPER: ''\n  CARGO_TERM_COLOR: always\n  CARGO_INCREMENTAL: 0",
       "env:\n  VERSION: ${{ needs.verify.outputs.version }}",
       "env:\n  VERSION: ${{ needs.verify.outputs.version }}",
       "env:\n  VERSION: ${{ needs.verify.outputs.version }}",
@@ -155,7 +155,9 @@
     "permissions": [
       "permissions:\n  contents: read"
     ],
-    "environment": [],
+    "environment": [
+      "env:\n  RUSTC_WRAPPER: ''"
+    ],
     "job_gates": [],
     "action_inputs": [
       [
@@ -176,6 +178,7 @@
       "permissions:\n  contents: read"
     ],
     "environment": [
+      "env:\n  RUSTC_WRAPPER: ''",
       "env:\n  CARGO_BUILD_JOBS: '2'"
     ],
     "job_gates": [],
@@ -215,7 +218,9 @@
     "permissions": [
       "permissions:\n  contents: read"
     ],
-    "environment": [],
+    "environment": [
+      "env:\n  RUSTC_WRAPPER: ''"
+    ],
     "job_gates": [],
     "action_inputs": [
       [
@@ -271,7 +276,9 @@
     "permissions": [
       "permissions:\n  contents: read"
     ],
-    "environment": [],
+    "environment": [
+      "env:\n  RUSTC_WRAPPER: ''"
+    ],
     "job_gates": [
       "    if: github.event_name != 'pull_request'",
       "    needs: fixtures"
@@ -310,7 +317,7 @@
       "permissions:\n  contents: read\n  id-token: write\n  attestations: write"
     ],
     "environment": [
-      "env:\n  CARGO_INCREMENTAL: '0'\n  CARGO_BUILD_JOBS: '2'\n  CHECKED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
+      "env:\n  RUSTC_WRAPPER: ''\n  CARGO_INCREMENTAL: '0'\n  CARGO_BUILD_JOBS: '2'\n  CHECKED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
     ],
     "job_gates": [
       "    needs: build",
@@ -371,7 +378,7 @@
       "permissions:\n  contents: read\n  id-token: write\n  attestations: write"
     ],
     "environment": [
-      "env:\n  CARGO_INCREMENTAL: '0'\n  CHECKED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
+      "env:\n  RUSTC_WRAPPER: ''\n  CARGO_INCREMENTAL: '0'\n  CHECKED_SHA: ${{ github.event.pull_request.head.sha || github.sha }}"
     ],
     "job_gates": [
       "    needs: build",
@@ -432,7 +439,7 @@
       "permissions:\n  contents: read\n  id-token: write\n  attestations: write"
     ],
     "environment": [
-      "env:\n  CARGO_INCREMENTAL: '0'\n  CHECKED_SHA: ${{ github.sha }}",
+      "env:\n  RUSTC_WRAPPER: ''\n  CARGO_INCREMENTAL: '0'\n  CHECKED_SHA: ${{ github.sha }}",
       "env:\n  EXPECTED_COMMIT: ${{ inputs.expected_commit }}"
     ],
     "job_gates": [

@@ -14,6 +14,8 @@ cargo test
 ### Prerequisites
 
 - Current stable **Rust** via [rustup](https://rustup.rs)
+- `kache` on `PATH`, used by `.cargo/config.toml` for local Rust builds.
+  Set `RUSTC_WRAPPER` to an empty value to build without it, as hosted CI does.
 - SQLite is bundled via `rusqlite`.
 - For the browser/tray UI, use **Node.js 24 LTS** (CI), or Node.js 22.12+.
   CLI-only development does not require Node.js.

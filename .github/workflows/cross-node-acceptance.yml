@@ -12,6 +12,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTC_WRAPPER: ''
+
 jobs:
   destinations:
     # Match the OpenSSH container's Ubuntu runtime for the host-built helper.

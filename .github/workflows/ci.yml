@@ -9,6 +9,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RUSTC_WRAPPER: ''
+
 jobs:
   vsock:
     name: CLI with Linux AF_VSOCK
