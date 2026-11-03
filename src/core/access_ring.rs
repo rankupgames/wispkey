@@ -153,8 +153,9 @@ impl Vault {
             return Ok(previous);
         }
         if ring < previous {
-            let password = owner_password
-                .ok_or(rejected("broadening an access ring requires owner password"))?;
+            let password = owner_password.ok_or(rejected(
+                "broadening an access ring requires owner password",
+            ))?;
             self.verify_operation_owner_password(password)
                 .map_err(rejected)?;
         }
@@ -176,7 +177,9 @@ impl Vault {
         project: &str,
     ) -> Result<()> {
         if self.db.is_autocommit() {
-            return Err(rejected("access ring classification requires a transaction"));
+            return Err(rejected(
+                "access ring classification requires a transaction",
+            ));
         }
         self.ensure_access_ring_policy()?;
         let changed = self.db.execute(
@@ -184,7 +187,9 @@ impl Vault {
             params![ring.as_str(), credential.id],
         )?;
         if changed != 1 {
-            return Err(rejected("access ring classification requires a new credential"));
+            return Err(rejected(
+                "access ring classification requires a new credential",
+            ));
         }
         self.log_access_ring_change(&credential.name, "unclassified", ring.as_str(), project)
     }

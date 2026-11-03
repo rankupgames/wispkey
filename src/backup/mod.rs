@@ -1673,7 +1673,11 @@ mod tests {
         };
         assert!(ringed(Value::from("critical"), CURRENT_SCHEMA_VERSION).is_ok());
         assert!(ringed(Value::Null, "16").is_ok());
-        for ring in [Value::from("superuser"), Value::from("Routine"), Value::Bool(true)] {
+        for ring in [
+            Value::from("superuser"),
+            Value::from("Routine"),
+            Value::Bool(true),
+        ] {
             assert!(ringed(ring, CURRENT_SCHEMA_VERSION).is_err());
         }
         assert!(ringed(Value::from("critical"), "16").is_err());

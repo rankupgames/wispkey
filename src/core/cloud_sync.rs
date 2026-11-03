@@ -1302,7 +1302,9 @@ mod auth_transport_tests {
         assert_eq!(ring_of(vault, "critical-key"), Some(AccessRing::Critical));
         assert_eq!(ring_of(vault, "routine-key"), Some(AccessRing::Routine));
         assert_eq!(
-            vault.access_ring_in_project("default", "plain-key").unwrap(),
+            vault
+                .access_ring_in_project("default", "plain-key")
+                .unwrap(),
             AccessRing::Restricted
         );
     }
@@ -1333,8 +1335,7 @@ mod auth_transport_tests {
 
         let credential = temp.path().join("credential.wkcred");
         let credential = credential.to_str().unwrap();
-        crate::sharing::export_credential(&source, "critical-key", PASSPHRASE, credential)
-            .unwrap();
+        crate::sharing::export_credential(&source, "critical-key", PASSPHRASE, credential).unwrap();
         assert_eq!(envelope(b"WKCR", credential)["version"], 4);
         let destination = vault();
         crate::sharing::import_credential(&destination, credential, PASSPHRASE, None, None)
@@ -1349,7 +1350,10 @@ mod auth_transport_tests {
         crate::sharing::export_credential(&plain, "plain-key", PASSPHRASE, credential).unwrap();
         let payload = envelope(b"WKCR", credential);
         assert_eq!(payload["version"], 4);
-        assert_eq!(payload["payload"]["credential"]["access_ring"], "restricted");
+        assert_eq!(
+            payload["payload"]["credential"]["access_ring"],
+            "restricted"
+        );
     }
 
     #[test]

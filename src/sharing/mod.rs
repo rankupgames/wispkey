@@ -256,14 +256,11 @@ pub fn import_project(
         read_transport_payload(PROJECT_BUNDLE_MAGIC, bundle_path, passphrase)?;
     validate_transport_format(
         registered,
-        payload
-            .partitions
-            .iter()
-            .any(|partition| {
-                partition.auth_data.is_some()
-                    || partition.signup_profiles.is_some()
-                    || any_access_ring(&partition.credentials)
-            }),
+        payload.partitions.iter().any(|partition| {
+            partition.auth_data.is_some()
+                || partition.signup_profiles.is_some()
+                || any_access_ring(&partition.credentials)
+        }),
     )?;
     for partition in &payload.partitions {
         validate_bundle_auth_bindings(&partition.credentials, partition.auth_data.as_ref())?;

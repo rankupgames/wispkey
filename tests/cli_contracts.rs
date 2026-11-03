@@ -273,7 +273,10 @@ fn ring_cli_classifies_narrows_and_refuses_unattended_broadening() {
         .unwrap()
         .collect::<rusqlite::Result<_>>()
         .unwrap();
-    assert_eq!(changes, vec!["unclassified->critical", "restricted->critical"]);
+    assert_eq!(
+        changes,
+        vec!["unclassified->critical", "restricted->critical"]
+    );
     let audit_text: String = db
         .query_row(
             "SELECT group_concat(coalesce(target_path, '') || coalesce(deny_reason, ''), '|')
