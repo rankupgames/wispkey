@@ -29,7 +29,7 @@ host, so the token proxy never substitutes it into outbound traffic.
 
 ```sh
 printf '%s' "$WEBHOOK_SIGNING_SECRET" | wispkey add billing-webhook-signing \
-  --type api_key --value-file - --hosts webhook-signing.invalid
+  --ring routine --type api_key --value-file - --hosts webhook-signing.invalid
 wispkey --format json get billing-webhook-signing   # credential.id
 wispkey instance enroll billing-receiver --credential billing-webhook-signing
 wispkey serve --listen unix:/run/wispkey/proxy.sock

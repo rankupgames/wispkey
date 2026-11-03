@@ -14,7 +14,7 @@ export PATH="$PWD/target/release:$PATH"
 wispkey init
 
 # 3. Add credentials
-printf '%s' "$OPENAI_API_KEY" | wispkey add "openai-key" --type bearer_token --value-file - --hosts "api.openai.com"
+printf '%s' "$OPENAI_API_KEY" | wispkey add "openai-key" --ring routine --type bearer_token --value-file - --hosts "api.openai.com"
 printf '%s' "$BASIC_AUTH_VALUE" | wispkey add "db-creds" --type basic_auth --value-file - --tags "database"
 wispkey add "ssh-key" --type api_key --value-file ~/.ssh/my_key --partition "ssh-keys"
 
@@ -118,6 +118,10 @@ printf '%s' "$BOOTSTRAP_TOKEN" | wispkey instance join --token-file - --name wor
 ```
 
 Bootstrap redemption is atomic and race-safe; TTL and max-use limits are enforced under concurrent joins. The proxy management API also exposes `POST /api/instances/join` for first-contact self-enrollment authenticated only by the bootstrap token.
+
+## Access Rings
+
+Each credential has an owner ring: `routine`, `restricted` or `critical`. Unclassified is `restricted`. The proxy, MCP, webhook verification, auth bundle resolution and `exec`/`run`/`inject` release only `routine`. Browser fill and one-use operation grants also release `restricted`. Nothing releases `critical`. Existing credentials are unclassified after the schema 17 migration; set them with `wispkey ring <name> --set routine`. See `docs/access-rings.md`.
 
 ## Secret Injection
 
