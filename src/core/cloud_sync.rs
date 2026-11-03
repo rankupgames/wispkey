@@ -25,6 +25,8 @@ pub(crate) struct SnapshotCredential {
     pub name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    access_ring: Option<access_ring::AccessRing>,
     description: String,
     credential_type: CredentialType,
     value: String,
@@ -39,6 +41,20 @@ pub(crate) struct SnapshotCredential {
 impl Drop for SnapshotCredential {
     fn drop(&mut self) {
         self.value.zeroize();
+    }
+}
+
+/// Transport format versions. Version 4 carries access rings; older readers
+/// reject it, so a ring is never silently dropped and broadened.
+pub(crate) fn transport_version(access_rings: bool, signup_profiles: bool, auth: bool) -> u8 {
+    if access_rings {
+        4
+    } else if signup_profiles {
+        3
+    } else if auth {
+        2
+    } else {
+        1
     }
 }
 
@@ -146,6 +162,7 @@ impl Vault {
                     .auth_metadata_for_id(&credential.id)?
                     .map(|metadata| metadata.id);
                 Ok(SnapshotCredential {
+                    access_ring: self.explicit_access_ring(&credential.id)?,
                     name: credential.name,
                     auth_id,
                     description: credential.description,
@@ -166,13 +183,11 @@ impl Vault {
             .then_some(auth_data);
         let signup_profiles = self.export_signup_profiles(project, &partition.name)?;
         let snapshot = Snapshot {
-            version: if signup_profiles.is_some() {
-                3
-            } else if auth_data.is_some() {
-                2
-            } else {
-                1
-            },
+            version: transport_version(
+                credentials.iter().any(|c| c.access_ring.is_some()),
+                signup_profiles.is_some(),
+                auth_data.is_some(),
+            ),
             project: project.to_owned(),
             partition: partition.name,
             description: partition.description,
@@ -219,9 +234,13 @@ impl Vault {
             (
                 snapshot.version,
                 snapshot.auth_data.is_some(),
-                snapshot.signup_profiles.is_some()
+                snapshot.signup_profiles.is_some(),
+                snapshot.credentials.iter().any(|c| c.access_ring.is_some())
             ),
-            (1, false, false) | (2, true, false) | (3, _, true)
+            (1, false, false, false)
+                | (2, true, false, false)
+                | (3, _, true, false)
+                | (4, _, _, true)
         ) || snapshot.project.is_empty()
             || snapshot.partition.is_empty()
         {
@@ -410,9 +429,15 @@ impl Vault {
                         "credential belongs to another partition".into(),
                     ));
                 }
+                self.replace_transport_access_ring(
+                    &id,
+                    &credential.name,
+                    &snapshot.project,
+                    credential.access_ring,
+                )?;
                 id
             } else {
-                self.insert_credential_row(
+                let created = self.insert_credential_row(
                     key,
                     &AddCredentialRequest {
                         name: &credential.name,
@@ -427,8 +452,11 @@ impl Vault {
                         lifecycle_state: Some(&credential.lifecycle_state),
                         review_at: credential.review_at.as_deref(),
                     },
-                )?
-                .id
+                )?;
+                if let Some(ring) = credential.access_ring {
+                    self.classify_new_credential(&created, ring, &snapshot.project)?;
+                }
+                created.id
             };
             let encrypted = self.encrypt_bytes(key, credential.value.as_bytes())?;
             self.db.execute("UPDATE credentials SET description=?1,credential_type=?2,encrypted_value=?3,wisp_token=?4,hosts=?5,tags=?6,origin=?7,lifecycle_state=?8,review_at=?9,updated_at=?10 WHERE id=?11",
@@ -459,6 +487,7 @@ impl Vault {
 #[cfg(test)]
 mod auth_transport_tests {
     use super::*;
+    use crate::core::access_ring::AccessRing;
     use crate::core::auth::{
         AuthAlternative, AuthBundle, AuthReference, AuthRegistration, ProviderExpiry,
     };
@@ -475,6 +504,7 @@ mod auth_transport_tests {
             session_timeout_override: None,
         };
         vault.create_project("default", "").unwrap();
+        access_ring::insert_access_ring_policy(&vault.db).unwrap();
         vault
     }
 
@@ -1230,5 +1260,169 @@ mod auth_transport_tests {
         assert!(crate::sharing::import_project(&destination, path, PASSPHRASE).is_err());
         assert!(destination.get_project("new-project").is_err());
         assert_eq!(destination.credential_count().unwrap(), 0);
+    }
+
+    fn add_ringed(vault: &Vault, name: &str, ring: Option<AccessRing>) {
+        vault
+            .add_classified_credential(
+                AddCredentialRequest::new(name, CredentialType::ApiKey, SECRET)
+                    .hosts(Some("api.example.test"))
+                    .project(Some("default")),
+                ring,
+            )
+            .unwrap();
+    }
+
+    fn ring_of(vault: &Vault, name: &str) -> Option<AccessRing> {
+        let credential = vault.get_credential_in_project("default", name).unwrap();
+        vault.explicit_access_ring(&credential.id).unwrap()
+    }
+
+    fn ringed_source() -> Vault {
+        let source = vault();
+        add_ringed(&source, "critical-key", Some(AccessRing::Critical));
+        add_ringed(&source, "routine-key", Some(AccessRing::Routine));
+        add_ringed(&source, "plain-key", None);
+        source
+    }
+
+    fn assert_rings(vault: &Vault) {
+        assert_eq!(ring_of(vault, "critical-key"), Some(AccessRing::Critical));
+        assert_eq!(ring_of(vault, "routine-key"), Some(AccessRing::Routine));
+        assert_eq!(ring_of(vault, "plain-key"), None);
+    }
+
+    fn envelope(magic: &[u8; 4], path: &str) -> serde_json::Value {
+        crate::bundle::read_encrypted_payload(magic, path, PASSPHRASE).unwrap()
+    }
+
+    #[test]
+    fn bundles_preserve_access_rings_in_a_v4_envelope() {
+        let source = ringed_source();
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project.wkbundle");
+        let project = project.to_str().unwrap();
+        crate::sharing::export_project(&source, "default", PASSPHRASE, project).unwrap();
+        assert_eq!(envelope(b"WKPJ", project)["version"], 4);
+        let destination = vault();
+        crate::sharing::import_project(&destination, project, PASSPHRASE).unwrap();
+        assert_rings(&destination);
+
+        let partition = temp.path().join("partition.wkbundle");
+        let partition = partition.to_str().unwrap();
+        crate::partition::export_partition(&source, "personal", PASSPHRASE, partition).unwrap();
+        assert_eq!(envelope(b"WKBX", partition)["version"], 4);
+        let destination = vault();
+        crate::partition::import_partition(&destination, partition, PASSPHRASE).unwrap();
+        assert_rings(&destination);
+
+        let credential = temp.path().join("credential.wkcred");
+        let credential = credential.to_str().unwrap();
+        crate::sharing::export_credential(&source, "critical-key", PASSPHRASE, credential)
+            .unwrap();
+        assert_eq!(envelope(b"WKCR", credential)["version"], 4);
+        let destination = vault();
+        crate::sharing::import_credential(&destination, credential, PASSPHRASE, None, None)
+            .unwrap();
+        assert_eq!(
+            ring_of(&destination, "critical-key"),
+            Some(AccessRing::Critical)
+        );
+
+        let plain = vault();
+        add_ringed(&plain, "plain-key", None);
+        crate::sharing::export_credential(&plain, "plain-key", PASSPHRASE, credential).unwrap();
+        assert!(envelope(b"WKCR", credential).get("version").is_none());
+    }
+
+    #[test]
+    fn bundles_with_malformed_or_downgraded_rings_import_nothing() {
+        let source = ringed_source();
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("project.wkbundle");
+        let path = path.to_str().unwrap();
+        crate::sharing::export_project(&source, "default", PASSPHRASE, path).unwrap();
+        let original = envelope(b"WKPJ", path);
+        let ring = "/payload/partitions/0/credentials/0/access_ring";
+        assert!(original.pointer(ring).is_some());
+        let mut cases = Vec::new();
+        for value in ["superuser", "Routine", ""] {
+            let mut tampered = original.clone();
+            *tampered.pointer_mut(ring).unwrap() = serde_json::json!(value);
+            cases.push(tampered);
+        }
+        let mut downgraded = original.clone();
+        downgraded["version"] = serde_json::json!(3);
+        cases.push(downgraded);
+        let mut unknown = original.clone();
+        unknown["version"] = serde_json::json!(5);
+        cases.push(unknown);
+        cases.push(original["payload"].clone());
+        for payload in cases {
+            crate::bundle::write_encrypted_payload(b"WKPJ", &payload, PASSPHRASE, path).unwrap();
+            let destination = vault();
+            assert!(crate::sharing::import_project(&destination, path, PASSPHRASE).is_err());
+            assert_eq!(destination.credential_count().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn cloud_snapshot_preserves_rings_and_rejects_downgrades() {
+        let source = ringed_source();
+        let snapshot = source
+            .cloud_snapshot("default", "personal")
+            .unwrap()
+            .unwrap();
+        assert_eq!(snapshot.version, 4);
+        let target = vault();
+        target
+            .cloud_apply(&snapshot, Some(&current_hash(&target)), None)
+            .unwrap();
+        assert_rings(&target);
+
+        let mut value = serde_json::to_value(&snapshot).unwrap();
+        value["version"] = serde_json::json!(3);
+        let downgraded: Snapshot = serde_json::from_value(value.clone()).unwrap();
+        let fresh = vault();
+        let before = current_hash(&fresh);
+        assert!(fresh.cloud_apply(&downgraded, Some(&before), None).is_err());
+        assert_eq!(current_hash(&fresh), before);
+
+        value["version"] = serde_json::json!(4);
+        value["credentials"][0]["access_ring"] = serde_json::json!("superuser");
+        assert!(serde_json::from_value::<Snapshot>(value).is_err());
+    }
+
+    #[test]
+    fn cloud_snapshot_may_narrow_but_never_broaden_a_ring() {
+        let local = ringed_source();
+        let mut remote = serde_json::to_value(
+            local
+                .cloud_snapshot("default", "personal")
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        let credentials = remote["credentials"].as_array_mut().unwrap();
+        let critical = credentials
+            .iter_mut()
+            .find(|c| c["name"] == "critical-key")
+            .unwrap();
+        critical["access_ring"] = serde_json::json!("routine");
+        let broaden: Snapshot = serde_json::from_value(remote.clone()).unwrap();
+        let before = current_hash(&local);
+        assert!(local.cloud_apply(&broaden, Some(&before), None).is_err());
+        assert_eq!(current_hash(&local), before);
+        assert_rings(&local);
+
+        let credentials = remote["credentials"].as_array_mut().unwrap();
+        for credential in credentials.iter_mut() {
+            credential["access_ring"] = serde_json::json!("critical");
+        }
+        let narrow: Snapshot = serde_json::from_value(remote).unwrap();
+        local.cloud_apply(&narrow, Some(&before), None).unwrap();
+        for name in ["critical-key", "routine-key", "plain-key"] {
+            assert_eq!(ring_of(&local, name), Some(AccessRing::Critical));
+        }
     }
 }

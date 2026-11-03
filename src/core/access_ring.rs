@@ -3,6 +3,7 @@
 //! auth registry and policy checks. They never establish identity.
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 
 use super::{Result, Vault, VaultError};
 
@@ -24,7 +25,8 @@ fn rejected(reason: &'static str) -> VaultError {
 }
 
 /// Ordered from broadest to narrowest release.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AccessRing {
     Routine,
     Restricted,
@@ -54,6 +56,10 @@ impl AccessRing {
     pub(crate) fn from_stored(value: Option<&str>) -> Self {
         value.and_then(Self::parse).unwrap_or(Self::Restricted)
     }
+}
+
+fn ring_label(ring: Option<AccessRing>) -> &'static str {
+    ring.map_or("unclassified", AccessRing::as_str)
 }
 
 impl Vault {
@@ -112,14 +118,14 @@ impl Vault {
             "UPDATE credentials SET access_ring=?1, updated_at=?2 WHERE id=?3",
             params![ring.as_str(), Utc::now().to_rfc3339(), credential.id],
         )?;
-        self.log_access_ring_change(&credential.name, previous.as_str(), ring, project)?;
+        self.log_access_ring_change(&credential.name, previous.as_str(), ring.as_str(), project)?;
         tx.commit()?;
         Ok(previous)
     }
 
     /// Classifies a row inserted earlier in the caller's transaction. A new row
     /// needs no step-up: the owner supplied its value in the same call.
-    pub(super) fn classify_new_credential(
+    pub(crate) fn classify_new_credential(
         &self,
         credential: &super::Credential,
         ring: AccessRing,
@@ -136,17 +142,49 @@ impl Vault {
         if changed != 1 {
             return Err(rejected("access ring classification requires a new credential"));
         }
-        self.log_access_ring_change(&credential.name, "unclassified", ring, project)
+        self.log_access_ring_change(&credential.name, "unclassified", ring.as_str(), project)
+    }
+
+    /// Applies a transported classification to an existing row inside the
+    /// caller's transport transaction. A snapshot may keep or narrow a ring,
+    /// but never broaden it: only the local owner control can broaden.
+    pub(crate) fn replace_transport_access_ring(
+        &self,
+        credential_id: &str,
+        name: &str,
+        project: &str,
+        ring: Option<AccessRing>,
+    ) -> Result<()> {
+        if self.db.is_autocommit() {
+            return Err(VaultError::InvalidBundle(
+                "transport transaction required".into(),
+            ));
+        }
+        let previous = self.explicit_access_ring(credential_id)?;
+        if previous == ring {
+            return Ok(());
+        }
+        self.ensure_access_ring_policy()?;
+        if ring.unwrap_or(AccessRing::Restricted) < previous.unwrap_or(AccessRing::Restricted) {
+            return Err(VaultError::InvalidBundle(
+                "snapshot cannot broaden an access ring".into(),
+            ));
+        }
+        self.db.execute(
+            "UPDATE credentials SET access_ring=?1 WHERE id=?2",
+            params![ring.map(AccessRing::as_str), credential_id],
+        )?;
+        self.log_access_ring_change(name, ring_label(previous), ring_label(ring), project)
     }
 
     fn log_access_ring_change(
         &self,
         name: &str,
         previous: &str,
-        ring: AccessRing,
+        next: &str,
         project: &str,
     ) -> Result<()> {
-        let detail = format!("{previous}->{}", ring.as_str());
+        let detail = format!("{previous}->{next}");
         crate::audit::try_log_event(
             &self.db,
             "AccessRingChanged",
