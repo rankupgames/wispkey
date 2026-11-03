@@ -121,7 +121,7 @@ Bootstrap redemption is atomic and race-safe; TTL and max-use limits are enforce
 
 ## Access Rings
 
-Each credential has an owner ring: `routine`, `restricted` or `critical`. Unclassified is `restricted`. The proxy, MCP, webhook verification, auth bundle resolution and `exec`/`run`/`inject` release only `routine`. Browser fill and one-use operation grants also release `restricted`. Nothing releases `critical`. Existing credentials are unclassified after the schema 17 migration; set them with `wispkey ring <name> --set routine`. See `docs/access-rings.md`.
+Each credential has an owner ring: `routine`, `restricted` or `critical`. Unclassified is `restricted`. The proxy, MCP, webhook verification, auth bundle resolution and `exec`/`run`/`inject` release only `routine`. Browser fill and one-use operation grants also release `restricted`. Delegated execution and fill deny `critical`; owner recovery, encrypted export and Cloud push retain their existing trust boundary for every ring. Existing credentials are unclassified after the schema 17 migration; set them with `wispkey ring <name> --set routine`. See `docs/access-rings.md`.
 
 ## Secret Injection
 

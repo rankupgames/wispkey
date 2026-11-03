@@ -62,8 +62,8 @@ fn ring_label(ring: Option<AccessRing>) -> &'static str {
     ring.map_or("unclassified", AccessRing::as_str)
 }
 
-/// The approval a release path holds. Critical has no local release path
-/// until trusted-device presence exists.
+/// The approval a delegated release path holds. Critical execution and fill
+/// remain denied; explicit owner recovery and transfer use a separate boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RingRelease {
     /// Proxy, MCP, webhook signing, auth resolution and owner egress.

@@ -15,7 +15,7 @@ release.
 |------|---------|
 | `routine` | Unattended release is allowed |
 | `restricted` | Release needs a fresh owner approval |
-| `critical` | No local release path exists |
+| `critical` | No delegated execution or fill path exists |
 
 A credential without a ring is unclassified. WispKey treats an unclassified or
 unknown stored value as `restricted`. The vault records ring policy version `1`
@@ -44,9 +44,12 @@ The ring check runs before the project, instance scope and website-login
 checks. Browser fill and operation grants show their existing error and hide
 the ring reason.
 
-`critical` has no local release path. Trusted-device presence does not exist
-yet. Owner-local reads that do not release a value to a delegate, such as
-`get`, export, backup and value replacement, do not check rings.
+`critical` has no delegated execution or fill path. Trusted-device presence does
+not exist yet. Owner-local reads, encrypted export, Cloud push, backup and value
+replacement retain the existing owner recovery and transfer boundary. Rings do
+not protect a credential from the local account that can unlock the vault. A
+process with that account's cached session and a bundle passphrase can export
+and decrypt even a critical credential. These transfers add no ring step-up.
 
 ## Owner control
 
@@ -63,6 +66,8 @@ wispkey ring "openai-key" --set routine
 - `ring --set` with a narrower ring needs no password.
 - `ring --set` with a broader ring needs the vault password at an interactive
   terminal. `WISPKEY_PASSWORD` and piped input do not satisfy it.
+- Broadening also requires a finite owner session. Unlock with a positive
+  timeout before broadening if `WISPKEY_SESSION_TIMEOUT=0` was used.
 - Setting the current ring again does nothing.
 - The audit event records the credential name, project, previous ring and new
   ring. It records no value or token.
@@ -99,6 +104,8 @@ are outside ring enforcement.
   passphrase holder or sync peer chose that ring.
 - A legacy snapshot without rings narrows `routine` rows to unclassified. It is
   rejected over `critical` rows.
+- Nonempty project and partition bundles import atomically: overlapping names
+  reject the whole import instead of skipping those rows.
 - A backup restore with replace brings back the rings from the backup. A
   restore cannot reactivate delegated authority: restored instances need
   re-enrollment.
@@ -106,7 +113,8 @@ are outside ring enforcement.
 ## Limits
 
 - Device enrollment, trusted-device presence, signing-key custody and remote
-  grants are not implemented. No path releases `critical`.
+  grants are not implemented. Critical delegated execution and fill remain denied.
 - Rings apply to one local vault. They are not a cross-device or team policy.
+- Owner recovery and transfer remain possible for every ring, including critical.
 - A process that holds the vault password can create `routine` rows with
   `add --ring routine`.
