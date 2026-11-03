@@ -195,7 +195,7 @@ fn proxy(dir: &Path) -> (ChildGuard, u16) {
 fn proxy_in_project(dir: &Path, project: Option<&str>) -> (ChildGuard, u16) {
     let mut command = wispkey_bin();
     if let Some(project) = project {
-        command.args(["--project", project]);
+        command.env("WISPKEY_PROJECT", project);
     }
     let child = command
         .args(["serve", "--random-port"])
@@ -620,7 +620,7 @@ fn auth_registry_expiry_and_revocation_deny_verification() {
                 "--account",
                 "test",
                 "--origin",
-                "https://127.0.0.1",
+                "https://webhook-signing.invalid",
                 "--provider-expiry",
                 provider_expiry,
                 "--use-until",
