@@ -75,7 +75,7 @@ required header exactly once.
 | 200 | `{"result":"stale"}` | The timestamp is outside the tolerance |
 | 400 | `{"error":"malformed verification request"}` | Missing, duplicate, unsupported or malformed input |
 | 401 | `{"error":"instance authentication failed"}` | Unknown, revoked or wrong instance identity |
-| 403 | `{"error":"credential not permitted"}` | Credential absent, out of scope, not an `api_key`, not a `whsec_` secret, or auth registration revoked or expired |
+| 403 | `{"error":"credential not permitted"}` | Credential absent, out of scope, not an `api_key`, auth registration revoked or expired, or invalid signing-key encoding for a fresh timestamp |
 | 405 | `{"error":"method not allowed"}` | Method is not `POST` |
 | 408 | `{"error":"webhook body timed out"}` | Body not received within 5 seconds |
 | 413 | `{"error":"webhook body too large"}` | Declared or streamed body over 1 MiB |
@@ -113,9 +113,11 @@ The verifier never falls back from one credential to another. To rotate:
 
 The verifier reopens the unlocked session and authenticates the instance again
 after receiving the body. A lock, session expiry or secret change during upload
-therefore invalidates that request. It keeps no key cache. Before it
-returns `valid`, it checks the instance, the scope, the stored value and the auth
-registry again in the same transaction.
+therefore invalidates that request. It reloads the session after instance
+authentication too, without extending its expiry. It keeps no key cache.
+An immediate transaction serializes the stored instance, scope, credential and
+auth-registry checks with the result audit write. Delegated auth deadlines are
+checked again after a matching HMAC, before the audit commit.
 
 ## Availability
 

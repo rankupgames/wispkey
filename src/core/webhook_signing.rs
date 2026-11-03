@@ -7,7 +7,7 @@
  * Last Modified: 2026-11-03
  */
 
-use rusqlite::{OptionalExtension, params};
+use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use zeroize::Zeroizing;
 
 use super::instances::INSTANCE_STATUS_ACTIVE;
@@ -20,11 +20,10 @@ pub(crate) struct WebhookInstance {
     id: String,
 }
 
-/// Stored credential state that a valid result must still match before release.
+/// Signing material resolved inside the verification transaction.
 struct SigningCredential {
     credential: Credential,
     encrypted_value: String,
-    updated_at: String,
 }
 
 impl Vault {
@@ -55,23 +54,17 @@ impl Vault {
     /// Verifies one signed webhook with the exact in-scope signing credential.
     ///
     /// The decrypted key stays inside this call. A valid result requires a
-    /// recheck of the instance, scope, credential state and auth registry, and a
-    /// committed audit row.
+    /// serialized check of the instance, scope and credential state, a current
+    /// auth deadline, and a committed audit row.
     pub(crate) fn verify_webhook(
         &self,
         instance: &WebhookInstance,
         credential_id: &str,
         project_scope: Option<&str>,
         webhook: &SignedWebhook,
-        now_unix_seconds: i64,
     ) -> Result<WebhookResult, WebhookDenial> {
-        let outcome = self.verify_webhook_in_transaction(
-            instance,
-            credential_id,
-            project_scope,
-            webhook,
-            now_unix_seconds,
-        );
+        let outcome =
+            self.verify_webhook_in_transaction(instance, credential_id, project_scope, webhook);
         if let Err(denial) = outcome {
             self.audit_webhook_denial(denial, Some(instance));
         }
@@ -84,18 +77,16 @@ impl Vault {
         credential_id: &str,
         project_scope: Option<&str>,
         webhook: &SignedWebhook,
-        now_unix_seconds: i64,
     ) -> Result<WebhookResult, WebhookDenial> {
         let master_key = self
             .ensure_unlocked()
             .map_err(|_| WebhookDenial::Unavailable)?;
-        let transaction = self
-            .db
-            .unchecked_transaction()
-            .map_err(|_| WebhookDenial::Unavailable)?;
+        let transaction =
+            rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)
+                .map_err(|_| WebhookDenial::Unavailable)?;
         let signing = self.authorized_signing_credential(instance, credential_id, project_scope)?;
 
-        let result = if !webhook.is_fresh_at(now_unix_seconds) {
+        let result = if !webhook.is_fresh_at(chrono::Utc::now().timestamp()) {
             WebhookResult::Stale
         } else {
             let encrypted = self
@@ -109,7 +100,10 @@ impl Vault {
                 .matches_signing_secret(&plaintext)
                 .map_err(|_| WebhookDenial::Forbidden)?;
             if signature_matches {
-                self.recheck_signing_release(instance, &signing, project_scope)?;
+                // The write reservation stabilizes stored authority. Time can
+                // still advance while computing HMAC, so check deadlines again.
+                self.ensure_auth_usable(&signing.credential.id, true, None)
+                    .map_err(auth_denial)?;
                 WebhookResult::Valid
             } else {
                 WebhookResult::Invalid
@@ -162,7 +156,6 @@ impl Vault {
                     Ok(SigningCredential {
                         credential: credential_from_row(row)?,
                         encrypted_value: row.get(14)?,
-                        updated_at: row.get(8)?,
                     })
                 },
             )
@@ -219,34 +212,6 @@ impl Vault {
             }
         }
         Ok(())
-    }
-
-    /// Last check before a valid result: identity, scope, stored value and auth deadlines.
-    fn recheck_signing_release(
-        &self,
-        instance: &WebhookInstance,
-        signing: &SigningCredential,
-        project_scope: Option<&str>,
-    ) -> Result<(), WebhookDenial> {
-        self.ensure_signing_scope(instance, &signing.credential.id, project_scope)?;
-        let unchanged: bool = self
-            .db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM credentials WHERE id = ?1 AND encrypted_value = ?2 AND updated_at = ?3 AND lifecycle_state = ?4)",
-                params![
-                    signing.credential.id,
-                    signing.encrypted_value,
-                    signing.updated_at,
-                    LIFECYCLE_ACTIVE
-                ],
-                |row| row.get(0),
-            )
-            .map_err(|_| WebhookDenial::Unavailable)?;
-        if !unchanged {
-            return Err(WebhookDenial::Forbidden);
-        }
-        self.ensure_auth_usable(&signing.credential.id, true, None)
-            .map_err(auth_denial)
     }
 
     /// Records a metadata-only denial. Only the authenticated instance ID is trusted.

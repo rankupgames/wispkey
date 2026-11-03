@@ -345,20 +345,19 @@ pub(crate) async fn handle_verify_request(
     };
     // Body collection yields. Reopen the session and authenticate again so lock,
     // expiry and instance-secret changes during upload cannot retain authority.
-    let Ok(vault) = Vault::open_with_session() else {
+    let Ok(mut vault) = Vault::open_with_session() else {
         return denial(WebhookDenial::Unavailable);
     };
     let instance = match vault.authenticate_webhook_instance(&instance_id, &instance_secret) {
         Ok(instance) => instance,
         Err(rejection) => return denial(rejection),
     };
-    match vault.verify_webhook(
-        &instance,
-        &credential_id,
-        project_scope.as_deref(),
-        &webhook,
-        chrono::Utc::now().timestamp(),
-    ) {
+    // Authentication performs password hashing. Revalidate the session after
+    // that work as well; this reload does not extend its deadline.
+    if vault.restore_or_refresh_session(None).is_err() {
+        return denial(WebhookDenial::Unavailable);
+    }
+    match vault.verify_webhook(&instance, &credential_id, project_scope.as_deref(), &webhook) {
         Ok(result) => response(
             StatusCode::OK,
             serde_json::json!({ "result": result.as_str() }),
