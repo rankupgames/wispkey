@@ -45,7 +45,7 @@ For repeated headless unlocks, prefer `wispkey unlock --remember --password-file
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v16 automatically. Encrypted signup profiles have explicit project/partition scope; see `docs/signup-profiles.md`. Browser fill requests are short-lived metadata, omitted from encrypted backups.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v17 automatically. Encrypted signup profiles have explicit project/partition scope; see `docs/signup-profiles.md`. Browser fill requests are short-lived metadata, omitted from encrypted backups.
 
 ```bash
 # Create a project

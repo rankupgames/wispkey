@@ -324,6 +324,7 @@ mod tests {
     fn vault() -> Vault {
         let db = Connection::open_in_memory().unwrap();
         Vault::create_schema(&db).unwrap();
+        crate::core::access_ring::insert_access_ring_policy(&db).unwrap();
         db.execute("INSERT INTO projects VALUES ('default','default','','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", []).unwrap();
         db.execute("INSERT INTO partitions VALUES ('personal','personal','','default','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", []).unwrap();
         Vault {
@@ -723,7 +724,7 @@ mod tests {
             .cloud_snapshot("default", "personal")
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.version, 3);
+        assert_eq!(snapshot.version, 4);
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sync");
         let path = path.to_str().unwrap();

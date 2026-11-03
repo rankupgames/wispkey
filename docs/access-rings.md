@@ -89,6 +89,9 @@ are outside ring enforcement.
 | Cloud partition sync | Snapshot version 4 carries rings. Older peers reject it, so mixed-version sync stops. |
 | Vault backup | A ring requires source schema 17. An unknown ring value is malformed. |
 
+- Exports carry the effective `restricted` ring for unclassified credentials,
+  so an older reader cannot drop the default restriction. Unknown local policy
+  versions block sharing and sync exports.
 - An import or sync can keep or narrow the ring of an existing row. It cannot
   broaden it. Only the local owner control broadens a ring, so a broadening
   change from a peer stops until the local owner applies it.

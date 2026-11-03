@@ -1353,5 +1353,6 @@ mod tests {
                 .decrypt_credential_for_owner_egress("default", "key")
                 .is_err()
         );
+        assert!(vault.cloud_snapshot("default", "personal").is_err());
     }
 }

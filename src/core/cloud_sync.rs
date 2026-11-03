@@ -162,7 +162,7 @@ impl Vault {
                     .auth_metadata_for_id(&credential.id)?
                     .map(|metadata| metadata.id);
                 Ok(SnapshotCredential {
-                    access_ring: self.explicit_access_ring(&credential.id)?,
+                    access_ring: Some(self.transport_access_ring(&credential.id)?),
                     name: credential.name,
                     auth_id,
                     description: credential.description,
@@ -682,7 +682,7 @@ mod auth_transport_tests {
             .cloud_snapshot("default", "personal")
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.version, 2);
+        assert_eq!(snapshot.version, 4);
         let destination = vault();
         let expected = current_hash(&destination);
         destination
@@ -1072,16 +1072,17 @@ mod auth_transport_tests {
     }
 
     #[test]
-    fn auth_transport_legacy_cloud_snapshot_remains_v1() {
+    fn auth_transport_unclassified_snapshot_preserves_restricted_default() {
         let source = vault();
         add(&source, "legacy-key", false);
         let snapshot = source
             .cloud_snapshot("default", "personal")
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.version, 1);
+        assert_eq!(snapshot.version, 4);
         let value = serde_json::to_value(&snapshot).unwrap();
         assert!(value.get("auth_data").is_none());
+        assert_eq!(value["credentials"][0]["access_ring"], "restricted");
         let destination = vault();
         let expected = current_hash(&destination);
         destination
@@ -1300,7 +1301,10 @@ mod auth_transport_tests {
     fn assert_rings(vault: &Vault) {
         assert_eq!(ring_of(vault, "critical-key"), Some(AccessRing::Critical));
         assert_eq!(ring_of(vault, "routine-key"), Some(AccessRing::Routine));
-        assert_eq!(ring_of(vault, "plain-key"), None);
+        assert_eq!(
+            vault.access_ring_in_project("default", "plain-key").unwrap(),
+            AccessRing::Restricted
+        );
     }
 
     fn envelope(magic: &[u8; 4], path: &str) -> serde_json::Value {
@@ -1343,7 +1347,9 @@ mod auth_transport_tests {
         let plain = vault();
         add_ringed(&plain, "plain-key", None);
         crate::sharing::export_credential(&plain, "plain-key", PASSPHRASE, credential).unwrap();
-        assert!(envelope(b"WKCR", credential).get("version").is_none());
+        let payload = envelope(b"WKCR", credential);
+        assert_eq!(payload["version"], 4);
+        assert_eq!(payload["payload"]["credential"]["access_ring"], "restricted");
     }
 
     #[test]

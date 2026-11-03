@@ -483,7 +483,7 @@ fn export_bundle_credential(
         .auth_metadata_for_id(&credential.id)?
         .map(|metadata| metadata.id);
     Ok(BundleCredential {
-        access_ring: vault.explicit_access_ring(&credential.id)?,
+        access_ring: Some(vault.transport_access_ring(&credential.id)?),
         name: credential.name,
         auth_id,
         description: credential.description,

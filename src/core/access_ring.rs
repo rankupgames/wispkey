@@ -106,6 +106,13 @@ impl Vault {
             .unwrap_or(AccessRing::Restricted))
     }
 
+    /// Transport the effective restriction, including the restricted default.
+    /// Omitting an unclassified ring would let older readers ignore it.
+    pub(crate) fn transport_access_ring(&self, credential_id: &str) -> Result<AccessRing> {
+        self.ensure_access_ring_policy()?;
+        self.stored_access_ring(credential_id)
+    }
+
     pub(crate) fn ensure_access_ring(
         &self,
         credential_id: &str,
