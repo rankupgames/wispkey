@@ -654,12 +654,19 @@ fn instance_scope_does_not_override_the_proxy_project() {
     init_vault(dir.path());
     let signing = add_key(dir.path(), "webhook-a", "api_key", &signing_secret(KEY_A));
     let worker = enroll(dir.path(), "webhook-worker", &["webhook-a"]);
-    run_ok(dir.path(), &["project", "create", "isolated-webhook-project"]);
+    run_ok(
+        dir.path(),
+        &["project", "create", "isolated-webhook-project"],
+    );
     let (_proxy, port) = proxy_in_project(dir.path(), Some("isolated-webhook-project"));
     let delivery = Delivery::signed(&worker, &signing, KEY_A, now(), BODY);
     assert_reply(port, "different proxy project", &delivery, 403, FORBIDDEN);
     let (_, entries) = audit_log(dir.path());
-    assert!(!entries.iter().any(|row| row["event_type"] == "WebhookVerified"));
+    assert!(
+        !entries
+            .iter()
+            .any(|row| row["event_type"] == "WebhookVerified")
+    );
 }
 
 #[test]

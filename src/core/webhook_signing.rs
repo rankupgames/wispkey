@@ -134,7 +134,9 @@ impl Vault {
             None,
         )
         .map_err(|_| WebhookDenial::Unavailable)?;
-        transaction.commit().map_err(|_| WebhookDenial::Unavailable)?;
+        transaction
+            .commit()
+            .map_err(|_| WebhookDenial::Unavailable)?;
         Ok(result)
     }
 

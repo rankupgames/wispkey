@@ -318,8 +318,7 @@ pub(crate) async fn handle_verify_request(
         let Ok(vault) = Vault::open_with_session() else {
             return denial(WebhookDenial::Unavailable);
         };
-        if let Err(rejection) =
-            vault.authenticate_webhook_instance(&instance_id, &instance_secret)
+        if let Err(rejection) = vault.authenticate_webhook_instance(&instance_id, &instance_secret)
         {
             return denial(rejection);
         }
@@ -357,7 +356,12 @@ pub(crate) async fn handle_verify_request(
     if vault.restore_or_refresh_session(None).is_err() {
         return denial(WebhookDenial::Unavailable);
     }
-    match vault.verify_webhook(&instance, &credential_id, project_scope.as_deref(), &webhook) {
+    match vault.verify_webhook(
+        &instance,
+        &credential_id,
+        project_scope.as_deref(),
+        &webhook,
+    ) {
         Ok(result) => response(
             StatusCode::OK,
             serde_json::json!({ "result": result.as_str() }),
