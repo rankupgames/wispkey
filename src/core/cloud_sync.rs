@@ -854,6 +854,8 @@ mod auth_transport_tests {
         let before = current_hash(&source);
         deletion.credentials.clear();
         deletion.auth_data = Some(AuthPartitionData::default());
+        // No credential rings remain; preserve the existing v2 auth tombstone.
+        deletion.version = 2;
         source.cloud_apply(&deletion, Some(&before), None).unwrap();
         let snapshot = source
             .cloud_snapshot("default", "personal")
