@@ -9,7 +9,7 @@
 
 mod common;
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::Path;
 use std::process::Stdio;
@@ -189,7 +189,15 @@ fn run_ok(dir: &Path, args: &[&str]) {
 }
 
 fn proxy(dir: &Path) -> (ChildGuard, u16) {
-    let child = wispkey_bin()
+    proxy_in_project(dir, None)
+}
+
+fn proxy_in_project(dir: &Path, project: Option<&str>) -> (ChildGuard, u16) {
+    let mut command = wispkey_bin();
+    if let Some(project) = project {
+        command.args(["--project", project]);
+    }
+    let child = command
         .args(["serve", "--random-port"])
         .env("WISPKEY_VAULT_PATH", dir)
         .env("WISPKEY_PASSWORD", "test-password")
@@ -205,11 +213,7 @@ fn proxy(dir: &Path) -> (ChildGuard, u16) {
     )
 }
 
-fn send(port: u16, delivery: &Delivery) -> Reply {
-    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect proxy");
-    stream
-        .set_read_timeout(Some(Duration::from_secs(10)))
-        .expect("read timeout");
+fn request_head(delivery: &Delivery) -> Vec<u8> {
     let mut request = format!(
         "{} {} HTTP/1.1\r\nhost: 127.0.0.1\r\nconnection: close\r\n",
         delivery.method, delivery.target
@@ -227,6 +231,15 @@ fn send(port: u16, delivery: &Delivery) -> Reply {
         request.extend_from_slice(length_header.as_bytes());
     }
     request.extend_from_slice(b"\r\n");
+    request
+}
+
+fn send(port: u16, delivery: &Delivery) -> Reply {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect proxy");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .expect("read timeout");
+    let mut request = request_head(delivery);
     request.extend_from_slice(&delivery.body);
     // The server can close an oversized request before it reads every byte.
     // The response is still read below, so a write error is not a result.
@@ -240,6 +253,10 @@ fn send(port: u16, delivery: &Delivery) -> Reply {
         }
         raw.extend_from_slice(&buffer[..read]);
     }
+    parse_reply(raw)
+}
+
+fn parse_reply(raw: Vec<u8>) -> Reply {
     let text = String::from_utf8(raw).expect("utf-8 response");
     let (head, body) = text
         .split_once("\r\n\r\n")
@@ -629,6 +646,79 @@ fn auth_registry_expiry_and_revocation_deny_verification() {
         &["auth", "revoke", "webhook-active", "--project", "default"],
     );
     assert_reply(port, "auth revoked", &registered, 403, FORBIDDEN);
+}
+
+#[test]
+fn instance_scope_does_not_override_the_proxy_project() {
+    let dir = tempfile::tempdir().unwrap();
+    init_vault(dir.path());
+    let signing = add_key(dir.path(), "webhook-a", "api_key", &signing_secret(KEY_A));
+    let worker = enroll(dir.path(), "webhook-worker", &["webhook-a"]);
+    run_ok(dir.path(), &["project", "create", "isolated-webhook-project"]);
+    let (_proxy, port) = proxy_in_project(dir.path(), Some("isolated-webhook-project"));
+    let delivery = Delivery::signed(&worker, &signing, KEY_A, now(), BODY);
+    assert_reply(port, "different proxy project", &delivery, 403, FORBIDDEN);
+    let (_, entries) = audit_log(dir.path());
+    assert!(!entries.iter().any(|row| row["event_type"] == "WebhookVerified"));
+}
+
+#[test]
+fn locking_during_upload_invalidates_the_authenticated_session() {
+    let dir = tempfile::tempdir().unwrap();
+    init_vault(dir.path());
+    let signing = add_key(dir.path(), "webhook-a", "api_key", &signing_secret(KEY_A));
+    let worker = enroll(dir.path(), "webhook-worker", &["webhook-a"]);
+    let (_proxy, port) = proxy(dir.path());
+    let delivery =
+        Delivery::signed(&worker, &signing, KEY_A, now(), BODY).plus("expect", "100-continue");
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    stream.write_all(&request_head(&delivery)).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(line, "HTTP/1.1 100 Continue\r\n");
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert_eq!(line, "\r\n");
+    // Hyper emits Continue when the authenticated handler polls the body.
+    // Lock only after that signal; no timing assumptions or test-only hooks.
+    run_ok(dir.path(), &["lock"]);
+    stream.write_all(BODY).unwrap();
+    let mut raw = Vec::new();
+    reader.read_to_end(&mut raw).unwrap();
+    let reply = parse_reply(raw);
+    assert_eq!((reply.status, reply.body.as_str()), (503, UNAVAILABLE));
+}
+
+#[test]
+fn audit_write_failure_prevents_a_valid_acknowledgement() {
+    let dir = tempfile::tempdir().unwrap();
+    init_vault(dir.path());
+    let signing = add_key(dir.path(), "webhook-a", "api_key", &signing_secret(KEY_A));
+    let worker = enroll(dir.path(), "webhook-worker", &["webhook-a"]);
+    let (_proxy, port) = proxy(dir.path());
+    let delivery = Delivery::signed(&worker, &signing, KEY_A, now(), BODY);
+    assert_reply(port, "before audit failure", &delivery, 200, VALID);
+    let database = rusqlite::Connection::open(dir.path().join("vault.db")).unwrap();
+    database
+        .execute_batch(
+            "CREATE TRIGGER reject_webhook_audit BEFORE INSERT ON audit_log
+         WHEN NEW.event_type = 'WebhookVerified'
+         BEGIN SELECT RAISE(FAIL, 'synthetic audit failure'); END;",
+        )
+        .unwrap();
+    assert_reply(port, "audit failure", &delivery, 503, UNAVAILABLE);
+    let count: i64 = database
+        .query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE event_type = 'WebhookVerified'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1);
 }
 
 #[test]

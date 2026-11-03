@@ -111,7 +111,9 @@ The verifier never falls back from one credential to another. To rotate:
 | `wispkey remove <name>` | 403 |
 | `wispkey auth revoke <name> --project <project>` | 403 |
 
-The verifier reads the vault on every request and keeps no key cache. Before it
+The verifier reopens the unlocked session and authenticates the instance again
+after receiving the body. A lock, session expiry or secret change during upload
+therefore invalidates that request. It keeps no key cache. Before it
 returns `valid`, it checks the instance, the scope, the stored value and the auth
 registry again in the same transaction.
 
@@ -119,9 +121,10 @@ registry again in the same transaction.
 
 The verifier needs an unlocked session. `wispkey lock`, an expired session or a
 storage failure gives 503 and never `valid`. Each result writes a metadata-only
-audit row (`WebhookVerified`, `WebhookRejected` or `WebhookDenied`) with the
-credential ID and `instance:<UUID>`. If the audit row cannot be written, the
-result is 503.
+audit row (`WebhookVerified` or `WebhookRejected`) with the credential ID in
+`credential_name` and `instance:<UUID>` in `target_host`. If that result row cannot
+be written, the result is 503. Authenticated verification denials use
+`WebhookDenied`; requests rejected before authentication may have no audit row.
 
 ## Trust boundary
 

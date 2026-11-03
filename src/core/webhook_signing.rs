@@ -250,7 +250,11 @@ impl Vault {
     }
 
     /// Records a metadata-only denial. Only the authenticated instance ID is trusted.
-    fn audit_webhook_denial(&self, denial: WebhookDenial, instance: Option<&WebhookInstance>) {
+    pub(crate) fn audit_webhook_denial(
+        &self,
+        denial: WebhookDenial,
+        instance: Option<&WebhookInstance>,
+    ) {
         let instance_principal = instance.map(|instance| format!("instance:{}", instance.id));
         crate::audit::log_event(
             &self.db,

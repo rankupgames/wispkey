@@ -137,7 +137,7 @@ impl SignedWebhook {
             .is_some_and(|age| (-TOLERANCE_SECONDS..=TOLERANCE_SECONDS).contains(&age))
     }
 
-    /// Compares every candidate signature in constant time with the signing secret.
+    /// Uses constant-time HMAC comparison for each candidate until one matches.
     pub(crate) fn matches_signing_secret(
         &self,
         signing_secret: &[u8],
@@ -280,6 +280,9 @@ pub(crate) async fn handle_verify_request(
         single_header(headers, INSTANCE_ID_HEADER),
         single_header(headers, INSTANCE_SECRET_HEADER),
     ) else {
+        if let Ok(vault) = Vault::open_with_session() {
+            vault.audit_webhook_denial(WebhookDenial::Unauthenticated, None);
+        }
         return denial(WebhookDenial::Unauthenticated);
     };
     let Some(credential_id) =
@@ -311,13 +314,16 @@ pub(crate) async fn handle_verify_request(
     let instance_id = instance_id.to_owned();
     let instance_secret = Zeroizing::new(instance_secret.to_owned());
 
-    let Ok(vault) = Vault::open_with_session() else {
-        return denial(WebhookDenial::Unavailable);
-    };
-    let instance = match vault.authenticate_webhook_instance(&instance_id, &instance_secret) {
-        Ok(instance) => instance,
-        Err(rejection) => return denial(rejection),
-    };
+    {
+        let Ok(vault) = Vault::open_with_session() else {
+            return denial(WebhookDenial::Unavailable);
+        };
+        if let Err(rejection) =
+            vault.authenticate_webhook_instance(&instance_id, &instance_secret)
+        {
+            return denial(rejection);
+        }
+    }
 
     let body = match tokio::time::timeout(
         BODY_READ_TIMEOUT,
@@ -336,6 +342,15 @@ pub(crate) async fn handle_verify_request(
     let webhook = SignedWebhook {
         headers: webhook_headers,
         body,
+    };
+    // Body collection yields. Reopen the session and authenticate again so lock,
+    // expiry and instance-secret changes during upload cannot retain authority.
+    let Ok(vault) = Vault::open_with_session() else {
+        return denial(WebhookDenial::Unavailable);
+    };
+    let instance = match vault.authenticate_webhook_instance(&instance_id, &instance_secret) {
+        Ok(instance) => instance,
+        Err(rejection) => return denial(rejection),
     };
     match vault.verify_webhook(
         &instance,
