@@ -36,6 +36,7 @@ fn test_vault(password: &str) -> Vault {
     let now = Utc::now().to_rfc3339();
     db.execute("INSERT INTO projects (id, name, description, created_at, updated_at) VALUES ('default', 'default', 'Default project', ?1, ?2)", params![now, now]).unwrap();
     db.execute("INSERT INTO partitions (id, name, description, project_id, created_at, updated_at) VALUES ('personal', 'personal', '', 'default', ?1, ?2)", params![now, now]).unwrap();
+    access_ring::insert_access_ring_policy(&db).unwrap();
 
     let master_key = Vault::derive_key(password, salt.as_ref());
     std::mem::forget(dir);
@@ -1773,4 +1774,239 @@ fn schema_v10_to_current_adds_website_login_columns_without_touching_data() {
         .unwrap();
     assert_eq!(origin, "");
     assert_eq!(lifecycle, "active");
+}
+
+fn stored_ring(vault: &Vault, name: &str) -> Option<String> {
+    vault
+        .db
+        .query_row(
+            "SELECT access_ring FROM credentials WHERE name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn ring_request(name: &str) -> AddCredentialRequest<'_> {
+    AddCredentialRequest::new(name, CredentialType::ApiKey, "synthetic-ring-secret")
+        .project(Some("default"))
+}
+
+#[test]
+fn migration_to_v17_keeps_existing_rows_restricted() {
+    let vault = test_vault("pw");
+    vault.add_credential(ring_request("legacy")).unwrap();
+    vault
+        .db
+        .execute_batch(
+            "ALTER TABLE credentials DROP COLUMN access_ring;
+             DELETE FROM vault_meta WHERE key='access_ring_policy';
+             UPDATE vault_meta SET value='16' WHERE key='version';",
+        )
+        .unwrap();
+    Vault::migrate_schema(&vault.db).unwrap();
+    assert_eq!(stored_ring(&vault, "legacy"), None);
+    assert_eq!(
+        vault.access_ring_in_project("default", "legacy").unwrap(),
+        access_ring::AccessRing::Restricted
+    );
+    let policy: String = vault
+        .db
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key='access_ring_policy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(policy, "1");
+    let version: String = vault
+        .db
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key='version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn unknown_stored_ring_and_unclassified_rows_are_restricted() {
+    let vault = test_vault("pw");
+    vault.add_credential(ring_request("plain")).unwrap();
+    assert_eq!(stored_ring(&vault, "plain"), None);
+    vault
+        .db
+        .execute(
+            "UPDATE credentials SET access_ring='superuser' WHERE name='plain'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        vault.access_ring_in_project("default", "plain").unwrap(),
+        access_ring::AccessRing::Restricted
+    );
+    assert_eq!(access_ring::AccessRing::parse("Routine"), None);
+    assert_eq!(access_ring::AccessRing::parse(""), None);
+}
+
+#[test]
+fn access_ring_changes_fail_closed_without_supported_policy() {
+    use access_ring::AccessRing;
+    for policy in [Some("2"), Some(""), None] {
+        let vault = test_vault("pw");
+        vault
+            .add_classified_credential(ring_request("kept"), Some(AccessRing::Routine))
+            .unwrap();
+        vault
+            .db
+            .execute("DELETE FROM vault_meta WHERE key='access_ring_policy'", [])
+            .unwrap();
+        if let Some(value) = policy {
+            vault
+                .db
+                .execute(
+                    "INSERT INTO vault_meta (key, value) VALUES ('access_ring_policy', ?1)",
+                    [value],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            vault.set_access_ring("default", "kept", AccessRing::Critical, None),
+            Err(VaultError::AuthRejected("access ring policy unsupported"))
+        ));
+        assert_eq!(stored_ring(&vault, "kept").as_deref(), Some("routine"));
+        assert!(matches!(
+            vault.add_classified_credential(ring_request("new"), Some(AccessRing::Critical)),
+            Err(VaultError::AuthRejected("access ring policy unsupported"))
+        ));
+        assert!(vault.get_credential_in_project("default", "new").is_err());
+    }
+}
+
+#[test]
+fn broadening_access_ring_requires_fresh_owner_password() {
+    use access_ring::AccessRing;
+    let vault = test_vault("pw");
+    vault
+        .add_classified_credential(ring_request("vaulted"), Some(AccessRing::Critical))
+        .unwrap();
+    assert_eq!(stored_ring(&vault, "vaulted").as_deref(), Some("critical"));
+    assert!(matches!(
+        vault.set_access_ring("default", "vaulted", AccessRing::Restricted, None),
+        Err(VaultError::AuthRejected(
+            "broadening an access ring requires owner password"
+        ))
+    ));
+    assert!(
+        vault
+            .set_access_ring("default", "vaulted", AccessRing::Routine, Some("wrong"))
+            .is_err()
+    );
+    assert_eq!(stored_ring(&vault, "vaulted").as_deref(), Some("critical"));
+
+    vault.add_credential(ring_request("unclassified")).unwrap();
+    assert!(
+        vault
+            .set_access_ring("default", "unclassified", AccessRing::Routine, None)
+            .is_err()
+    );
+    assert_eq!(stored_ring(&vault, "unclassified"), None);
+}
+
+#[test]
+fn narrowing_access_ring_needs_no_password_and_invalidates_revision() {
+    use access_ring::AccessRing;
+    let vault = test_vault("pw");
+    let created = vault
+        .add_classified_credential(ring_request("narrow"), Some(AccessRing::Routine))
+        .unwrap();
+    let revision = |vault: &Vault| -> String {
+        vault
+            .db
+            .query_row(
+                "SELECT updated_at FROM credentials WHERE id=?1",
+                [&created.id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    vault
+        .db
+        .execute(
+            "UPDATE credentials SET updated_at='2000-01-01T00:00:00+00:00' WHERE id=?1",
+            [&created.id],
+        )
+        .unwrap();
+    assert_eq!(
+        vault
+            .set_access_ring("default", "narrow", AccessRing::Critical, None)
+            .unwrap(),
+        AccessRing::Routine
+    );
+    assert_eq!(stored_ring(&vault, "narrow").as_deref(), Some("critical"));
+    let changed = revision(&vault);
+    assert_ne!(changed, "2000-01-01T00:00:00+00:00");
+    assert_eq!(
+        vault
+            .set_access_ring("default", "narrow", AccessRing::Critical, None)
+            .unwrap(),
+        AccessRing::Critical
+    );
+    assert_eq!(revision(&vault), changed);
+}
+
+#[test]
+fn access_ring_audit_records_metadata_only() {
+    use access_ring::AccessRing;
+    let vault = test_vault("pw");
+    let created = vault
+        .add_classified_credential(ring_request("audited"), Some(AccessRing::Routine))
+        .unwrap();
+    vault
+        .set_access_ring("default", "audited", AccessRing::Critical, None)
+        .unwrap();
+    vault
+        .set_access_ring("default", "audited", AccessRing::Critical, None)
+        .unwrap();
+    let mut statement = vault
+        .db
+        .prepare(
+            "SELECT credential_name, wisp_token, target_host, target_path, project_name
+             FROM audit_log WHERE event_type='AccessRingChanged' ORDER BY id",
+        )
+        .unwrap();
+    let rows: Vec<(String, Option<String>, Option<String>, String, String)> = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.3.as_str()).collect::<Vec<_>>(),
+        vec!["unclassified->routine", "routine->critical"]
+    );
+    for (name, token, host, _, project) in &rows {
+        assert_eq!(name, "audited");
+        assert_eq!(project, "default");
+        assert!(token.is_none() && host.is_none());
+    }
+    let dump: String = vault
+        .db
+        .query_row(
+            "SELECT group_concat(coalesce(credential_name, '') || coalesce(wisp_token, '') ||
+             coalesce(target_path, '') || coalesce(deny_reason, ''), '|') FROM audit_log",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!dump.contains("synthetic-ring-secret"));
+    assert!(!dump.contains(&created.wisp_token));
 }

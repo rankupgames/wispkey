@@ -59,7 +59,7 @@ pub use cloud::{
 pub use credential_sharing::{handle_credential_export, handle_credential_import};
 pub use credentials::{
     AddCredentialArgs, handle_add, handle_get, handle_import, handle_list, handle_remove,
-    handle_rotate,
+    handle_ring, handle_rotate,
 };
 pub use doctor::handle_doctor;
 pub use env::{handle_env_attach, handle_env_list};

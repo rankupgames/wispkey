@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::secure_files;
 
+use super::access_ring::insert_access_ring_policy;
 use super::rows::table_has_column;
 use super::{CURRENT_SCHEMA_VERSION, Result, Vault, VaultError};
 
@@ -108,6 +109,7 @@ impl Vault {
             "INSERT INTO vault_meta (key, value) VALUES ('created_at', ?1)",
             params![Utc::now().to_rfc3339()],
         )?;
+        insert_access_ring_policy(&db)?;
         // A newly created audit table contains no legacy tokens. Initialize its
         // marker now so concurrent first opens do not both need to write it.
         crate::audit::redact_legacy_audit_tokens(&db)?;
@@ -592,7 +594,7 @@ impl Vault {
             super::signup::create_schema(db)?;
             db.execute("UPDATE vault_meta SET value=?1 WHERE key='version'", ["15"])?;
             migration.commit()?;
-        } else if version != "15" && version != CURRENT_SCHEMA_VERSION {
+        } else if !matches!(version.as_str(), "15" | "16") && version != CURRENT_SCHEMA_VERSION {
             return Err(VaultError::AuthRejected("unsupported vault schema"));
         }
 
@@ -610,6 +612,23 @@ impl Vault {
                 )?;
             }
             super::browser_receiver::create_schema(db)?;
+            db.execute("UPDATE vault_meta SET value=?1 WHERE key='version'", ["16"])?;
+            migration.commit()?;
+        }
+
+        let version: String = db.query_row(
+            "SELECT value FROM vault_meta WHERE key='version'",
+            [],
+            |r| r.get(0),
+        )?;
+        if version == "16" {
+            // Existing rows stay NULL, which is restricted: migration never
+            // broadens release. The owner classifies routine credentials.
+            let migration = MigrationSavepoint::begin(db)?;
+            if !table_has_column(db, "credentials", "access_ring")? {
+                db.execute("ALTER TABLE credentials ADD COLUMN access_ring TEXT", [])?;
+            }
+            insert_access_ring_policy(db)?;
             db.execute(
                 "UPDATE vault_meta SET value=?1 WHERE key='version'",
                 [CURRENT_SCHEMA_VERSION],
@@ -674,7 +693,8 @@ impl Vault {
 				partition_id TEXT REFERENCES partitions(id),
 				origin TEXT NOT NULL DEFAULT '',
 				lifecycle_state TEXT NOT NULL DEFAULT 'active',
-				review_at TEXT
+				review_at TEXT,
+				access_ring TEXT
 			);
 			CREATE TABLE IF NOT EXISTS audit_log (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,

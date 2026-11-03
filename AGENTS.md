@@ -140,12 +140,13 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey unlock [--timeout N] [--remember] [--password-file PATH]` | Unlock vault (30 min session); `--remember` stores a password-free protector |
 | `wispkey lock [--forget]` | Revoke the current session; `--forget` also deletes the remembered protector |
 | `wispkey tray [--ipc-only]` | Start authenticated owner IPC; optionally spawn the tray GUI |
-| `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store credential |
+| `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P] [--ring R]` | Store credential; `--ring` classifies it (default unclassified, which is restricted) |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials (names only) |
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
 | `wispkey replace-value <name> --project P --partition P [--stdin]` | Owner whole-value replacement with hidden input and stale-change checks; see `docs/replace-value.md` |
 | `wispkey remove <name>` | Delete credential |
 | `wispkey rotate <name>` | Regenerate wisp token |
+| `wispkey ring <name> [--project P] [--set routine|restricted|critical]` | Show or set the access ring; broadening asks for the owner password at a terminal |
 | `wispkey signup-profile create/list/update/remove` | Manage encrypted reusable identities; owner input from file/stdin, metadata-only output |
 | `wispkey login generate <name> --username U --url HTTPS [--project P] [--partition P] [--review-after 180d]` | Generate and store a unique website login (password never printed) |
 | `wispkey login add-existing/update-existing <name> --project P --partition P --origin HTTPS [--stdin]` | Owner typed existing-login input; see `docs/existing-website-login.md` |

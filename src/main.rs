@@ -80,6 +80,10 @@ struct AddArgs {
     /// Project override (default: active project)
     #[arg(long)]
     project: Option<String>,
+
+    /// Access ring for the new credential (default: unclassified, which is restricted)
+    #[arg(long, value_parser = ["routine", "restricted", "critical"])]
+    ring: Option<String>,
 }
 
 #[derive(Args)]
@@ -230,6 +234,18 @@ enum Commands {
     Rotate {
         /// Credential name
         name: String,
+    },
+
+    /// Show or set a credential's access ring; broadening asks for the owner password
+    Ring {
+        /// Credential name
+        name: String,
+        /// Project override (default: active project)
+        #[arg(long)]
+        project: Option<String>,
+        /// New ring
+        #[arg(long, value_parser = ["routine", "restricted", "critical"])]
+        set: Option<String>,
     },
 
     /// Run a child process with a credential injected through controlled channels
@@ -1342,6 +1358,7 @@ async fn main() {
             param_name,
             partition,
             project,
+            ring,
         }) => {
             let resolved_value = match (&value, &value_file) {
                 (Some(_), Some(_)) => {
@@ -1385,6 +1402,7 @@ async fn main() {
                 param_name: param_name.as_deref(),
                 partition: partition.as_deref(),
                 project: project.as_deref(),
+                ring: ring.as_deref(),
             })
             .await;
         }
@@ -1411,6 +1429,9 @@ async fn main() {
         }
         Commands::Rotate { name } => {
             cli::handle_rotate(&name).await;
+        }
+        Commands::Ring { name, project, set } => {
+            cli::handle_ring(&name, project.as_deref(), set.as_deref());
         }
         Commands::Exec(ExecArgs {
             credential,

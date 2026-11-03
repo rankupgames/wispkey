@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use crate::secure_files;
 
+pub mod access_ring;
 pub mod auth;
 pub(crate) mod cloud_sync;
 mod crypto;
@@ -64,7 +65,7 @@ pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
 /// Current on-disk SQLite schema version written to `vault_meta`.
-pub const CURRENT_SCHEMA_VERSION: &str = "16";
+pub const CURRENT_SCHEMA_VERSION: &str = "17";
 
 pub mod browser;
 pub mod browser_receiver;
@@ -404,7 +405,17 @@ impl Vault {
 
     /// Inserts a new credential (encrypted secret, wisp token, optional description/hosts/tags/partition).
     pub fn add_credential(&self, request: AddCredentialRequest<'_>) -> Result<Credential> {
-        self.add_credentials_atomic(&[request])?
+        self.add_classified_credential(request, None)
+    }
+
+    /// Inserts one credential and, when given, its owner access ring in the same
+    /// transaction. Without a ring the row is unclassified (restricted).
+    pub fn add_classified_credential(
+        &self,
+        request: AddCredentialRequest<'_>,
+        ring: Option<access_ring::AccessRing>,
+    ) -> Result<Credential> {
+        self.insert_credentials(&[request], ring)?
             .pop()
             .ok_or_else(|| VaultError::Encryption("credential insert produced no row".into()))
     }
@@ -413,6 +424,14 @@ impl Vault {
     pub fn add_credentials_atomic(
         &self,
         requests: &[AddCredentialRequest<'_>],
+    ) -> Result<Vec<Credential>> {
+        self.insert_credentials(requests, None)
+    }
+
+    fn insert_credentials(
+        &self,
+        requests: &[AddCredentialRequest<'_>],
+        ring: Option<access_ring::AccessRing>,
     ) -> Result<Vec<Credential>> {
         if requests.is_empty() {
             return Err(VaultError::InvalidCredentialTemplate(
@@ -433,7 +452,15 @@ impl Vault {
         let inserted = (|| {
             let mut created = Vec::with_capacity(requests.len());
             for request in requests {
-                created.push(self.insert_credential_row(key, request)?);
+                let credential = self.insert_credential_row(key, request)?;
+                if let Some(ring) = ring {
+                    let project = request
+                        .project
+                        .map(String::from)
+                        .unwrap_or_else(resolve_active_project);
+                    self.classify_new_credential(&credential, ring, &project)?;
+                }
+                created.push(credential);
             }
             Ok(created)
         })();
