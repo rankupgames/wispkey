@@ -43,6 +43,7 @@ pub mod signup;
 mod templates;
 #[cfg(test)]
 mod tests;
+pub(crate) mod webhook_signing;
 
 pub use instances::{
     AccessRequest, BootstrapJoinResult, BootstrapToken, CreateBootstrapTokenResult,

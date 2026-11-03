@@ -55,8 +55,8 @@ type NativeRootsLoader = fn() -> NativeRootsResult;
 type ProxyActionResult<T> = Result<T, Box<Response<Full<Bytes>>>>;
 
 const MAX_PROXY_BODY_BYTES: usize = 10 * 1024 * 1024;
-const INSTANCE_ID_HEADER: &str = "x-wispkey-instance-id";
-const INSTANCE_SECRET_HEADER: &str = "x-wispkey-instance-secret";
+pub(crate) const INSTANCE_ID_HEADER: &str = "x-wispkey-instance-id";
+pub(crate) const INSTANCE_SECRET_HEADER: &str = "x-wispkey-instance-secret";
 
 #[derive(Debug, Clone)]
 pub enum StartProxyOutcome {
@@ -356,6 +356,14 @@ async fn handle_request(
                 StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
                 &body,
             ));
+        }
+        if uri.path() == crate::webhooks::VERIFY_PATH {
+            // Instance-authenticated requester API: no management token, no CORS.
+            return Ok(Box::pin(crate::webhooks::handle_verify_request(
+                req,
+                runtime.project_scope.as_ref().clone(),
+            ))
+            .await);
         }
         if method == Method::OPTIONS {
             return Ok(cors_preflight());
