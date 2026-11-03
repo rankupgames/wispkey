@@ -384,7 +384,7 @@ pub fn decrypt_reserved(
         )
         .map_err(|_| "credential unavailable")?;
     vault
-        .ensure_auth_usable(&binding.credential_id, true, None)
+        .ensure_owner_approved_release(&binding.credential_id, None)
         .map_err(|_| "auth unavailable")?;
     let ciphertext = vault
         .decode_auth_ciphertext(&binding.credential_id, &encoded)
@@ -394,7 +394,7 @@ pub fn decrypt_reserved(
         .decrypt_bytes(key, &ciphertext)
         .map_err(|_| "credential unavailable")?;
     if vault
-        .ensure_auth_usable(&binding.credential_id, true, None)
+        .ensure_owner_approved_release(&binding.credential_id, None)
         .is_err()
     {
         plaintext.fill(0);
@@ -451,7 +451,7 @@ pub fn decrypt_provider(
         |row| row.get(0),
     ).map_err(|_| "provider credential unavailable")?;
     vault
-        .ensure_auth_usable(provider_credential, true, None)
+        .ensure_owner_approved_release(provider_credential, None)
         .map_err(|_| "auth unavailable")?;
     let ciphertext = vault
         .decode_auth_ciphertext(provider_credential, &encoded)
@@ -461,7 +461,7 @@ pub fn decrypt_provider(
         .decrypt_bytes(key, &ciphertext)
         .map_err(|_| "provider credential unavailable")?;
     if vault
-        .ensure_auth_usable(provider_credential, true, None)
+        .ensure_owner_approved_release(provider_credential, None)
         .is_err()
     {
         plaintext.fill(0);
@@ -520,7 +520,7 @@ pub fn decrypt_previous(
         )
         .map_err(|_| "previous credential unavailable")?;
     vault
-        .ensure_auth_usable(old_id, true, None)
+        .ensure_owner_approved_release(old_id, None)
         .map_err(|_| "auth unavailable")?;
     let ciphertext = vault
         .decode_auth_ciphertext(old_id, &encoded)
@@ -529,7 +529,7 @@ pub fn decrypt_previous(
     let mut plaintext = vault
         .decrypt_bytes(key, &ciphertext)
         .map_err(|_| "previous credential unavailable")?;
-    if vault.ensure_auth_usable(old_id, true, None).is_err() {
+    if vault.ensure_owner_approved_release(old_id, None).is_err() {
         plaintext.fill(0);
         return Err("auth unavailable");
     }

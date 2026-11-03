@@ -148,6 +148,8 @@ fn add_key(dir: &Path, name: &str, credential_type: &str, value: &str) -> String
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             name,
             "--type",
             credential_type,

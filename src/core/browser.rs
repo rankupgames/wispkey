@@ -305,14 +305,14 @@ pub(crate) fn release(vault: &Vault, approved: &FillRequest) -> Result<WebsiteLo
         "BrowserFillApproved",
     )?;
     vault
-        .ensure_auth_usable(&credential.id, true, Some(&current.origin))
+        .ensure_owner_approved_release(&credential.id, Some(&current.origin))
         .map_err(|_| "auth unavailable")?;
     let plaintext = vault
         .decrypt_credential_value_in_project(&current.project, &current.name)
         .map_err(|_| "login unavailable")?;
     let payload = serde_json::from_str(&plaintext).map_err(|_| "invalid website login")?;
     vault
-        .ensure_auth_usable(&credential.id, true, Some(&current.origin))
+        .ensure_owner_approved_release(&credential.id, Some(&current.origin))
         .map_err(|_| "auth unavailable")?;
     super::browser_receiver::released(vault, &current)?;
     tx.commit()
@@ -356,6 +356,7 @@ mod tests {
             [&now],
         )
         .unwrap();
+        crate::core::access_ring::insert_access_ring_policy(&db).unwrap();
         let vault = Vault {
             db,
             master_key: Some([7; 32]),
@@ -891,6 +892,29 @@ mod tests {
         vault.master_key = Some([7; 32]);
         assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_ok());
         assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_err());
+    }
+
+    #[test]
+    fn critical_ring_denies_owner_approved_browser_release() {
+        let vault = fixture();
+        let request = enqueue(&vault);
+        let set_ring = |ring: &str| {
+            vault
+                .db
+                .execute(
+                    "UPDATE credentials SET access_ring=?1 WHERE name='careers'",
+                    [ring],
+                )
+                .unwrap();
+        };
+        set_ring("critical");
+        assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_err());
+        assert_eq!(
+            status(&vault, &request.request_id).unwrap().status,
+            "pending"
+        );
+        set_ring("restricted");
+        assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_ok());
     }
 
     #[test]

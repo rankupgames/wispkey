@@ -220,7 +220,7 @@ fn check_live(vault: &Vault, binding: &StoredBinding) -> Result<()> {
         return Err("receiver target changed");
     }
     vault
-        .ensure_auth_usable(&credential.id, true, Some(&binding.origin))
+        .ensure_owner_approved_release(&credential.id, Some(&binding.origin))
         .map_err(|_| "receiver authorization unavailable")
 }
 

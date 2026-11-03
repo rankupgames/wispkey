@@ -41,6 +41,7 @@ fn proxy_refuses_generic_website_login_token_substitution() {
     let token = generated["credential"]["wisp_token"]
         .as_str()
         .expect("wisp token");
+    classify_routine(vault_dir.path(), "blocked-login");
     let (_guard, proxy_port) = start_proxy(vault_dir.path());
     let request = format!(
         "POST http://example.com/login HTTP/1.1\r\n\
@@ -85,6 +86,8 @@ fn bundle_passphrase_file_roundtrips_multiline_secret_through_proxy() {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "ssh-key",
             "--type",
             "api_key",
@@ -212,6 +215,8 @@ fn proxy_swaps_wisp_token_before_local_upstream_receives_request() {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "proxy-key",
             "--type",
             "bearer_token",
@@ -251,6 +256,64 @@ fn proxy_swaps_wisp_token_before_local_upstream_receives_request() {
 }
 
 #[test]
+fn proxy_denies_critical_ring_token_before_upstream() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let upstream = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    upstream
+        .set_nonblocking(true)
+        .expect("nonblocking upstream");
+    let upstream_port = upstream.local_addr().expect("upstream address").port();
+    let added = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "add",
+            "--ring",
+            "critical",
+            "vaulted-key",
+            "--type",
+            "bearer_token",
+            "--value",
+            "real-secret",
+            "--hosts",
+            "127.0.0.1",
+        ],
+    );
+    let token = added["credential"]["wisp_token"]
+        .as_str()
+        .expect("wisp token")
+        .to_string();
+
+    let (_guard, proxy_port) = start_proxy(vault_dir.path());
+    let mut proxy_stream = TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect to proxy");
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/test HTTP/1.1\r\n\
+         Host: 127.0.0.1:{upstream_port}\r\n\
+         Authorization: Bearer {token}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    proxy_stream
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = String::new();
+    proxy_stream
+        .read_to_string(&mut response)
+        .expect("read proxy response");
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden"),
+        "expected ring denial, got:\n{response}"
+    );
+    assert!(response.contains("access ring critical"));
+    assert!(!response.contains("real-secret"));
+    assert_eq!(
+        upstream.accept().map(|_| ()).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
 fn proxy_resolves_token_adjacent_to_lowercase_suffix() {
     let vault_dir = tempfile::tempdir().expect("temp vault dir");
     init_vault(vault_dir.path());
@@ -261,6 +324,8 @@ fn proxy_resolves_token_adjacent_to_lowercase_suffix() {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "adjacent-key",
             "--type",
             "api_key",
@@ -329,6 +394,8 @@ fn proxy_does_not_rewrite_tokens_embedded_in_injected_secret() {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "secondary-key",
             "--type",
             "api_key",
@@ -349,6 +416,8 @@ fn proxy_does_not_rewrite_tokens_embedded_in_injected_secret() {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "primary-key",
             "--type",
             "api_key",

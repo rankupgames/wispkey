@@ -204,3 +204,83 @@ fn unauthenticated_cloud_sync_does_not_contact_server_or_claim_success() {
     );
     assert!(!dir.path().join("cloud-manifests.json").exists());
 }
+
+fn add_ringed_secret(path: &std::path::Path, name: &str, ring: &str) -> std::process::Output {
+    let secret_path = path.join("synthetic-input.txt");
+    write_private_test_file(&secret_path, "synthetic-ring-cli-secret");
+    run_wispkey(
+        path,
+        &[
+            "--format",
+            "json",
+            "add",
+            name,
+            "--type",
+            "api_key",
+            "--value-file",
+            secret_path.to_str().unwrap(),
+            "--ring",
+            ring,
+        ],
+    )
+}
+
+#[test]
+fn ring_cli_classifies_narrows_and_refuses_unattended_broadening() {
+    let dir = tempfile::tempdir().unwrap();
+    init_vault(dir.path());
+    let created = add_ringed_secret(dir.path(), "vaulted", "critical");
+    assert!(created.status.success());
+    let shown = run_wispkey_json(dir.path(), &["--format", "json", "ring", "vaulted"]);
+    assert_eq!(shown["access_ring"], "critical");
+
+    let broaden = run_wispkey(
+        dir.path(),
+        &["--format", "json", "ring", "vaulted", "--set", "restricted"],
+    );
+    assert!(!broaden.status.success());
+    assert!(String::from_utf8_lossy(&broaden.stderr).contains("interactive terminal"));
+    let unchanged = run_wispkey_json(dir.path(), &["--format", "json", "ring", "vaulted"]);
+    assert_eq!(unchanged["access_ring"], "critical");
+
+    add_secret(dir.path(), "plain", "default");
+    let plain = run_wispkey_json(dir.path(), &["--format", "json", "ring", "plain"]);
+    assert_eq!(plain["access_ring"], "restricted");
+    let narrowed = run_wispkey_json(
+        dir.path(),
+        &["--format", "json", "ring", "plain", "--set", "critical"],
+    );
+    assert_eq!(narrowed["access_ring"], "critical");
+    assert_eq!(narrowed["previous"], "restricted");
+
+    let invalid = add_ringed_secret(dir.path(), "invalid", "superuser");
+    assert!(!invalid.status.success());
+    let db = rusqlite::Connection::open(dir.path().join("vault.db")).unwrap();
+    let invalid_rows: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM credentials WHERE name='invalid'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(invalid_rows, 0);
+    let changes: Vec<String> = db
+        .prepare(
+            "SELECT target_path FROM audit_log WHERE event_type='AccessRingChanged' ORDER BY id",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(changes, vec!["unclassified->critical", "restricted->critical"]);
+    let audit_text: String = db
+        .query_row(
+            "SELECT group_concat(coalesce(target_path, '') || coalesce(deny_reason, ''), '|')
+             FROM audit_log",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!audit_text.contains("synthetic-ring-cli-secret"));
+}

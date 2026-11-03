@@ -11,6 +11,8 @@ fn add_named_secret(vault_dir: &std::path::Path, name: &str, value: &str) {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             name,
             "--type",
             "api_key",

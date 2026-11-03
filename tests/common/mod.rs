@@ -204,3 +204,17 @@ pub fn file_mode(path: &Path) -> u32 {
         .mode()
         & 0o777
 }
+
+/// Fixture owner classification for rows the CLI cannot broaden without a terminal
+/// (`login generate`, `login add-existing`).
+pub fn classify_routine(vault_dir: &Path, name: &str) {
+    let db = rusqlite::Connection::open(vault_dir.join("vault.db"))
+        .expect("open vault db");
+    let classified = db
+        .execute(
+            "UPDATE credentials SET access_ring='routine' WHERE name=?1",
+            [name],
+        )
+        .expect("classify");
+    assert_eq!(classified, 1);
+}

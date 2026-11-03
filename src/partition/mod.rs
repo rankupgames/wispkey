@@ -11,9 +11,10 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::core::auth::AuthPartitionData;
+use crate::core::cloud_sync::transport_version;
 use crate::core::{self, Vault};
 use crate::sharing::{
-    BundleCredential, ensure_partition, ensure_project, export_bundle_credentials,
+    BundleCredential, any_access_ring, ensure_partition, ensure_project, export_bundle_credentials,
     import_bundle_credentials, merge_auth_data, optional_auth_data, read_transport_payload,
     validate_bundle_auth_bindings, validate_transport_format, write_versioned_transport_payload,
 };
@@ -64,13 +65,11 @@ pub fn export_partition(
     write_versioned_transport_payload(
         BUNDLE_MAGIC,
         &payload,
-        if payload.signup_profiles.is_some() {
-            3
-        } else if payload.auth_data.is_some() {
-            2
-        } else {
-            1
-        },
+        transport_version(
+            any_access_ring(&payload.credentials),
+            payload.signup_profiles.is_some(),
+            payload.auth_data.is_some(),
+        ),
         passphrase,
         output_path,
     )?;
@@ -87,7 +86,9 @@ pub fn import_partition(
         read_transport_payload(BUNDLE_MAGIC, bundle_path, passphrase)?;
     validate_transport_format(
         registered,
-        payload.auth_data.is_some() || payload.signup_profiles.is_some(),
+        payload.auth_data.is_some()
+            || payload.signup_profiles.is_some()
+            || any_access_ring(&payload.credentials),
     )?;
     validate_bundle_auth_bindings(&payload.credentials, payload.auth_data.as_ref())?;
     let project_name = if payload.project.is_empty() {

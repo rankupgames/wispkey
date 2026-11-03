@@ -418,6 +418,7 @@ fn signup_structured_errors_and_audit_never_contain_stored_identity_or_password(
     let temp = tempfile::tempdir().unwrap();
     let p = setup(temp.path());
     assert!(generate(temp.path(), &p, "saved").status.success());
+    classify_routine(temp.path(), "saved");
     // Read only this synthetic fixture through the existing owner-only export
     // path so the canary assertion uses the actual generated password.
     let template = temp.path().join("synthetic-login.template");

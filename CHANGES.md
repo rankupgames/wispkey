@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Local access rings
+
+- Added routine, restricted and critical classifications. Schema 17 treats existing
+  credentials as restricted; unattended release requires explicit owner
+  classification with `wispkey ring <name> --set routine`.
+- Nonempty encrypted bundles and Cloud snapshots use version 4. Upgrade peers
+  together; older readers reject these restrictions. Overlapping names now reject
+  a whole project or partition import instead of being skipped.
+- Upgrading changes nonempty partition hashes and can produce a sync conflict.
+  Inspect both devices before explicit resolution; see `docs/cloud-sync.md`.
+- Owner-local recovery, encrypted export and Cloud push remain available for all
+  rings. Trusted-device enrollment and critical delegated release remain incomplete.
+
 ### Development environment inheritance across Git worktrees
 
 - Added explicit `env bind` repository/project/development-partition bindings, discovered through registered Git worktrees and local common-directory identity. Independent repositories cannot inherit by remote URL, copied marker or reused checkout path.

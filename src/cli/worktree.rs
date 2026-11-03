@@ -407,7 +407,7 @@ fn bind(project: &str, environment: &str, manifest: &str, replace: bool) -> Resu
     for value in binding.manifest.env.values() {
         if let Some(name) = value.strip_prefix("cred:") {
             vault
-                .decrypt_credential_value_in_project(project, name)
+                .decrypt_credential_for_owner_egress(project, name)
                 .map_err(|_| "bound credential is unavailable for use")?;
         }
     }

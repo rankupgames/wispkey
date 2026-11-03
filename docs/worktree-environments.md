@@ -15,7 +15,7 @@ project **and** partition.
 ```sh
 wispkey partition create development --project example
 wispkey add development-secret --project example --partition development \
-  --type api_key --value-file /private/input
+  --ring routine --type api_key --value-file /private/input
 wispkey env bind --project example --environment development \
   --manifest wispkey.toml
 ```

@@ -12,8 +12,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use zeroize::Zeroize;
 
 use crate::bundle;
+use crate::core::access_ring::AccessRing;
 use crate::core::auth::AuthPartitionData;
-use crate::core::cloud_sync::validate_transport_auth_bindings;
+use crate::core::cloud_sync::{transport_version, validate_transport_auth_bindings};
 use crate::core::{
     AddCredentialRequest, CredentialType, DEFAULT_PARTITION_NAME, DEFAULT_PROJECT_NAME, Vault,
     VaultError,
@@ -39,6 +40,8 @@ pub(crate) struct BundleCredential {
     pub(crate) name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     auth_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) access_ring: Option<AccessRing>,
     #[serde(default)]
     description: String,
     credential_type: CredentialType,
@@ -103,20 +106,25 @@ struct AuthEnvelope<T> {
     payload: T,
 }
 
-pub(crate) fn write_transport_payload<T: Serialize>(
-    magic: &[u8; 4],
-    payload: &T,
-    registered: bool,
-    passphrase: &str,
-    output_path: &str,
-) -> crate::core::Result<()> {
-    write_versioned_transport_payload(
-        magic,
-        payload,
-        if registered { 2 } else { 1 },
-        passphrase,
-        output_path,
-    )
+pub(crate) fn any_access_ring(credentials: &[BundleCredential]) -> bool {
+    credentials
+        .iter()
+        .any(|credential| credential.access_ring.is_some())
+}
+
+fn json_has_access_ring(payload: &serde_json::Value) -> bool {
+    let ringed = |credential: &serde_json::Value| credential.get("access_ring").is_some();
+    let any_ringed = |credentials: &serde_json::Value| {
+        credentials
+            .as_array()
+            .is_some_and(|credentials| credentials.iter().any(ringed))
+    };
+    let partitions = payload["partitions"].as_array().into_iter().flatten();
+    ringed(&payload["credential"])
+        || any_ringed(&payload["credentials"])
+        || partitions
+            .map(|partition| &partition["credentials"])
+            .any(any_ringed)
 }
 
 pub(crate) fn write_versioned_transport_payload<T: Serialize>(
@@ -151,14 +159,19 @@ pub(crate) fn read_transport_payload<T: DeserializeOwned>(
             || value["payload"]["partitions"]
                 .as_array()
                 .is_some_and(|ps| ps.iter().any(|p| p.get("signup_profiles").is_some()));
-        if (value["version"] == 3) != profiles {
+        if (value["version"] == 4) != json_has_access_ring(&value["payload"]) {
+            return Err(VaultError::InvalidBundle(
+                "access ring transport version mismatch".into(),
+            ));
+        }
+        if value["version"] != 4 && (value["version"] == 3) != profiles {
             return Err(VaultError::InvalidBundle(
                 "signup profile transport version mismatch".into(),
             ));
         }
         let envelope: AuthEnvelope<T> = serde_json::from_value(value)
             .map_err(|_| VaultError::InvalidBundle("invalid auth bundle envelope".into()))?;
-        if !matches!(envelope.version, 2 | 3) {
+        if !matches!(envelope.version, 2..=4) {
             return Err(VaultError::InvalidBundle(
                 "unsupported auth bundle version".into(),
             ));
@@ -205,10 +218,18 @@ pub fn export_project(
             partitions: bundle_partitions,
         })
     })?;
-    let registered = payload
+    let rings = payload
         .partitions
         .iter()
-        .any(|partition| partition.auth_data.is_some() || partition.signup_profiles.is_some());
+        .any(|partition| any_access_ring(&partition.credentials));
+    let profiles = payload
+        .partitions
+        .iter()
+        .any(|partition| partition.signup_profiles.is_some());
+    let auth = payload
+        .partitions
+        .iter()
+        .any(|partition| partition.auth_data.is_some());
     let count = payload
         .partitions
         .iter()
@@ -217,17 +238,7 @@ pub fn export_project(
     write_versioned_transport_payload(
         PROJECT_BUNDLE_MAGIC,
         &payload,
-        if payload
-            .partitions
-            .iter()
-            .any(|p| p.signup_profiles.is_some())
-        {
-            3
-        } else if registered {
-            2
-        } else {
-            1
-        },
+        transport_version(rings, profiles, auth),
         passphrase,
         output_path,
     )?;
@@ -248,7 +259,11 @@ pub fn import_project(
         payload
             .partitions
             .iter()
-            .any(|partition| partition.auth_data.is_some() || partition.signup_profiles.is_some()),
+            .any(|partition| {
+                partition.auth_data.is_some()
+                    || partition.signup_profiles.is_some()
+                    || any_access_ring(&partition.credentials)
+            }),
     )?;
     for partition in &payload.partitions {
         validate_bundle_auth_bindings(&partition.credentials, partition.auth_data.as_ref())?;
@@ -330,10 +345,14 @@ pub fn export_credential(
             auth_data: optional_auth_data(auth_data),
         })
     })?;
-    write_transport_payload(
+    write_versioned_transport_payload(
         CREDENTIAL_BUNDLE_MAGIC,
         &payload,
-        payload.auth_data.is_some(),
+        transport_version(
+            payload.credential.access_ring.is_some(),
+            false,
+            payload.auth_data.is_some(),
+        ),
         passphrase,
         output_path,
     )
@@ -350,14 +369,19 @@ pub fn import_credential(
 ) -> crate::core::Result<ImportResults> {
     let (payload, registered): (CredentialBundlePayload, _) =
         read_transport_payload(CREDENTIAL_BUNDLE_MAGIC, bundle_path, passphrase)?;
-    validate_transport_format(registered, payload.auth_data.is_some())?;
+    validate_transport_format(
+        registered,
+        payload.auth_data.is_some() || payload.credential.access_ring.is_some(),
+    )?;
     validate_bundle_auth_bindings(
         std::slice::from_ref(&payload.credential),
         payload.auth_data.as_ref(),
     )?;
     let project_name = project_override.unwrap_or(&payload.project);
     let partition_name = partition_override.unwrap_or(&payload.partition);
-    if registered && (project_name != payload.project || partition_name != payload.partition) {
+    if payload.auth_data.is_some()
+        && (project_name != payload.project || partition_name != payload.partition)
+    {
         return Err(VaultError::InvalidBundle(
             "registered auth scope cannot be overridden".into(),
         ));
@@ -402,7 +426,7 @@ pub(crate) fn validate_transport_format(
 ) -> crate::core::Result<()> {
     if registered != has_auth {
         return Err(VaultError::InvalidBundle(
-            "auth metadata requires the v2 envelope".into(),
+            "policy metadata requires a versioned envelope".into(),
         ));
     }
     Ok(())
@@ -459,6 +483,7 @@ fn export_bundle_credential(
         .auth_metadata_for_id(&credential.id)?
         .map(|metadata| metadata.id);
     Ok(BundleCredential {
+        access_ring: Some(vault.transport_access_ring(&credential.id)?),
         name: credential.name,
         auth_id,
         description: credential.description,
@@ -495,9 +520,14 @@ pub(crate) fn import_bundle_credentials(
             review_at: credential.review_at.as_deref(),
         };
         let result = if strict {
-            vault.insert_transport_credential(request)
+            vault
+                .insert_transport_credential(request)
+                .and_then(|created| match credential.access_ring {
+                    Some(ring) => vault.classify_new_credential(&created, ring, project),
+                    None => Ok(()),
+                })
         } else {
-            vault.add_credential(request)
+            vault.add_credential(request).map(|_| ())
         };
         match result {
             Ok(_) => results.imported += 1,

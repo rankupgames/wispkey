@@ -19,7 +19,8 @@ fn add_run_secrets(vault_dir: &std::path::Path) {
         run_wispkey_json(
             vault_dir,
             &[
-                "--format", "json", "add", name, "--type", "api_key", "--value", value,
+                "--format", "json", "add", "--ring", "routine", name, "--type", "api_key",
+                "--value", value,
             ],
         );
     }

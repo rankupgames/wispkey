@@ -44,7 +44,7 @@ pub async fn handle_exec(args: ExecArgs<'_>) {
         .map(String::from)
         .unwrap_or_else(core::resolve_active_project);
     let vault = open_unlocked_vault();
-    let secret = match vault.decrypt_credential_value_in_project(&project, args.credential) {
+    let secret = match vault.decrypt_credential_for_owner_egress(&project, args.credential) {
         Ok(value) => value,
         Err(e) => {
             eprintln!("Error: {}", e);
@@ -152,7 +152,7 @@ pub async fn handle_askpass() {
     };
     let vault = open_unlocked_vault();
     let secret =
-        match vault.decrypt_credential_value_in_project(&handoff.project, &handoff.credential) {
+        match vault.decrypt_credential_for_owner_egress(&handoff.project, &handoff.credential) {
             Ok(value) => value,
             Err(e) => {
                 eprintln!("Error: {}", e);

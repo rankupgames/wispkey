@@ -20,6 +20,8 @@ fn register_at(dir: &Path, expiry: &str, origin: &str) -> String {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "bounded-key",
             "--type",
             "api_key",

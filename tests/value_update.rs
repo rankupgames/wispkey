@@ -19,6 +19,8 @@ fn add(dir: &Path, name: &str, project: &str, kind: &str) -> Value {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             name,
             "--project",
             project,

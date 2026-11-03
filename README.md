@@ -130,8 +130,10 @@ printf '%s' "$DB_PASSWORD" | wispkey add "db-password" --type api_key --value-fi
 printf '%s' "$DATABASE_URL" | wispkey add "db-url" --type api_key --value-file - --tags "database"
 wispkey add "ssh-private-key" --type api_key --value-file ~/.ssh/id_ed25519 --partition "ssh-keys"
 wispkey add "service-account-json" --type api_key --value-file ./service-account.json --tags "gcp"
-printf '%s' "$BASIC_AUTH_VALUE" | wispkey add "basic-auth-api" --type basic_auth --value-file - --hosts "api.example.com"
+printf '%s' "$BASIC_AUTH_VALUE" | wispkey add "basic-auth-api" --ring routine --type basic_auth --value-file - --hosts "api.example.com"
 ```
+
+The proxy, MCP and `exec`/`run`/`inject` release only credentials in the `routine` access ring. A credential without a ring is `restricted`. Set the ring with `add --ring` or `wispkey ring <name> --set routine`. See [access rings](docs/access-rings.md).
 
 ## Secret Injection (`wispkey exec`, `wispkey run`, `wispkey inject`)
 
@@ -381,7 +383,8 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey unlock [--timeout N] [--remember] [--protector-timeout N] [--password-file PATH\|-]` | Unlock vault for the current session; `--remember` stores a password-free re-unlock protector |
 | `wispkey lock [--forget]` | Revoke the current session; `--forget` also deletes the remembered protector |
 | `wispkey tray [--ipc-only]` | Start authenticated owner IPC; optionally spawn the tray GUI |
-| `wispkey add <name> [--type TYPE] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store a credential |
+| `wispkey add <name> [--type TYPE] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P] [--ring R]` | Store a credential; `--ring` sets its access ring |
+| `wispkey ring <name> [--project P] [--set routine\|restricted\|critical]` | Show or set the access ring; broadening asks for the owner password |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials |
 | `wispkey get <name> [--show-token]` | Show credential metadata and wisp token |
 | `wispkey remove <name>` | Delete a credential |

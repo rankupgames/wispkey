@@ -20,6 +20,8 @@ fn add_secret(dir: &Path, name: &str) -> Value {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             name,
             "--type",
             "api_key",
@@ -431,6 +433,7 @@ fn website_login_nondefault_port_registration_and_encrypted_roundtrip() {
             ],
         );
         assert_eq!(generated["credential"]["origin"], origin);
+        classify_routine(source.path(), "site-login");
         assert_eq!(
             generated["credential"]["hosts"],
             json!(["jobs.example.com:8443"])

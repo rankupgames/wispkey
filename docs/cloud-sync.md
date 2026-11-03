@@ -51,6 +51,19 @@ partition so a server cannot substitute another partition's valid bundle.
 Renaming a project or partition creates a different sync identity; inspect and
 explicitly migrate such changes rather than expecting a remote rename.
 
+## Access-ring upgrade
+
+Schema 17 exports effective ring restrictions in version 4 snapshots, including
+the restricted default for unclassified credentials. Upgrade all participating
+clients before syncing; older clients reject version 4.
+
+The new representation changes the hash of every nonempty partition. Devices
+that upgrade separately can report a conflict even without a secret edit. Use
+`wispkey cloud status --remote --format json`, inspect both devices, then use the
+existing explicit resolution flow with the observed remote revision. Do not
+erase the journal or reset account bindings. Resolution preserves an encrypted
+recovery copy and still rejects a ring broadening that lacks local owner approval.
+
 ## Routine synchronization
 
 ```sh
