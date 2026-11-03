@@ -771,7 +771,7 @@ mod tests {
             .cloud_snapshot("default", "personal")
             .unwrap()
             .unwrap();
-        assert_eq!(deletion.version, 3);
+        assert_eq!(deletion.version, 4);
         destination
             .cloud_apply(&deletion, Some(&hash(&destination)), None)
             .unwrap();
@@ -847,7 +847,7 @@ mod tests {
             }
             let mut document: serde_json::Value =
                 crate::bundle::read_encrypted_payload(magic, path, PASSPHRASE).unwrap();
-            assert_eq!(document["version"], 3);
+            assert_eq!(document["version"], 4);
             let destination = vault();
             let import = |v: &Vault| {
                 if partition {
@@ -1022,7 +1022,15 @@ mod tests {
                 .cloud_snapshot("default", "personal")
                 .unwrap()
                 .unwrap();
-            assert_eq!(legacy.version, 1);
+            assert_eq!(legacy.version, if has_login { 4 } else { 1 });
+            // Model a historical v1 peer, without today's ring metadata. The
+            // managed-profile tombstone must still reject this valid old format.
+            let mut historical = serde_json::to_value(&legacy).unwrap();
+            historical["version"] = serde_json::json!(1);
+            for credential in historical["credentials"].as_array_mut().unwrap() {
+                credential.as_object_mut().unwrap().remove("access_ring");
+            }
+            let legacy = serde_json::from_value(historical).unwrap();
             assert!(restored.cloud_apply(&legacy, Some(&before), None).is_err());
             assert_eq!(hash(&restored), before);
         }
