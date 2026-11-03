@@ -66,9 +66,11 @@ URLs, state and PKCE challenges are not printed. If the system browser cannot
 be launched, the attempt ends; run login on a computer with a browser.
 
 The CLI accepts only a bounded opaque `oat_` bearer with `expires_in` no greater
-than 24 hours. It rejects JWT/ID tokens as access bearers and any extra granted
-scope. There is no `offline_access` request, refresh-token storage, or automatic
-refresh. OIDC may return an ID token, and Clerk may include a refresh token. The CLI immediately
+than 24 hours. Accepted grants contain `openid`, optionally with Clerk's
+`offline_access` built-in. Other scopes, duplicates and malformed scope strings
+are rejected. The CLI still requests only `openid`; it does not request
+`offline_access`, store refresh tokens, or refresh automatically. OIDC may return
+an ID token, and Clerk may include a refresh token. The CLI immediately
 zeroizes and discards both without persisting, logging, transmitting or using
 them. Only the resource-bound opaque access token authenticates API requests.
 Expiry requires `wispkey cloud login` again.
@@ -137,7 +139,8 @@ migration, redaction, persistence races and logout outcomes. No real Clerk
 account, consent grant, token, deployment or billing operation is needed.
 
 Before enabling this preview, check the paired Cloud deployment, public
-application, exact resource/audience and singleton `openid` scope, loopback redirect,
+application, exact resource/audience and `openid` grant with only optional
+`offline_access`, loopback redirect,
 consent, opaque token format/lifetime, entitlement mapping, and browser
 login/logout on each supported OS. Synthetic tests do not replace that acceptance.
 

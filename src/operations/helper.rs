@@ -561,11 +561,12 @@ mod tests {
     #[tokio::test]
     async fn stdin_only_child_keeps_canaries_out_of_output_and_store() {
         let (dir, mut config, store) = fixture();
-        config.program = std::env::current_exe()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
+        // Jenkins build paths can contain characters the fixed-program policy rejects.
+        // Keep the executable's compiled canary separate from the output/store fixture.
+        let probe_dir = tempfile::tempdir().unwrap();
+        let probe_program = probe_dir.path().join("channel-probe");
+        std::fs::copy(std::env::current_exe().unwrap(), &probe_program).unwrap();
+        config.program = probe_program.to_str().unwrap().to_owned();
         config.args = vec![
             "--exact".into(),
             "operations::helper::tests::channel_probe_child".into(),

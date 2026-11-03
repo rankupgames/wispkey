@@ -317,10 +317,12 @@ fn validate_token_response(response: &TokenResponse) -> CloudResult<()> {
         || !response.access_token.bytes().all(|b| {
             b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'~' | b'+' | b'/' | b'=')
         })
-        || response
-            .scope
-            .as_deref()
-            .is_some_and(|scope| scope != SCOPE)
+        || response.scope.as_deref().is_some_and(|scope| {
+            !matches!(
+                scope,
+                SCOPE | "openid offline_access" | "offline_access openid"
+            )
+        })
     {
         return Err(invalid(
             "invalid_oauth_token_response; expected a short-lived opaque access token",

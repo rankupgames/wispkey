@@ -38,7 +38,7 @@ fn response() -> TokenResponse {
         access_token: OPAQUE.into(),
         token_type: "Bearer".into(),
         expires_in: 3600,
-        scope: Some("openid".into()),
+        scope: Some("openid offline_access".into()),
         refresh_token: None,
         id_token: None,
     }
@@ -207,6 +207,16 @@ fn opaque_tokens_and_verified_context_fail_closed_without_secret_errors() {
     let data = account(&d, now);
     let r = response();
     validate_token_response(&r).unwrap();
+    for scope in [
+        None,
+        Some("openid"),
+        Some("openid offline_access"),
+        Some("offline_access openid"),
+    ] {
+        let mut granted = response();
+        granted.scope = scope.map(str::to_owned);
+        validate_token_response(&granted).unwrap();
+    }
     let session = verified_session(&r, &d, "https://api.example", &data, now, now).unwrap();
     assert_eq!(session.account_id, "user_fixture");
     assert_eq!(session.expires_at, now + 3600);
@@ -244,7 +254,20 @@ fn opaque_tokens_and_verified_context_fail_closed_without_secret_errors() {
     let mut bad = response();
     bad.refresh_token = Some(REFRESH_CANARY.into());
     validate_token_response(&bad).unwrap();
-    for scope in ["", "wispkey:sync", "openid offline_access", "openid openid"] {
+    for scope in [
+        "",
+        "wispkey:sync",
+        "offline_access",
+        "openid openid",
+        "openid profile",
+        "openid offline_access email",
+        "openid offline_access offline_access",
+        "openid openid offline_access",
+        " openid",
+        "openid offline_access ",
+        "openid  offline_access",
+        "openid\toffline_access",
+    ] {
         let mut bad = response();
         bad.scope = Some(scope.into());
         assert!(validate_token_response(&bad).is_err());
@@ -571,7 +594,7 @@ impl Fixture {
                             status = "307 Temporary Redirect";
                             location = format!("Location: {api_clone}/stolen\r\n");
                         }
-                        let mut tokens = json!({"access_token":OPAQUE,"token_type":"Bearer","expires_in":3600,"scope":SCOPE});
+                        let mut tokens = json!({"access_token":OPAQUE,"token_type":"Bearer","expires_in":3600,"scope":"openid offline_access"});
                         if mode == "unused_tokens" {
                             tokens["refresh_token"] = json!(REFRESH_CANARY);
                             tokens["id_token"] = json!(ID_TOKEN_CANARY);
