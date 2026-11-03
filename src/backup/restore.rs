@@ -1646,6 +1646,9 @@ fn rows_equivalent(left: &Map<String, Value>, right: &Map<String, Value>) -> boo
 fn comparable_row(row: &Map<String, Value>) -> Map<String, Value> {
     row.iter()
         .filter(|(key, _)| !matches!(key.as_str(), "updated_at" | "last_used_at" | "last_seen_at"))
+        // Schema 17 adds NULL for an unclassified legacy credential.
+        // An explicit classification must still compare exactly.
+        .filter(|(key, value)| key.as_str() != "access_ring" || !value.is_null())
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }
@@ -1788,8 +1791,10 @@ mod tests {
             .iter()
             .find(|r| r["id"] == "credential-auth")
             .unwrap();
+        let mut existing = existing.as_object().unwrap().clone();
+        assert_eq!(existing.remove("access_ring"), Some(Value::Null));
         assert!(
-            existing == &before[TABLE_CREDENTIALS][0],
+            Value::Object(existing) == before[TABLE_CREDENTIALS][0],
             "existing credential changed"
         );
         let mut request = after["browser_fill_requests"][0]
@@ -1878,6 +1883,13 @@ mod tests {
         let plan = plan_merge(&db, target.path(), &payload).unwrap();
         assert_eq!(plan.skipped.auth_records, 1);
         assert_eq!(plan.skipped.auth_bundles, 1);
+        for ring in ["routine", "restricted", "critical"] {
+            db.execute("UPDATE credentials SET access_ring=?1", [ring])
+                .unwrap();
+            assert!(plan_merge(&db, target.path(), &payload).is_err());
+        }
+        db.execute("UPDATE credentials SET access_ring=NULL", [])
+            .unwrap();
         let original_metadata = &payload.contents.auth_registry[0]["metadata_json"];
         db.execute("UPDATE auth_registry SET metadata_json = '{}'", [])
             .unwrap();
