@@ -1976,7 +1976,8 @@ fn access_ring_audit_records_metadata_only() {
              FROM audit_log WHERE event_type='AccessRingChanged' ORDER BY id",
         )
         .unwrap();
-    let rows: Vec<(String, Option<String>, Option<String>, String, String)> = statement
+    type RingAuditRow = (String, Option<String>, Option<String>, String, String);
+    let rows: Vec<RingAuditRow> = statement
         .query_map([], |row| {
             Ok((
                 row.get(0)?,
