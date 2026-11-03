@@ -64,6 +64,7 @@ fn login_generate_stores_metadata_without_emitting_password() {
     assert!(generated["credential"].get("password").is_none());
     assert!(generated["credential"].get("value").is_none());
 
+    classify_routine(vault_dir.path(), "acme-careers");
     let template = vault_dir.path().join("login.template");
     std::fs::write(&template, "{{ cred:acme-careers }}").expect("write template");
     let rendered = run_wispkey(
@@ -102,6 +103,7 @@ fn login_generate_stores_metadata_without_emitting_password() {
     );
     let stdout = String::from_utf8_lossy(&generate_raw.stdout);
     let stderr = String::from_utf8_lossy(&generate_raw.stderr);
+    classify_routine(vault_dir.path(), "other-careers");
     let other_template = vault_dir.path().join("other.template");
     std::fs::write(&other_template, "{{ cred:other-careers }}").expect("write other template");
     let other_rendered = run_wispkey(

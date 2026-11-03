@@ -559,6 +559,14 @@ mod auth_transport_tests {
             .unwrap();
     }
 
+    /// The local owner classifies the pair routine; transport never broadens.
+    fn classify_routine(vault: &Vault) {
+        vault
+            .db
+            .execute("UPDATE credentials SET access_ring='routine'", [])
+            .unwrap();
+    }
+
     fn current_hash(vault: &Vault) -> String {
         vault
             .cloud_snapshot_hash(
@@ -686,6 +694,7 @@ mod auth_transport_tests {
                 .export_auth_partition("default", "personal")
                 .unwrap()
         );
+        classify_routine(&destination);
         assert_eq!(
             destination
                 .resolve_auth_bundle(
@@ -772,6 +781,7 @@ mod auth_transport_tests {
                 .export_auth_partition("default", "personal")
                 .unwrap()
         );
+        classify_routine(&destination);
         assert!(
             destination
                 .resolve_auth_bundle(
@@ -1228,6 +1238,7 @@ mod auth_transport_tests {
                 .decrypt_credential_value_in_project("default", "a-key")
                 .is_err()
         );
+        classify_routine(&destination);
         assert!(
             destination
                 .resolve_auth_bundle(

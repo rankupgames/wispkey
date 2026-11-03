@@ -16,6 +16,8 @@ fn add_exec_secret(vault_dir: &std::path::Path) {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             EXEC_SECRET_NAME,
             "--type",
             "api_key",

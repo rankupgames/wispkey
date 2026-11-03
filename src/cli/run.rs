@@ -114,7 +114,7 @@ fn resolve_manifest_env(
                     std::process::exit(1);
                 }
             }
-            let secret = match vault.decrypt_credential_value_in_project(project, credential_name) {
+            let secret = match vault.decrypt_credential_for_owner_egress(project, credential_name) {
                 Ok(value) => value,
                 Err(_) => {
                     eprintln!("Error: referenced credential is unavailable for use");

@@ -60,6 +60,8 @@ impl Fixture {
             fixture.vault.path(),
             &[
                 "add",
+                "--ring",
+                "routine",
                 "development-secret",
                 "--type",
                 "api_key",

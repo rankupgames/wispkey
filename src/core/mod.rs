@@ -970,7 +970,7 @@ impl Vault {
         project_name: &str,
         name: &str,
     ) -> Result<String> {
-        self.decrypt_credential_for_use(project_name, name, false)
+        self.decrypt_credential_for_use(project_name, name, false, false)
     }
 
     pub(crate) fn decrypt_credential_for_delegated_use(
@@ -978,7 +978,17 @@ impl Vault {
         project_name: &str,
         name: &str,
     ) -> Result<String> {
-        self.decrypt_credential_for_use(project_name, name, true)
+        self.decrypt_credential_for_use(project_name, name, true, false)
+    }
+
+    /// Owner CLI plaintext egress (exec, run, inject). A cached unlock is not
+    /// step-up, so only routine credentials leave the vault this way.
+    pub(crate) fn decrypt_credential_for_owner_egress(
+        &self,
+        project_name: &str,
+        name: &str,
+    ) -> Result<String> {
+        self.decrypt_credential_for_use(project_name, name, false, true)
     }
 
     fn decrypt_credential_for_use(
@@ -986,6 +996,7 @@ impl Vault {
         project_name: &str,
         name: &str,
         delegated: bool,
+        owner_egress: bool,
     ) -> Result<String> {
         let transaction = if self.db.is_autocommit() {
             Some(self.db.unchecked_transaction()?)
@@ -993,9 +1004,16 @@ impl Vault {
             None
         };
         let credential = self.get_credential_in_project(project_name, name)?;
-        self.ensure_auth_usable(&credential.id, delegated, None)?;
+        let ensure_release = || -> Result<()> {
+            self.ensure_auth_usable(&credential.id, delegated, None)?;
+            if owner_egress {
+                self.ensure_access_ring(&credential.id, access_ring::RingRelease::Unattended)?;
+            }
+            Ok(())
+        };
+        ensure_release()?;
         let value = self.decrypt_credential_for_transfer(project_name, name)?;
-        self.ensure_auth_usable(&credential.id, delegated, None)?;
+        ensure_release()?;
         if let Some(transaction) = transaction {
             transaction.commit()?;
         }

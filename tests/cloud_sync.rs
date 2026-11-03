@@ -305,6 +305,8 @@ fn add(path: &Path, name: &str, value: &str, partition: &str) {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             name,
             "--value-file",
             input.to_str().unwrap(),

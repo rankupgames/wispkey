@@ -100,7 +100,7 @@ fn render_template(template: &str, vault: &Vault, project: &str) -> (String, Vec
                 eprintln!("Error: malformed credential reference in template");
                 std::process::exit(1);
             }
-            let secret = match vault.decrypt_credential_value_in_project(project, name) {
+            let secret = match vault.decrypt_credential_for_owner_egress(project, name) {
                 Ok(value) => value,
                 Err(e) => {
                     eprintln!("Error: {}", e);

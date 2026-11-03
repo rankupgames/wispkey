@@ -62,6 +62,28 @@ fn ring_label(ring: Option<AccessRing>) -> &'static str {
     ring.map_or("unclassified", AccessRing::as_str)
 }
 
+/// The approval a release path holds. Critical has no local release path
+/// until trusted-device presence exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RingRelease {
+    /// Proxy, MCP, webhook signing, auth resolution and owner egress.
+    /// A cached unlock is not step-up.
+    Unattended,
+    /// Browser fill after OS verification, or a one-use operation grant after
+    /// a fresh interactive owner password. Both bind identity and revision.
+    /// The default-off browser receiver uses the same native approval.
+    OwnerApproved,
+}
+
+impl RingRelease {
+    fn permits(self, ring: AccessRing) -> bool {
+        match self {
+            Self::Unattended => ring == AccessRing::Routine,
+            Self::OwnerApproved => ring <= AccessRing::Restricted,
+        }
+    }
+}
+
 impl Vault {
     fn ensure_access_ring_policy(&self) -> Result<()> {
         let policy: Option<String> = self
@@ -82,6 +104,21 @@ impl Vault {
         Ok(self
             .explicit_access_ring(credential_id)?
             .unwrap_or(AccessRing::Restricted))
+    }
+
+    pub(crate) fn ensure_access_ring(
+        &self,
+        credential_id: &str,
+        release: RingRelease,
+    ) -> Result<()> {
+        self.ensure_access_ring_policy()?;
+        match self.stored_access_ring(credential_id)? {
+            ring if release.permits(ring) => Ok(()),
+            AccessRing::Critical => Err(rejected(
+                "access ring critical denies release without trusted-device presence",
+            )),
+            _ => Err(rejected("access ring restricted requires owner approval")),
+        }
     }
 
     pub fn access_ring_in_project(&self, project: &str, name: &str) -> Result<AccessRing> {

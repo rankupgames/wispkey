@@ -129,6 +129,7 @@ fn fixture() -> tempfile::TempDir {
     dir
 }
 fn assert_stored_pair(dir: &Path, password: &str) {
+    classify_routine(dir, "entry");
     // Existing owner egress is used only to verify a disposable fixture. Never print the captured payload.
     let template = dir.join("template");
     std::fs::write(&template, "{{ cred:entry }}").unwrap();

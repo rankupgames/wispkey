@@ -17,7 +17,8 @@ fn add_inject_secrets(vault_dir: &std::path::Path) {
         run_wispkey_json(
             vault_dir,
             &[
-                "--format", "json", "add", name, "--type", "api_key", "--value", value,
+                "--format", "json", "add", "--ring", "routine", name, "--type", "api_key",
+                "--value", value,
             ],
         );
     }
@@ -101,5 +102,43 @@ fn inject_missing_credential_fails_without_writing_output() {
         &["inject", "-i", &input_arg, "-o", &output_arg],
     );
     assert!(!result.status.success());
+    assert!(!output.exists(), "output should not have been written");
+}
+
+#[test]
+fn inject_refuses_unclassified_credential_without_writing_output() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    let template_dir = tempfile::tempdir().expect("template dir");
+    init_vault(vault_dir.path());
+    run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "add",
+            "unclassified-secret",
+            "--type",
+            "api_key",
+            "--value",
+            INJECT_SECRET_ONE_VALUE,
+        ],
+    );
+
+    let input = template_dir.path().join("template.txt");
+    let output = template_dir.path().join("rendered.env");
+    std::fs::write(&input, "secret={{ cred:unclassified-secret }}\n").expect("write template");
+    let input_arg = input.to_string_lossy().to_string();
+    let output_arg = output.to_string_lossy().to_string();
+
+    let result = run_wispkey(
+        vault_dir.path(),
+        &["inject", "-i", &input_arg, "-o", &output_arg],
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(stderr.contains("access ring restricted requires owner approval"));
+    assert!(!stdout.contains(INJECT_SECRET_ONE_VALUE));
+    assert!(!stderr.contains(INJECT_SECRET_ONE_VALUE));
     assert!(!output.exists(), "output should not have been written");
 }

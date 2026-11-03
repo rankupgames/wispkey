@@ -391,7 +391,31 @@ impl Vault {
         Ok(())
     }
 
+    /// Delegated release also needs a routine ring. Owner-local use does not.
     pub(crate) fn ensure_auth_usable(
+        &self,
+        credential_id: &str,
+        delegated: bool,
+        origin: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_auth_lifecycle(credential_id, delegated, origin)?;
+        if delegated {
+            self.ensure_access_ring(credential_id, access_ring::RingRelease::Unattended)?;
+        }
+        Ok(())
+    }
+
+    /// Release after a fresh owner approval that binds identity and revision.
+    pub(crate) fn ensure_owner_approved_release(
+        &self,
+        credential_id: &str,
+        origin: Option<&str>,
+    ) -> Result<()> {
+        self.ensure_auth_lifecycle(credential_id, true, origin)?;
+        self.ensure_access_ring(credential_id, access_ring::RingRelease::OwnerApproved)
+    }
+
+    fn ensure_auth_lifecycle(
         &self,
         credential_id: &str,
         delegated: bool,
@@ -734,18 +758,22 @@ mod tests {
             [&now],
         )
         .unwrap();
+        access_ring::insert_access_ring_policy(&db).unwrap();
         Vault {
             db,
             master_key: Some([42; 32]),
             session_timeout_override: None,
         }
     }
+    /// The owner classifies fixtures routine so delegated release reaches the
+    /// auth lifecycle checks.
     fn add(vault: &Vault, name: &str) -> Credential {
         vault
-            .add_credential(
+            .add_classified_credential(
                 AddCredentialRequest::new(name, CredentialType::ApiKey, "synthetic-auth-canary")
                     .hosts(Some("api.example.com"))
                     .project(Some("default")),
+                Some(access_ring::AccessRing::Routine),
             )
             .unwrap()
     }
@@ -982,6 +1010,13 @@ mod tests {
                 length: None,
                 symbols: true,
             })
+            .unwrap();
+        vault
+            .db
+            .execute(
+                "UPDATE credentials SET access_ring='routine' WHERE name='login'",
+                [],
+            )
             .unwrap();
         assert_eq!(credential.hosts, vec!["jobs.example.com:8443"]);
         let mut request = registration();
@@ -1236,5 +1271,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn delegated_release_requires_routine_ring_and_owner_approval_stops_at_critical() {
+        let vault = vault();
+        let credential = add(&vault, "key");
+        let set_ring = |ring: Option<&str>| {
+            vault
+                .db
+                .execute(
+                    "UPDATE credentials SET access_ring=?1 WHERE id=?2",
+                    params![ring, credential.id],
+                )
+                .unwrap();
+        };
+        let unattended = || vault.ensure_auth_usable(&credential.id, true, None);
+        let approved = || vault.ensure_owner_approved_release(&credential.id, None);
+        assert!(unattended().is_ok());
+        for ring in [None, Some("restricted"), Some("superuser")] {
+            set_ring(ring);
+            assert!(matches!(
+                unattended(),
+                Err(VaultError::AuthRejected(
+                    "access ring restricted requires owner approval"
+                ))
+            ));
+            assert!(approved().is_ok());
+            assert!(
+                vault
+                    .ensure_auth_usable(&credential.id, false, None)
+                    .is_ok()
+            );
+        }
+        set_ring(Some("critical"));
+        assert!(matches!(
+            unattended(),
+            Err(VaultError::AuthRejected(reason)) if reason.starts_with("access ring critical")
+        ));
+        assert!(approved().is_err());
+        assert!(
+            vault
+                .lookup_auth_token(&credential.wisp_token, true, None)
+                .is_err()
+        );
+        assert!(
+            vault
+                .decrypt_credential_for_owner_egress("default", "key")
+                .is_err()
+        );
+        assert_eq!(
+            vault
+                .decrypt_credential_value_in_project("default", "key")
+                .unwrap(),
+            "synthetic-auth-canary"
+        );
+    }
+
+    #[test]
+    fn unsupported_ring_policy_denies_every_release() {
+        let vault = vault();
+        let credential = add(&vault, "key");
+        vault
+            .db
+            .execute(
+                "UPDATE vault_meta SET value='2' WHERE key=?1",
+                [access_ring::ACCESS_RING_POLICY_KEY],
+            )
+            .unwrap();
+        assert!(matches!(
+            vault.ensure_auth_usable(&credential.id, true, None),
+            Err(VaultError::AuthRejected("access ring policy unsupported"))
+        ));
+        assert!(
+            vault
+                .ensure_owner_approved_release(&credential.id, None)
+                .is_err()
+        );
+        assert!(
+            vault
+                .decrypt_credential_for_owner_egress("default", "key")
+                .is_err()
+        );
     }
 }

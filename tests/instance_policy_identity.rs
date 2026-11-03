@@ -59,6 +59,8 @@ fn agent_policy_uses_authenticated_instance_id_only() {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "policy-token",
             "--type",
             "bearer_token",
