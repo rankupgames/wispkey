@@ -87,6 +87,18 @@ struct AddArgs {
 }
 
 #[derive(Args)]
+struct RingArgs {
+    /// Credential name
+    name: String,
+    /// Project override (default: active project)
+    #[arg(long)]
+    project: Option<String>,
+    /// New ring
+    #[arg(long, value_parser = ["routine", "restricted", "critical"])]
+    set: Option<String>,
+}
+
+#[derive(Args)]
 struct ServeArgs {
     /// Port to listen on (ignored when --random-port is set)
     #[arg(long, default_value = "7700")]
@@ -237,16 +249,7 @@ enum Commands {
     },
 
     /// Show or set a credential's access ring; broadening asks for the owner password
-    Ring {
-        /// Credential name
-        name: String,
-        /// Project override (default: active project)
-        #[arg(long)]
-        project: Option<String>,
-        /// New ring
-        #[arg(long, value_parser = ["routine", "restricted", "critical"])]
-        set: Option<String>,
-    },
+    Ring(RingArgs),
 
     /// Run a child process with a credential injected through controlled channels
     Exec(ExecArgs),
@@ -1430,7 +1433,7 @@ async fn main() {
         Commands::Rotate { name } => {
             cli::handle_rotate(&name).await;
         }
-        Commands::Ring { name, project, set } => {
+        Commands::Ring(RingArgs { name, project, set }) => {
             cli::handle_ring(&name, project.as_deref(), set.as_deref());
         }
         Commands::Exec(ExecArgs {
