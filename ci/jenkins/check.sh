@@ -30,8 +30,14 @@ rust)
     need_rust
     test "$(python3 --version)" = 'Python 3.12.3'
     command -v strace >/dev/null || { echo 'strace is required' >&2; exit 1; }
+    # Keep compilation off the mounted source drive and inside this lane's budget.
+    cargo_target="$(mktemp -d /tmp/wispkey-rust.XXXXXXXX)"
+    trap 'rm -rf -- "$cargo_target"' EXIT
+    export CARGO_TARGET_DIR="$cargo_target" CARGO_BUILD_JOBS=2 CARGO_INCREMENTAL=0
+    export CARGO_PROFILE_DEV_DEBUG=0 CARGO_PROFILE_TEST_DEBUG=0
     cargo fmt --check
-    cargo install cargo-audit --version 0.22.2 --locked --root "$lane_root/tools"
+    # The pinned audit tool needs no release optimization to perform the same audit.
+    cargo install cargo-audit --version 0.22.2 --locked --debug --root "$lane_root/tools"
     PATH="$lane_root/tools/bin:$PATH" cargo audit
     cargo clippy --locked --all-targets --features experimental-browser-receiver -- -D warnings \
         -W clippy::suspicious -W clippy::style -W clippy::perf -W clippy::complexity
