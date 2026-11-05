@@ -11,6 +11,11 @@ checks, coverage boundaries, and the remaining destination-owner acceptance.
 
 ## Approval and execution
 
+Authorization checks the access rings of the credentials that the selected action
+will release before it issues a grant. Kubernetes revocation releases only its
+provider credential. Final one-use release checks still run under the database
+and owner-session locks; a spent grant is never refunded automatically.
+
 Keep the vault, finite unlocked session and catalog on a trusted owner-controlled
 runner. Workload agents must use a different account or machine: the local vault
 owner can already decrypt credentials, so these commands cannot isolate a
