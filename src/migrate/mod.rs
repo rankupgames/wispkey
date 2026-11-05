@@ -244,6 +244,10 @@ pub fn attach_env_file(
         named_entries.push((entry, credential_name));
     }
 
+    // Scope creation, reuse checks and all new credentials share one writer
+    // reservation. Errors before commit cannot leave an empty project behind.
+    let transaction =
+        rusqlite::Transaction::new_unchecked(vault.db(), rusqlite::TransactionBehavior::Immediate)?;
     let project_exists = match vault.get_project(project) {
         Ok(_) => true,
         Err(VaultError::ProjectNotFound(_)) => {
@@ -399,11 +403,11 @@ pub fn attach_env_file(
             review_at: None,
         })
         .collect();
-    let created = if requests.is_empty() {
-        Vec::new()
-    } else {
-        vault.add_credentials_atomic(&requests)?
-    };
+    let created = requests
+        .iter()
+        .cloned()
+        .map(|request| vault.insert_transport_credential(request))
+        .collect::<crate::core::Result<Vec<_>>>()?;
     drop(requests);
     let mut created = created.into_iter();
     for plan in &mut plans {
@@ -432,6 +436,7 @@ pub fn attach_env_file(
             reused += 1;
         }
     }
+    transaction.commit()?;
 
     let mut replacements = Vec::new();
     let mut credentials = Vec::with_capacity(plans.len());
@@ -450,15 +455,22 @@ pub fn attach_env_file(
     }
 
     let updated = replacements.len();
-    if updated > 0 {
-        replacements.sort_by_key(|replacement| std::cmp::Reverse(replacement.0.start));
-        let mut attached = original.clone();
-        for (range, token) in replacements {
-            attached.replace_range(range, &token);
+    let publish = (|| -> crate::core::Result<()> {
+        if updated > 0 {
+            replacements.sort_by_key(|replacement| std::cmp::Reverse(replacement.0.start));
+            let mut attached = original.clone();
+            for (range, token) in replacements {
+                attached.replace_range(range, &token);
+            }
+            replace_env_file(&canonical_path, original.as_bytes(), attached.as_bytes())?;
         }
-        replace_env_file(&canonical_path, original.as_bytes(), attached.as_bytes())?;
-    }
-    secure_files::harden_existing_file(&canonical_path)?;
+        secure_files::harden_existing_file(&canonical_path)
+    })();
+    publish.map_err(|error| {
+        VaultError::InvalidEnvFile(format!(
+            "credentials are stored in project '{project}' and environment '{environment}', but source file update failed: {error}"
+        ))
+    })?;
 
     Ok(AttachEnvResults {
         path: canonical_path.to_string_lossy().into_owned(),
@@ -575,12 +587,24 @@ fn has_meaningful_host_restriction(hosts: &[String]) -> bool {
 }
 
 fn lock_env_file(path: &Path) -> crate::core::Result<fs::File> {
+    let lock = open_env_lock(path)?;
+    lock.lock_exclusive()?;
+    Ok(lock)
+}
+
+/// Import must not wait for another writer while holding its plan-store mutex.
+pub(crate) fn try_lock_env_file(path: &Path) -> crate::core::Result<fs::File> {
+    let lock = open_env_lock(path)?;
+    lock.try_lock_exclusive()?;
+    Ok(lock)
+}
+
+fn open_env_lock(path: &Path) -> crate::core::Result<fs::File> {
     let parent = path.parent().unwrap_or(Path::new("."));
     let file_name = path.file_name().unwrap_or_default().to_string_lossy();
     let lock_path = parent.join(format!("{file_name}.wispkey.lock"));
     let _created = secure_files::create_private_in_existing_directory(&lock_path, b"")?;
     let lock = OpenOptions::new().read(true).write(true).open(&lock_path)?;
-    lock.lock_exclusive()?;
     Ok(lock)
 }
 

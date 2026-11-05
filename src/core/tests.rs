@@ -293,6 +293,59 @@ fn token_lookup_waits_for_writer_before_reading_and_updates_last_use() {
 }
 
 #[test]
+fn attach_source_failure_reports_committed_credentials_and_can_retry() {
+    let vault = test_vault("pw");
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join(".env.production");
+    let original = "API_TOKEN=fixture-attach-secret\n";
+    fs::write(&source, original).unwrap();
+    let source_for_writer = source.clone();
+    let attach = || {
+        crate::migrate::attach_env_file(
+            &vault,
+            source.to_str().unwrap(),
+            &["API_TOKEN".into()],
+            "attach-source-failure",
+            None,
+            Some("api.example.com"),
+        )
+    };
+    let (result, waited) = with_reserved_writer(
+        &vault,
+        move || {
+            fs::remove_file(&source_for_writer).unwrap();
+            fs::create_dir(&source_for_writer).unwrap();
+        },
+        attach,
+    );
+    assert!(waited, "source change must occur after attachment reads it");
+    let error = result
+        .expect_err("source publication must fail")
+        .to_string();
+    assert!(error.contains("credentials are stored"), "{error}");
+    assert!(error.contains("source file update failed"), "{error}");
+    assert!(!error.contains("fixture-attach-secret"));
+    assert!(source.is_dir());
+    assert_eq!(
+        vault
+            .decrypt_credential_value_in_project("attach-source-failure", "production-api-token")
+            .unwrap(),
+        "fixture-attach-secret"
+    );
+    fs::remove_dir(&source).unwrap();
+    fs::write(&source, original).unwrap();
+    let retried = attach().unwrap();
+    assert_eq!(retried.imported, 0);
+    assert_eq!(retried.reused, 1);
+    assert_eq!(retried.updated, 1);
+    assert!(
+        fs::read_to_string(&source)
+            .unwrap()
+            .starts_with("API_TOKEN=wk_")
+    );
+}
+
+#[test]
 fn partitions_crud() {
     let vault = test_vault("pw");
     let partitions = vault.list_partitions().unwrap();

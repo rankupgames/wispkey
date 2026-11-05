@@ -120,7 +120,8 @@ impl Vault {
         Ok(result)
     }
 
-    /// Only transport callers holding a transaction may bypass add's own transaction.
+    /// Transport and attachment callers holding a transaction may compose
+    /// scope creation and insertion without committing a partial database phase.
     pub(crate) fn insert_transport_credential(
         &self,
         request: AddCredentialRequest<'_>,

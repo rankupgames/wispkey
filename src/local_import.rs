@@ -119,6 +119,8 @@ pub struct ImportItem {
     #[serde(rename = "type")]
     pub credential_type: &'static str,
     pub conflict: &'static str,
+    /// Suitable for HTTP token substitution and therefore requires hosts.
+    /// Source rewriting additionally requires a file path and a value range.
     pub tokenizable: bool,
     pub hosts: Vec<String>,
 }
@@ -224,6 +226,10 @@ impl ImportSession {
 
     pub fn clear(&mut self) {
         self.plans.clear();
+    }
+
+    pub(crate) fn has_plans(&self) -> bool {
+        !self.plans.is_empty()
     }
 
     /// Owner IPC housekeeping drops expired staged values even without a review.
@@ -486,7 +492,11 @@ impl ImportSession {
                         skipped -= 1;
                         continue;
                     }
-                    ConflictAction::Replace => {}
+                    ConflictAction::Replace => {
+                        if item.value.starts_with("wk_") {
+                            return Err(ImportError::InvalidSelection);
+                        }
+                    }
                     _ => return Err(ImportError::Conflict),
                 }
                 hosts.push(existing.hosts.join(","));
@@ -590,6 +600,8 @@ impl ImportSession {
                     .as_ref()
                     .ok_or(ImportError::InvalidSelection)
                     .and_then(|path| {
+                        let _lock = crate::migrate::try_lock_env_file(path)
+                            .map_err(|_| ImportError::SourceChanged)?;
                         if read_source(path)?.as_str() != source.content.as_str() {
                             return Err(ImportError::SourceChanged);
                         }
@@ -716,12 +728,27 @@ fn read_source(path: &Path) -> Result<Zeroizing<String>> {
         use std::os::unix::fs::OpenOptionsExt;
         options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let file = options.open(path).map_err(|_| ImportError::SourceChanged)?;
-    if !file
-        .metadata()
-        .map_err(|_| ImportError::SourceChanged)?
-        .is_file()
+    #[cfg(windows)]
     {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ);
+    }
+    let file = options.open(path).map_err(|_| ImportError::SourceChanged)?;
+    let metadata = file.metadata().map_err(|_| ImportError::SourceChanged)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ImportError::SourceChanged);
+        }
+    }
+    if !metadata.is_file() {
         return Err(ImportError::InvalidInput);
     }
     let mut bytes = Zeroizing::new(Vec::new());

@@ -24,6 +24,7 @@ fn local_import_owner_boundary() {
         "conflicts",
         "rollback",
         "bounds",
+        "rings",
     ] {
         let dir = tempfile::tempdir().unwrap();
         init_vault(dir.path());
@@ -66,6 +67,120 @@ fn local_import_fixture() {
         .unwrap();
     let mut session = ImportSession::new();
     match case.as_str() {
+        "rings" => {
+            use wispkey::core::VaultError;
+            use wispkey::core::access_ring::AccessRing;
+
+            let owner_session = Vault::session_metadata().unwrap();
+            assert_eq!(
+                owner_session.1, 30,
+                "owner confirmation requires a finite saved session"
+            );
+            let credential = vault
+                .add_classified_credential(
+                    AddCredentialRequest {
+                        name: "ring-owner-fixture",
+                        credential_type: CredentialType::ApiKey,
+                        value: SECRET,
+                        description: None,
+                        hosts: Some("api.fixture.invalid"),
+                        tags: None,
+                        partition: None,
+                        project: Some("default"),
+                        origin: None,
+                        lifecycle_state: None,
+                        review_at: None,
+                    },
+                    Some(AccessRing::Critical),
+                )
+                .unwrap();
+            assert_eq!(
+                vault
+                    .db()
+                    .execute(
+                        "UPDATE credentials SET updated_at='2000-01-01T00:00:00+00:00' WHERE id=?1",
+                        [&credential.id],
+                    )
+                    .unwrap(),
+                1
+            );
+            let original = vault
+                .get_credential_in_project("default", &credential.name)
+                .unwrap();
+            let audit_count = || -> i64 {
+                vault.db().query_row(
+                    "SELECT COUNT(*) FROM audit_log WHERE event_type='AccessRingChanged' AND credential_name=?1",
+                    [&credential.name], |row| row.get(0),
+                ).unwrap()
+            };
+            let original_audits = audit_count();
+            assert_eq!(original_audits, 1);
+            assert!(matches!(
+                vault.set_access_ring(
+                    "default",
+                    &credential.name,
+                    AccessRing::Routine,
+                    Some("wrong-fixture-password")
+                ),
+                Err(VaultError::AuthRejected(
+                    "operation owner confirmation failed"
+                ))
+            ));
+            assert_eq!(
+                vault
+                    .access_ring_in_project("default", &credential.name)
+                    .unwrap(),
+                AccessRing::Critical
+            );
+            assert_eq!(
+                vault
+                    .get_credential_in_project("default", &credential.name)
+                    .unwrap()
+                    .updated_at,
+                original.updated_at
+            );
+            assert_eq!(audit_count(), original_audits);
+            assert_eq!(
+                vault
+                    .set_access_ring(
+                        "default",
+                        &credential.name,
+                        AccessRing::Routine,
+                        Some("test-password")
+                    )
+                    .unwrap(),
+                AccessRing::Critical
+            );
+            assert_eq!(
+                vault
+                    .access_ring_in_project("default", &credential.name)
+                    .unwrap(),
+                AccessRing::Routine
+            );
+            assert_ne!(
+                vault
+                    .get_credential_in_project("default", &credential.name)
+                    .unwrap()
+                    .updated_at,
+                original.updated_at
+            );
+            assert_eq!(audit_count(), original_audits + 1);
+            let audit: (String, Option<String>, Option<String>, String, String) = vault.db().query_row(
+                "SELECT credential_name,wisp_token,target_host,target_path,project_name FROM audit_log WHERE event_type='AccessRingChanged' AND credential_name=?1 ORDER BY id DESC LIMIT 1",
+                [&credential.name], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?)),
+            ).unwrap();
+            assert_eq!(
+                audit,
+                (
+                    credential.name,
+                    None,
+                    None,
+                    "critical->routine".into(),
+                    "default".into()
+                )
+            );
+            assert_eq!(Vault::session_metadata().unwrap(), owner_session);
+        }
         "store" => {
             let source = dir.join(".env.dev");
             let original = format!(
@@ -336,6 +451,47 @@ fn local_import_fixture() {
                 .unwrap();
             assert_eq!((outcome.stored, outcome.reused), (0, 1));
             assert_eq!(outcome.sources[0].status, "unchanged");
+            // A rotated or foreign token must never become the encrypted value.
+            for token in ["wk_obsolete_fixture_token", "wk_foreign_fixture_token"] {
+                let content = format!("KEY={token}\n");
+                write_private_test_file(&source, &content);
+                let plan = file_plan(&mut session, &vault, &source);
+                assert_eq!(
+                    session
+                        .commit(&vault, commit(&plan, false, "replace"))
+                        .err()
+                        .unwrap()
+                        .code(),
+                    "invalid_selection"
+                );
+                assert_eq!(
+                    vault
+                        .decrypt_credential_value_in_project("fixture", "dev-key")
+                        .unwrap(),
+                    SECOND
+                );
+                assert_eq!(std::fs::read_to_string(&source).unwrap(), content);
+            }
+            // An attach writer owns the sibling lock. Database success and
+            // source failure must remain separate observable outcomes.
+            write_private_test_file(&source, &format!("KEY={SECOND}\n"));
+            let plan = file_plan(&mut session, &vault, &source);
+            let lock = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(dir.join(".env.dev.wispkey.lock"))
+                .unwrap();
+            fs2::FileExt::lock_exclusive(&lock).unwrap();
+            let outcome = session.commit(&vault, commit(&plan, true, "keep")).unwrap();
+            assert!(outcome.source_update_failed);
+            assert_eq!(outcome.sources[0].status, "not_changed");
+            assert_eq!(
+                std::fs::read_to_string(&source).unwrap(),
+                format!("KEY={SECOND}\n")
+            );
+            drop(lock);
             let unscoped = vault
                 .add_credential(AddCredentialRequest {
                     name: "dev-unscoped",
@@ -462,6 +618,32 @@ fn local_import_fixture() {
         "bounds" => {
             let source = dir.join(".env.dev");
             write_private_test_file(&source, &format!("KEY={SECRET}\n"));
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                use windows_sys::Win32::Storage::FileSystem::{
+                    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                };
+
+                let writer = std::fs::OpenOptions::new()
+                    .write(true)
+                    .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                    .open(&source)
+                    .unwrap();
+                assert_eq!(
+                    session
+                        .preview(&vault, request_for_file(&source))
+                        .err()
+                        .unwrap()
+                        .code(),
+                    "source_changed"
+                );
+                assert_eq!(
+                    std::fs::read_to_string(&source).unwrap(),
+                    format!("KEY={SECRET}\n")
+                );
+                drop(writer);
+            }
             let plan = file_plan(&mut session, &vault, &source);
             let mut request = commit(&plan, false, "unresolved");
             request.items[0].hosts = vec!["*".into()];
