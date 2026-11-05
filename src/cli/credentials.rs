@@ -83,7 +83,7 @@ pub async fn handle_add(args: AddCredentialArgs<'_>) {
             hosts: args.hosts,
             tags: args.tags,
             partition: args.partition,
-            project: args.project,
+            project: Some(&active_project),
             origin: None,
             lifecycle_state: None,
             review_at: None,
@@ -194,8 +194,8 @@ pub async fn handle_list(partition: Option<&str>, project: Option<&str>, all_pro
                 } else {
                     cred.tags.join(", ")
                 };
-                let desc = if cred.description.len() > 28 {
-                    format!("{}..", &cred.description[..28])
+                let desc = if let Some((end, _)) = cred.description.char_indices().nth(28) {
+                    format!("{}..", &cred.description[..end])
                 } else {
                     cred.description.clone()
                 };

@@ -3,6 +3,36 @@ mod common;
 use common::*;
 use serde_json::{Value, json};
 
+#[test]
+fn text_listing_preserves_multibyte_description_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    init_vault(dir.path());
+    let description = format!("{}é", "a".repeat(27));
+    let added = run_wispkey(
+        dir.path(),
+        &[
+            "add",
+            "unicode",
+            "--value",
+            "synthetic-description-fixture",
+            "--description",
+            &description,
+        ],
+    );
+    assert!(added.status.success());
+    let output = run_wispkey(dir.path(), &["list"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains(&description)
+    );
+}
+
 fn add_secret(path: &std::path::Path, name: &str, project: &str) -> Value {
     let secret_path = path.join("synthetic-input.txt");
     write_private_test_file(&secret_path, "synthetic-cli-contract-secret");
@@ -190,7 +220,11 @@ fn unauthenticated_cloud_sync_does_not_contact_server_or_claim_success() {
     ] {
         let output = run_wispkey_bundle(dir.path(), &args);
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("not authenticated"));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("not authenticated"),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert!(!String::from_utf8_lossy(&output.stderr).contains("synthetic-session-canary"));
         assert!(output.stdout.is_empty());
     }

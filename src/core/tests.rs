@@ -55,6 +55,56 @@ fn init_creates_vault() {
 }
 
 #[test]
+fn ignored_rotation_write_is_not_reported_as_success() {
+    let vault = test_vault("pw");
+    let original = vault
+        .add_credential(
+            AddCredentialRequest::new("rotate", CredentialType::ApiKey, "fixture")
+                .project(Some("default")),
+        )
+        .unwrap();
+    vault.db.execute_batch("CREATE TRIGGER ignore_rotation BEFORE UPDATE OF wisp_token ON credentials BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+    assert!(matches!(
+        vault.rotate_wisp_token_in_project("default", "rotate"),
+        Err(VaultError::CredentialNotFound(_))
+    ));
+    assert_eq!(
+        vault
+            .get_credential_in_project("default", "rotate")
+            .unwrap()
+            .wisp_token,
+        original.wisp_token
+    );
+}
+
+#[test]
+fn project_creation_rolls_back_if_default_partition_fails() {
+    let vault = test_vault("pw");
+    vault.db.execute_batch("CREATE TRIGGER reject_partition BEFORE INSERT ON partitions BEGIN SELECT RAISE(ABORT, 'fixture partition refusal'); END;").unwrap();
+    assert!(vault.create_project("fixture", "").is_err());
+    assert!(
+        !vault
+            .list_projects()
+            .unwrap()
+            .iter()
+            .any(|project| project.name == "fixture")
+    );
+    vault
+        .db
+        .execute_batch("DROP TRIGGER reject_partition; BEGIN IMMEDIATE;")
+        .unwrap();
+    vault.create_project("nested", "").unwrap();
+    vault.db.execute_batch("ROLLBACK;").unwrap();
+    assert!(
+        !vault
+            .list_projects()
+            .unwrap()
+            .iter()
+            .any(|project| project.name == "nested")
+    );
+}
+
+#[test]
 fn add_and_get_credential() {
     let vault = test_vault("pw");
     let cred = vault

@@ -1086,20 +1086,14 @@ impl Vault {
         let _ = self.ensure_unlocked()?;
         let project_id = self.resolve_project_id(project_name)?;
 
-        let exists: bool = self.db.query_row(
-            "SELECT COUNT(*) > 0 FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
-            params![project_id, name],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(VaultError::CredentialNotFound(name.to_string()));
-        }
-
         let new_token = self.generate_wisp_token(name)?;
-        self.db.execute(
+        let changed = self.db.execute(
             "UPDATE credentials SET wisp_token = ?1, updated_at = ?2 WHERE name = ?3 AND partition_id IN (SELECT id FROM partitions WHERE project_id = ?4)",
             params![new_token, Utc::now().to_rfc3339(), name, project_id],
         )?;
+        if changed != 1 {
+            return Err(VaultError::CredentialNotFound(name.to_string()));
+        }
         Ok(new_token)
     }
 
@@ -1152,6 +1146,11 @@ impl Vault {
     /// Creates a new project with the given name and description.
     pub fn create_project(&self, name: &str, description: &str) -> Result<Project> {
         let _ = self.ensure_unlocked()?;
+        let transaction = if self.db.is_autocommit() {
+            Some(self.db.unchecked_transaction()?)
+        } else {
+            None
+        };
 
         let exists: bool = self.db.query_row(
             "SELECT COUNT(*) > 0 FROM projects WHERE name = ?1",
@@ -1179,7 +1178,11 @@ impl Vault {
             ],
         )?;
 
-        self.get_project(name)
+        let project = self.get_project(name)?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(project)
     }
 
     /// Lists all projects, sorted by name.
