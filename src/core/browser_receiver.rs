@@ -217,6 +217,7 @@ mod schema_tests {
             db,
             master_key: Some([1; 32]),
             session_timeout_override: None,
+            _lifecycle_lease: None,
         };
         let mut r = FillRequest {
             request_id: "request".into(),

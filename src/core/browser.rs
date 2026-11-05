@@ -361,6 +361,7 @@ mod tests {
             db,
             master_key: Some([7; 32]),
             session_timeout_override: None,
+            _lifecycle_lease: None,
         };
         create_login(&vault);
         vault
@@ -681,6 +682,7 @@ mod tests {
                         db,
                         master_key: Some([7; 32]),
                         session_timeout_override: None,
+                        _lifecycle_lease: None,
                     };
                     barrier.wait();
                     release(&vault, &request).is_ok()

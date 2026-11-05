@@ -218,9 +218,6 @@ pub async fn handle_backup_restore(
         },
     ) {
         Ok(report) => {
-            if !dry_run {
-                log_restore_event(&target_dir);
-            }
             if json_output() {
                 print_json(serde_json::to_value(&report).expect("restore report serializes"));
                 return;
@@ -274,23 +271,5 @@ pub async fn handle_backup_restore(
             eprintln!("Error: {error}");
             std::process::exit(1);
         }
-    }
-}
-
-fn log_restore_event(target_dir: &std::path::Path) {
-    if let Ok(db) = rusqlite::Connection::open(target_dir.join("vault.db")) {
-        audit::log_event(
-            &db,
-            "VaultBackupRestored",
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            false,
-            None,
-            None,
-        );
     }
 }

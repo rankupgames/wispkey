@@ -763,6 +763,7 @@ mod tests {
             db,
             master_key: Some([42; 32]),
             session_timeout_override: None,
+            _lifecycle_lease: None,
         }
     }
     /// The owner classifies fixtures routine so delegated release reaches the

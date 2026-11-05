@@ -331,6 +331,7 @@ mod tests {
             db,
             master_key: Some([9; 32]),
             session_timeout_override: None,
+            _lifecycle_lease: None,
         }
     }
     fn identity() -> SignupIdentity {
@@ -988,6 +989,7 @@ mod tests {
             db: Connection::open(target.path().join("vault.db")).unwrap(),
             master_key: Some([9; 32]),
             session_timeout_override: None,
+            _lifecycle_lease: None,
         };
         assert!(
             restored
@@ -1050,6 +1052,7 @@ mod tests {
             db: Connection::open(&path).unwrap(),
             master_key: Some([9; 32]),
             session_timeout_override: None,
+            _lifecycle_lease: None,
         };
         let first = open();
         let second = open();

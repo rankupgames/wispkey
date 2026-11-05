@@ -75,6 +75,7 @@ impl Vault {
     pub fn init(password: &str) -> Result<Self> {
         let vault_dir = Self::vault_dir();
         let db_path = Self::db_path();
+        let lifecycle_lease = shared_lifecycle_lease(&vault_dir)?;
 
         if db_path.exists() {
             return Err(VaultError::AlreadyExists(db_path));
@@ -130,6 +131,7 @@ impl Vault {
             db,
             master_key: Some(master_key),
             session_timeout_override: None,
+            _lifecycle_lease: Some(lifecycle_lease),
         };
         vault.write_session()?;
 
@@ -140,6 +142,11 @@ impl Vault {
     /// Opens an existing vault database without loading or verifying a session (locked until [`Self::unlock`]).
     pub fn open() -> Result<Self> {
         let db_path = Self::db_path();
+        let vault_dir = Self::vault_dir();
+        if !vault_dir.exists() {
+            return Err(VaultError::NotFound);
+        }
+        let lifecycle_lease = shared_lifecycle_lease(&vault_dir)?;
         if !db_path.exists() {
             return Err(VaultError::NotFound);
         }
@@ -150,6 +157,7 @@ impl Vault {
             db,
             master_key: None,
             session_timeout_override: None,
+            _lifecycle_lease: Some(lifecycle_lease),
         })
     }
 
@@ -720,6 +728,111 @@ impl Vault {
         super::browser_receiver::create_schema(db)?;
         Ok(())
     }
+}
+
+/// The stable lock file stays outside the set of restored files. Never unlink
+/// it: every cooperating process must lock the same file for the vault lifetime.
+fn open_lifecycle_lock(directory: &Path, create: bool) -> Result<Option<std::fs::File>> {
+    let path = directory.join("lifecycle.lock");
+    if create {
+        secure_files::ensure_private_directory(directory)?;
+        secure_files::create_private_in_existing_directory(&path, b"")?;
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(create);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+        options
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+    }
+    let file = match options.open(&path) {
+        Ok(file) => file,
+        Err(error) if !create && error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if !file.metadata()?.is_file() || !std::fs::symlink_metadata(&path)?.is_file() {
+        return Err(VaultError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "vault lifecycle lock must be a regular file",
+        )));
+    }
+    Ok(Some(file))
+}
+
+pub(crate) fn shared_lifecycle_lease(directory: &Path) -> Result<std::fs::File> {
+    let file = open_lifecycle_lock(directory, true)?.expect("created lifecycle lock");
+    fs2::FileExt::try_lock_shared(&file).map_err(lifecycle_lock_error)?;
+    ensure_no_incomplete_restore(directory)?;
+    Ok(file)
+}
+
+/// Actual restores exclude open Vault handles. Dry-run planning shares an
+/// existing lease with readers and never creates or hardens target state.
+pub(crate) fn restore_lifecycle_lease(
+    directory: &Path,
+    dry_run: bool,
+) -> Result<Option<std::fs::File>> {
+    let file = open_lifecycle_lock(directory, !dry_run)?;
+    if let Some(file) = file.as_ref() {
+        if dry_run {
+            fs2::FileExt::try_lock_shared(file).map_err(lifecycle_lock_error)?;
+        } else {
+            fs2::FileExt::try_lock_exclusive(file).map_err(lifecycle_lock_error)?;
+        }
+    }
+    ensure_no_incomplete_restore(directory)?;
+    Ok(file)
+}
+
+fn lifecycle_lock_error(error: std::io::Error) -> VaultError {
+    if error.raw_os_error() == fs2::lock_contended_error().raw_os_error() {
+        VaultError::Io(std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            "vault lifecycle is busy; close open vault processes before restore",
+        ))
+    } else {
+        error.into()
+    }
+}
+
+pub(crate) fn ensure_no_incomplete_restore(directory: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".wk-restore-")
+            || !entry.file_type()?.is_dir()
+        {
+            continue;
+        }
+        match std::fs::symlink_metadata(entry.path().join("restore-in-progress")) {
+            Ok(_) => {
+                return Err(VaultError::Backup(format!(
+                    "unfinished vault restore requires owner recovery; files retained at {}",
+                    entry.path().display()
+                )));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
 }
 
 fn create_instance_tables(db: &Connection) -> Result<()> {

@@ -746,9 +746,13 @@ impl CloudClient {
     }
 }
 
-pub(super) struct ConfigLock(std::fs::File);
+pub(super) struct ConfigLock {
+    file: std::fs::File,
+    _lifecycle_lease: std::fs::File,
+}
 impl ConfigLock {
     pub(super) fn acquire() -> CloudResult<Self> {
+        let lifecycle = crate::core::shared_lifecycle_lease(&Vault::vault_dir())?;
         let path = Vault::vault_dir().join("cloud-auth.lock");
         secure_files::create_private(&path, b"")?;
         let metadata =
@@ -764,12 +768,15 @@ impl ConfigLock {
             .map_err(|_| invalid("cloud_auth_lock_unavailable"))?;
         fs2::FileExt::try_lock_exclusive(&file)
             .map_err(|_| invalid("cloud_auth_change_in_progress"))?;
-        Ok(Self(file))
+        Ok(Self {
+            file,
+            _lifecycle_lease: lifecycle,
+        })
     }
 }
 impl Drop for ConfigLock {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
+        let _ = fs2::FileExt::unlock(&self.file);
     }
 }
 

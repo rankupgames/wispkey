@@ -38,6 +38,9 @@ pub use existing_login::{
 mod value_update;
 pub use value_update::{MAX_REPLACEMENT_VALUE_BYTES, PreparedValueUpdate};
 mod schema;
+pub(crate) use schema::{
+    ensure_no_incomplete_restore, restore_lifecycle_lease, shared_lifecycle_lease,
+};
 mod session;
 mod session_store;
 pub mod signup;
@@ -380,6 +383,9 @@ pub struct Vault {
     db: Connection,
     master_key: Option<[u8; 32]>,
     session_timeout_override: Option<i64>,
+    // Declared after db so the connection closes before restore can acquire
+    // exclusive access. Unbacked internal fixtures do not need a file lease.
+    _lifecycle_lease: Option<fs::File>,
 }
 
 impl Vault {

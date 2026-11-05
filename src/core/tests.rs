@@ -44,6 +44,7 @@ fn test_vault(password: &str) -> Vault {
         db,
         master_key: Some(master_key),
         session_timeout_override: None,
+        _lifecycle_lease: None,
     }
 }
 

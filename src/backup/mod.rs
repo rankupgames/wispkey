@@ -72,6 +72,7 @@ const PROTECTED_VAULT_OUTPUT_NAMES: &[&str] = &[
     "proxy.json",
     "owner.sock",
     "owner.json",
+    "lifecycle.lock",
     SIDECAR_POLICIES,
     SIDECAR_CLOUD,
     SIDECAR_CLOUD_MANIFESTS,

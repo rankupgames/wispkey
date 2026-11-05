@@ -4,6 +4,10 @@ use crate::core::{Vault, VaultError};
 use super::shared::{json_output, print_json, prompt_password_confirm, read_unlock_password};
 
 pub async fn handle_init() {
+    if let Err(error) = crate::core::ensure_no_incomplete_restore(&Vault::vault_dir()) {
+        eprintln!("Error: {error}");
+        std::process::exit(1);
+    }
     if Vault::exists() {
         eprintln!(
             "Error: vault already exists at {}",
