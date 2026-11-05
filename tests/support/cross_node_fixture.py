@@ -5,12 +5,14 @@ Requires Docker, kind 0.33+, ssh-keygen, Python 3.10+, and the Rust toolchain.
 No existing cluster/context, vault, SSH config, or provider credentials are used.
 """
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -79,6 +81,20 @@ def write(path, data, mode=0o600):
     path.chmod(mode)
 
 
+@contextmanager
+def termination_scope():
+    """Unwind owned-resource cleanup on SIGTERM and restore the caller's handler."""
+    def terminate(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
+
+
 def main():
     if os.name != "posix":
         raise RuntimeError("run this fixture on Linux (WSL is supported)")
@@ -97,7 +113,7 @@ def main():
     # kind cannot place its nodes in the shared queue's cgroup; never start an unbounded CI cluster.
     if "CI_BUDGET_CGROUP" in os.environ:
         raise RuntimeError("kind cannot honor CI_BUDGET_CGROUP; cross-node CI requires an approved bounded route")
-    with tempfile.TemporaryDirectory(prefix="wk-cross-node-") as directory:
+    with termination_scope(), tempfile.TemporaryDirectory(prefix="wk-cross-node-") as directory:
         scratch = Path(directory)
         try:
             print("Building the restricted operation helper...", flush=True)
@@ -236,8 +252,16 @@ apiServer:
             accepted = run(["docker","exec",ssh_container,"cat","/var/lib/wispkey-helper/accepted"])
             if accepted != b"accepted\n":
                 raise RuntimeError("SSH helper did not execute exactly once")
+            revoked = json.loads(kubectl("get", "secret", "selected", "-n", "wk-acceptance", "-o", "json"))
+            if (revoked["metadata"]["resourceVersion"] == secret["metadata"]["resourceVersion"]
+                    or revoked["metadata"]["uid"] != secret["metadata"]["uid"]
+                    or revoked["data"] != secret["data"]
+                    or revoked["metadata"]["annotations"]["owner"] != "preserved"):
+                raise RuntimeError("Kubernetes delivery/revocation did not preserve the selected Secret")
             for argv in [["docker","logs",ssh_container],["docker","logs",node]]:
                 result = subprocess.run(argv, capture_output=True)
+                if result.returncode:
+                    raise RuntimeError("container log collection failed")
                 if SECRET in result.stdout + result.stderr:
                     raise RuntimeError("synthetic credential appeared in container logs")
             print("PASS: pinned SSH, replay rejection, signed Kubernetes delivery/revocation, narrow RBAC, encrypted etcd.", flush=True)

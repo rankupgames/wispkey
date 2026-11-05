@@ -21,21 +21,34 @@ if [[ -n "${CI_BUDGET_CGROUP+set}" ]]; then
     placement=(--cgroup-parent "${CI_BUDGET_CGROUP#/}")
 fi
 scratch="$(mktemp -d)"
-created=0
 cleanup() {
-    if [[ "$created" == 1 ]]; then
-        "$engine" rm -f -v "$name" >/dev/null 2>&1 || true
+    local status=$? container
+    if [[ -f "$scratch/container.cid" ]]; then
+        container="$(cat "$scratch/container.cid")"
+        if [[ ! "$container" =~ ^[a-f0-9]{64}$ ]] || ! "$engine" rm -f -v "$container" >/dev/null 2>&1; then
+            echo "PostgreSQL fixture cleanup failed; owned resource evidence remains in $scratch" >&2
+            if [[ "$status" == 0 ]]; then status=1; fi
+            exit "$status"
+        fi
     fi
-    if [[ -n "$scratch" && "$scratch" == /tmp/* ]]; then
-        rm -rf -- "$scratch"
-    fi
+    # mktemp created this exact directory, including when TMPDIR is customized.
+    rm -rf -- "$scratch"
+    exit "$status"
 }
 trap cleanup EXIT
 
-"$engine" run -d --name "$name" ${placement[@]+"${placement[@]}"} -p 127.0.0.1::5432 \
+"$engine" create --cidfile "$scratch/container.cid" --name "$name" ${placement[@]+"${placement[@]}"} -p 127.0.0.1::5432 \
     -e POSTGRES_PASSWORD=synthetic_admin_password_9214 \
+    -e POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 \
     docker.io/library/postgres@sha256:5a5a84b19854a9ffaa54082c166ff4ec27473a361e496e5ea167f298f2da9722 >/dev/null
-created=1
+container="$(cat "$scratch/container.cid")"
+if [[ ! "$container" =~ ^[a-f0-9]{64}$ ]]; then
+    echo 'fixture container ID is invalid' >&2
+    exit 1
+fi
+"$engine" start "$container" >/dev/null
+# Use the recorded ID for all later commands, including cleanup.
+name="$container"
 for _ in $(seq 1 60); do
     if "$engine" exec -u postgres "$name" pg_isready -U postgres >/dev/null 2>&1; then
         break
@@ -121,13 +134,16 @@ else
     export WISPKEY_TEST_PG_CA="$scratch/ca.pem"
     export WISPKEY_TEST_PG_FUNCTION_OID="${function_identity%%,*}"
     export WISPKEY_TEST_PG_FUNCTION_HASH="${function_identity#*,}"
-    cargo test --lib operations::postgres::tests::disposable_postgres_tls_rotation -- --ignored
-    test "$("$engine" exec -u postgres "$name" psql -U postgres -d appdb -Atc 'SELECT marker FROM public.fixture_marker')" = preserved-row
-    if "$engine" logs "$name" 2>&1 | grep -Fq 'synthetic_new_password_9214'; then
+    cargo test --locked --lib operations::postgres::tests::disposable_postgres_tls_rotation -- --ignored --exact
+    # Authenticate over TCP with the new password, so a zero-test Cargo run cannot pass.
+    test "$("$engine" exec -e PGPASSWORD=synthetic_new_password_9214 -e PGSSLMODE=require "$name" \
+        psql -w -h 127.0.0.1 -U appuser -d appdb -Atc 'SELECT marker FROM public.fixture_marker')" = preserved-row
+    "$engine" logs "$name" >"$scratch/postgres.log" 2>&1
+    if grep -Fq 'synthetic_new_password_9214' "$scratch/postgres.log"; then
         echo 'synthetic password appeared in PostgreSQL logs' >&2
         exit 1
     fi
-    if "$engine" logs "$name" 2>&1 | grep -Fq 'fail_synthetic_canary_9214'; then
+    if grep -Fq 'fail_synthetic_canary_9214' "$scratch/postgres.log"; then
         echo 'synthetic failure canary appeared in PostgreSQL logs' >&2
         exit 1
     fi
