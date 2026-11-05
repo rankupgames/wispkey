@@ -9,7 +9,7 @@ WispKey never accepts the vault master password as a command-line argument. Head
    - Windows Credential Manager
 2. **Bounded local protector (Linux default and universal fallback)** -- when the OS store is unavailable or not compiled in, WispKey writes a machine-bound encrypted `session-protector` file next to the vault (`WISPKEY_PROTECTOR=auto` or `file`). Linux builds keep this file path so the binary does not require D-Bus or libsecret.
 3. **Current session** -- `~/.wispkey/session` remains the short-lived unlocked state (default 30 minutes). Commands use this file; they do not re-read the master password.
-4. **Owner-only password file** -- `wispkey unlock --password-file ~/.wispkey/master.pass` for first authorization or recovery. The file must be owner-only on Unix (mode `0600`).
+4. **Owner-only password file** -- `wispkey unlock --password-file ~/.wispkey/master.pass` for first authorization or recovery. The file must be owner-only: mode `0600` on Unix or a restricted current-user ACL on Windows. Reading an unsafe file fails without changing its permissions.
 5. **`WISPKEY_PASSWORD`** -- still supported for trusted local automation. Do not put it in guest environments, URLs, repository files, or process arguments.
 
 `wispkey lock` revokes the current session immediately. `wispkey lock --forget` also deletes the remembered protector so later unlocks require the master password again.

@@ -93,7 +93,8 @@ token's shape or the local config, remains the authorization authority.
 ## Local storage and migration
 
 Credentials remain in the existing owner-only `cloud.json` file (0600 on Unix,
-restricted ACL on Windows), written atomically. This preview does not use an
+restricted ACL on Windows), written atomically. Unsafe existing permissions are
+rejected without repair; the owner must restrict the file before retrying. This preview does not use an
 OS keychain. The existing `clerk_session_token` field now contains the OAuth
 access bearer; the historical `access_token` input alias still parses.
 `oauth_session` pins issuer, client, API origin, resource, verified user, token
