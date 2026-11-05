@@ -5,6 +5,7 @@ use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
+use super::operation_session::OWNER_CONFIRMATION_FAILED;
 use super::{Result, Vault, VaultError};
 
 pub(crate) const ACCESS_RING_POLICY_KEY: &str = "access_ring_policy";
@@ -145,6 +146,22 @@ impl Vault {
         ring: AccessRing,
         owner_password: Option<&str>,
     ) -> Result<AccessRing> {
+        self.ensure_access_ring_policy()?;
+        let reviewed_credential = self.get_credential_in_project(project, name)?;
+        let reviewed_ring = self.explicit_access_ring(&reviewed_credential.id)?;
+        let confirmation = if reviewed_ring != Some(ring)
+            && ring < reviewed_ring.unwrap_or(AccessRing::Restricted)
+        {
+            let password = owner_password.ok_or(rejected(
+                "broadening an access ring requires owner password",
+            ))?;
+            Some(
+                self.confirm_operation_owner_password(password)
+                    .map_err(rejected)?,
+            )
+        } else {
+            None
+        };
         let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
         self.ensure_access_ring_policy()?;
         let credential = self.get_credential_in_project(project, name)?;
@@ -152,18 +169,45 @@ impl Vault {
         if self.explicit_access_ring(&credential.id)? == Some(ring) {
             return Ok(previous);
         }
-        if ring < previous {
-            let password = owner_password.ok_or(rejected(
+        let store = super::session_store::session_store();
+        let _session_guard = if ring < previous {
+            let proof = confirmation.as_ref().ok_or(rejected(
                 "broadening an access ring requires owner password",
             ))?;
-            self.verify_operation_owner_password(password)
-                .map_err(rejected)?;
-        }
+            if credential.id != reviewed_credential.id
+                || credential.updated_at != reviewed_credential.updated_at
+                || self.explicit_access_ring(&credential.id)? != reviewed_ring
+            {
+                return Err(rejected("access ring changed during owner confirmation"));
+            }
+            let guard = store
+                .lock()
+                .map_err(|_| rejected(OWNER_CONFIRMATION_FAILED))?;
+            self.revalidate_owner_password_confirmation(
+                proof,
+                store
+                    .load_locked()
+                    .map_err(|_| rejected(OWNER_CONFIRMATION_FAILED))?,
+            )
+            .map_err(rejected)?;
+            Some(guard)
+        } else {
+            None
+        };
         self.db.execute(
             "UPDATE credentials SET access_ring=?1, updated_at=?2 WHERE id=?3",
             params![ring.as_str(), Utc::now().to_rfc3339(), credential.id],
         )?;
         self.log_access_ring_change(&credential.name, previous.as_str(), ring.as_str(), project)?;
+        if let Some(proof) = confirmation.as_ref().filter(|_| ring < previous) {
+            self.revalidate_owner_password_confirmation(
+                proof,
+                store
+                    .load_locked()
+                    .map_err(|_| rejected(OWNER_CONFIRMATION_FAILED))?,
+            )
+            .map_err(rejected)?;
+        }
         tx.commit()?;
         Ok(previous)
     }

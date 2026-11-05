@@ -84,6 +84,9 @@ impl Vault {
         let transaction =
             rusqlite::Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)
                 .map_err(|_| WebhookDenial::Unavailable)?;
+        let session = self
+            .pin_current_session()
+            .map_err(|_| WebhookDenial::Unavailable)?;
         let signing = self.authorized_signing_credential(instance, credential_id, project_scope)?;
 
         let result = if !webhook.is_fresh_at(chrono::Utc::now().timestamp()) {
@@ -134,6 +137,9 @@ impl Vault {
             None,
         )
         .map_err(|_| WebhookDenial::Unavailable)?;
+        session
+            .validate(self)
+            .map_err(|_| WebhookDenial::Unavailable)?;
         transaction
             .commit()
             .map_err(|_| WebhookDenial::Unavailable)?;

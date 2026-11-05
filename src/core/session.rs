@@ -4,10 +4,60 @@ use chrono::{DateTime, Utc};
 use crate::audit;
 
 use super::protector::{self, ProtectorBackend, ProtectorStatus};
-use super::session_store::{SessionStore, session_store, validate_timeout_minutes};
+use super::session_store::{
+    SessionFileStore, SessionGuard, SessionRecord, SessionStore, session_store,
+    validate_timeout_minutes,
+};
 use super::{Result, Vault, VaultError};
 
+/// Pins the current session through a synchronous release or acknowledgement.
+/// Timeout-zero sessions remain valid; finite operation grants use their own binding.
+pub(crate) struct SessionPin {
+    store: SessionFileStore,
+    _guard: SessionGuard,
+    issued_at: DateTime<Utc>,
+    timeout_minutes: i64,
+}
+
+impl SessionPin {
+    pub(crate) fn validate(&self, vault: &Vault) -> Result<()> {
+        let record = self.store.load_locked()?;
+        validate_session_key(vault, &record)?;
+        if record.issued_at != self.issued_at || record.timeout_minutes != self.timeout_minutes {
+            return Err(VaultError::SessionInvalid);
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn validate_session_key(vault: &Vault, record: &SessionRecord) -> Result<()> {
+    let domain = b"wispkey-operation-session-key-check-v1";
+    let expected = ring::hmac::sign(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, vault.ensure_unlocked()?),
+        domain,
+    );
+    ring::hmac::verify(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &record.key),
+        domain,
+        expected.as_ref(),
+    )
+    .map_err(|_| VaultError::SessionInvalid)
+}
+
 impl Vault {
+    /// Acquire only after the database reservation to preserve lock order.
+    pub(crate) fn pin_current_session(&self) -> Result<SessionPin> {
+        let store = session_store();
+        let guard = store.lock()?;
+        let record = store.load_locked()?;
+        validate_session_key(self, &record)?;
+        Ok(SessionPin {
+            store,
+            _guard: guard,
+            issued_at: record.issued_at,
+            timeout_minutes: record.timeout_minutes,
+        })
+    }
     /// Unlocks with the master password using the default session timeout from env.
     #[allow(dead_code)]
     pub fn unlock(&mut self, password: &str) -> Result<()> {

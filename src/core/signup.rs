@@ -624,6 +624,28 @@ mod tests {
 
     #[test]
     fn signup_port_scoped_auth_survives_export_and_browser_release() {
+        if std::env::var_os("WISPKEY_SIGNUP_BROWSER_TEST").is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "core::signup::tests::signup_port_scoped_auth_survives_export_and_browser_release",
+                    "--nocapture",
+                ])
+                .env("WISPKEY_SIGNUP_BROWSER_TEST", "1")
+                .env("WISPKEY_VAULT_PATH", directory.path())
+                .env("WISPKEY_PROTECTOR", "file")
+                .env("WISPKEY_SESSION_TIMEOUT", "30")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         use crate::core::auth::{AuthRegistration, ProviderExpiry};
         let source = vault();
         let profile = create(&source);
@@ -651,6 +673,7 @@ mod tests {
         crate::sharing::export_project(&source, "default", PASSPHRASE, path).unwrap();
         let mut restored = vault();
         restored.master_key = Some([8; 32]);
+        restored.write_session().unwrap();
         crate::sharing::import_project(&restored, path, PASSPHRASE).unwrap();
         assert_eq!(
             restored
