@@ -473,6 +473,12 @@ fn add_credential_response(params: &Value) -> Result<Value, Value> {
         params.get("param_name").and_then(Value::as_str),
     )
     .map_err(vault_error)?;
+    if credential_type == CredentialType::WebsiteLogin {
+        return Err(error_body(
+            "invalid_input",
+            "website_login credentials must be created with generate_login",
+        ));
+    }
     let description = optional_string(params, "description");
     let hosts = optional_string(params, "hosts");
     let tags = optional_string(params, "tags");

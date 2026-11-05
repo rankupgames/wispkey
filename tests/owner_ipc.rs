@@ -564,6 +564,26 @@ async fn owner_ipc_adds_one_credential_without_returning_secret() {
             .get("wisp_token")
             .is_none()
     );
+
+    let invalid_login = owner_call(
+        dir.path(),
+        json!({"id":"invalid-login", "method":"add_credential", "params":{
+            "name":"unstructured-login", "type":"website_login",
+            "value":"synthetic-unstructured-login", "destination_confirmed":true
+        }}),
+    )
+    .await;
+    assert_eq!(invalid_login["ok"], false, "{invalid_login}");
+    assert_eq!(invalid_login["error"]["code"], "invalid_input");
+    let db = rusqlite::Connection::open(dir.path().join("vault.db")).unwrap();
+    let stored: i64 = db
+        .query_row(
+            "SELECT count(*) FROM credentials WHERE name='unstructured-login'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, 0);
 }
 
 #[tokio::test]
