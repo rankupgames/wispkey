@@ -104,11 +104,8 @@ fn repository(create_identity: bool) -> Result<Repository> {
     // common path additionally prevents copied markers in independent clones.
     let marker = common.join("wispkey-repository-id");
     if create_identity && !marker.exists() {
-        secure_files::create_private_in_existing_directory(
-            &marker,
-            uuid::Uuid::new_v4().to_string().as_bytes(),
-        )
-        .map_err(|_| "cannot establish repository identity")?;
+        secure_files::publish_private(&marker, uuid::Uuid::new_v4().to_string().as_bytes())
+            .map_err(|_| "cannot establish repository identity")?;
     }
     let repository_id = secure_files::read_private_string(&marker, 128)
         .map_err(|_| "repository is not bound; use wispkey env bind or explicit --manifest")?;
@@ -205,10 +202,10 @@ fn validate_manifest(manifest: &Manifest) -> Result<()> {
         }
     }
     for name in &manifest.worktree.overrides {
-        if !manifest
+        if manifest
             .env
             .get(name)
-            .is_some_and(|value| !value.starts_with("cred:"))
+            .is_none_or(|value| value.starts_with("cred:"))
         {
             return Err("worktree overrides must name existing non-credential settings");
         }
@@ -421,20 +418,16 @@ fn bind(project: &str, environment: &str, manifest: &str, replace: bool) -> Resu
     let path = binding_path(&repo.identity);
     if replace {
         // Atomic replacement prevents readers from seeing a partially written snapshot.
-        let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-        if !secure_files::create_private(&temporary, &bytes)
-            .map_err(|_| "cannot stage repository binding")?
+        secure_files::replace_private(&path, &bytes)
+            .map_err(|_| "cannot replace repository binding")?;
+    } else {
+        secure_files::ensure_private_directory(path.parent().ok_or("invalid binding path")?)
+            .map_err(|_| "cannot create binding directory")?;
+        if !secure_files::publish_private(&path, &bytes)
+            .map_err(|_| "cannot save repository binding")?
         {
-            return Err("cannot stage repository binding");
+            return Err("repository already bound; use --replace explicitly");
         }
-        if fs::rename(&temporary, &path).is_err() {
-            let _ = fs::remove_file(&temporary);
-            return Err("cannot replace repository binding");
-        }
-    } else if !secure_files::create_private(&path, &bytes)
-        .map_err(|_| "cannot save repository binding")?
-    {
-        return Err("repository already bound; use --replace explicitly");
     }
     Ok(())
 }

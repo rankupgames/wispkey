@@ -1409,8 +1409,7 @@ pub fn resolve_active_project() -> String {
 pub fn set_active_project(name: &str) -> Result<()> {
     let vault_dir = Vault::vault_dir();
     secure_files::ensure_private_directory(&vault_dir)?;
-    fs::write(vault_dir.join("active_project"), name)?;
-    Ok(())
+    secure_files::replace_private(&vault_dir.join("active_project"), name.as_bytes())
 }
 
 /// Returns the exact HTTPS origin (`https://host[:port]`) for website-login policy binding.
