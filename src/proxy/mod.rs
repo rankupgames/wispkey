@@ -430,13 +430,13 @@ async fn handle_request(
 
     let target_host = extract_target_host(&uri, &headers);
 
-    let vault = Vault::open_with_session().ok();
-
     let (parts, body) = req.into_parts();
     let body_bytes = match collect_limited_body(body).await {
         Ok(bytes) => bytes,
         Err(response) => return Ok(*response),
     };
+    // Upload can outlive the session that admitted the request.
+    let vault = Vault::open_with_session().ok();
 
     let mut new_headers = parts.headers.clone();
     let mut new_body = body_bytes.to_vec();
@@ -659,13 +659,12 @@ async fn handle_reverse_proxy(
 
     let target_host = target_uri.host().unwrap_or("unknown").to_string();
 
-    let vault = Vault::open_with_session().ok();
-
     let (parts, body) = req.into_parts();
     let body_bytes = match collect_limited_body(body).await {
         Ok(bytes) => bytes,
         Err(response) => return *response,
     };
+    let vault = Vault::open_with_session().ok();
 
     let mut new_headers = parts.headers.clone();
     new_headers.remove("x-target-url");

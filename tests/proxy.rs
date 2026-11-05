@@ -21,6 +21,67 @@ fn start_proxy(vault_dir: &std::path::Path) -> (ChildGuard, u16) {
 }
 
 #[test]
+fn lock_during_upload_prevents_forward_and_reverse_substitution() {
+    use std::io::{BufRead, BufReader};
+    use std::time::Duration;
+    for reverse in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        init_vault(dir.path());
+        let credential = run_wispkey_json(
+            dir.path(),
+            &[
+                "--format",
+                "json",
+                "add",
+                "upload",
+                "--ring",
+                "routine",
+                "--value",
+                "synthetic-upload-secret",
+                "--hosts",
+                "127.0.0.1",
+            ],
+        );
+        let token = credential["credential"]["wisp_token"].as_str().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/upload", upstream.local_addr().unwrap());
+        let (_proxy, port) = start_proxy(dir.path());
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let destination = if reverse { "/upload" } else { &target };
+        let target_header = if reverse {
+            format!("X-Target-Url: {target}\r\n")
+        } else {
+            String::new()
+        };
+        let head = format!(
+            "POST {destination} HTTP/1.1\r\nHost: 127.0.0.1\r\n{target_header}Content-Type: text/plain\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+            token.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "HTTP/1.1 100 Continue\r\n");
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "\r\n");
+        assert!(run_wispkey(dir.path(), &["lock"]).status.success());
+        stream.write_all(token.as_bytes()).unwrap();
+        let mut response = String::new();
+        reader.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert_eq!(
+            upstream.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
 fn proxy_refuses_generic_website_login_token_substitution() {
     let vault_dir = tempfile::tempdir().expect("temp vault dir");
     init_vault(vault_dir.path());
