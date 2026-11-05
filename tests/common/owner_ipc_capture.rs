@@ -77,6 +77,7 @@ fn safe_record(bytes: &[u8], expected_pid: u32) -> Option<String> {
             "pending"
                 | "unknown"
                 | "status"
+                | "initialize"
                 | "unlock"
                 | "lock"
                 | "list_credentials"

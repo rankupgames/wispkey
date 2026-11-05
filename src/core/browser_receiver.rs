@@ -64,15 +64,12 @@ fn is_bound(vault: &Vault, request: &FillRequest) -> Result<bool> {
     }
 }
 
-pub(super) fn release_guard(
-    vault: &Vault,
-    request: &FillRequest,
-) -> Result<Option<super::session_store::SessionGuard>> {
+pub(super) fn validate_release(vault: &Vault, request: &FillRequest) -> Result<()> {
     if !is_bound(vault, request)? {
-        return Ok(None);
+        return Ok(());
     }
     #[cfg(feature = "experimental-browser-receiver")]
-    return enabled::release_guard(vault, request).map(Some);
+    return enabled::validate_release(vault, request);
     #[cfg(not(feature = "experimental-browser-receiver"))]
     {
         let _ = vault;
@@ -217,6 +214,7 @@ mod schema_tests {
             db,
             master_key: Some([1; 32]),
             session_timeout_override: None,
+            _lifecycle_lease: None,
         };
         let mut r = FillRequest {
             request_id: "request".into(),
@@ -233,11 +231,11 @@ mod schema_tests {
         };
         v.db().execute("INSERT INTO browser_receiver_jobs VALUES('request','binding','job','{}','queued',?1)",[i64::MAX]).unwrap();
         assert!(matches!(
-            release_guard(&v, &r),
+            validate_release(&v, &r),
             Err("browser receiver is disabled")
         ));
         assert!(approval_details(&v, &r).is_err());
         r.receiver_binding = None;
-        assert!(release_guard(&v, &r).is_err());
+        assert!(validate_release(&v, &r).is_err());
     }
 }

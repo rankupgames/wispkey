@@ -135,7 +135,7 @@ impl PreparedValueUpdate<'_> {
     }
 }
 
-fn validate_value(kind: &CredentialType, value: &str) -> Result<()> {
+pub(super) fn validate_value(kind: &CredentialType, value: &str) -> Result<()> {
     if value.is_empty() || value.len() > MAX_REPLACEMENT_VALUE_BYTES || value.contains('\0') {
         return Err(rejected(
             "replacement must contain 1 to 1048576 UTF-8 bytes without NUL",

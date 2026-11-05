@@ -324,12 +324,14 @@ mod tests {
     fn vault() -> Vault {
         let db = Connection::open_in_memory().unwrap();
         Vault::create_schema(&db).unwrap();
+        crate::core::access_ring::insert_access_ring_policy(&db).unwrap();
         db.execute("INSERT INTO projects VALUES ('default','default','','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", []).unwrap();
         db.execute("INSERT INTO partitions VALUES ('personal','personal','','default','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')", []).unwrap();
         Vault {
             db,
             master_key: Some([9; 32]),
             session_timeout_override: None,
+            _lifecycle_lease: None,
         }
     }
     fn identity() -> SignupIdentity {
@@ -622,6 +624,28 @@ mod tests {
 
     #[test]
     fn signup_port_scoped_auth_survives_export_and_browser_release() {
+        if std::env::var_os("WISPKEY_SIGNUP_BROWSER_TEST").is_none() {
+            let directory = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "core::signup::tests::signup_port_scoped_auth_survives_export_and_browser_release",
+                    "--nocapture",
+                ])
+                .env("WISPKEY_SIGNUP_BROWSER_TEST", "1")
+                .env("WISPKEY_VAULT_PATH", directory.path())
+                .env("WISPKEY_PROTECTOR", "file")
+                .env("WISPKEY_SESSION_TIMEOUT", "30")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
         use crate::core::auth::{AuthRegistration, ProviderExpiry};
         let source = vault();
         let profile = create(&source);
@@ -649,6 +673,7 @@ mod tests {
         crate::sharing::export_project(&source, "default", PASSPHRASE, path).unwrap();
         let mut restored = vault();
         restored.master_key = Some([8; 32]);
+        restored.write_session().unwrap();
         crate::sharing::import_project(&restored, path, PASSPHRASE).unwrap();
         assert_eq!(
             restored
@@ -723,7 +748,7 @@ mod tests {
             .cloud_snapshot("default", "personal")
             .unwrap()
             .unwrap();
-        assert_eq!(snapshot.version, 3);
+        assert_eq!(snapshot.version, 4);
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("sync");
         let path = path.to_str().unwrap();
@@ -770,7 +795,7 @@ mod tests {
             .cloud_snapshot("default", "personal")
             .unwrap()
             .unwrap();
-        assert_eq!(deletion.version, 3);
+        assert_eq!(deletion.version, 4);
         destination
             .cloud_apply(&deletion, Some(&hash(&destination)), None)
             .unwrap();
@@ -846,7 +871,7 @@ mod tests {
             }
             let mut document: serde_json::Value =
                 crate::bundle::read_encrypted_payload(magic, path, PASSPHRASE).unwrap();
-            assert_eq!(document["version"], 3);
+            assert_eq!(document["version"], 4);
             let destination = vault();
             let import = |v: &Vault| {
                 if partition {
@@ -987,6 +1012,7 @@ mod tests {
             db: Connection::open(target.path().join("vault.db")).unwrap(),
             master_key: Some([9; 32]),
             session_timeout_override: None,
+            _lifecycle_lease: None,
         };
         assert!(
             restored
@@ -1021,7 +1047,15 @@ mod tests {
                 .cloud_snapshot("default", "personal")
                 .unwrap()
                 .unwrap();
-            assert_eq!(legacy.version, 1);
+            assert_eq!(legacy.version, if has_login { 4 } else { 1 });
+            // Model a historical v1 peer, without today's ring metadata. The
+            // managed-profile tombstone must still reject this valid old format.
+            let mut historical = serde_json::to_value(&legacy).unwrap();
+            historical["version"] = serde_json::json!(1);
+            for credential in historical["credentials"].as_array_mut().unwrap() {
+                credential.as_object_mut().unwrap().remove("access_ring");
+            }
+            let legacy = serde_json::from_value(historical).unwrap();
             assert!(restored.cloud_apply(&legacy, Some(&before), None).is_err());
             assert_eq!(hash(&restored), before);
         }
@@ -1041,6 +1075,7 @@ mod tests {
             db: Connection::open(&path).unwrap(),
             master_key: Some([9; 32]),
             session_timeout_override: None,
+            _lifecycle_lease: None,
         };
         let first = open();
         let second = open();

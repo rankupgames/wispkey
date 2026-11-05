@@ -1,6 +1,7 @@
 //! Durable, metadata-only grants for approved cross-node operations.
 //! The caller that issues a grant must be the authenticated local owner; grant IDs
-//! are references, not bearer credentials. No function here decrypts a secret.
+//! are references, not bearer credentials. Grant-aware release decrypts only
+//! into executor memory after current authority and one-use checks.
 
 use argon2::{Argon2, PasswordVerifier};
 use chrono::{DateTime, Duration, Utc};
@@ -353,67 +354,23 @@ fn delivery_revision_with_session(
         .collect())
 }
 
-/// The sole grant-aware plaintext release for an SSH operation. The caller
-/// must send the returned bytes only to the fixed helper's private stdin.
+/// One-time release of the selected operation credential. The caller must
+/// use the bytes only in the approved helper or provider adapter.
 pub fn decrypt_reserved(
     vault: &Vault,
     requester: &AuthenticatedRequester,
     attempt: &AttemptStatus,
     binding: &OperationBinding,
 ) -> GrantResult<Vec<u8>> {
-    let session = vault
-        .operation_session_binding()
-        .map_err(|_| "session unavailable")?;
-    let tx = vault
-        .db()
-        .unchecked_transaction()
-        .map_err(|_| "operation store unavailable")?;
-    validate_live(&tx, requester, attempt, binding, &session)?;
-    let changed = tx.execute(
-        "UPDATE operation_attempts SET secret_released=1 WHERE id=?1 AND state='started' AND cancel_requested=0 AND secret_released=0",
-        [attempt.attempt_id.as_str()],
-    ).map_err(|_| "operation store unavailable")?;
-    if changed != 1 {
-        return Err("attempt unavailable");
-    }
-    let encoded: String = tx
-        .query_row(
-            "SELECT c.encrypted_value FROM credentials c JOIN partitions p ON p.id=c.partition_id WHERE c.id=?1 AND p.project_id=?2",
-            params![binding.credential_id,binding.project_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| "credential unavailable")?;
-    vault
-        .ensure_auth_usable(&binding.credential_id, true, None)
-        .map_err(|_| "auth unavailable")?;
-    let ciphertext = vault
-        .decode_auth_ciphertext(&binding.credential_id, &encoded)
-        .map_err(|_| "credential unavailable")?;
-    let key = vault.ensure_unlocked().map_err(|_| "session unavailable")?;
-    let mut plaintext = vault
-        .decrypt_bytes(key, &ciphertext)
-        .map_err(|_| "credential unavailable")?;
-    if vault
-        .ensure_auth_usable(&binding.credential_id, true, None)
-        .is_err()
-    {
-        plaintext.fill(0);
-        return Err("auth unavailable");
-    }
-    let renewed = vault
-        .operation_session_binding()
-        .map_err(|_| "session unavailable");
-    if !renewed.is_ok_and(|current| {
-        current.revision == session.revision && current.expires_at > Utc::now()
-    }) {
-        plaintext.fill(0);
-        return Err("session unavailable");
-    }
-    if tx.commit().is_err() {
-        plaintext.fill(0);
-        return Err("operation store unavailable");
-    }
-    Ok(plaintext)
+    release_once(
+        vault,
+        requester,
+        attempt,
+        binding,
+        &binding.credential_id,
+        &binding.project_id,
+        ReleaseRole::Reserved,
+    )
 }
 
 /// One-time release of the separately bound provider credential. The adapter
@@ -430,57 +387,15 @@ pub fn decrypt_provider(
     ) else {
         return Err("provider credential unavailable");
     };
-    let session = vault
-        .operation_session_binding()
-        .map_err(|_| "session unavailable")?;
-    let tx = vault
-        .db()
-        .unchecked_transaction()
-        .map_err(|_| "operation store unavailable")?;
-    validate_live(&tx, requester, attempt, binding, &session)?;
-    let changed = tx.execute(
-        "UPDATE operation_attempts SET provider_released=1 WHERE id=?1 AND state='started' AND cancel_requested=0 AND provider_released=0",
-        [attempt.attempt_id.as_str()],
-    ).map_err(|_| "operation store unavailable")?;
-    if changed != 1 {
-        return Err("provider credential unavailable");
-    }
-    let encoded: String = tx.query_row(
-        "SELECT c.encrypted_value FROM credentials c JOIN partitions p ON p.id=c.partition_id WHERE c.id=?1 AND p.project_id=?2",
-        params![provider_credential, provider_project],
-        |row| row.get(0),
-    ).map_err(|_| "provider credential unavailable")?;
-    vault
-        .ensure_auth_usable(provider_credential, true, None)
-        .map_err(|_| "auth unavailable")?;
-    let ciphertext = vault
-        .decode_auth_ciphertext(provider_credential, &encoded)
-        .map_err(|_| "credential unavailable")?;
-    let key = vault.ensure_unlocked().map_err(|_| "session unavailable")?;
-    let mut plaintext = vault
-        .decrypt_bytes(key, &ciphertext)
-        .map_err(|_| "provider credential unavailable")?;
-    if vault
-        .ensure_auth_usable(provider_credential, true, None)
-        .is_err()
-    {
-        plaintext.fill(0);
-        return Err("auth unavailable");
-    }
-    let renewed = vault
-        .operation_session_binding()
-        .map_err(|_| "session unavailable");
-    if !renewed.is_ok_and(|current| {
-        current.revision == session.revision && current.expires_at > Utc::now()
-    }) {
-        plaintext.fill(0);
-        return Err("session unavailable");
-    }
-    if tx.commit().is_err() {
-        plaintext.fill(0);
-        return Err("operation store unavailable");
-    }
-    Ok(plaintext)
+    release_once(
+        vault,
+        requester,
+        attempt,
+        binding,
+        provider_credential,
+        provider_project,
+        ReleaseRole::Provider,
+    )
 }
 
 /// One-time release of the exact prior password for a separately approved
@@ -495,46 +410,92 @@ pub fn decrypt_previous(
     let Some(old_id) = &binding.old_password_credential_id else {
         return Err("previous credential unavailable");
     };
-    let session = vault
-        .operation_session_binding()
+    release_once(
+        vault,
+        requester,
+        attempt,
+        binding,
+        old_id,
+        &binding.project_id,
+        ReleaseRole::Previous,
+    )
+}
+
+enum ReleaseRole {
+    Reserved,
+    Provider,
+    Previous,
+}
+
+// Each role owns a separate one-use flag. Keep the flag write, release guards
+// and session recheck in one transaction so every failed release rolls it back.
+fn release_once(
+    vault: &Vault,
+    requester: &AuthenticatedRequester,
+    attempt: &AttemptStatus,
+    binding: &OperationBinding,
+    credential: &str,
+    project: &str,
+    role: ReleaseRole,
+) -> GrantResult<Vec<u8>> {
+    let (release_sql, unavailable, already_released) = match role {
+        ReleaseRole::Reserved => (
+            "UPDATE operation_attempts SET secret_released=1 WHERE id=?1 AND state='started' AND cancel_requested=0 AND secret_released=0",
+            "credential unavailable",
+            "attempt unavailable",
+        ),
+        ReleaseRole::Provider => (
+            "UPDATE operation_attempts SET provider_released=1 WHERE id=?1 AND state='started' AND cancel_requested=0 AND provider_released=0",
+            "provider credential unavailable",
+            "provider credential unavailable",
+        ),
+        ReleaseRole::Previous => (
+            "UPDATE operation_attempts SET old_password_released=1 WHERE id=?1 AND state='started' AND cancel_requested=0 AND old_password_released=0",
+            "previous credential unavailable",
+            "previous credential unavailable",
+        ),
+    };
+    let tx =
+        rusqlite::Transaction::new_unchecked(vault.db(), rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| "operation store unavailable")?;
+    let store = super::session_store::session_store();
+    let _session_guard = store.lock().map_err(|_| "session unavailable")?;
+    let session = store
+        .load_locked()
+        .and_then(|record| vault.operation_session_binding_from_record(record))
         .map_err(|_| "session unavailable")?;
-    let tx = vault
-        .db()
-        .unchecked_transaction()
-        .map_err(|_| "operation store unavailable")?;
     validate_live(&tx, requester, attempt, binding, &session)?;
     let changed = tx
-        .execute(
-            "UPDATE operation_attempts SET old_password_released=1 WHERE id=?1 AND state='started' AND cancel_requested=0 AND old_password_released=0",
-            [attempt.attempt_id.as_str()],
-        )
+        .execute(release_sql, [attempt.attempt_id.as_str()])
         .map_err(|_| "operation store unavailable")?;
     if changed != 1 {
-        return Err("previous credential unavailable");
+        return Err(already_released);
     }
-    let encoded: String = tx
-        .query_row(
-            "SELECT c.encrypted_value FROM credentials c JOIN partitions p ON p.id=c.partition_id WHERE c.id=?1 AND p.project_id=?2",
-            params![old_id, binding.project_id],
-            |row| row.get(0),
-        )
-        .map_err(|_| "previous credential unavailable")?;
+    let encoded: String = tx.query_row(
+        "SELECT c.encrypted_value FROM credentials c JOIN partitions p ON p.id=c.partition_id WHERE c.id=?1 AND p.project_id=?2",
+        params![credential, project],
+        |row| row.get(0),
+    ).map_err(|_| unavailable)?;
     vault
-        .ensure_auth_usable(old_id, true, None)
+        .ensure_owner_approved_release(credential, None)
         .map_err(|_| "auth unavailable")?;
     let ciphertext = vault
-        .decode_auth_ciphertext(old_id, &encoded)
+        .decode_auth_ciphertext(credential, &encoded)
         .map_err(|_| "credential unavailable")?;
     let key = vault.ensure_unlocked().map_err(|_| "session unavailable")?;
     let mut plaintext = vault
         .decrypt_bytes(key, &ciphertext)
-        .map_err(|_| "previous credential unavailable")?;
-    if vault.ensure_auth_usable(old_id, true, None).is_err() {
+        .map_err(|_| unavailable)?;
+    if vault
+        .ensure_owner_approved_release(credential, None)
+        .is_err()
+    {
         plaintext.fill(0);
         return Err("auth unavailable");
     }
-    let renewed = vault
-        .operation_session_binding()
+    let renewed = store
+        .load_locked()
+        .and_then(|record| vault.operation_session_binding_from_record(record))
         .map_err(|_| "session unavailable");
     if !renewed.is_ok_and(|current| {
         current.revision == session.revision && current.expires_at > Utc::now()
@@ -1272,6 +1233,160 @@ fn hash_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grant_release_characterization() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "core::operation_grants::tests::grant_release_fixture_child",
+                "--nocapture",
+            ])
+            .env("WISPKEY_VAULT_PATH", dir.path())
+            .env("WISPKEY_SESSION_TIMEOUT", "30")
+            .env("WISPKEY_GRANT_RELEASE_FIXTURE", "1")
+            .env_remove("WISPKEY_PROJECT")
+            .env_remove("WISPKEY_SESSION_PLAINTEXT")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "grant release fixture failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[test]
+    #[ignore = "isolated finite-session fixture launched by grant_release_characterization"]
+    fn grant_release_fixture_child() {
+        use super::super::{AddCredentialRequest, CredentialType, access_ring::AccessRing};
+        assert_eq!(
+            std::env::var("WISPKEY_GRANT_RELEASE_FIXTURE").as_deref(),
+            Ok("1")
+        );
+        let password = "synthetic-grant-owner";
+        let vault = Vault::init(password).unwrap();
+        let names = ["release-selected", "release-provider", "release-previous"];
+        let values = [
+            "synthetic-selected",
+            "synthetic-provider",
+            "synthetic-previous",
+        ];
+        let credentials: Vec<_> = names
+            .iter()
+            .zip(values)
+            .map(|(name, value)| {
+                vault
+                    .add_credential(
+                        AddCredentialRequest::new(name, CredentialType::ApiKey, value)
+                            .project(Some("default")),
+                    )
+                    .unwrap()
+            })
+            .collect();
+        let instance = vault.enroll_instance("release-worker", "", &[]).unwrap();
+        let requester =
+            AuthenticatedRequester::authenticate(&vault, &instance.instance.id, &instance.secret)
+                .unwrap();
+        let mut binding = binding();
+        binding.credential_id = credentials[0].id.clone();
+        binding.provider_credential_id = Some(credentials[1].id.clone());
+        binding.provider_project_id = Some("default".into());
+        binding.old_password_credential_id = Some(credentials[2].id.clone());
+        binding.requester_instance_id = instance.instance.id;
+        type Release = fn(
+            &Vault,
+            &AuthenticatedRequester,
+            &AttemptStatus,
+            &OperationBinding,
+        ) -> GrantResult<Vec<u8>>;
+        let releases: [(Release, &str); 3] = [
+            (decrypt_reserved, "attempt unavailable"),
+            (decrypt_provider, "provider credential unavailable"),
+            (decrypt_previous, "previous credential unavailable"),
+        ];
+        let flags = |attempt: &AttemptStatus| -> (u8, u8, u8) {
+            vault.db().query_row("SELECT secret_released,provider_released,old_password_released FROM operation_attempts WHERE id=?1",
+                [&attempt.attempt_id], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap()
+        };
+        let grant = issue_grant(&vault, &binding, binding.expires_at).unwrap();
+        let attempt = reserve(&vault, &requester, &grant.grant_id, &binding).unwrap();
+        for (index, (release, repeated_error)) in releases.iter().enumerate() {
+            let mut plaintext = release(&vault, &requester, &attempt, &binding).unwrap();
+            assert_eq!(plaintext, values[index].as_bytes());
+            plaintext.fill(0);
+            assert_eq!(
+                release(&vault, &requester, &attempt, &binding).unwrap_err(),
+                *repeated_error
+            );
+            assert_eq!(flags(&attempt), [(1, 0, 0), (1, 1, 0), (1, 1, 1)][index]);
+        }
+        finish_attempt(
+            &vault,
+            &requester,
+            &attempt.attempt_id,
+            GrantState::Succeeded,
+            Some(0),
+        )
+        .unwrap();
+        for ring_denied in [true, false] {
+            for name in names {
+                vault
+                    .set_access_ring(
+                        "default",
+                        name,
+                        if ring_denied {
+                            AccessRing::Critical
+                        } else {
+                            AccessRing::Restricted
+                        },
+                        Some(password),
+                    )
+                    .unwrap();
+            }
+            if !ring_denied {
+                // Valid base64 reaches the actual decrypt failure after consuming
+                // the role flag, so this also proves transaction-drop rollback.
+                assert_eq!(
+                    vault
+                        .db()
+                        .execute("UPDATE credentials SET encrypted_value='AA=='", [])
+                        .unwrap(),
+                    3
+                );
+            }
+            let grant = issue_grant(&vault, &binding, binding.expires_at).unwrap();
+            let attempt = reserve(&vault, &requester, &grant.grant_id, &binding).unwrap();
+            for (index, (release, _)) in releases.iter().enumerate() {
+                let error = release(&vault, &requester, &attempt, &binding).unwrap_err();
+                assert_eq!(
+                    error,
+                    if ring_denied {
+                        "auth unavailable"
+                    } else {
+                        [
+                            "credential unavailable",
+                            "provider credential unavailable",
+                            "previous credential unavailable",
+                        ][index]
+                    }
+                );
+                assert_eq!(flags(&attempt), (0, 0, 0));
+            }
+            finish_attempt(
+                &vault,
+                &requester,
+                &attempt.attempt_id,
+                GrantState::FailedChild,
+                Some(1),
+            )
+            .unwrap();
+        }
+    }
 
     const INSTANCE_ID: &str = "00000000-0000-4000-8000-000000000001";
     const CREDENTIAL_ID: &str = "00000000-0000-4000-8000-000000000002";

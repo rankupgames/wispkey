@@ -1,4 +1,5 @@
 use crate::audit;
+use crate::core::access_ring::AccessRing;
 use crate::core::{self, AddCredentialRequest, CredentialType, Vault};
 use crate::migrate;
 
@@ -15,6 +16,14 @@ pub struct AddCredentialArgs<'a> {
     pub param_name: Option<&'a str>,
     pub partition: Option<&'a str>,
     pub project: Option<&'a str>,
+    pub ring: Option<&'a str>,
+}
+
+fn parse_ring_or_exit(value: &str) -> AccessRing {
+    AccessRing::parse(value).unwrap_or_else(|| {
+        eprintln!("Error: access ring must be routine, restricted or critical");
+        std::process::exit(1);
+    })
 }
 
 pub async fn handle_add(args: AddCredentialArgs<'_>) {
@@ -44,6 +53,8 @@ pub async fn handle_add(args: AddCredentialArgs<'_>) {
         }
     };
 
+    let ring = args.ring.map(parse_ring_or_exit);
+
     let resolved_value = match args.value {
         Some(v) => v.to_string(),
         None => {
@@ -63,19 +74,23 @@ pub async fn handle_add(args: AddCredentialArgs<'_>) {
         .map(String::from)
         .unwrap_or_else(core::resolve_active_project);
 
-    match vault.add_credential(AddCredentialRequest {
-        name: args.name,
-        credential_type,
-        value: &resolved_value,
-        description: args.description,
-        hosts: args.hosts,
-        tags: args.tags,
-        partition: args.partition,
-        project: args.project,
-        origin: None,
-        lifecycle_state: None,
-        review_at: None,
-    }) {
+    let added = vault.add_classified_credential(
+        AddCredentialRequest {
+            name: args.name,
+            credential_type,
+            value: &resolved_value,
+            description: args.description,
+            hosts: args.hosts,
+            tags: args.tags,
+            partition: args.partition,
+            project: Some(&active_project),
+            origin: None,
+            lifecycle_state: None,
+            review_at: None,
+        },
+        ring,
+    );
+    match added {
         Ok(cred) => {
             audit::log_event(
                 vault.db(),
@@ -179,8 +194,8 @@ pub async fn handle_list(partition: Option<&str>, project: Option<&str>, all_pro
                 } else {
                     cred.tags.join(", ")
                 };
-                let desc = if cred.description.len() > 28 {
-                    format!("{}..", &cred.description[..28])
+                let desc = if let Some((end, _)) = cred.description.char_indices().nth(28) {
+                    format!("{}..", &cred.description[..end])
                 } else {
                     cred.description.clone()
                 };
@@ -347,6 +362,81 @@ pub async fn handle_rotate(name: &str) {
             std::process::exit(1);
         }
     }
+}
+
+/// Shows or sets an access ring. Broadening needs the owner password typed at an
+/// interactive terminal; `WISPKEY_PASSWORD` and a cached unlock never count.
+pub fn handle_ring(name: &str, project: Option<&str>, set: Option<&str>) {
+    let vault = match Vault::open_with_session() {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let project = project
+        .map(String::from)
+        .unwrap_or_else(core::resolve_active_project);
+    let current = vault
+        .access_ring_in_project(&project, name)
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        });
+    let Some(requested) = set.map(parse_ring_or_exit) else {
+        if json_output() {
+            print_json(serde_json::json!({
+                "credential": name,
+                "project": project,
+                "access_ring": current.as_str(),
+            }));
+        } else {
+            println!("{}", current.as_str());
+        }
+        return;
+    };
+    let password = if requested < current {
+        use std::io::IsTerminal;
+        if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+            eprintln!("Error: broadening an access ring requires an interactive terminal");
+            std::process::exit(1);
+        }
+        let entered = rpassword::prompt_password("Owner approval - enter vault password: ")
+            .unwrap_or_else(|_| {
+                eprintln!("Error: owner approval unavailable");
+                std::process::exit(1);
+            });
+        Some(zeroize::Zeroizing::new(entered))
+    } else {
+        None
+    };
+    let previous = vault
+        .set_access_ring(
+            &project,
+            name,
+            requested,
+            password.as_deref().map(String::as_str),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        });
+    if json_output() {
+        print_json(serde_json::json!({
+            "ok": true,
+            "credential": name,
+            "project": project,
+            "access_ring": requested.as_str(),
+            "previous": previous.as_str(),
+        }));
+        return;
+    }
+    println!(
+        "Access ring for '{}': {} (was {}).",
+        name,
+        requested.as_str(),
+        previous.as_str()
+    );
 }
 
 pub async fn handle_import(

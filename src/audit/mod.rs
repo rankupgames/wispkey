@@ -25,6 +25,8 @@ use serde::{Deserialize, Serialize};
 use crate::core::Vault;
 use crate::secure_files;
 
+pub mod remediation;
+
 pub const SIDELOAD_FALLBACK_AUDIT_FILE: &str = "sideload-audit.jsonl";
 const AUDIT_FINGERPRINT_KEY_FILE: &str = "audit-fingerprint.key";
 const AUDIT_FINGERPRINT_KEY_LEN: usize = 32;
@@ -54,7 +56,11 @@ fn token_fingerprint(token: &str, key_material: &[u8]) -> String {
 }
 
 fn stored_token_fingerprint(value: Option<String>) -> Option<String> {
-    value.filter(|value| value.starts_with("hmac-sha256:"))
+    value.filter(|value| {
+        value.strip_prefix("hmac-sha256:").is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+    })
 }
 
 fn database_fingerprint_key(db: &Connection) -> Option<String> {
@@ -86,7 +92,11 @@ fn fallback_fingerprint_key() -> Option<Vec<u8>> {
         tracing::error!("Failed to generate audit fingerprint key: {error}");
         return None;
     }
-    match secure_files::create_private(&path, &key) {
+    if let Err(error) = secure_files::ensure_private_directory(&Vault::vault_dir()) {
+        tracing::error!("Failed to prepare audit fingerprint directory: {error}");
+        return None;
+    }
+    match secure_files::publish_private(&path, &key) {
         Ok(true) => Some(key),
         Ok(false) => match fs::read(&path) {
             Ok(winning_key) if winning_key.len() == AUDIT_FINGERPRINT_KEY_LEN => Some(winning_key),
@@ -449,7 +459,7 @@ pub fn query_log(
 
     if let Some(since_date) = since {
         query.push_str(" AND timestamp >= ?");
-        param_values.push(Box::new(since_lower_bound(since_date)));
+        param_values.push(Box::new(lower_bound(since_date)));
     }
 
     query.push_str(" ORDER BY id DESC LIMIT ?");
@@ -466,51 +476,7 @@ pub fn query_log(
         }
     };
 
-    let rows = match stmt.query_map(params_ref.as_slice(), |row| {
-        Ok(AuditEntry {
-            id: row.get(0)?,
-            timestamp: row.get(1)?,
-            event_type: redact_required(&row.get::<_, String>(2)?),
-            credential_name: redact_capabilities(row.get::<_, Option<String>>(3)?.as_deref()),
-            token_fingerprint: stored_token_fingerprint(row.get(4)?),
-            target_host: redact_capabilities(row.get::<_, Option<String>>(5)?.as_deref()),
-            target_path: redact_capabilities(row.get::<_, Option<String>>(6)?.as_deref()),
-            http_method: redact_capabilities(row.get::<_, Option<String>>(7)?.as_deref()),
-            response_status: row
-                .get::<_, Option<i64>>(8)?
-                .map(u16::try_from)
-                .transpose()
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        8,
-                        rusqlite::types::Type::Integer,
-                        Box::new(error),
-                    )
-                })?,
-            denied: row.get::<_, i32>(9)? != 0,
-            deny_reason: redact_capabilities(row.get::<_, Option<String>>(10)?.as_deref()),
-            project_name: redact_capabilities(row.get::<_, Option<String>>(11)?.as_deref()),
-            source: "vault".to_string(),
-        })
-    }) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Failed to query audit log: {}", e);
-            return Vec::new();
-        }
-    };
-
-    let mut entries = Vec::new();
-    for row in rows {
-        match row {
-            Ok(entry) => entries.push(entry),
-            Err(e) => {
-                tracing::error!("Failed to read audit log row: {}", e);
-                return Vec::new();
-            }
-        }
-    }
-    entries
+    read_audit_rows(&mut stmt, params_ref.as_slice())
 }
 
 /// Queries the audit log with optional credential and timestamp range filters, without a row limit.
@@ -634,8 +600,9 @@ fn query_fallback_log_from_path(
 
         let row = match serde_json::from_str::<FallbackAuditLine>(&line) {
             Ok(row) => row,
-            Err(error) => {
-                tracing::error!("Failed to parse fallback audit log line: {}", error);
+            Err(_) => {
+                // Serde errors can include the offending (possibly secret) value.
+                tracing::error!("Failed to parse fallback audit log line {}", line_index + 1);
                 continue;
             }
         };
@@ -648,8 +615,7 @@ fn query_fallback_log_from_path(
         let token_fingerprint = if row.wisp_token.is_some() {
             None
         } else {
-            row.token_fingerprint
-                .filter(|value| value.starts_with("hmac-sha256:"))
+            stored_token_fingerprint(row.token_fingerprint)
         };
         let event_type = redact_required(&row.event_type);
         let credential_name = redact_capabilities(row.credential_name.as_deref());
@@ -661,7 +627,7 @@ fn query_fallback_log_from_path(
         let source = redact_required(row.sink.as_deref().unwrap_or("sideload-fallback-jsonl"));
         entries.push(AuditEntry {
             id: -((line_index as i64) + 1),
-            timestamp: row.timestamp,
+            timestamp: redact_required(&row.timestamp),
             event_type,
             credential_name,
             token_fingerprint,
@@ -706,7 +672,7 @@ fn read_audit_rows(
     let rows = match stmt.query_map(params_ref, |row| {
         Ok(AuditEntry {
             id: row.get(0)?,
-            timestamp: row.get(1)?,
+            timestamp: redact_required(&row.get::<_, String>(1)?),
             event_type: redact_required(&row.get::<_, String>(2)?),
             credential_name: redact_capabilities(row.get::<_, Option<String>>(3)?.as_deref()),
             token_fingerprint: stored_token_fingerprint(row.get(4)?),
@@ -766,10 +732,6 @@ fn sideload_env_key_filter(credential: &str) -> Option<String> {
         return None;
     }
     crate::env_sideload::env_key_for_name(credential)
-}
-
-fn since_lower_bound(since: &str) -> String {
-    lower_bound(since)
 }
 
 fn lower_bound(value: &str) -> String {
@@ -1078,5 +1040,24 @@ mod tests {
         let serialized = serde_json::to_string(&entries).unwrap();
         assert!(!serialized.contains("wk_env_openai"));
         assert!(!serialized.contains("sideload-secret"));
+    }
+    #[test]
+    fn fallback_reader_redacts_timestamp_and_rejects_forged_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("legacy.jsonl");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "timestamp": "wk_timestamp_secret",
+                "event_type": "Use", "denied": false,
+                "token_fingerprint": "hmac-sha256:wk_fingerprint_secret"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let rows = query_fallback_log_from_path(&path, 10, None, None);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].token_fingerprint.is_none());
+        assert!(!serde_json::to_string(&rows).unwrap().contains("wk_"));
     }
 }

@@ -9,7 +9,7 @@ WispKey is a credential firewall for AI agents. Its main boundary is between a p
 - Credential use outside configured boundaries when host restrictions or TOML policies are configured. Policies can restrict hosts, paths, methods, time windows, and rate limits.
 - Untrusted VM or worker instances using credentials outside their enrolled scope when served over identity-required transports. Instance requests must authenticate with an enrollment secret, scope checks fail closed, and out-of-scope use is denied before forwarding.
 - VM fleet first-contact enrollment. Bootstrap tokens are scoped, optional-TTL-limited, optional-use-limited, revocable bearer tokens stored only as Argon2id hashes. The join endpoint is authenticated only by the bootstrap token and returns a per-instance identity.
-- Silent privilege escalation by enrolled instances. Out-of-scope use creates a pending access request that must be approved by the host before the instance can retry successfully.
+- Silent privilege escalation by enrolled instances. Out-of-scope use of a routine credential that passes lifecycle checks creates a pending access request that requires host approval. Other rings fail before the scope check; see [access rings](access-rings.md).
 - Revocation racing an in-flight instance authentication. WispKey conditionally commits successful Argon2 verification only if the instance is still active, so a concurrent revoke fails the request closed.
 - Brittle instance-secret rollout. Due-aware rotation atomically installs a new secret and can retain the previous hash for a bounded grace window. Successful authentication with the new secret clears the previous hash early.
 - Silent vault-backed credential use. WispKey writes use and denial events to the SQLite audit log. Env-sideload-only proxy use without an unlocked vault writes fallback JSONL audit events.
@@ -99,7 +99,7 @@ Fleet self-enrollment uses bootstrap tokens for first contact. A host mints a bo
 
 Unix domain socket, Linux AF_VSOCK, Firecracker UDS-backed vsock, and non-loopback TCP listeners require instance identity by default. Loopback TCP keeps the original no-identity default unless `--require-identity` is set. Missing, invalid, or revoked instance identity returns HTTP 401.
 
-After authentication, WispKey checks instance scope before injecting a vault credential. Scope selectors can match by partition, project, credential name, or exact tag, but credential selectors and approved requests persist and compare the resolved credential ID. A same-named credential in another project does not inherit that authorization. If a vault token is out of scope, WispKey returns HTTP 403 with `error: "out_of_scope"`, queues or reuses a pending access request, audits the denial, and does not forward the upstream request. Host approval makes only that credential ID available to the instance on retry. Env-sideload tokens have no persisted credential ID, so identity-authenticated requests cannot use or request approval for them.
+After authentication, WispKey checks instance scope before injecting a vault credential. Scope selectors can match by partition, project, credential name, or exact tag, but credential selectors and approved requests persist and compare the resolved credential ID. A same-named credential in another project does not inherit that authorization. If a routine vault token passes lifecycle checks but is out of scope, WispKey returns HTTP 403 with `error: "out_of_scope"`, queues or reuses a pending access request, audits the denial, and does not forward the upstream request. Host approval makes only that credential ID available to the instance on retry. Env-sideload tokens have no persisted credential ID, so identity-authenticated requests cannot use or request approval for them.
 
 Each instance secret is 48 uniformly generated mixed-alphanumeric characters, approximately 286 bits of entropy, and only an Argon2id hash is stored. `instance rotate-secret` supports `--if-older-than` for idempotent periodic jobs and `--grace` for rollout overlap. A request authenticated with the new secret clears the previous hash immediately; otherwise the previous hash expires at the recorded deadline. Revocation and rotation races use conditional active-state/hash updates and fail closed. After a vault restore, instances are marked `needs_reenrollment` because plaintext secrets were never stored; `rotate-secret` mints a new secret and returns the instance to `active`.
 
@@ -126,3 +126,13 @@ the runtime proof does not establish production readiness or total key custody.
 `wispkey backup` writes a versioned, authenticated AES-256-GCM archive (`WKVB`) encrypted with a dedicated backup passphrase, not the vault master password. The archive contains vault tables and selected sidecars. Credential values remain encrypted under the original master key. Inspect, verify, and dry-run output omit plaintext secrets, encrypted blobs, password hashes, instance secret hashes, bootstrap token hashes, wisp tokens, and cloud session tokens.
 
 Session files and remembered protectors are excluded and will not unlock a restored vault on another machine. Instance bearer secrets and bootstrap tokens cannot be restored; workers must receive newly minted secrets. A lost master password or lost backup passphrase is unrecoverable. See [`docs/vault-backup.md`](vault-backup.md).
+
+## Legacy fallback audit remediation
+
+`wispkey audit remediate-fallback` writes a bounded, owner-only sanitized copy of
+an offline legacy JSONL snapshot without modifying its source. It rejects unsafe
+file types, links, broad permissions, malformed records, and existing output
+paths; unsupported private-file verification fails closed. It removes legacy
+token fields and unknown fields and never echoes input diagnostics. Original
+files remain sensitive evidence; this is not erasure or capability revocation.
+See [operator guidance](audit-remediation.md) for retention and rotation steps.

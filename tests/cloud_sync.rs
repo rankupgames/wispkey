@@ -305,6 +305,8 @@ fn add(path: &Path, name: &str, value: &str, partition: &str) {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             name,
             "--value-file",
             input.to_str().unwrap(),
@@ -524,7 +526,7 @@ fn interrupted_upload_retries_identical_ciphertext_without_advancing_revision() 
 }
 
 #[test]
-fn concurrent_edits_conflict_and_explicit_remote_resolution_keeps_encrypted_recovery() {
+fn divergent_edits_conflict_and_explicit_remote_resolution_keeps_encrypted_recovery() {
     let server = Server::new();
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
@@ -1395,7 +1397,7 @@ mod foreground_watch {
     }
 
     #[test]
-    fn concurrent_edits_remain_visible_and_neither_side_is_overwritten() {
+    fn divergent_edits_remain_visible_and_neither_side_is_overwritten() {
         let (server, first, second) = tracked_pair();
         add(
             first.path(),
@@ -1570,21 +1572,22 @@ mod foreground_watch {
         let before = journal(second.path());
         let download_started = Arc::new(AtomicBool::new(false));
         let callback_marker = download_started.clone();
+        let (release, blocked) = std::sync::mpsc::sync_channel(1);
         server.state.lock().unwrap().before_download = Some(Box::new(move || {
             callback_marker.store(true, Ordering::SeqCst);
-            thread::sleep(Duration::from_secs(3));
+            blocked
+                .recv_timeout(Duration::from_secs(30))
+                .expect("test must release the stalled download after watch exits");
         }));
-        let started = Instant::now();
         let mut child = ChildGuard(watch_command(second.path(), "1").spawn().unwrap());
         let output = finish(&mut child);
         assert!(
             download_started.load(Ordering::SeqCst),
             "deadline did not interrupt a real download"
         );
-        assert!(
-            started.elapsed() < Duration::from_millis(2500),
-            "watch waited beyond its deadline for the stalled download"
-        );
+        release
+            .send(())
+            .expect("watch must finish while its download is still held");
         assert_redacted(&output);
         let after = journal(second.path());
         for field in ["revision", "local_hash", "last_success"] {

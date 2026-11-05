@@ -38,6 +38,9 @@ python scripts/verify.py --suite offline
 # Native tray: OS GUI libraries, plus the Rust and Node prerequisites above.
 python scripts/verify.py --suite tray
 
+# Automatic popout interactions with a simulated native bridge; no desktop clicks.
+python scripts/verify.py --suite tray-simulated
+
 # Native-host protocol/approval state machine and macOS installer fixtures.
 # Compiles the real backend on macOS; never opens an OS verification prompt.
 python scripts/verify.py --suite native-host
@@ -53,11 +56,36 @@ python scripts/verify.py --suite cross-node
 
 The native tray build on Debian/Ubuntu needs `libgtk-3-dev`,
 `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, and `libxdo-dev`.
-The native tray crate currently has no Rust unit tests: its `cargo test` step
-checks test-mode compilation, not GUI behavior. Browser fixtures cover the UI;
-the actual system tray, autostart, and OS consent dialogs still need acceptance.
+The native tray crate has bridge, queue and placement unit tests. The
+`tray-simulated` suite combines these with real owner IPC tests and the built
+popout in headless Chromium/Firefox. Picker and clipboard results are synthetic;
+the actual system tray, autostart, clipboard delivery and OS dialogs still need
+platform acceptance. No controls for the test runner ship in the application.
 Linux `--all-features` compiles AF_VSOCK but a host
 without a usable vsock device cannot establish guest/host connectivity.
+
+## Socket-free owner IPC protocol checks
+
+When a sandbox prohibits Unix socket creation, run the production Unix client's
+post-connect byte-stream exchange against an in-memory Tokio duplex transport:
+
+```sh
+cargo test --locked --lib owner_ipc::simulated_transport
+```
+
+These tests cover one-byte backpressure, fragmented UTF-8 and JSON, newline
+framing, multiple response frames, empty/truncated EOF, invalid JSON/UTF-8,
+disconnected writes, and cancellation during a partial response. They preserve
+the current acceptance of complete JSON at EOF without a final newline. The
+bounded test harness is not a new production timeout: Unix owner IPC currently
+has no built-in request/response deadline.
+
+This simulation does not exercise Unix connection setup, filesystem permissions,
+peer credentials, endpoint cleanup, server dispatch, or Windows named pipes.
+The existing real-socket `tests/owner_ipc.rs` suite and Linux/macOS CI remain
+required; do not replace them with this simulation or treat a sandbox-denied
+socket test as passed. CI's default and feature-enabled library test runs include
+the simulation automatically, without a special skip or alternate security mode.
 
 ## Feature-to-test map
 
@@ -83,6 +111,8 @@ features should add a regression at the public interface and update this map.
 | Bootstrap TTL, revocation, max uses, concurrent joins | `tests/bootstrap.rs` and core tests | Real fleet distribution of bootstrap secrets is outside the test runner |
 | Policy check/test/explain, host/agent/instance scope | Policy unit tests; `tests/policy.rs`, `tests/instance_policy_identity.rs` | Unknown identity must fail closed; labels cannot authenticate a caller |
 | Owner-approved SSH/Kubernetes/PostgreSQL operations | `src/operations` unit/adapter tests; `tests/operation_auth.rs`, `tests/operations.rs`; PostgreSQL Docker suite | Actual destination posture/RBAC/host keys and owner approvals need target-specific acceptance; see #32 below |
+| Repository/worktree development inheritance | `tests/worktree_run.rs` (real Git worktrees), `tests/run_manifest.rs` | Owner-only runtime use; live application and database migrations remain project acceptance |
+| Credential-free read proposal (not implemented) | `tests/operations.rs`: v2 metadata-only preflight and v1/v2 rejection of unapproved read/output fields, missing credentials and v3 | [Contract decisions](proposals/credential-free-read-operations.md) required before new authority, protocol or result schema |
 | Child-only exec/run/inject and askpass | `tests/exec.rs`, `tests/run.rs`, `tests/inject.rs` | OS/application consumers beyond the fixture children need acceptance |
 | Audit export/tail/filter and secret-safe diagnostics | Audit tests; `tests/audit.rs`, `tests/doctor.rs` | Operational log retention/export destinations are outside this repo |
 | MCP tools, env sideloads, client config, shell/plugin guards | `tests/mcp.rs`, `tests/env_sideload.rs`, `tests/integrate.rs`, `tests/plugin_hooks.rs` | Actual IDE/client installation is separate from config/stdio contracts |

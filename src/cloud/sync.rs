@@ -88,9 +88,13 @@ fn network_error(error: reqwest::Error, interrupted: &str) -> CloudError {
     )
 }
 
-struct SyncLock(std::fs::File);
+struct SyncLock {
+    file: std::fs::File,
+    _lifecycle_lease: std::fs::File,
+}
 impl SyncLock {
     fn acquire() -> CloudResult<Self> {
+        let lifecycle = crate::core::shared_lifecycle_lease(&Vault::vault_dir())?;
         let path = Vault::vault_dir().join("cloud-sync.lock");
         secure_files::create_private(&path, b"")?;
         let metadata = std::fs::symlink_metadata(&path).map_err(|_| invalid("unsafe_sync_lock"))?;
@@ -107,12 +111,15 @@ impl SyncLock {
             .open(path)
             .map_err(|_| invalid("sync_lock_unavailable"))?;
         fs2::FileExt::try_lock_exclusive(&file).map_err(|_| invalid("sync_already_running"))?;
-        Ok(Self(file))
+        Ok(Self {
+            file,
+            _lifecycle_lease: lifecycle,
+        })
     }
 }
 impl Drop for SyncLock {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
+        let _ = fs2::FileExt::unlock(&self.file);
     }
 }
 
@@ -481,7 +488,7 @@ impl CloudClient {
         let snapshot: Snapshot =
             crate::bundle::decrypt_payload_bytes(MAGIC, &bytes, password, MAX_BYTES as u64)
                 .map_err(|_| invalid("bundle_authentication_failed"))?;
-        if !matches!(snapshot.version, 1..=3)
+        if !matches!(snapshot.version, 1..=4)
             || snapshot.project != project
             || snapshot.partition != partition
         {

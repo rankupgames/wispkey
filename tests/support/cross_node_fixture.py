@@ -5,11 +5,14 @@ Requires Docker, kind 0.33+, ssh-keygen, Python 3.10+, and the Rust toolchain.
 No existing cluster/context, vault, SSH config, or provider credentials are used.
 """
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -29,9 +32,67 @@ def run(argv, *, data=None, env=None, visible=False):
     return result.stdout or b""
 
 
+def docker_id(path):
+    """Return the ID Docker wrote after it created a resource, or None when it created nothing."""
+    if not path.exists():
+        return None
+    value = path.read_text().strip()
+    if not re.fullmatch(r"(sha256:)?[a-f0-9]{64}", value):
+        raise RuntimeError("Docker resource ID file is invalid")
+    return value
+
+
+def kind_nodes(cluster, mount):
+    """Return kind node IDs whose bind mount proves this run created them; same-named nodes stay."""
+    listed = subprocess.run(["docker", "ps", "-a", "-q", "--no-trunc", "--filter", "label=io.x-k8s.kind.cluster=" + cluster],
+                            capture_output=True)
+    if listed.returncode:
+        return None
+    owned = []
+    for container in listed.stdout.decode().split():
+        if not re.fullmatch(r"[a-f0-9]{64}", container):
+            return None
+        mounts = subprocess.run(["docker", "container", "inspect", "--format", "{{json .Mounts}}", container], capture_output=True)
+        if mounts.returncode:
+            return None
+        if any(entry.get("Source") == mount and entry.get("Destination") == "/etc/kubernetes/wispkey-encryption.json"
+               for entry in json.loads(mounts.stdout)):
+            owned.append(container)
+    return owned
+
+
+def cleanup(cluster, scratch):
+    nodes = kind_nodes(cluster, str(scratch / "encryption.json"))
+    failed = nodes is None
+    commands = [["docker", "rm", "-f", "-v", node] for node in nodes or []]
+    if container := docker_id(scratch / "ssh.cid"):
+        commands.append(["docker", "rm", "-f", "-v", container])
+    if image := docker_id(scratch / "image.id"):
+        commands.append(["docker", "image", "rm", image])
+    for command in commands:
+        result = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        failed = failed or result.returncode != 0
+    if failed:
+        raise RuntimeError("cross-node fixture cleanup failed; owned resources require reconciliation")
+
+
 def write(path, data, mode=0o600):
     path.write_bytes(data.encode() if isinstance(data, str) else data)
     path.chmod(mode)
+
+
+@contextmanager
+def termination_scope():
+    """Unwind owned-resource cleanup on SIGTERM and restore the caller's handler."""
+    def terminate(signum, frame):
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, terminate)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def main():
@@ -42,10 +103,17 @@ def main():
     for tool in [kind, "docker", "ssh-keygen", "ssh", "cargo"]:
         if not shutil.which(tool):
             raise RuntimeError(f"missing fixture prerequisite: {tool}")
-    suffix = uuid.uuid4().hex[:12]
-    cluster, ssh_name, image = f"wk-accept-{suffix}", f"wk-ssh-{suffix}", f"wk-ssh-fixture:{suffix}"
-    owned_cluster = owned_ssh = owned_image = False
-    with tempfile.TemporaryDirectory(prefix="wk-cross-node-") as directory:
+    # CI registries declare exact owned containers, so they pin the suffix; local runs stay random.
+    suffix = os.environ.get("WISPKEY_CROSS_NODE_SUFFIX")
+    if suffix is None:
+        suffix = uuid.uuid4().hex[:12]
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", suffix):
+        raise RuntimeError("WISPKEY_CROSS_NODE_SUFFIX must be 1-32 lowercase letters, digits or hyphens")
+    cluster, ssh_name = f"wk-accept-{suffix}", f"wk-ssh-{suffix}"
+    # kind cannot place its nodes in the shared queue's cgroup; never start an unbounded CI cluster.
+    if "CI_BUDGET_CGROUP" in os.environ:
+        raise RuntimeError("kind cannot honor CI_BUDGET_CGROUP; cross-node CI requires an approved bounded route")
+    with termination_scope(), tempfile.TemporaryDirectory(prefix="wk-cross-node-") as directory:
         scratch = Path(directory)
         try:
             print("Building the restricted operation helper...", flush=True)
@@ -79,16 +147,23 @@ RUN touch /var/lib/wispkey-helper/attempts.db && chmod 600 /var/lib/wispkey-help
 CMD ["/usr/sbin/sshd", "-D", "-e"]
 ''')
             print("Starting loopback-only OpenSSH with a forced helper...", flush=True)
-            owned_image = True
-            run(["docker", "build", "-q", "-t", image, str(scratch)])
-            owned_ssh = True
-            run(["docker", "run", "-d", "--name", ssh_name, "--label", "wispkey.acceptance=" + suffix,
-                 "-p", "127.0.0.1::22", image])
-            port = run(["docker", "port", ssh_name, "22/tcp"]).decode().strip()
+            # Docker writes these ID files only after it creates the resource; cleanup removes only those IDs.
+            run(["docker", "buildx", "build", "--provenance=false", "--load", "-q", "--iidfile", str(scratch / "image.id"),
+                 "--label", "wispkey.acceptance=" + suffix, str(scratch)])
+            image = docker_id(scratch / "image.id")
+            if image is None:
+                raise RuntimeError("SSH fixture image ID is missing")
+            run(["docker", "create", "--cidfile", str(scratch / "ssh.cid"), "--name", ssh_name,
+                 "--label", "wispkey.acceptance=" + suffix, "-p", "127.0.0.1::22", image])
+            ssh_container = docker_id(scratch / "ssh.cid")
+            if ssh_container is None:
+                raise RuntimeError("SSH fixture container ID is missing")
+            run(["docker", "start", ssh_container])
+            port = run(["docker", "port", ssh_container, "22/tcp"]).decode().strip()
             if not port.startswith("127.0.0.1:"):
                 raise RuntimeError("SSH fixture did not bind loopback")
-            fingerprint = run(["docker", "exec", ssh_name, "ssh-keygen", "-lf", "/etc/ssh/ssh_host_ed25519_key.pub", "-E", "sha256"]).decode().split()[1]
-            public_key = run(["docker", "exec", ssh_name, "cat", "/etc/ssh/ssh_host_ed25519_key.pub"]).decode().strip()
+            fingerprint = run(["docker", "exec", ssh_container, "ssh-keygen", "-lf", "/etc/ssh/ssh_host_ed25519_key.pub", "-E", "sha256"]).decode().split()[1]
+            public_key = run(["docker", "exec", ssh_container, "cat", "/etc/ssh/ssh_host_ed25519_key.pub"]).decode().strip()
             write(scratch / "known_hosts", f"[127.0.0.1]:{port.split(':')[1]} {public_key}\n")
             attempt = str(uuid.uuid4())
             hello = {"version":1,"attempt_id":attempt,"phase":"hello","remaining_ms":10000,"deadline_unix_ms":int(time.time()*1000)+10000}
@@ -127,10 +202,12 @@ apiServer:
                       "nodes":[{"role":"control-plane", "kubeadmConfigPatches":[patch], "extraMounts":[{
                           "hostPath":str(scratch / "encryption.json"), "containerPath":"/etc/kubernetes/wispkey-encryption.json", "readOnly":True}]}]}
             write(scratch / "kind.json", json.dumps(config))
-            owned_cluster = True
             run([kind, "create", "cluster", "--name", cluster, "--config", str(scratch / "kind.json"),
                  "--kubeconfig", str(scratch / "kubeconfig"), "--wait", "120s"], visible=True)
-            node = cluster + "-control-plane"
+            nodes = kind_nodes(cluster, str(scratch / "encryption.json"))
+            if nodes is None or len(nodes) != 1:
+                raise RuntimeError("kind fixture node ownership could not be established")
+            node = nodes[0]
 
             def kubectl(*args, data=None):
                 return run(["docker", "exec", "-i", node, "kubectl", "--kubeconfig=/etc/kubernetes/admin.conf", *args], data=data)
@@ -149,7 +226,7 @@ apiServer:
                 result = subprocess.run(["docker","exec",node,"kubectl","--kubeconfig=/etc/kubernetes/admin.conf","auth","can-i",verb,resource,"-n","wk-acceptance","--as=system:serviceaccount:wk-acceptance:delivery"], capture_output=True)
                 if result.stdout.strip() != b"no" or result.returncode != 1:
                     raise RuntimeError("fixture RBAC is broader than intended")
-            raw = kubectl("exec", "-n", "kube-system", "etcd-" + node, "--", "etcdctl",
+            raw = kubectl("exec", "-n", "kube-system", "etcd-" + cluster + "-control-plane", "--", "etcdctl",
                           "--cacert=/etc/kubernetes/pki/etcd/ca.crt", "--cert=/etc/kubernetes/pki/etcd/server.crt", "--key=/etc/kubernetes/pki/etcd/server.key",
                           "get", "/registry/secrets/wk-acceptance/selected", "--print-value-only")
             if not raw.startswith(b"k8s:enc:aescbc:v1:"):
@@ -172,21 +249,24 @@ apiServer:
             env = dict(os.environ, WISPKEY_TEST_CROSS_NODE_FIXTURE=str(scratch / "fixture.json"))
             print("Running real SSH and Kubernetes transport acceptance...", flush=True)
             run(["cargo","test","--locked","--lib","operations::live_tests::","--","--ignored","--test-threads=1"], env=env, visible=True)
-            accepted = run(["docker","exec",ssh_name,"cat","/var/lib/wispkey-helper/accepted"])
+            accepted = run(["docker","exec",ssh_container,"cat","/var/lib/wispkey-helper/accepted"])
             if accepted != b"accepted\n":
                 raise RuntimeError("SSH helper did not execute exactly once")
-            for argv in [["docker","logs",ssh_name],["docker","logs",node]]:
+            revoked = json.loads(kubectl("get", "secret", "selected", "-n", "wk-acceptance", "-o", "json"))
+            if (revoked["metadata"]["resourceVersion"] == secret["metadata"]["resourceVersion"]
+                    or revoked["metadata"]["uid"] != secret["metadata"]["uid"]
+                    or revoked["data"] != secret["data"]
+                    or revoked["metadata"]["annotations"]["owner"] != "preserved"):
+                raise RuntimeError("Kubernetes delivery/revocation did not preserve the selected Secret")
+            for argv in [["docker","logs",ssh_container],["docker","logs",node]]:
                 result = subprocess.run(argv, capture_output=True)
+                if result.returncode:
+                    raise RuntimeError("container log collection failed")
                 if SECRET in result.stdout + result.stderr:
                     raise RuntimeError("synthetic credential appeared in container logs")
             print("PASS: pinned SSH, replay rejection, signed Kubernetes delivery/revocation, narrow RBAC, encrypted etcd.", flush=True)
         finally:
-            if owned_cluster:
-                subprocess.run([kind,"delete","cluster","--name",cluster], check=False)
-            if owned_ssh:
-                subprocess.run(["docker","rm","-f","-v",ssh_name], stdout=subprocess.DEVNULL, check=False)
-            if owned_image:
-                subprocess.run(["docker","image","rm",image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+            cleanup(cluster, scratch)
 
 
 if __name__ == "__main__":

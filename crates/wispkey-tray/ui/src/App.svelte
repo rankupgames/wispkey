@@ -1,292 +1,258 @@
 <script>
   import { onMount } from "svelte";
+  import Icon from "./Icon.svelte";
+  import Unlock from "./Unlock.svelte";
+  import AddCredential from "./AddCredential.svelte";
+  import Credentials from "./Credentials.svelte";
+  import Intake from "./Intake.svelte";
+  import { request, cancelPending } from "./ipc.js";
+  import { createSession } from "./session.svelte.js";
+  import { createCredentialEntry } from "./credential-entry.svelte.js";
+  import { createInventory } from "./inventory.svelte.js";
+  import { createIntake } from "./intake.svelte.js";
+  import "./app.css";
 
-  const initialView =
-    typeof window !== "undefined" && window.__WISPKEY_VIEW ? window.__WISPKEY_VIEW : "add";
-  let view = $state(initialView);
-  let mode = $state(initialView === "login" ? "website_login" : "single");
-  let reveal = $state(false);
-  let status = $state("");
-  let credentials = $state([]);
+  const requestedView = window.__WISPKEY_VIEW;
+  const initialView = ({ list: "credentials", add: "add", login: "add", unlock: "unlock", settings: "settings" })[requestedView] || "intake";
+  const navigation = $state({ view: initialView });
+  const feedback = $state({ message: "", notice: "", mutationNotice: "" });
+  const fields = $state({ password: "", confirmation: "", revealPassword: false, remember: false });
+  const session = createSession({ request, cancelPending });
+  const entry = createCredentialEntry({ session, request, feedback, fail: failure, loadProjects, requestedView });
+  const inventory = createInventory({ session, request, feedback, fail: failure, isUnlocked: () => unlocked });
+  const intake = createIntake({ session, request, feedback, fail: failure, isUnlocked: () => unlocked, navigation });
+  let vault = $state(null);
+  let menuOpen = $state(false);
+  let dragging = $state(false);
+  let projects = $state([]);
   let startAtLogin = $state(false);
-  let destinationConfirmed = $state(false);
-  let form = $state({
-    name: "",
-    type: "bearer_token",
-    value: "",
-    description: "",
-    tags: "",
-    hosts: "",
-    project: "",
-    partition: "",
-    headerName: "",
-    paramName: "",
-    namePrefix: "",
-    applicationKey: "",
-    applicationSecret: "",
-    consumerKey: "",
-    password: "",
-    username: "",
-    url: "",
-  });
-
-  window.__wispkeyPending = window.__wispkeyPending || {};
-  window.__wispkeyResolve = function (id, payload) {
-    const pending = window.__wispkeyPending[id];
-    if (pending) {
-      delete window.__wispkeyPending[id];
-      pending(payload);
-    }
-  };
+  let autostartSupported = $state(false);
+  let root;
+  let scopeInitialized = false;
+  const view = $derived(navigation.view);
+  const busy = $derived(session.busy);
+  const message = $derived(feedback.message);
+  const notice = $derived(feedback.notice);
+  const unlocked = $derived(vault?.initialized === true && vault?.session_active === true);
 
   function clearSecrets() {
-    form.value = "";
-    form.applicationKey = "";
-    form.applicationSecret = "";
-    form.consumerKey = "";
-    form.password = "";
-    reveal = false;
+    fields.password = "";
+    fields.confirmation = "";
+    fields.revealPassword = false;
+    entry.clearSecrets();
+    intake.clearSecrets();
   }
 
-  async function ipc(request) {
-    return new Promise((resolve) => {
-      const id = crypto.randomUUID();
-      window.__wispkeyPending = window.__wispkeyPending || {};
-      window.__wispkeyPending[id] = resolve;
-      request.id = id;
-      try {
-        if (!window.ipc || typeof window.ipc.postMessage !== "function") {
-          throw new Error("IPC unavailable");
-        }
-        window.ipc.postMessage(JSON.stringify(request));
-      } catch (_error) {
-        window.__wispkeyResolve(id, { ok: false, error: { message: "IPC unavailable" } });
-      }
-    });
+  function clearPrivateState() {
+    session.invalidate();
+    clearSecrets();
+    intake.clearPrivate();
+    if (view === "scanning") session.abandonPreview();
+    inventory.clearPrivate();
+    menuOpen = false;
   }
 
-  async function copySecret(value) {
-    if (!value) return;
-    try {
-      await navigator.clipboard.writeText(value);
-      status = "Copied";
-    } catch (_error) {
-      status = "Copy failed";
+  function privateView() {
+    return unlocked ? intake.outcome ? "import_done" : "intake" : "unlock";
+  }
+
+  async function enterUnlocked() {
+    navigation.view = "intake";
+    await loadScope();
+  }
+
+  function failure(response) {
+    feedback.message = response.error?.message || "The operation failed";
+    if (["locked", "session_expired", "not_initialized"].includes(response.error?.code)) {
+      clearPrivateState();
+      vault = { ...vault, session_active: false, initialized: response.error.code !== "not_initialized" };
+      navigation.view = "unlock";
     }
   }
 
-  async function save() {
-    if (!destinationConfirmed) {
-      status = "Confirm the destination before saving";
+  async function refreshStatus() {
+    const response = await request("status");
+    if (!response.ok) { failure(response); return; }
+    const next = response.result;
+    if (typeof next.initialized !== "boolean" || typeof next.session_active !== "boolean") {
+      clearPrivateState();
+      vault = null;
+      feedback.message = "Invalid vault status";
       return;
     }
-    const response =
-      mode === "website_login"
-        ? await ipc({
-            method: "generate_login",
-            params: {
-              name: form.name, username: form.username, url: form.url,
-              project: form.project, partition: form.partition, destination_confirmed: true,
-            },
-          })
-        : mode === "ovh_api"
-        ? await ipc({
-            method: "add_template",
-            params: {
-              template: "ovh_api",
-              name_prefix: form.namePrefix,
-              application_key: form.applicationKey,
-              application_secret: form.applicationSecret,
-              consumer_key: form.consumerKey,
-              project: form.project,
-              partition: form.partition,
-              hosts: form.hosts,
-              tags: form.tags,
-              destination_confirmed: true,
-            },
-          })
-        : await ipc({
-            method: "add_credential",
-            params: {
-              name: form.name,
-              type: form.type,
-              value: form.value,
-              description: form.description,
-              tags: form.tags,
-              hosts: form.hosts,
-              project: form.project,
-              partition: form.partition,
-              header_name: form.headerName,
-              param_name: form.paramName,
-              destination_confirmed: true,
-            },
-          });
-    clearSecrets();
-    destinationConfirmed = false;
-    if (response.ok) {
-      status = mode === "website_login"
-        ? `Login saved for ${response.result.origin}. Pending until you activate it; review in 180 days. Fill from the extension in your human-controlled browser profile.`
-        : "Saved";
-    } else {
-      status = (response.error && response.error.message) || "Save failed";
+    const wasUnlocked = unlocked;
+    vault = next;
+    if (!next.initialized || !next.session_active) {
+      if (wasUnlocked) clearPrivateState();
+      if (view !== "settings") navigation.view = "unlock";
     }
+    if (!scopeInitialized && typeof next.active_project === "string") {
+      entry.form.project = next.active_project;
+      intake.project = next.active_project;
+      inventory.project = next.active_project;
+      scopeInitialized = true;
+    }
+    if (!wasUnlocked && unlocked && view === "unlock") await enterUnlocked();
   }
 
-  async function unlock() {
-    const response = await ipc({
-      method: "unlock",
-      params: { password: form.password },
-    });
+  async function loadProjects() {
+    const response = await request("list_projects");
+    if (!response.ok) { failure(response); return; }
+    if (!Array.isArray(response.result.projects)) { feedback.message = "Invalid project list"; return; }
+    projects = response.result.projects;
+  }
+
+  async function loadScope() {
+    await loadProjects();
+    if (view === "add") await entry.loadPartitions(entry.form.project);
+    else await intake.loadPartitions();
+  }
+
+  async function navigate(next) {
+    session.invalidate();
+    menuOpen = false;
+    feedback.message = "";
+    feedback.notice = "";
+    feedback.mutationNotice = "";
     clearSecrets();
-    status = response.ok ? "Unlocked" : (response.error && response.error.message) || "Unlock failed";
+    if (view === "scanning") session.abandonPreview();
+    intake.discardPlan();
+    intake.outcome = null;
+    navigation.view = next;
+    if (next === "credentials") await inventory.loadCredentials();
+    if (next === "add") await entry.loadPartitions(entry.form.project);
+    if (next === "settings") await loadSettings();
   }
 
-  async function loadList() {
-    const response = await ipc({ method: "list_credentials" });
-    credentials = ((response.result || {}).credentials) || [];
+  async function unlockVault(event) {
+    event.preventDefault();
+    if (busy) return;
+    feedback.message = "";
+    if (!vault?.initialized && (!fields.password || fields.password !== fields.confirmation)) {
+      feedback.message = "Passwords must match";
+      clearSecrets();
+      return;
+    }
+    const owner = session.begin();
+    const epoch = session.generation;
+    const response = await request(vault.initialized ? "unlock" : "initialize", vault.initialized
+      ? { password: fields.password, remember: fields.remember }
+      : { password: fields.password, password_confirmation: fields.confirmation });
+    if (epoch === session.generation) clearSecrets();
+    session.finish(owner);
+    if (!response.ok) { failure(response); return; }
+    await refreshStatus();
+    if (!unlocked) { feedback.message = "The vault is still locked"; return; }
+    if (view === "unlock") await enterUnlocked();
+  }
+
+  async function lockVault() {
+    clearPrivateState();
+    const owner = session.begin();
+    const response = await request("lock");
+    session.finish(owner);
+    if (!response.ok) { failure(response); return; }
+    vault = { ...vault, session_active: false };
+    navigation.view = "unlock";
+    feedback.message = "";
   }
 
   async function loadSettings() {
-    const response = await ipc({ method: "get_settings" });
-    startAtLogin = !!(response.result || {}).start_at_login;
+    const response = await request("get_settings");
+    if (!response.ok) { failure(response); return; }
+    startAtLogin = response.result.start_at_login === true;
+    autostartSupported = response.result.start_at_login_supported === true;
   }
 
   async function saveSettings() {
-    const response = await ipc({
-      method: "set_settings",
-      params: { start_at_login: startAtLogin },
-    });
-    status = response.ok ? "Saved" : (response.error && response.error.message) || "Failed";
+    const response = await request("set_settings", { start_at_login: startAtLogin });
+    if (!response.ok) { failure(response); return; }
+    feedback.notice = "Settings saved";
   }
 
-  onMount(() => {
-    if (view === "list") {
-      void loadList();
+  function closeMenus(event) {
+    if (!event.target.closest(".navigation")) menuOpen = false;
+  }
+
+  function escape(event) {
+    if (event.key !== "Escape") return;
+    if (menuOpen) { menuOpen = false; root?.querySelector(".menu-button")?.focus(); }
+    else if (!inventory.dismissReview() && !busy) {
+      if (intake.plan || view === "clipboard_name") void navigate("intake");
+      else {
+        if (unlocked) void navigate("intake");
+        void request("close_window");
+      }
     }
-    if (view === "settings") {
-      void loadSettings();
-    }
-    const timeoutId = setTimeout(() => {
-      clearSecrets();
-      status = "Secrets cleared after idle timeout";
-    }, 120000);
-    return () => clearTimeout(timeoutId);
-  });
+    clearSecrets();
+  }
+
+  onMount(() => session.bindWindow({
+    root,
+    start: async (isAlive) => {
+      await refreshStatus();
+      if (!isAlive() || !unlocked) return;
+      await loadScope();
+      if (view === "credentials") await inventory.loadCredentials();
+      if (view === "settings") await loadSettings();
+    },
+    refreshStatus,
+    filesDropped: (paths) => {
+      if (!Array.isArray(paths) || !paths.length) { feedback.message = "No files were dropped"; return; }
+      void intake.previewImport({ paths });
+    },
+    setDragging: (active) => { dragging = active; },
+    clearPrivate: (reason) => {
+      clearPrivateState();
+      navigation.view = privateView();
+      if (reason === "blur") {
+        feedback.message = "";
+        feedback.notice = feedback.mutationNotice;
+      }
+      if (reason === "idle") feedback.notice = "Entered secrets cleared after inactivity";
+    },
+  }));
 </script>
 
-<main>
-  <h1>WispKey</h1>
-  {#if view === "add" || view === "login"}
-    <label>Mode
-      <select bind:value={mode}>
-        <option value="single">Single credential</option>
-        <option value="ovh_api">OVH API template</option>
-        <option value="website_login">Generate website login</option>
-      </select>
-    </label>
-    {#if mode === "website_login"}
-      <p>Generate and save a unique password. The password stays out of this window.</p>
-      <button type="button" onclick={() => {
-        form.project = "career-ops";
-        form.partition = "job-applications";
-        destinationConfirmed = false;
-      }}>Use job application preset</button>
-      <label>Name <input bind:value={form.name} /></label>
-      <label>Username or email <input bind:value={form.username} autocomplete="off" /></label>
-      <label>Website URL (HTTPS) <input type="url" bind:value={form.url} placeholder="https://careers.example.com" /></label>
-      <p>Saved logins start as pending, with a review reminder after 180 days. Review dates never delete a login.</p>
-      <p>The confirmed project and partition will be created if they do not exist.</p>
-    {:else if mode === "ovh_api"}
-      <label>Name prefix
-        <input bind:value={form.namePrefix} />
-      </label>
-      <label>Application Key
-        <input type={reveal ? "text" : "password"} bind:value={form.applicationKey} />
-      </label>
-      <button type="button" onclick={() => copySecret(form.applicationKey)}>Copy</button>
-      <label>Application Secret
-        <input type={reveal ? "text" : "password"} bind:value={form.applicationSecret} />
-      </label>
-      <button type="button" onclick={() => copySecret(form.applicationSecret)}>Copy</button>
-      <label>Consumer Key
-        <input type={reveal ? "text" : "password"} bind:value={form.consumerKey} />
-      </label>
-      <button type="button" onclick={() => copySecret(form.consumerKey)}>Copy</button>
+<svelte:window onkeydown={(event) => { escape(event); session.activity(); }} onpointerdown={(event) => { closeMenus(event); session.activity(); }} />
+<main bind:this={root}>
+  <header>
+    {#if unlocked}
+      <div class="navigation" role="group" onpointerleave={() => (menuOpen = false)}>
+        <button class="icon-button menu-button" aria-label="Navigation" aria-expanded={menuOpen} aria-controls="navigation-menu" onpointerenter={() => (menuOpen = true)} onfocus={() => (menuOpen = true)} onclick={() => (menuOpen = true)}><Icon name="menu" /></button>
+        {#if menuOpen}
+          <nav id="navigation-menu" aria-label="Local navigation">
+            <button class:active={view === "intake"} onclick={() => navigate("intake")}><Icon name="download" />Intake</button>
+            <button class:active={view === "credentials"} onclick={() => navigate("credentials")}><Icon name="key" />Credentials</button>
+            <button class:active={view === "add"} onclick={() => navigate("add")}><Icon name="plus" />Add credential</button>
+          </nav>
+        {/if}
+      </div>
+    {/if}
+    <span class="logo" role="img" aria-label="WispKey"><Icon name="key" /></span>
+    <span class="spacer"></span>
+    <button class="lock-control" disabled={!unlocked || busy} aria-label={unlocked ? "Lock vault" : vault?.initialized === false ? "No vault" : "Vault locked"} onclick={lockVault}><Icon name={unlocked ? "unlock" : "lock"} />{vault?.initialized === false ? "No vault" : unlocked ? "Unlocked" : "Locked"}</button>
+    <button class="icon-button" aria-label="Settings" onclick={() => navigate("settings")}><Icon name="settings" /></button>
+  </header>
+  <section class="content" aria-busy={busy}>
+    {#if !vault}
+      <div class="empty"><p>Connecting to vault</p><button onclick={refreshStatus}>Retry</button></div>
+    {:else if view === "settings"}
+      <h1>Settings</h1>
+      <label class="check"><input type="checkbox" bind:checked={startAtLogin} disabled={!autostartSupported} />Start at login</label>
+      {#if !autostartSupported}<p class="muted">Start at login is not supported on this platform.</p>{/if}
+      <div class="actions"><button onclick={() => navigate(unlocked ? "intake" : "unlock")}>Back</button><button class="primary" disabled={!autostartSupported} onclick={saveSettings}>Save</button></div>
+    {:else if !unlocked}
+      <Unlock {vault} {fields} {message} {busy} {unlockVault} />
+    {:else if view === "add"}
+      <AddCredential {entry} {projects} {busy} {feedback} {navigate} />
+    {:else if view === "credentials"}
+      <Credentials {inventory} {projects} {busy} />
     {:else}
-      <label>Name
-        <input bind:value={form.name} />
-      </label>
-      <label>Type
-        <select bind:value={form.type}>
-          <option value="bearer_token">bearer_token</option>
-          <option value="api_key">api_key</option>
-          <option value="basic_auth">basic_auth</option>
-          <option value="custom_header">custom_header</option>
-          <option value="query_param">query_param</option>
-        </select>
-      </label>
-      {#if form.type === "custom_header"}
-        <label>Header name
-          <input bind:value={form.headerName} />
-        </label>
-      {/if}
-      {#if form.type === "query_param"}
-        <label>Param name
-          <input bind:value={form.paramName} />
-        </label>
-      {/if}
-      <label>Value
-        <input type={reveal ? "text" : "password"} bind:value={form.value} />
-      </label>
-      <button type="button" onclick={() => copySecret(form.value)}>Copy</button>
-      <label>Description
-        <input bind:value={form.description} />
-      </label>
+      <Intake {intake} {view} {dragging} {busy} {navigate} />
     {/if}
-    {#if mode !== "website_login"}
-    <label>Tags
-      <input bind:value={form.tags} />
-    </label>
-    <label>Hosts
-      <input bind:value={form.hosts} />
-    </label>
-    {/if}
-    <label>Project
-      <input bind:value={form.project} oninput={() => (destinationConfirmed = false)} />
-    </label>
-    <label>Partition
-      <input bind:value={form.partition} oninput={() => (destinationConfirmed = false)} />
-    </label>
-    <label class="destination-confirmation">
-      <input type="checkbox" bind:checked={destinationConfirmed} />
-      Confirm save to project <strong>{form.project || "active project"}</strong>, partition <strong>{form.partition || "personal"}</strong>
-    </label>
-    {#if mode !== "website_login"}
-      <button type="button" onclick={() => (reveal = !reveal)}>Reveal</button>
-    {/if}
-    <button type="button" onclick={save}>{mode === "website_login" ? "Generate and save" : "Save"}</button>
-    <button type="button" onclick={() => { clearSecrets(); window.close(); }}>Cancel</button>
-  {:else if view === "list"}
-    <button type="button" onclick={loadList}>Refresh</button>
-    <ul>
-      {#each credentials as credential (credential.name)}
-        <li>{credential.name} · {credential.type}</li>
-      {/each}
-    </ul>
-  {:else if view === "unlock"}
-    <label>Master password
-      <input type={reveal ? "text" : "password"} bind:value={form.password} />
-    </label>
-    <button type="button" onclick={() => (reveal = !reveal)}>Reveal</button>
-    <button type="button" onclick={unlock}>Unlock</button>
-    <button type="button" onclick={() => { clearSecrets(); window.close(); }}>Cancel</button>
-  {:else}
-    <label>
-      <input type="checkbox" bind:checked={startAtLogin} />
-      Start at login
-    </label>
-    <button type="button" onclick={saveSettings}>Save</button>
-    <button type="button" onclick={loadSettings}>Reload</button>
-  {/if}
-  <p>{status}</p>
+    {#if message && (unlocked || view === "settings" || !vault)}<p class="error-text feedback" role="alert">{message}</p>{/if}
+    {#if notice}<p class="feedback" role="status">{notice}</p>{/if}
+  </section>
+  <datalist id="projects">{#each projects as item}<option value={item.name}></option>{/each}</datalist>
 </main>

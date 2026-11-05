@@ -65,6 +65,9 @@ upload/download. It fails for missing, extra, wrapped, changed, empty or linked
 content; ZIP permission normalization is deliberately outside this comparison.
 It creates no additional artifact and changes no retention setting. Local
 negative fixtures cover missing/extra/wrapped/truncated trees and setup errors.
+The Jenkins browser lane runs the same comparison on a tar archive that it
+packs and unpacks in its own workspace. That proves the archived tree, not
+Jenkins artifact storage.
 
 Validate syntax/expressions separately with `actionlint` (local review used
 official 1.7.12 with its published SHA-256 verified). The full hosted CI must

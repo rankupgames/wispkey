@@ -267,11 +267,23 @@ fn transition(
 /// Only the native host calls this, after OS user verification. Never exposed via MCP/IPC.
 /// Reopen the session after the approval prompt, then revalidate within one transaction.
 pub(crate) fn release(vault: &Vault, approved: &FillRequest) -> Result<WebsiteLoginPayload> {
+    let result = release_in_transaction(vault, approved);
+    if result.is_err() {
+        // A failed release rolls its state transition back, but its denial
+        // must survive independently. The request remains pending for review.
+        log(vault, approved, "BrowserFillDenied")?;
+    }
+    result
+}
+
+fn release_in_transaction(vault: &Vault, approved: &FillRequest) -> Result<WebsiteLoginPayload> {
     expire(vault)?;
-    let tx = vault
-        .db()
-        .unchecked_transaction()
-        .map_err(|_| "browser request store unavailable")?;
+    let tx =
+        rusqlite::Transaction::new_unchecked(vault.db(), rusqlite::TransactionBehavior::Immediate)
+            .map_err(|_| "browser request store unavailable")?;
+    let session = vault
+        .pin_current_session()
+        .map_err(|_| "browser session unavailable")?;
     let current = load(vault, &approved.request_id)?;
     if current.credential_id != approved.credential_id
         || current.revision != approved.revision
@@ -285,7 +297,7 @@ pub(crate) fn release(vault: &Vault, approved: &FillRequest) -> Result<WebsiteLo
     {
         return Err("request changed after approval");
     }
-    let _receiver_guard = super::browser_receiver::release_guard(vault, &current)?;
+    super::browser_receiver::validate_release(vault, &current)?;
     let credential = vault
         .get_credential_in_project(&current.project, &current.name)
         .map_err(|_| "login unavailable")?;
@@ -305,16 +317,19 @@ pub(crate) fn release(vault: &Vault, approved: &FillRequest) -> Result<WebsiteLo
         "BrowserFillApproved",
     )?;
     vault
-        .ensure_auth_usable(&credential.id, true, Some(&current.origin))
+        .ensure_owner_approved_release(&credential.id, Some(&current.origin))
         .map_err(|_| "auth unavailable")?;
     let plaintext = vault
         .decrypt_credential_value_in_project(&current.project, &current.name)
         .map_err(|_| "login unavailable")?;
     let payload = serde_json::from_str(&plaintext).map_err(|_| "invalid website login")?;
     vault
-        .ensure_auth_usable(&credential.id, true, Some(&current.origin))
+        .ensure_owner_approved_release(&credential.id, Some(&current.origin))
         .map_err(|_| "auth unavailable")?;
     super::browser_receiver::released(vault, &current)?;
+    session
+        .validate(vault)
+        .map_err(|_| "browser session unavailable")?;
     tx.commit()
         .map_err(|_| "browser request store unavailable")?;
     Ok(payload)
@@ -342,6 +357,34 @@ mod tests {
     use super::*;
     use crate::core::{GenerateWebsiteLoginRequest, LIFECYCLE_ACTIVE};
 
+    // Real session files belong to one child, not the shared test environment.
+    fn isolated_browser_case(name: &str) -> bool {
+        if std::env::var("BROWSER_TEST_CASE").as_deref() == Ok(name) {
+            return true;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("core::browser::tests::{name}"),
+                "--nocapture",
+            ])
+            .env("BROWSER_TEST_CASE", name)
+            .env("WISPKEY_VAULT_PATH", dir.path())
+            .env("WISPKEY_PROTECTOR", "file")
+            .env("WISPKEY_SESSION_TIMEOUT", "30")
+            .env_remove("WISPKEY_PROJECT")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
     fn fixture() -> Vault {
         let db = Connection::open_in_memory().unwrap();
         Vault::create_schema(&db).unwrap();
@@ -356,11 +399,14 @@ mod tests {
             [&now],
         )
         .unwrap();
+        crate::core::access_ring::insert_access_ring_policy(&db).unwrap();
         let vault = Vault {
             db,
             master_key: Some([7; 32]),
             session_timeout_override: None,
+            _lifecycle_lease: None,
         };
+        vault.write_session().unwrap();
         create_login(&vault);
         vault
     }
@@ -398,6 +444,11 @@ mod tests {
 
     #[test]
     fn registered_login_expiry_and_revocation_deny_actual_browser_release() {
+        if !isolated_browser_case(
+            "registered_login_expiry_and_revocation_deny_actual_browser_release",
+        ) {
+            return;
+        }
         use crate::core::auth::{AuthRegistration, ProviderExpiry};
         for (origin, revoked) in [
             ("https://jobs.example.com", false),
@@ -430,6 +481,7 @@ mod tests {
             let mut restored = fixture();
             restored.remove_credential("careers").unwrap();
             restored.master_key = Some([8; 32]);
+            restored.write_session().unwrap();
             crate::sharing::import_project(&restored, path, passphrase).unwrap();
             let vault = restored;
             let successful = request(
@@ -496,6 +548,10 @@ mod tests {
 
     #[test]
     fn browser_request_metadata_and_audit_never_contain_login_payload() {
+        if !isolated_browser_case("browser_request_metadata_and_audit_never_contain_login_payload")
+        {
+            return;
+        }
         let vault = fixture();
         let request = enqueue(&vault);
         let password = release(&vault, &request).unwrap().password;
@@ -532,6 +588,11 @@ mod tests {
 
     #[test]
     fn browser_requests_reject_wrong_origins_projects_and_archived_logins() {
+        if !isolated_browser_case(
+            "browser_requests_reject_wrong_origins_projects_and_archived_logins",
+        ) {
+            return;
+        }
         let vault = fixture();
         for origin in [
             "http://jobs.example.com",
@@ -569,6 +630,10 @@ mod tests {
 
     #[test]
     fn browser_requests_fail_after_expiry_denial_replacement_or_change() {
+        if !isolated_browser_case("browser_requests_fail_after_expiry_denial_replacement_or_change")
+        {
+            return;
+        }
         let vault = fixture();
         let expired = enqueue(&vault);
         vault
@@ -601,6 +666,9 @@ mod tests {
 
     #[test]
     fn browser_requests_bound_pending_queue_and_untrusted_labels() {
+        if !isolated_browser_case("browser_requests_bound_pending_queue_and_untrusted_labels") {
+            return;
+        }
         let vault = fixture();
         assert!(
             request(
@@ -642,6 +710,11 @@ mod tests {
 
     #[test]
     fn browser_schema_migrates_v11_and_concurrent_release_has_one_winner() {
+        if !isolated_browser_case(
+            "browser_schema_migrates_v11_and_concurrent_release_has_one_winner",
+        ) {
+            return;
+        }
         let vault = fixture();
         vault
             .db()
@@ -680,6 +753,7 @@ mod tests {
                         db,
                         master_key: Some([7; 32]),
                         session_timeout_override: None,
+                        _lifecycle_lease: None,
                     };
                     barrier.wait();
                     release(&vault, &request).is_ok()
@@ -695,6 +769,9 @@ mod tests {
 
     #[test]
     fn browser_release_rolls_back_if_audit_cannot_be_written() {
+        if !isolated_browser_case("browser_release_rolls_back_if_audit_cannot_be_written") {
+            return;
+        }
         let vault = fixture();
         let request = enqueue(&vault);
         vault.db().execute_batch("CREATE TRIGGER fail_audit BEFORE INSERT ON audit_log BEGIN SELECT RAISE(ABORT,'full'); END;").unwrap();
@@ -707,6 +784,11 @@ mod tests {
 
     #[test]
     fn native_approval_preserves_profile_snapshot_port_and_exact_expiry() {
+        if !isolated_browser_case(
+            "native_approval_preserves_profile_snapshot_port_and_exact_expiry",
+        ) {
+            return;
+        }
         use crate::core::auth::{AuthRegistration, ProviderExpiry};
         use crate::core::signup::{ProfileSelection, SignupIdentity};
         let vault = fixture();
@@ -813,6 +895,11 @@ mod tests {
 
     #[test]
     fn native_cancel_denial_and_unavailable_are_terminal_without_decryption() {
+        if !isolated_browser_case(
+            "native_cancel_denial_and_unavailable_are_terminal_without_decryption",
+        ) {
+            return;
+        }
         // Synthetic OS outcomes exercise the production state transition, not
         // LocalAuthentication or physical user presence.
         for outcome in [Ok(false), Err("OS verification unavailable")] {
@@ -838,6 +925,9 @@ mod tests {
 
     #[test]
     fn approval_binds_every_request_field_including_deadline() {
+        if !isolated_browser_case("approval_binds_every_request_field_including_deadline") {
+            return;
+        }
         for column in [
             "name",
             "project",
@@ -880,6 +970,9 @@ mod tests {
 
     #[test]
     fn approved_snapshot_cannot_release_after_lock_or_replay() {
+        if !isolated_browser_case("approved_snapshot_cannot_release_after_lock_or_replay") {
+            return;
+        }
         let mut vault = fixture();
         let request = enqueue(&vault);
         vault.master_key = None;
@@ -889,12 +982,73 @@ mod tests {
             "pending"
         );
         vault.master_key = Some([7; 32]);
+        // External revocation must defeat a previously loaded in-memory key.
+        Vault::lock_session().unwrap();
+        assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_err());
+        assert_eq!(
+            status(&vault, &request.request_id).unwrap().status,
+            "pending"
+        );
+        vault.write_session().unwrap();
         assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_ok());
         assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_err());
     }
 
     #[test]
+    fn critical_ring_denies_owner_approved_browser_release() {
+        if !isolated_browser_case("critical_ring_denies_owner_approved_browser_release") {
+            return;
+        }
+        let vault = fixture();
+        let request = enqueue(&vault);
+        let set_ring = |ring: &str| {
+            vault
+                .db
+                .execute(
+                    "UPDATE credentials SET access_ring=?1 WHERE name='careers'",
+                    [ring],
+                )
+                .unwrap();
+        };
+        set_ring("critical");
+        assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_err());
+        let denials: i64 = vault
+            .db()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE event_type='BrowserFillDenied'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            denials, 1,
+            "release denial must survive transaction rollback"
+        );
+        assert_eq!(
+            status(&vault, &request.request_id).unwrap().status,
+            "pending"
+        );
+        set_ring("restricted");
+        assert!(crate::browser_host::finish_approval(&vault, &request, Ok(true)).is_ok());
+    }
+
+    #[test]
+    fn browser_release_preserves_unbounded_owner_sessions() {
+        if !isolated_browser_case("browser_release_preserves_unbounded_owner_sessions") {
+            return;
+        }
+        let mut vault = fixture();
+        vault.session_timeout_override = Some(0);
+        vault.write_session().unwrap();
+        let request = enqueue(&vault);
+        assert!(release(&vault, &request).is_ok());
+    }
+
+    #[test]
     fn native_outcome_audit_redacts_payload_and_untrusted_labels() {
+        if !isolated_browser_case("native_outcome_audit_redacts_payload_and_untrusted_labels") {
+            return;
+        }
         let vault = fixture();
         let request = request(
             &vault,

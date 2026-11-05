@@ -20,17 +20,9 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
     harden_directory(path)
 }
 
-/// Writes sensitive bytes to disk and then applies the platform's strongest
-/// local owner-only protection available to WispKey.
+/// Atomically replaces a file with a complete, privately created payload.
 pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        ensure_private_directory(parent)?;
-    }
-    write_private_file(path, bytes)?;
-    harden_file(path)
+    replace_private(path, bytes)
 }
 
 /// Restricts an existing sensitive file to the current user.
@@ -38,7 +30,7 @@ pub(crate) fn harden_existing_file(path: &Path) -> Result<()> {
     harden_file(path)
 }
 
-/// Appends sensitive bytes to disk and then applies owner-only protection.
+/// Appends sensitive bytes only to a private file, creating it privately if absent.
 pub(crate) fn append_private(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path
         .parent()
@@ -46,8 +38,7 @@ pub(crate) fn append_private(path: &Path, bytes: &[u8]) -> Result<()> {
     {
         ensure_private_directory(parent)?;
     }
-    append_private_file(path, bytes)?;
-    harden_file(path)
+    append_private_file(path, bytes)
 }
 
 /// Creates a new owner-only file without replacing an existing file.
@@ -60,6 +51,64 @@ pub(crate) fn create_private(path: &Path, bytes: &[u8]) -> Result<bool> {
         ensure_private_directory(parent)?;
     }
     create_private_in_existing_directory(path, bytes)
+}
+
+/// Publishes a complete private file without replacing a concurrent winner.
+/// The existing parent keeps its permissions; unsupported hard links fail closed.
+pub(crate) fn publish_private(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let staged = parent.join(format!(".wk-publish-{}", uuid::Uuid::new_v4()));
+    if !create_private_in_existing_directory(&staged, bytes)? {
+        return Err(VaultError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "publication staging exists",
+        )));
+    }
+    let result = (|| {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&staged)?
+            .sync_all()?;
+        match fs::hard_link(&staged, path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    })();
+    if staged.exists() {
+        fs::remove_file(&staged)?;
+    }
+    result
+}
+
+/// Atomically replaces a small private state file with a complete payload.
+pub(crate) fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty());
+    if let Some(parent) = parent {
+        ensure_private_directory(parent)?;
+    }
+    let parent = parent.unwrap_or(Path::new("."));
+    let staged = parent.join(format!(".wk-replace-{}", uuid::Uuid::new_v4()));
+    if !create_private_in_existing_directory(&staged, bytes)? {
+        return Err(VaultError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "replacement staging exists",
+        )));
+    }
+    let result = (|| {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&staged)?
+            .sync_all()?;
+        fs::rename(&staged, path)?;
+        Ok(())
+    })();
+    if staged.exists() {
+        fs::remove_file(&staged)?;
+    }
+    result
 }
 
 /// Creates a new private file without changing permissions on its existing
@@ -147,10 +196,29 @@ fn inspect_private_metadata(
     ))
 }
 
-/// Reads a small sensitive text file after rejecting obviously unsafe inputs
-/// such as directories, oversized files, and broad Unix permissions.
+/// Reads a bounded sensitive text file without changing its permissions.
 pub(crate) fn read_private_string(path: &Path, max_bytes: u64) -> Result<String> {
-    let metadata = fs::metadata(path)?;
+    use std::io::Read;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        };
+        options
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .share_mode(FILE_SHARE_READ);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Err(VaultError::InvalidBundle(format!(
             "{} is not a regular file",
@@ -163,24 +231,17 @@ pub(crate) fn read_private_string(path: &Path, max_bytes: u64) -> Result<String>
             path.display()
         )));
     }
-    validate_private_file(path, &metadata)?;
-    fs::read_to_string(path).map_err(VaultError::from)
-}
-
-#[cfg(unix)]
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    Ok(())
+    validate_private_file(path, &metadata, &file)?;
+    let mut text = String::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > max_bytes {
+        return Err(VaultError::InvalidBundle(format!(
+            "{} exceeds the size limit",
+            path.display()
+        )));
+    }
+    Ok(text)
 }
 
 #[cfg(unix)]
@@ -194,6 +255,7 @@ fn append_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
         .create(true)
         .mode(0o600)
         .open(path)?;
+    validate_private_file(path, &file.metadata()?, &file)?;
     file.write_all(bytes)?;
     Ok(())
 }
@@ -213,13 +275,7 @@ fn create_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn write_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
-    fs::write(path, bytes)?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn append_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
@@ -229,12 +285,97 @@ fn append_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(all(not(unix), not(windows)))]
 fn create_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
     use std::fs::OpenOptions;
     use std::io::Write;
 
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_private_file(path: &Path, creation: u32, access: u32) -> Result<fs::File> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{
+        ERROR_ALREADY_EXISTS, GetLastError, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{
+        CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let descriptor = windows_acl::private_file_security_descriptor()?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor.as_mut_ptr(),
+        bInheritHandle: 0,
+    };
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return Err(
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL").into(),
+        );
+    }
+    wide.push(0);
+    // SAFETY: the path and descriptor remain valid for the call. The new handle
+    // is not inherited; creation publishes a private DACL before any bytes.
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            creation,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    let creation_status = unsafe { GetLastError() };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::from_raw_os_error(creation_status as i32).into());
+    }
+    // SAFETY: a successful CreateFileW returns an owned file handle.
+    let file = unsafe { fs::File::from_raw_handle(handle) };
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(VaultError::InvalidBundle(
+            "private output must be a regular file".into(),
+        ));
+    }
+    if creation == CREATE_NEW || creation_status != ERROR_ALREADY_EXISTS {
+        return Ok(file);
+    }
+    windows_private::verify_acl(&file)
+        .map_err(|message| VaultError::InvalidBundle(message.into()))?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn append_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_GENERIC_WRITE, FILE_WRITE_DATA, OPEN_ALWAYS,
+    };
+
+    // Match OpenOptions::append: retain metadata/security query rights while
+    // omitting FILE_WRITE_DATA so each write is atomically appended by Windows.
+    let mut file = open_private_file(path, OPEN_ALWAYS, FILE_GENERIC_WRITE & !FILE_WRITE_DATA)?;
+    file.write_all(bytes)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_private_file(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use windows_sys::Win32::Foundation::GENERIC_WRITE;
+    use windows_sys::Win32::Storage::FileSystem::CREATE_NEW;
+
+    let mut file = open_private_file(path, CREATE_NEW, GENERIC_WRITE)?;
     file.write_all(bytes)?;
     Ok(())
 }
@@ -256,7 +397,7 @@ fn harden_file(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn validate_private_file(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+fn validate_private_file(path: &Path, metadata: &fs::Metadata, _file: &fs::File) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let mode = metadata.permissions().mode();
@@ -280,8 +421,18 @@ fn harden_file(path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-fn validate_private_file(path: &Path, _metadata: &fs::Metadata) -> Result<()> {
-    windows_acl::apply_private_acl(path)
+fn validate_private_file(path: &Path, metadata: &fs::Metadata, file: &fs::File) -> Result<()> {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(VaultError::InvalidBundle(format!(
+            "{} must not be a reparse point",
+            path.display()
+        )));
+    }
+    windows_private::verify_acl(file)
+        .map_err(|message| VaultError::InvalidBundle(format!("{}: {message}", path.display())))
 }
 
 #[cfg(all(not(unix), not(windows)))]
@@ -295,7 +446,7 @@ fn harden_file(_path: &Path) -> Result<()> {
 }
 
 #[cfg(all(not(unix), not(windows)))]
-fn validate_private_file(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
+fn validate_private_file(_path: &Path, _metadata: &fs::Metadata, _file: &fs::File) -> Result<()> {
     Ok(())
 }
 
@@ -306,23 +457,18 @@ pub(crate) mod windows_acl {
     use std::path::Path;
     use std::ptr::null_mut;
 
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE, LocalFree};
+    use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        SDDL_REVISION_1,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
-        DACL_SECURITY_INFORMATION, GetTokenInformation, PSECURITY_DESCRIPTOR, SetFileSecurityW,
-        TOKEN_QUERY, TOKEN_USER, TokenUser,
+        DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, SetFileSecurityW,
     };
-    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     use crate::core::{Result, VaultError};
 
     pub(super) fn apply_private_acl(path: &Path) -> Result<()> {
-        let sid = current_user_sid_string()?;
-        let sddl = format!("D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)");
-        let descriptor = security_descriptor_from_sddl(&sddl)?;
+        let descriptor = private_file_security_descriptor()?;
         let path_wide = wide_null(path.as_os_str());
 
         let set_result = unsafe {
@@ -335,53 +481,19 @@ pub(crate) mod windows_acl {
         Ok(())
     }
 
-    fn current_user_sid_string() -> Result<String> {
-        let mut token: HANDLE = null_mut();
-        let opened =
-            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token as *mut _) };
-        if opened == 0 {
-            return Err(VaultError::Io(std::io::Error::last_os_error()));
-        }
-        let token = Handle(token);
-
-        let mut needed = 0u32;
-        unsafe {
-            GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut needed as *mut _);
-        }
-        if needed == 0 {
-            return Err(VaultError::Io(std::io::Error::from_raw_os_error(
-                unsafe { GetLastError() } as i32,
-            )));
-        }
-
-        let mut buffer = vec![0u8; needed as usize];
-        let read = unsafe {
-            GetTokenInformation(
-                token.0,
-                TokenUser,
-                buffer.as_mut_ptr().cast(),
-                needed,
-                &mut needed as *mut _,
-            )
-        };
-        if read == 0 {
-            return Err(VaultError::Io(std::io::Error::last_os_error()));
-        }
-
-        let token_user = unsafe { &*(buffer.as_ptr().cast::<TOKEN_USER>()) };
-        let mut sid_ptr = null_mut();
-        let converted = unsafe { ConvertSidToStringSidW(token_user.User.Sid, &mut sid_ptr) };
-        if converted == 0 {
-            return Err(VaultError::Io(std::io::Error::last_os_error()));
-        }
-        let sid = unsafe { wide_ptr_to_string(sid_ptr) };
-        unsafe {
-            LocalFree(sid_ptr.cast());
-        }
-        Ok(sid)
+    pub(super) fn private_file_security_descriptor() -> Result<SecurityDescriptor> {
+        let sid = current_user_sid_string()?;
+        security_descriptor_from_sddl(&format!(
+            "O:{sid}D:P(A;;FA;;;{sid})(A;;FA;;;SY)(A;;FA;;;BA)"
+        ))
     }
 
-    fn security_descriptor_from_sddl(sddl: &str) -> Result<SecurityDescriptor> {
+    fn current_user_sid_string() -> Result<String> {
+        super::windows_private::current_sid_string()
+            .map_err(|message| VaultError::Io(std::io::Error::other(message)))
+    }
+
+    pub(crate) fn security_descriptor_from_sddl(sddl: &str) -> Result<SecurityDescriptor> {
         let mut descriptor: PSECURITY_DESCRIPTOR = null_mut();
         let sddl_wide: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
         let converted = unsafe {
@@ -402,28 +514,16 @@ pub(crate) mod windows_acl {
         value.encode_wide().chain(std::iter::once(0)).collect()
     }
 
-    unsafe fn wide_ptr_to_string(ptr: *const u16) -> String {
-        let mut len = 0usize;
-        while unsafe { *ptr.add(len) } != 0 {
-            len += 1;
-        }
-        let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-        String::from_utf16_lossy(slice)
-    }
-
-    struct Handle(HANDLE);
-
-    impl Drop for Handle {
-        fn drop(&mut self) {
-            unsafe {
-                CloseHandle(self.0);
-            }
-        }
-    }
-
     pub(crate) fn current_user_only_security_descriptor() -> Result<SecurityDescriptor> {
         let sid = current_user_sid_string()?;
         security_descriptor_from_sddl(&format!("D:P(A;;GA;;;{sid})"))
+    }
+
+    /// Explicit owner avoids an elevated token defaulting ownership to Administrators.
+    pub(crate) fn current_user_owned_security_descriptor() -> Result<SecurityDescriptor> {
+        let sid = super::windows_private::current_sid_string()
+            .map_err(|message| VaultError::Io(std::io::Error::other(message)))?;
+        security_descriptor_from_sddl(&format!("O:{sid}D:P(A;;GA;;;{sid})"))
     }
 
     pub(crate) struct SecurityDescriptor(PSECURITY_DESCRIPTOR);
@@ -440,5 +540,148 @@ pub(crate) mod windows_acl {
                 LocalFree(self.0.cast());
             }
         }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) mod windows_private;
+
+#[cfg(all(test, any(unix, windows)))]
+mod tests {
+    use super::*;
+    use std::io::Read;
+
+    #[cfg(unix)]
+    pub(super) fn make_broad(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[cfg(windows)]
+    pub(super) fn make_broad(path: &Path) {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, SetFileSecurityW};
+
+        let sid = windows_private::current_sid_string().unwrap();
+        let descriptor =
+            windows_acl::security_descriptor_from_sddl(&format!("D:P(A;;FA;;;{sid})(A;;FR;;;WD)"))
+                .unwrap();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        assert_ne!(
+            unsafe {
+                SetFileSecurityW(
+                    wide.as_ptr(),
+                    DACL_SECURITY_INFORMATION,
+                    descriptor.as_mut_ptr(),
+                )
+            },
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    fn protection(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode()
+    }
+
+    #[cfg(windows)]
+    fn protection(path: &Path) -> Vec<usize> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Security::{DACL_SECURITY_INFORMATION, GetFileSecurityW};
+
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut needed = 0;
+        unsafe {
+            GetFileSecurityW(
+                wide.as_ptr(),
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            )
+        };
+        assert!(needed > 0);
+        let mut descriptor = vec![0usize; (needed as usize).div_ceil(std::mem::size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetFileSecurityW(
+                    wide.as_ptr(),
+                    DACL_SECURITY_INFORMATION,
+                    descriptor.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                )
+            },
+            0
+        );
+        descriptor
+    }
+
+    #[test]
+    fn private_write_keeps_replacement_bytes_out_of_preopened_readers() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("existing-output");
+        fs::write(&path, b"old-public-fixture").unwrap();
+        make_broad(&path);
+        let mut prior_reader = fs::File::open(&path).unwrap();
+        write_private(&path, b"new-private-fixture").unwrap();
+        let mut prior_bytes = String::new();
+        prior_reader.read_to_string(&mut prior_bytes).unwrap();
+        assert_eq!(prior_bytes, "old-public-fixture");
+        assert_eq!(
+            read_private_string(&path, 128).unwrap(),
+            "new-private-fixture"
+        );
+    }
+
+    #[test]
+    fn append_rejects_unsafe_existing_file_without_changing_bytes_or_protection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unsafe-append");
+        fs::write(&path, b"old-public-fixture").unwrap();
+        make_broad(&path);
+        let prior_protection = protection(&path);
+        assert!(append_private(&path, b"new-private-fixture").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"old-public-fixture");
+        assert_eq!(protection(&path), prior_protection);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::io::Write;
+    use windows_sys::Win32::Foundation::GENERIC_WRITE;
+    use windows_sys::Win32::Storage::FileSystem::CREATE_NEW;
+
+    #[test]
+    fn private_read_rejects_broad_acl_without_repair() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("supplied-passphrase");
+        let bytes = b"synthetic-private-file-fixture";
+        fs::write(&path, bytes).unwrap();
+        super::tests::make_broad(&path);
+        assert!(windows_private::verify_acl(&fs::File::open(&path).unwrap()).is_err());
+        assert!(read_private_string(&path, 128).is_err());
+        assert!(windows_private::verify_acl(&fs::File::open(&path).unwrap()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+
+    #[test]
+    fn private_creation_protects_empty_file_before_writing_and_preserves_writer_modes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("private-output");
+        let mut file = open_private_file(&path, CREATE_NEW, GENERIC_WRITE).unwrap();
+        assert_eq!(file.metadata().unwrap().len(), 0);
+        windows_private::verify_acl(&fs::File::open(&path).unwrap()).unwrap();
+        file.write_all(b"first").unwrap();
+        drop(file);
+        append_private(&path, b"-second").unwrap();
+        assert_eq!(read_private_string(&path, 128).unwrap(), "first-second");
+        write_private(&path, b"replacement").unwrap();
+        assert_eq!(read_private_string(&path, 128).unwrap(), "replacement");
+        assert!(!create_private_in_existing_directory(&path, b"must-not-replace").unwrap());
+        assert_eq!(read_private_string(&path, 128).unwrap(), "replacement");
     }
 }

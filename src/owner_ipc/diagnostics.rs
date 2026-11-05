@@ -14,6 +14,7 @@ impl Method {
     pub(super) fn from_request(request: &Value) -> Self {
         match request.get("method").and_then(Value::as_str) {
             Some("status") => Self::Known("status"),
+            Some("initialize") => Self::Known("initialize"),
             Some("unlock") => Self::Known("unlock"),
             Some("lock") => Self::Known("lock"),
             Some("list_credentials") => Self::Known("list_credentials"),

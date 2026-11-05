@@ -19,7 +19,8 @@ fn add_run_secrets(vault_dir: &std::path::Path) {
         run_wispkey_json(
             vault_dir,
             &[
-                "--format", "json", "add", name, "--type", "api_key", "--value", value,
+                "--format", "json", "add", "--ring", "routine", name, "--type", "api_key",
+                "--value", value,
             ],
         );
     }
@@ -173,4 +174,99 @@ WISPKEY_TEST_RUN_MISSING = "cred:missing-secret"
     );
     assert!(!output.status.success());
     assert!(!marker.exists(), "child command should not have spawned");
+}
+
+#[test]
+fn run_attempt_survives_parent_killed_after_secret_reaches_child() {
+    use std::os::unix::process::ExitStatusExt;
+
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    add_run_secrets(vault_dir.path());
+    let manifest = vault_dir.path().join("run.toml");
+    std::fs::write(
+        &manifest,
+        "[env]\nWK_RUN_SECRET = \"cred:run-secret-one\"\n",
+    )
+    .expect("write manifest");
+    let output = run_wispkey(
+        vault_dir.path(),
+        &[
+            "run",
+            "--manifest",
+            manifest.to_str().expect("manifest path"),
+            "--",
+            "sh",
+            "-c",
+            "test \"$WK_RUN_SECRET\" = run-secret-value-one && kill -KILL \"$PPID\"",
+        ],
+    );
+    assert_eq!(output.status.signal(), Some(9));
+    assert!(output.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(RUN_SECRET_ONE_VALUE));
+    let log = run_wispkey_json(
+        vault_dir.path(),
+        &["--format", "json", "log", "--last", "10"],
+    );
+    let entries = log["entries"].as_array().expect("entries array");
+    let attempts: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry["event_type"] == "CredentialRunAttempted")
+        .collect();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0]["credential_name"], RUN_SECRET_ONE_NAME);
+    assert_eq!(attempts[0]["target_host"], "sh");
+    assert_eq!(attempts[0]["http_method"], "run");
+    assert!(attempts[0]["response_status"].is_null());
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["event_type"] == "CredentialRun")
+    );
+    assert!(!log.to_string().contains(RUN_SECRET_ONE_VALUE));
+}
+
+#[test]
+fn run_audit_failure_blocks_child_spawn() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    let marker_dir = tempfile::tempdir().expect("marker dir");
+    let marker = marker_dir.path().join("spawned");
+    init_vault(vault_dir.path());
+    add_run_secrets(vault_dir.path());
+    let manifest = vault_dir.path().join("run.toml");
+    std::fs::write(
+        &manifest,
+        "[env]\nWK_RUN_SECRET = \"cred:run-secret-one\"\n",
+    )
+    .expect("write manifest");
+    let db = rusqlite::Connection::open(vault_dir.path().join("vault.db")).expect("open vault db");
+    db.execute_batch(
+        "CREATE TRIGGER reject_run_audit BEFORE INSERT ON audit_log
+         WHEN NEW.event_type LIKE 'CredentialRun%'
+         BEGIN SELECT RAISE(FAIL, 'synthetic audit failure'); END;",
+    )
+    .expect("reject run audit inserts");
+    let output = run_wispkey(
+        vault_dir.path(),
+        &[
+            "run",
+            "--manifest",
+            manifest.to_str().expect("manifest path"),
+            "--",
+            "sh",
+            "-c",
+            "touch \"$1\"",
+            "marker",
+            marker.to_str().expect("marker path"),
+        ],
+    );
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("cannot record owner egress attempt"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(RUN_SECRET_ONE_VALUE));
+    assert!(!marker.exists(), "audit failure must prevent child spawn");
 }

@@ -16,7 +16,7 @@ const CALLBACK_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CALLBACK_BYTES: usize = 8192;
 const MAX_TOKEN_BYTES: usize = 16384;
 const MAX_TOKEN_LIFETIME: i64 = 86400;
-const SCOPE: &str = "wispkey:sync";
+const SCOPE: &str = "openid";
 
 fn invalid(message: &str) -> CloudError {
     CloudError::ApiError(message.to_owned())
@@ -82,14 +82,24 @@ struct TokenResponse {
     scope: Option<String>,
     #[serde(default)]
     refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+}
+
+impl TokenResponse {
+    fn discard_unused_tokens(&mut self) {
+        for token in [&mut self.refresh_token, &mut self.id_token] {
+            if let Some(mut token) = token.take() {
+                token.zeroize();
+            }
+        }
+    }
 }
 
 impl Drop for TokenResponse {
     fn drop(&mut self) {
         self.access_token.zeroize();
-        if let Some(token) = &mut self.refresh_token {
-            token.zeroize();
-        }
+        self.discard_unused_tokens();
     }
 }
 
@@ -307,10 +317,12 @@ fn validate_token_response(response: &TokenResponse) -> CloudResult<()> {
         || !response.access_token.bytes().all(|b| {
             b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'~' | b'+' | b'/' | b'=')
         })
-        || response
-            .scope
-            .as_deref()
-            .is_some_and(|scope| scope != SCOPE)
+        || response.scope.as_deref().is_some_and(|scope| {
+            !matches!(
+                scope,
+                SCOPE | "openid offline_access" | "offline_access openid"
+            )
+        })
     {
         return Err(invalid(
             "invalid_oauth_token_response; expected a short-lived opaque access token",
@@ -598,11 +610,9 @@ impl CloudClient {
                 ("resource", deployment.resource.as_str()),
             ]))
             .await?;
-        // Clerk may include a refresh token without an explicit offline_access
-        // request. It is never persisted, logged, sent elsewhere, or used.
-        if let Some(mut refresh) = response.refresh_token.take() {
-            refresh.zeroize();
-        }
+        // OIDC may return an ID token, and Clerk may include a refresh token.
+        // Neither authenticates sync or belongs in persisted Cloud state.
+        response.discard_unused_tokens();
         validate_token_response(&response)?;
         let verified: Envelope<serde_json::Value> = self
             .oauth_json(
@@ -736,9 +746,13 @@ impl CloudClient {
     }
 }
 
-pub(super) struct ConfigLock(std::fs::File);
+pub(super) struct ConfigLock {
+    file: std::fs::File,
+    _lifecycle_lease: std::fs::File,
+}
 impl ConfigLock {
     pub(super) fn acquire() -> CloudResult<Self> {
+        let lifecycle = crate::core::shared_lifecycle_lease(&Vault::vault_dir())?;
         let path = Vault::vault_dir().join("cloud-auth.lock");
         secure_files::create_private(&path, b"")?;
         let metadata =
@@ -754,12 +768,15 @@ impl ConfigLock {
             .map_err(|_| invalid("cloud_auth_lock_unavailable"))?;
         fs2::FileExt::try_lock_exclusive(&file)
             .map_err(|_| invalid("cloud_auth_change_in_progress"))?;
-        Ok(Self(file))
+        Ok(Self {
+            file,
+            _lifecycle_lease: lifecycle,
+        })
     }
 }
 impl Drop for ConfigLock {
     fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self.0);
+        let _ = fs2::FileExt::unlock(&self.file);
     }
 }
 

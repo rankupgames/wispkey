@@ -36,6 +36,7 @@ fn test_vault(password: &str) -> Vault {
     let now = Utc::now().to_rfc3339();
     db.execute("INSERT INTO projects (id, name, description, created_at, updated_at) VALUES ('default', 'default', 'Default project', ?1, ?2)", params![now, now]).unwrap();
     db.execute("INSERT INTO partitions (id, name, description, project_id, created_at, updated_at) VALUES ('personal', 'personal', '', 'default', ?1, ?2)", params![now, now]).unwrap();
+    access_ring::insert_access_ring_policy(&db).unwrap();
 
     let master_key = Vault::derive_key(password, salt.as_ref());
     std::mem::forget(dir);
@@ -43,6 +44,7 @@ fn test_vault(password: &str) -> Vault {
         db,
         master_key: Some(master_key),
         session_timeout_override: None,
+        _lifecycle_lease: None,
     }
 }
 
@@ -51,6 +53,56 @@ fn init_creates_vault() {
     let vault = test_vault("test-password");
     assert!(vault.is_unlocked());
     assert_eq!(vault.credential_count().unwrap(), 0);
+}
+
+#[test]
+fn ignored_rotation_write_is_not_reported_as_success() {
+    let vault = test_vault("pw");
+    let original = vault
+        .add_credential(
+            AddCredentialRequest::new("rotate", CredentialType::ApiKey, "fixture")
+                .project(Some("default")),
+        )
+        .unwrap();
+    vault.db.execute_batch("CREATE TRIGGER ignore_rotation BEFORE UPDATE OF wisp_token ON credentials BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+    assert!(matches!(
+        vault.rotate_wisp_token_in_project("default", "rotate"),
+        Err(VaultError::CredentialNotFound(_))
+    ));
+    assert_eq!(
+        vault
+            .get_credential_in_project("default", "rotate")
+            .unwrap()
+            .wisp_token,
+        original.wisp_token
+    );
+}
+
+#[test]
+fn project_creation_rolls_back_if_default_partition_fails() {
+    let vault = test_vault("pw");
+    vault.db.execute_batch("CREATE TRIGGER reject_partition BEFORE INSERT ON partitions BEGIN SELECT RAISE(ABORT, 'fixture partition refusal'); END;").unwrap();
+    assert!(vault.create_project("fixture", "").is_err());
+    assert!(
+        !vault
+            .list_projects()
+            .unwrap()
+            .iter()
+            .any(|project| project.name == "fixture")
+    );
+    vault
+        .db
+        .execute_batch("DROP TRIGGER reject_partition; BEGIN IMMEDIATE;")
+        .unwrap();
+    vault.create_project("nested", "").unwrap();
+    vault.db.execute_batch("ROLLBACK;").unwrap();
+    assert!(
+        !vault
+            .list_projects()
+            .unwrap()
+            .iter()
+            .any(|project| project.name == "nested")
+    );
 }
 
 #[test]
@@ -151,6 +203,147 @@ fn lookup_by_wisp_token_decrypts() {
     let (found, value) = vault.lookup_by_wisp_token(&cred.wisp_token).unwrap();
     assert_eq!(found.name, "lookup-test");
     assert_eq!(value, "the-real-secret");
+}
+
+/// Release a real competing writer only when SQLite asks the caller to wait.
+/// A deferred read-to-write upgrade bypasses this callback and returns BUSY.
+fn with_reserved_writer<T>(
+    vault: &Vault,
+    before_commit: impl FnOnce() + Send + 'static,
+    action: impl FnOnce() -> T,
+) -> (T, bool) {
+    use std::cell::RefCell;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::time::Duration;
+
+    struct WriterRelease {
+        release: Sender<()>,
+        committed: Receiver<()>,
+    }
+    thread_local! {
+        static WRITER_RELEASE: RefCell<Option<WriterRelease>> = const { RefCell::new(None) };
+    }
+    fn release_writer(_: i32) -> bool {
+        WRITER_RELEASE.with(|state| {
+            let Some(writer) = state.borrow_mut().take() else {
+                return false;
+            };
+            writer.release.send(()).is_ok()
+                && writer
+                    .committed
+                    .recv_timeout(Duration::from_secs(10))
+                    .is_ok()
+        })
+    }
+
+    let path = vault.db.path().expect("file-backed fixture").to_string();
+    let (ready_tx, ready_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (committed_tx, committed_rx) = channel();
+    let writer = std::thread::spawn(move || {
+        let db = Connection::open(path).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        before_commit();
+        db.execute_batch("COMMIT").unwrap();
+        let _ = committed_tx.send(());
+    });
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    WRITER_RELEASE.with(|state| {
+        *state.borrow_mut() = Some(WriterRelease {
+            release: release_tx.clone(),
+            committed: committed_rx,
+        });
+    });
+    vault.db.busy_handler(Some(release_writer)).unwrap();
+    let result = action();
+    vault.db.busy_handler(None).unwrap();
+    let waited = WRITER_RELEASE.with(|state| state.borrow_mut().take().is_none());
+    // Also release the writer when old behavior returned BUSY without waiting.
+    let _ = release_tx.send(());
+    writer.join().unwrap();
+    (result, waited)
+}
+
+#[test]
+fn token_lookup_waits_for_writer_before_reading_and_updates_last_use() {
+    let vault = test_vault("pw");
+    let credential = vault
+        .add_credential(
+            AddCredentialRequest::new("contended-token", CredentialType::ApiKey, "fixture-value")
+                .project(Some("default")),
+        )
+        .unwrap();
+    let (result, waited) = with_reserved_writer(
+        &vault,
+        || {},
+        || vault.lookup_by_wisp_token(&credential.wisp_token),
+    );
+    assert!(waited, "writer admission must invoke the busy handler");
+    let (found, plaintext) = result.unwrap();
+    assert_eq!(found.id, credential.id);
+    assert_eq!(plaintext, "fixture-value");
+    assert!(
+        vault
+            .get_credential_in_project("default", "contended-token")
+            .unwrap()
+            .last_used_at
+            .is_some()
+    );
+}
+
+#[test]
+fn attach_source_failure_reports_committed_credentials_and_can_retry() {
+    let vault = test_vault("pw");
+    let workspace = tempfile::tempdir().unwrap();
+    let source = workspace.path().join(".env.production");
+    let original = "API_TOKEN=fixture-attach-secret\n";
+    fs::write(&source, original).unwrap();
+    let source_for_writer = source.clone();
+    let attach = || {
+        crate::migrate::attach_env_file(
+            &vault,
+            source.to_str().unwrap(),
+            &["API_TOKEN".into()],
+            "attach-source-failure",
+            None,
+            Some("api.example.com"),
+        )
+    };
+    let (result, waited) = with_reserved_writer(
+        &vault,
+        move || {
+            fs::remove_file(&source_for_writer).unwrap();
+            fs::create_dir(&source_for_writer).unwrap();
+        },
+        attach,
+    );
+    assert!(waited, "source change must occur after attachment reads it");
+    let error = result
+        .expect_err("source publication must fail")
+        .to_string();
+    assert!(error.contains("credentials are stored"), "{error}");
+    assert!(error.contains("source file update failed"), "{error}");
+    assert!(!error.contains("fixture-attach-secret"));
+    assert!(source.is_dir());
+    assert_eq!(
+        vault
+            .decrypt_credential_value_in_project("attach-source-failure", "production-api-token")
+            .unwrap(),
+        "fixture-attach-secret"
+    );
+    fs::remove_dir(&source).unwrap();
+    fs::write(&source, original).unwrap();
+    let retried = attach().unwrap();
+    assert_eq!(retried.imported, 0);
+    assert_eq!(retried.reused, 1);
+    assert_eq!(retried.updated, 1);
+    assert!(
+        fs::read_to_string(&source)
+            .unwrap()
+            .starts_with("API_TOKEN=wk_")
+    );
 }
 
 #[test]
@@ -1773,4 +1966,240 @@ fn schema_v10_to_current_adds_website_login_columns_without_touching_data() {
         .unwrap();
     assert_eq!(origin, "");
     assert_eq!(lifecycle, "active");
+}
+
+fn stored_ring(vault: &Vault, name: &str) -> Option<String> {
+    vault
+        .db
+        .query_row(
+            "SELECT access_ring FROM credentials WHERE name=?1",
+            [name],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn ring_request(name: &str) -> AddCredentialRequest<'_> {
+    AddCredentialRequest::new(name, CredentialType::ApiKey, "synthetic-ring-secret")
+        .project(Some("default"))
+}
+
+#[test]
+fn migration_to_v17_keeps_existing_rows_restricted() {
+    let vault = test_vault("pw");
+    vault.add_credential(ring_request("legacy")).unwrap();
+    vault
+        .db
+        .execute_batch(
+            "ALTER TABLE credentials DROP COLUMN access_ring;
+             DELETE FROM vault_meta WHERE key='access_ring_policy';
+             UPDATE vault_meta SET value='16' WHERE key='version';",
+        )
+        .unwrap();
+    Vault::migrate_schema(&vault.db).unwrap();
+    assert_eq!(stored_ring(&vault, "legacy"), None);
+    assert_eq!(
+        vault.access_ring_in_project("default", "legacy").unwrap(),
+        access_ring::AccessRing::Restricted
+    );
+    let policy: String = vault
+        .db
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key='access_ring_policy'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(policy, "1");
+    let version: String = vault
+        .db
+        .query_row(
+            "SELECT value FROM vault_meta WHERE key='version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, CURRENT_SCHEMA_VERSION);
+}
+
+#[test]
+fn unknown_stored_ring_and_unclassified_rows_are_restricted() {
+    let vault = test_vault("pw");
+    vault.add_credential(ring_request("plain")).unwrap();
+    assert_eq!(stored_ring(&vault, "plain"), None);
+    vault
+        .db
+        .execute(
+            "UPDATE credentials SET access_ring='superuser' WHERE name='plain'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        vault.access_ring_in_project("default", "plain").unwrap(),
+        access_ring::AccessRing::Restricted
+    );
+    assert_eq!(access_ring::AccessRing::parse("Routine"), None);
+    assert_eq!(access_ring::AccessRing::parse(""), None);
+}
+
+#[test]
+fn access_ring_changes_fail_closed_without_supported_policy() {
+    use access_ring::AccessRing;
+    for policy in [Some("2"), Some(""), None] {
+        let vault = test_vault("pw");
+        vault
+            .add_classified_credential(ring_request("kept"), Some(AccessRing::Routine))
+            .unwrap();
+        vault
+            .db
+            .execute("DELETE FROM vault_meta WHERE key='access_ring_policy'", [])
+            .unwrap();
+        if let Some(value) = policy {
+            vault
+                .db
+                .execute(
+                    "INSERT INTO vault_meta (key, value) VALUES ('access_ring_policy', ?1)",
+                    [value],
+                )
+                .unwrap();
+        }
+        assert!(matches!(
+            vault.set_access_ring("default", "kept", AccessRing::Critical, None),
+            Err(VaultError::AuthRejected("access ring policy unsupported"))
+        ));
+        assert_eq!(stored_ring(&vault, "kept").as_deref(), Some("routine"));
+        assert!(matches!(
+            vault.add_classified_credential(ring_request("new"), Some(AccessRing::Critical)),
+            Err(VaultError::AuthRejected("access ring policy unsupported"))
+        ));
+        assert!(vault.get_credential_in_project("default", "new").is_err());
+    }
+}
+
+#[test]
+fn broadening_access_ring_requires_fresh_owner_password() {
+    use access_ring::AccessRing;
+    let vault = test_vault("pw");
+    vault
+        .add_classified_credential(ring_request("vaulted"), Some(AccessRing::Critical))
+        .unwrap();
+    assert_eq!(stored_ring(&vault, "vaulted").as_deref(), Some("critical"));
+    assert!(matches!(
+        vault.set_access_ring("default", "vaulted", AccessRing::Restricted, None),
+        Err(VaultError::AuthRejected(
+            "broadening an access ring requires owner password"
+        ))
+    ));
+    assert!(
+        vault
+            .set_access_ring("default", "vaulted", AccessRing::Routine, Some("wrong"))
+            .is_err()
+    );
+    assert_eq!(stored_ring(&vault, "vaulted").as_deref(), Some("critical"));
+
+    vault.add_credential(ring_request("unclassified")).unwrap();
+    assert!(
+        vault
+            .set_access_ring("default", "unclassified", AccessRing::Routine, None)
+            .is_err()
+    );
+    assert_eq!(stored_ring(&vault, "unclassified"), None);
+}
+
+#[test]
+fn narrowing_access_ring_needs_no_password_and_invalidates_revision() {
+    use access_ring::AccessRing;
+    let vault = test_vault("pw");
+    let created = vault
+        .add_classified_credential(ring_request("narrow"), Some(AccessRing::Routine))
+        .unwrap();
+    let revision = |vault: &Vault| -> String {
+        vault
+            .db
+            .query_row(
+                "SELECT updated_at FROM credentials WHERE id=?1",
+                [&created.id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    vault
+        .db
+        .execute(
+            "UPDATE credentials SET updated_at='2000-01-01T00:00:00+00:00' WHERE id=?1",
+            [&created.id],
+        )
+        .unwrap();
+    assert_eq!(
+        vault
+            .set_access_ring("default", "narrow", AccessRing::Critical, None)
+            .unwrap(),
+        AccessRing::Routine
+    );
+    assert_eq!(stored_ring(&vault, "narrow").as_deref(), Some("critical"));
+    let changed = revision(&vault);
+    assert_ne!(changed, "2000-01-01T00:00:00+00:00");
+    assert_eq!(
+        vault
+            .set_access_ring("default", "narrow", AccessRing::Critical, None)
+            .unwrap(),
+        AccessRing::Critical
+    );
+    assert_eq!(revision(&vault), changed);
+}
+
+#[test]
+fn access_ring_audit_records_metadata_only() {
+    use access_ring::AccessRing;
+    let vault = test_vault("pw");
+    let created = vault
+        .add_classified_credential(ring_request("audited"), Some(AccessRing::Routine))
+        .unwrap();
+    vault
+        .set_access_ring("default", "audited", AccessRing::Critical, None)
+        .unwrap();
+    vault
+        .set_access_ring("default", "audited", AccessRing::Critical, None)
+        .unwrap();
+    let mut statement = vault
+        .db
+        .prepare(
+            "SELECT credential_name, wisp_token, target_host, target_path, project_name
+             FROM audit_log WHERE event_type='AccessRingChanged' ORDER BY id",
+        )
+        .unwrap();
+    type RingAuditRow = (String, Option<String>, Option<String>, String, String);
+    let rows: Vec<RingAuditRow> = statement
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|row| row.3.as_str()).collect::<Vec<_>>(),
+        vec!["unclassified->routine", "routine->critical"]
+    );
+    for (name, token, host, _, project) in &rows {
+        assert_eq!(name, "audited");
+        assert_eq!(project, "default");
+        assert!(token.is_none() && host.is_none());
+    }
+    let dump: String = vault
+        .db
+        .query_row(
+            "SELECT group_concat(coalesce(credential_name, '') || coalesce(wisp_token, '') ||
+             coalesce(target_path, '') || coalesce(deny_reason, ''), '|') FROM audit_log",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!dump.contains("synthetic-ring-secret"));
+    assert!(!dump.contains(&created.wisp_token));
 }

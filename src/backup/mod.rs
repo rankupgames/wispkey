@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Number, Value};
 
 use crate::bundle;
+use crate::core::access_ring::AccessRing;
 use crate::core::auth::{AuthBundle, AuthMetadata, CIPHERTEXT_PREFIX};
 use crate::core::{CURRENT_SCHEMA_VERSION, Result, Vault, VaultError};
 use crate::secure_files;
@@ -36,6 +37,7 @@ const BACKUP_FORMAT_VERSION: u32 = 1;
 const AUTH_BACKUP_FORMAT_VERSION: u32 = 2;
 const SIGNUP_BACKUP_FORMAT_VERSION: u32 = 3;
 const AUTH_SCHEMA_VERSION: u32 = 14;
+const ACCESS_RING_SCHEMA_VERSION: u32 = 17;
 const MIN_SUPPORTED_SCHEMA_VERSION: u32 = 6;
 const MAX_VAULT_BACKUP_BYTES: u64 = 512 * 1024 * 1024;
 
@@ -70,6 +72,7 @@ const PROTECTED_VAULT_OUTPUT_NAMES: &[&str] = &[
     "proxy.json",
     "owner.sock",
     "owner.json",
+    "lifecycle.lock",
     SIDECAR_POLICIES,
     SIDECAR_CLOUD,
     SIDECAR_CLOUD_MANIFESTS,
@@ -561,6 +564,24 @@ fn validate_backup_format(payload: &VaultBackupPayload) -> Result<()> {
         return Err(VaultError::Backup(
             "auth data requires backup format version 2 and schema version 14 or newer".into(),
         ));
+    }
+    validate_access_rings(payload)
+}
+
+/// Rings ride in credential rows. A ring from an unknown policy, or in a backup
+/// that claims a schema without rings, is malformed rather than ignored.
+fn validate_access_rings(payload: &VaultBackupPayload) -> Result<()> {
+    let mut ringed = false;
+    for row in &payload.contents.credentials {
+        match row.get("access_ring") {
+            None | Some(Value::Null) => {}
+            Some(Value::String(ring)) if AccessRing::parse(ring).is_some() => ringed = true,
+            Some(_) => return Err(VaultError::Backup("invalid access ring in backup".into())),
+        }
+    }
+    let schema = || parse_schema_version(&payload.source_schema_version);
+    if ringed && schema()? < ACCESS_RING_SCHEMA_VERSION {
+        return Err(VaultError::Backup("access rings require schema 17".into()));
     }
     Ok(())
 }
@@ -1641,6 +1662,26 @@ mod tests {
         .unwrap();
         assert_eq!(report.skipped.auth_records, 1);
         assert_eq!(report.skipped.auth_bundles, 1);
+    }
+
+    #[test]
+    fn backup_rejects_unknown_rings_and_rings_before_schema_17() {
+        let ringed = |ring: Value, schema: &str| {
+            let mut payload = auth_payload();
+            payload.contents.credentials[0].insert("access_ring".into(), ring);
+            payload.source_schema_version = schema.into();
+            validate_backup_format(&payload)
+        };
+        assert!(ringed(Value::from("critical"), CURRENT_SCHEMA_VERSION).is_ok());
+        assert!(ringed(Value::Null, "16").is_ok());
+        for ring in [
+            Value::from("superuser"),
+            Value::from("Routine"),
+            Value::Bool(true),
+        ] {
+            assert!(ringed(ring, CURRENT_SCHEMA_VERSION).is_err());
+        }
+        assert!(ringed(Value::from("critical"), "16").is_err());
     }
 
     fn meta_row(key: &str, value: &str) -> Map<String, Value> {

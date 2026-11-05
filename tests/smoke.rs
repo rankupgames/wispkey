@@ -49,6 +49,7 @@ fn cli_starts_with_a_bounded_main_stack() {
         vec!["--version"],
         vec!["add", "--help"],
         vec!["exec", "--help"],
+        vec!["ring", "--help"],
         vec!["serve", "--help"],
         vec!["auth", "bundle", "resolve", "--help"],
         vec!["init"],

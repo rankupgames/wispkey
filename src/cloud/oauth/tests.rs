@@ -11,7 +11,7 @@ fn deployment() -> Deployment {
         issuer: "https://issuer.example".into(),
         client_id: "fixture-client".into(),
         resource: "https://api.example/api/v1".into(),
-        scopes: vec![SCOPE.into()],
+        scopes: vec!["openid".into()],
         token_format: "opaque".into(),
     }
 }
@@ -28,6 +28,7 @@ fn metadata(d: &Deployment) -> Metadata {
 }
 const OPAQUE: &str = "oat_synthetic_access_canary";
 const REFRESH_CANARY: &str = "synthetic_refresh_never_saved_or_sent";
+const ID_TOKEN_CANARY: &str = "synthetic_id_token_never_saved_or_sent";
 fn account(d: &Deployment, now: i64) -> Value {
     json!({"clerkUserId":"user_fixture","sessionClaims":{"sub":"user_fixture","plan":"cloud","features":["cloud_sync"]},
         "oauth":{"issuer":d.issuer,"clientId":d.client_id,"resource":d.resource,"issuedAt":now,"expiresAt":now+3600,"tokenFormat":"opaque"}})
@@ -37,8 +38,9 @@ fn response() -> TokenResponse {
         access_token: OPAQUE.into(),
         token_type: "Bearer".into(),
         expires_in: 3600,
-        scope: Some(SCOPE.into()),
+        scope: Some("openid offline_access".into()),
         refresh_token: None,
+        id_token: None,
     }
 }
 fn request(query: &str) -> Vec<u8> {
@@ -64,7 +66,7 @@ fn pkce_matches_rfc7636_and_uses_independent_random_state() {
     assert_eq!(query["response_type"], "code");
     assert_eq!(query["response_mode"], "query");
     assert_eq!(query["code_challenge_method"], "S256");
-    assert_eq!(query["scope"], SCOPE);
+    assert_eq!(query["scope"], "openid");
     assert_eq!(query["resource"], d.resource);
     assert!(!url.as_str().contains(a.verifier.as_str()));
     assert!(!query.contains_key("client_secret"));
@@ -102,9 +104,16 @@ fn configuration_and_discovery_are_https_origin_pinned() {
     let mut wrong_format = deployment();
     wrong_format.token_format = "jwt".into();
     assert!(wrong_format.validate("https://api.example", None).is_err());
-    let mut d = deployment();
-    d.scopes.push("offline_access".into());
-    assert!(d.validate("https://api.example", None).is_err());
+    for scopes in [
+        vec![],
+        vec!["wispkey:sync"],
+        vec!["openid", "offline_access"],
+        vec!["openid", "openid"],
+    ] {
+        let mut d = deployment();
+        d.scopes = scopes.into_iter().map(str::to_owned).collect();
+        assert!(d.validate("https://api.example", None).is_err());
+    }
     let mut d = deployment();
     d.resource = "https://other.example/api/v1".into();
     assert!(d.validate("https://api.example", None).is_err());
@@ -198,6 +207,16 @@ fn opaque_tokens_and_verified_context_fail_closed_without_secret_errors() {
     let data = account(&d, now);
     let r = response();
     validate_token_response(&r).unwrap();
+    for scope in [
+        None,
+        Some("openid"),
+        Some("openid offline_access"),
+        Some("offline_access openid"),
+    ] {
+        let mut granted = response();
+        granted.scope = scope.map(str::to_owned);
+        validate_token_response(&granted).unwrap();
+    }
     let session = verified_session(&r, &d, "https://api.example", &data, now, now).unwrap();
     assert_eq!(session.account_id, "user_fixture");
     assert_eq!(session.expires_at, now + 3600);
@@ -235,9 +254,24 @@ fn opaque_tokens_and_verified_context_fail_closed_without_secret_errors() {
     let mut bad = response();
     bad.refresh_token = Some(REFRESH_CANARY.into());
     validate_token_response(&bad).unwrap();
-    let mut bad = response();
-    bad.scope = Some("openid wispkey:sync".into());
-    assert!(validate_token_response(&bad).is_err());
+    for scope in [
+        "",
+        "wispkey:sync",
+        "offline_access",
+        "openid openid",
+        "openid profile",
+        "openid offline_access email",
+        "openid offline_access offline_access",
+        "openid openid offline_access",
+        " openid",
+        "openid offline_access ",
+        "openid  offline_access",
+        "openid\toffline_access",
+    ] {
+        let mut bad = response();
+        bad.scope = Some(scope.into());
+        assert!(validate_token_response(&bad).is_err());
+    }
     let mut bad = response();
     bad.token_type = "MAC".into();
     assert!(validate_token_response(&bad).is_err());
@@ -560,9 +594,10 @@ impl Fixture {
                             status = "307 Temporary Redirect";
                             location = format!("Location: {api_clone}/stolen\r\n");
                         }
-                        let mut tokens = json!({"access_token":OPAQUE,"token_type":"Bearer","expires_in":3600,"scope":SCOPE});
-                        if mode == "refresh" {
+                        let mut tokens = json!({"access_token":OPAQUE,"token_type":"Bearer","expires_in":3600,"scope":"openid offline_access"});
+                        if mode == "unused_tokens" {
                             tokens["refresh_token"] = json!(REFRESH_CANARY);
+                            tokens["id_token"] = json!(ID_TOKEN_CANARY);
                         }
                         tokens
                     }
@@ -747,11 +782,13 @@ async fn persistence_logout_and_concurrent_changes_use_isolated_storage() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(!String::from_utf8_lossy(&output.stdout).contains(REFRESH_CANARY));
-        assert!(!String::from_utf8_lossy(&output.stderr).contains(REFRESH_CANARY));
+        for canary in [REFRESH_CANARY, ID_TOKEN_CANARY] {
+            assert!(!String::from_utf8_lossy(&output.stdout).contains(canary));
+            assert!(!String::from_utf8_lossy(&output.stderr).contains(canary));
+        }
         return;
     }
-    for mode in ["ok", "revoke_fail", "refresh"] {
+    for mode in ["ok", "revoke_fail", "unused_tokens"] {
         let fixture = Fixture::new(mode);
         let candidate = fixture.login().await.unwrap();
         let mut stale = CloudClient {
@@ -765,24 +802,23 @@ async fn persistence_logout_and_concurrent_changes_use_isolated_storage() {
         client.persist_login(candidate.clone()).unwrap();
         let loaded = load_config().unwrap();
         assert_eq!(loaded, candidate);
-        assert!(
-            !fs::read_to_string(config_path())
-                .unwrap()
-                .contains(REFRESH_CANARY)
-        );
-        assert!(
-            !serde_json::to_string(&loaded)
-                .unwrap()
-                .contains("refresh_token")
-        );
-        assert!(
-            !fixture
-                .requests
-                .lock()
-                .unwrap()
-                .iter()
-                .any(|request| request.contains(REFRESH_CANARY))
-        );
+        let stored_json = fs::read_to_string(config_path()).unwrap();
+        let serialized = serde_json::to_string(&loaded).unwrap();
+        for (canary, field) in [
+            (REFRESH_CANARY, "refresh_token"),
+            (ID_TOKEN_CANARY, "id_token"),
+        ] {
+            assert!(!stored_json.contains(canary));
+            assert!(!serialized.contains(field));
+            assert!(
+                !fixture
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request.contains(canary))
+            );
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

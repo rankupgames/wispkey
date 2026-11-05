@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Package a WispKey release archive with the binary, license, README, and version metadata.
+# Requires Bash and Python 3; PYTHON can select the Python interpreter.
 set -euo pipefail
 
 usage() {
@@ -87,13 +88,25 @@ if [[ "$binary_name" == *.exe ]]; then
   (
     cd "$stage"
     # tar -a may create a tar container despite the .zip suffix (GNU tar).
-    python3 -m zipfile --create "$out_dir/$archive" "$binary_name" LICENSE README.md VERSION
+    "${PYTHON:-python3}" -m zipfile --create "$out_dir/$archive" "$binary_name" LICENSE README.md VERSION
   )
 else
   archive="wispkey-${target}.tar.gz"
   (
     cd "$stage"
-    tar czf "$out_dir/$archive" "$binary_name" LICENSE README.md VERSION
+    # Set the executable mode in the archive, including on Windows filesystems.
+    "${PYTHON:-python3}" - "$out_dir/$archive" "$binary_name" <<'PY'
+import sys
+import tarfile
+
+with tarfile.open(sys.argv[1], "w:gz") as archive:
+    for name in [sys.argv[2], "LICENSE", "README.md", "VERSION"]:
+        entry = archive.gettarinfo(name)
+        if name == sys.argv[2]:
+            entry.mode |= 0o111
+        with open(name, "rb") as payload:
+            archive.addfile(entry, payload)
+PY
   )
 fi
 

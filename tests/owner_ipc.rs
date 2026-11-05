@@ -84,6 +84,7 @@ fn start_owner_ipc(vault_dir: &std::path::Path) -> OwnerServer {
             .args(["tray", "--ipc-only"])
             .env("WISPKEY_VAULT_PATH", vault_dir)
             .env("WISPKEY_PASSWORD", "test-password")
+            .env("WISPKEY_PROTECTOR", "file")
             .env("WISPKEY_OWNER_IPC_DIAGNOSTICS", "1")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -139,6 +140,317 @@ async fn owner_call(vault_dir: &std::path::Path, request: serde_json::Value) -> 
                 started.elapsed().as_millis()
             )
         })
+}
+
+async fn raw_owner_connection(
+    vault_dir: &std::path::Path,
+) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(vault_dir.join("owner.sock"))
+            .await
+            .expect("connect raw owner client")
+    }
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+        let metadata: owner_ipc::OwnerEndpoint = serde_json::from_slice(
+            &std::fs::read(vault_dir.join("owner.json")).expect("owner metadata"),
+        )
+        .expect("decode owner metadata");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut retry = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                retry.tick().await;
+                match ClientOptions::new().open(&metadata.endpoint) {
+                    Ok(client) => return client,
+                    Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {}
+                    Err(error) => panic!("connect raw owner client: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("raw owner connection deadline")
+    }
+}
+
+async fn abandon_owner_response(vault_dir: &std::path::Path, mut request: serde_json::Value) {
+    use tokio::io::AsyncWriteExt;
+
+    // The echoed ID exceeds transport buffers, so receipt cannot complete before
+    // this client closes without reading. No handler delay or test hook is used.
+    request["id"] = json!("x".repeat(2 * 1024 * 1024));
+    let mut encoded = serde_json::to_vec(&request).expect("encode raw request");
+    encoded.push(b'\n');
+    let mut client = raw_owner_connection(vault_dir).await;
+    tokio::time::timeout(Duration::from_secs(5), client.write_all(&encoded))
+        .await
+        .expect("raw request write deadline")
+        .expect("write raw request");
+    drop(client);
+}
+
+#[tokio::test]
+async fn abandoned_response_keeps_the_server_and_completed_mutation() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    init_vault(dir.path());
+    let mut server = start_owner_ipc(dir.path());
+    abandon_owner_response(
+        dir.path(),
+        json!({"method":"create_project","params":{
+            "name":"abandoned-response-fixture","destination_confirmed":true
+        }}),
+    )
+    .await;
+    let listed = tokio::time::timeout(
+        Duration::from_secs(7),
+        owner_call(dir.path(), json!({"method":"list_projects"})),
+    )
+    .await
+    .expect("owner server did not accept a client after a dropped response");
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert!(
+        listed["result"]["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|project| project["name"] == "abandoned-response-fixture")
+    );
+    assert!(server.child.0.try_wait().expect("server state").is_none());
+    assert!(
+        server
+            .captured_logs()
+            .contains("owner ipc response delivery failed")
+    );
+}
+
+#[tokio::test]
+async fn abandoned_shutdown_response_still_exits_successfully() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    let mut server = start_owner_ipc(dir.path());
+    abandon_owner_response(dir.path(), json!({"method":"shutdown"})).await;
+    let status = tokio::time::timeout(Duration::from_secs(7), async {
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            poll.tick().await;
+            if let Some(status) = server.child.0.try_wait().expect("server state") {
+                return status;
+            }
+        }
+    })
+    .await
+    .expect("shutdown did not stop the server after its client disconnected");
+    assert!(status.success(), "shutdown exit status: {status}");
+    assert!(!dir.path().join("owner.json").exists());
+    assert!(
+        server
+            .captured_logs()
+            .contains("owner ipc response delivery failed")
+    );
+}
+
+#[tokio::test]
+async fn partial_request_times_out_and_releases_the_serial_listener() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().expect("vault dir");
+    let _server = start_owner_ipc(dir.path());
+    let mut client = raw_owner_connection(dir.path()).await;
+    client
+        .write_all(b"{\"method\":")
+        .await
+        .expect("partial request");
+    let closed = tokio::time::timeout(Duration::from_secs(12), client.read(&mut [0u8; 1]))
+        .await
+        .expect("partial owner request kept the serial listener beyond its deadline");
+    match closed {
+        Ok(bytes) => assert_eq!(bytes, 0, "timed-out connection must close"),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe),
+    }
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(7),
+            owner_call(dir.path(), json!({"method":"status"})),
+        )
+        .await
+        .expect("listener did not recover after closing a partial request")["ok"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn external_lock_discards_staged_imports_without_status_polling() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    init_vault(dir.path());
+    let _server = start_owner_ipc(dir.path());
+    let source = dir.path().join(".env.external-lock-fixture");
+    write_private_test_file(&source, "FIXTURE_API_KEY=external-lock-staged-value\n");
+    let mut plans = Vec::new();
+    for _ in 0..4 {
+        let preview = owner_call(
+            dir.path(),
+            json!({"method":"import_preview","params":{
+                "paths":[source],"project":"external-lock-fixture"
+            }}),
+        )
+        .await;
+        assert_eq!(preview["ok"], true, "{preview}");
+        plans.push(preview["result"]["plan_id"].clone());
+    }
+    assert!(run_wispkey(dir.path(), &["lock"]).status.success());
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut discarded = false;
+    for plan in plans {
+        interval.tick().await;
+        // Cancellation runs without opening the vault or consulting session
+        // validity, so only housekeeping can have removed this untouched plan.
+        let response = owner_call(
+            dir.path(),
+            json!({"method":"import_cancel","params":{
+                "plan_id":plan
+            }}),
+        )
+        .await;
+        if response["error"]["code"] == "plan_unavailable" {
+            discarded = true;
+        } else {
+            assert!(!discarded, "housekeeping must discard every staged plan");
+            assert_eq!(response["result"]["cancelled"], true, "{response}");
+        }
+    }
+    assert!(
+        discarded,
+        "external lock left staged plans available for every bounded probe"
+    );
+}
+
+#[tokio::test]
+async fn desktop_initializes_once_and_shares_cli_lock_state() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    let mut server = start_owner_ipc(dir.path());
+    let status = owner_call(dir.path(), json!({"id":"status","method":"status"})).await;
+    assert_eq!(status["result"]["initialized"], false);
+    let mismatch = owner_call(
+        dir.path(),
+        json!({"id":"create","method":"initialize","params":{
+            "password":"test-password", "password_confirmation":"different-fixture-password"
+        }}),
+    )
+    .await;
+    assert_eq!(mismatch["error"]["code"], "invalid_input");
+    assert!(!dir.path().join("vault.db").exists());
+    let initialized = owner_call(
+        dir.path(),
+        json!({"id":"create","method":"initialize","params":{
+            "password":"test-password", "password_confirmation":"test-password"
+        }}),
+    )
+    .await;
+    assert_eq!(
+        initialized["result"]["session_active"], true,
+        "{initialized}"
+    );
+    let duplicate = owner_call(dir.path(), json!({"id":"again","method":"initialize","params":{
+        "password":"replacement-fixture-password", "password_confirmation":"replacement-fixture-password"
+    }})).await;
+    assert_eq!(duplicate["error"]["code"], "already_initialized");
+    let locked = owner_call(dir.path(), json!({"id":"lock","method":"lock"})).await;
+    assert_eq!(locked["result"]["session_active"], false);
+    let wrong = owner_call(
+        dir.path(),
+        json!({"id":"wrong","method":"unlock","params":{"password":"wrong-fixture-password"}}),
+    )
+    .await;
+    assert_eq!(wrong["error"]["code"], "unauthorized");
+    let unlocked = owner_call(dir.path(), json!({"id":"unlock","method":"unlock","params":{"password":"test-password","remember":true}})).await;
+    assert_eq!(unlocked["result"]["session_active"], true, "{unlocked}");
+    assert!(dir.path().join("session-protector").exists());
+    let cli_status = wispkey_bin()
+        .arg("status")
+        .env("WISPKEY_VAULT_PATH", dir.path())
+        .output()
+        .expect("CLI status");
+    assert!(cli_status.status.success());
+    let logs = server.captured_logs();
+    for value in [
+        "test-password",
+        "wrong-fixture-password",
+        "replacement-fixture-password",
+    ] {
+        assert!(!logs.contains(value));
+    }
+}
+
+#[tokio::test]
+async fn desktop_import_review_is_metadata_only_and_commit_is_consumed() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    init_vault(dir.path());
+    let mut server = start_owner_ipc(dir.path());
+    let source = dir.path().join(".env.desktop-fixture");
+    let content = "FIXTURE_API_KEY=desktop-import-canary-value\nPORT=8123\n";
+    std::fs::write(&source, content).expect("fixture source");
+    for params in [
+        json!({"paths":[source],"project":7}),
+        json!({"paths":[source],"directory":dir.path(),"project":"desktop-fixture"}),
+    ] {
+        let rejected = owner_call(
+            dir.path(),
+            json!({"id":"invalid-preview","method":"import_preview","params":params}),
+        )
+        .await;
+        assert_eq!(rejected["error"]["code"], "invalid_input");
+    }
+    let preview = owner_call(
+        dir.path(),
+        json!({"id":"preview","method":"import_preview","params":{
+            "paths":[source],"project":"desktop-fixture"
+        }}),
+    )
+    .await;
+    assert_eq!(preview["ok"], true, "{preview}");
+    let result = &preview["result"];
+    assert!(!result.to_string().contains("desktop-import-canary-value"));
+    assert!(!result.to_string().contains("wk_"));
+    let item = result["items"]
+        .as_array()
+        .expect("preview items")
+        .iter()
+        .find(|item| item["key"] == "FIXTURE_API_KEY")
+        .expect("secret key");
+    let commit = json!({"id":"commit","method":"import_commit","params":{
+        "plan_id":result["plan_id"],"project":"desktop-fixture", "environment":"desktop-fixture", "destination_confirmed":true,
+        "items":result["items"].as_array().unwrap().iter().map(|row| json!({
+            "id":row["id"],"environment":row["environment"],"selected":row["id"] == item["id"],"hosts":"api.example.test","action":"keep"
+        })).collect::<Vec<_>>(), "rewrite_http":false
+    }});
+    let saved = owner_call(dir.path(), commit.clone()).await;
+    assert_eq!(saved["ok"], true, "{saved}");
+    assert_eq!(saved["result"]["imported"], 1);
+    assert_eq!(saved["result"]["files"][0]["status"], "unchanged");
+    assert_eq!(std::fs::read_to_string(&source).unwrap(), content);
+    assert_eq!(
+        owner_call(dir.path(), commit).await["error"]["code"],
+        "plan_unavailable"
+    );
+    let list = owner_call(
+        dir.path(),
+        json!({"id":"list","method":"list_credentials","params":{"all_projects":true}}),
+    )
+    .await;
+    let credential = list["result"]["credentials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["project"] == "desktop-fixture")
+        .expect("import destination");
+    assert_eq!(credential["partition"], "desktop-fixture");
+    assert!(!list.to_string().contains("desktop-import-canary-value"));
+    assert!(!list.to_string().contains("wisp_token"));
+    let logs = server.captured_logs();
+    assert!(!logs.contains("desktop-import-canary-value"));
+    assert!(!logs.contains("FIXTURE_API_KEY"));
 }
 
 #[tokio::test]
@@ -252,6 +564,26 @@ async fn owner_ipc_adds_one_credential_without_returning_secret() {
             .get("wisp_token")
             .is_none()
     );
+
+    let invalid_login = owner_call(
+        dir.path(),
+        json!({"id":"invalid-login", "method":"add_credential", "params":{
+            "name":"unstructured-login", "type":"website_login",
+            "value":"synthetic-unstructured-login", "destination_confirmed":true
+        }}),
+    )
+    .await;
+    assert_eq!(invalid_login["ok"], false, "{invalid_login}");
+    assert_eq!(invalid_login["error"]["code"], "invalid_input");
+    let db = rusqlite::Connection::open(dir.path().join("vault.db")).unwrap();
+    let stored: i64 = db
+        .query_row(
+            "SELECT count(*) FROM credentials WHERE name='unstructured-login'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, 0);
 }
 
 #[tokio::test]

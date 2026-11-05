@@ -64,6 +64,7 @@ fn login_generate_stores_metadata_without_emitting_password() {
     assert!(generated["credential"].get("password").is_none());
     assert!(generated["credential"].get("value").is_none());
 
+    classify_routine(vault_dir.path(), "acme-careers");
     let template = vault_dir.path().join("login.template");
     std::fs::write(&template, "{{ cred:acme-careers }}").expect("write template");
     let rendered = run_wispkey(
@@ -102,6 +103,7 @@ fn login_generate_stores_metadata_without_emitting_password() {
     );
     let stdout = String::from_utf8_lossy(&generate_raw.stdout);
     let stderr = String::from_utf8_lossy(&generate_raw.stderr);
+    classify_routine(vault_dir.path(), "other-careers");
     let other_template = vault_dir.path().join("other.template");
     std::fs::write(&other_template, "{{ cred:other-careers }}").expect("write other template");
     let other_rendered = run_wispkey(
@@ -211,7 +213,15 @@ fn login_archive_restore_and_due_list_never_delete() {
             "1s",
         ],
     );
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    let db = rusqlite::Connection::open(vault_dir.path().join("vault.db")).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE credentials SET review_at='2000-01-01T00:00:00Z' WHERE name='review-login'",
+            []
+        )
+        .unwrap(),
+        1
+    );
     let due = run_wispkey_json(
         vault_dir.path(),
         &["--format", "json", "login", "list", "--due"],

@@ -14,7 +14,7 @@ export PATH="$PWD/target/release:$PATH"
 wispkey init
 
 # 3. Add credentials
-printf '%s' "$OPENAI_API_KEY" | wispkey add "openai-key" --type bearer_token --value-file - --hosts "api.openai.com"
+printf '%s' "$OPENAI_API_KEY" | wispkey add "openai-key" --ring routine --type bearer_token --value-file - --hosts "api.openai.com"
 printf '%s' "$BASIC_AUTH_VALUE" | wispkey add "db-creds" --type basic_auth --value-file - --tags "database"
 wispkey add "ssh-key" --type api_key --value-file ~/.ssh/my_key --partition "ssh-keys"
 
@@ -45,7 +45,7 @@ For repeated headless unlocks, prefer `wispkey unlock --remember --password-file
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 By default all commands scope to the active project.
-Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v16 automatically. Encrypted signup profiles have explicit project/partition scope; see `docs/signup-profiles.md`. Browser fill requests are short-lived metadata, omitted from encrypted backups.
+Credential names are unique within a project, not vault-wide. The same name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve in the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v17 automatically. Encrypted signup profiles have explicit project/partition scope; see `docs/signup-profiles.md`. Browser fill requests are short-lived metadata, omitted from encrypted backups.
 
 ```bash
 # Create a project
@@ -87,6 +87,7 @@ wispkey env attach .env.production \
   --key OPENAI_API_KEY \
   --hosts api.openai.com
 wispkey project use client-alpha
+wispkey ring production-openai-api-key --project client-alpha --set routine
 ```
 
 Attachment rewrites the same file atomically with owner-only permissions. Re-attaching matching values or tokens is idempotent. A credential with a different stored value or environment fails closed without changing the `.env` file.
@@ -107,7 +108,7 @@ wispkey serve --listen unix:/run/wispkey/proxy.sock
 wispkey serve --listen firecracker-vsock:/run/wispkey/worker.vsock:7700
 ```
 
-Instances authenticate every proxied request with `x-wispkey-instance-id` and `x-wispkey-instance-secret`. Credential selectors and approvals bind to the resolved credential ID, so same-named credentials in other projects remain out of scope. Out-of-scope vault-token use returns `403 out_of_scope`, queues or reuses an access request, and requires host approval with `wispkey instance approve <request-id>` before retry. Env-sideload credentials have no enrollable credential ID and are denied for instance-authenticated requests.
+Instances authenticate every proxied request with `x-wispkey-instance-id` and `x-wispkey-instance-secret`. Credential selectors and approvals bind to the resolved credential ID, so same-named credentials in other projects remain out of scope. For a routine credential that passes lifecycle checks, out-of-scope vault-token use returns `403 out_of_scope`, queues or reuses an access request, and requires host approval with `wispkey instance approve <request-id>` before retry. Env-sideload credentials have no enrollable credential ID and are denied for instance-authenticated requests.
 
 Rotate instance secrets from a protected scheduler path with `wispkey --format json instance rotate-secret <name> --if-older-than 30d --grace 15m`. Treat stdout as a one-time secret channel. The old secret remains valid only for the grace window and is retired early after the new secret first authenticates.
 
@@ -118,6 +119,10 @@ printf '%s' "$BOOTSTRAP_TOKEN" | wispkey instance join --token-file - --name wor
 ```
 
 Bootstrap redemption is atomic and race-safe; TTL and max-use limits are enforced under concurrent joins. The proxy management API also exposes `POST /api/instances/join` for first-contact self-enrollment authenticated only by the bootstrap token.
+
+## Access Rings
+
+Each credential has an owner ring: `routine`, `restricted` or `critical`. Unclassified is `restricted`. The proxy, MCP, webhook verification, auth bundle resolution and `exec`/`run`/`inject` release only `routine`. Browser fill and one-use operation grants also release `restricted`. Delegated execution and fill deny `critical`; owner recovery, encrypted export and Cloud push retain their existing trust boundary for every ring. Existing credentials are unclassified after the schema 17 migration; set them with `wispkey ring <name> --set routine`. See `docs/access-rings.md`.
 
 ## Secret Injection
 
@@ -140,12 +145,13 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey unlock [--timeout N] [--remember] [--password-file PATH]` | Unlock vault (30 min session); `--remember` stores a password-free protector |
 | `wispkey lock [--forget]` | Revoke the current session; `--forget` also deletes the remembered protector |
 | `wispkey tray [--ipc-only]` | Start authenticated owner IPC; optionally spawn the tray GUI |
-| `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store credential |
+| `wispkey add <name> [--type TYPE] [--value VAL] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P] [--ring R]` | Store credential; `--ring` classifies it (default unclassified, which is restricted) |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials (names only) |
 | `wispkey get <name> [--show-token]` | Credential details + wisp token |
 | `wispkey replace-value <name> --project P --partition P [--stdin]` | Owner whole-value replacement with hidden input and stale-change checks; see `docs/replace-value.md` |
 | `wispkey remove <name>` | Delete credential |
 | `wispkey rotate <name>` | Regenerate wisp token |
+| `wispkey ring <name> [--project P] [--set routine|restricted|critical]` | Show or set the access ring; broadening asks for the owner password at a terminal |
 | `wispkey signup-profile create/list/update/remove` | Manage encrypted reusable identities; owner input from file/stdin, metadata-only output |
 | `wispkey login generate <name> --username U --url HTTPS [--project P] [--partition P] [--review-after 180d]` | Generate and store a unique website login (password never printed) |
 | `wispkey login add-existing/update-existing <name> --project P --partition P --origin HTTPS [--stdin]` | Owner typed existing-login input; see `docs/existing-website-login.md` |
@@ -155,6 +161,7 @@ wispkey inject -i .env.template -o .env.local
 | `wispkey inject -i <infile|-> [-o <outfile>] [--project P] [--stdout]` | Render `{{ cred:<name> }}` references to owner-only file output or explicit stdout |
 | `wispkey serve [--port 7700] [--random-port] [--listen SPEC]... [--require-identity|--no-require-identity] [--all-projects] [--daemon]` | Start proxy; `SPEC` supports TCP, Unix sockets, feature-gated Linux AF_VSOCK, and Firecracker UDS-backed vsock |
 | `wispkey proxy status/stop/cleanup` | Inspect and manage local proxy lifecycle state |
+| `wispkey env bind --project P --environment development --manifest PATH [--replace]` | Bind a repository and registered worktrees to a runtime development environment; see `docs/worktree-environments.md` |
 | `wispkey env list [directory]` | Discover attachable `.env*` files; supports global `--format json` output |
 | `wispkey env attach <path> --project P --key NAME... [--environment E]` | Attach selected secrets to a project/environment and tokenize them in-place |
 | `wispkey import <path> [--prefix P] [--partition P] [--project P]` | Legacy whole-file import that writes `.env.wispkey` |
@@ -346,3 +353,10 @@ Use `wispkey auth register/list/revoke` and `auth bundle set/list/resolve` for o
 ## Experimental browser receiver
 
 The default-off `experimental-browser-receiver` feature provides a local metadata bridge only. See `docs/browser-receiver.md`. No shipping transport, enrollment or CLI activation exists; never implement authentication by parsing caller-supplied identity or a verification boolean. Receiver requests still require the existing native owner approval. Schema16 prevents older clients ignoring the new release guard.
+
+## Legacy fallback audit remediation
+
+Use `wispkey audit remediate-fallback --input PATH --output PATH` only on an offline
+snapshot. It creates a new owner-only sanitized copy and preserves the source;
+never describe it as erasure or revocation. See `docs/audit-remediation.md` for
+platform limits, strict permissions, and separate operator retention/rotation steps.

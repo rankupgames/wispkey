@@ -34,22 +34,39 @@ pub async fn handle_inject(args: InjectArgs<'_>) {
     let (rendered, credential_names) = render_template(&template, &vault, &project);
 
     let destination = if args.stdout {
+        "stdout"
+    } else {
+        args.output.expect("validated output path")
+    };
+    super::egress::require_attempt(
+        &vault,
+        "CredentialInjectAttempted",
+        &credential_names.join(","),
+        None,
+        Some(destination),
+        "inject",
+        &project,
+    );
+
+    if args.stdout {
         let mut stdout = io::stdout().lock();
-        if let Err(e) = stdout.write_all(rendered.as_bytes()) {
+        if let Err(e) = stdout
+            .write_all(rendered.as_bytes())
+            .and_then(|()| stdout.flush())
+        {
             eprintln!("Error: failed to write rendered template to stdout: {}", e);
             std::process::exit(1);
         }
-        "stdout".to_string()
-    } else {
-        let output = args.output.expect("validated output path");
-        if let Err(e) = secure_files::write_private(Path::new(output), rendered.as_bytes()) {
-            eprintln!("Error: failed to write rendered template {}: {}", output, e);
-            std::process::exit(1);
-        }
-        output.to_string()
-    };
+    } else if let Err(e) = secure_files::write_private(Path::new(destination), rendered.as_bytes())
+    {
+        eprintln!(
+            "Error: failed to write rendered template {}: {}",
+            destination, e
+        );
+        std::process::exit(1);
+    }
 
-    audit_credential_inject(&vault, &credential_names, &destination, &project);
+    audit_credential_inject(&vault, &credential_names, destination, &project);
 }
 
 fn read_template(input: &str) -> String {
@@ -100,7 +117,7 @@ fn render_template(template: &str, vault: &Vault, project: &str) -> (String, Vec
                 eprintln!("Error: malformed credential reference in template");
                 std::process::exit(1);
             }
-            let secret = match vault.decrypt_credential_value_in_project(project, name) {
+            let secret = match vault.decrypt_credential_for_owner_egress(project, name) {
                 Ok(value) => value,
                 Err(e) => {
                     eprintln!("Error: {}", e);

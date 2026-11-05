@@ -67,10 +67,16 @@ Use `--exclude` to omit groups. Parent excludes cascade: `projects` also drops p
 
 Restore validates integrity and schema compatibility before writing. Replace writes go to a staging directory, then files are renamed into the destination. Merge sidecars are staged and created before the SQLite transaction commits; ordinary process I/O failures roll back both the database transaction and newly created sidecars. Failed operations retain `.wk-restore-*` staging when recovery is incomplete. SQLite and multiple file renames are not power-loss atomic.
 
+Open vaults hold a shared lifecycle lease. Restore requires the exclusive lease
+before it checks the destination and retains it through publication and cleanup.
+An interrupted restore marker blocks later opens and restores until the owner
+reconciles the retained stage. WispKey does not delete or repair that evidence
+automatically. A dry run does not create locks or staging.
+
 | Destination | Behavior |
 |-------------|----------|
 | Empty `--target` path | Full replace. Creates `vault.db` and sidecars. |
-| Current vault with `--replace` | Atomic replace of `vault.db` and restored sidecars. |
+| Current vault with `--replace` | Staged replacement of `vault.db` and restored sidecars with rollback on handled failure. |
 | Existing vault without `--replace` | Merge. Conflicts never overwrite. Default `--on-conflict fail`. |
 
 Encrypted credential blobs stay wrapped with the original vault master key. Merge into a vault with a different `password_hash` is rejected; restore to an empty `--target` or pass `--replace`. After restore, unlock with the **original master password**. Session and protector files are not restored.

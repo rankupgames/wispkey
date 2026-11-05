@@ -32,6 +32,9 @@ wispkey env list .
 wispkey env attach .env --project my-app --key OPENAI_API_KEY --hosts api.openai.com
 wispkey project use my-app
 
+# In a terminal, approve routine release with your owner password
+wispkey ring default-openai-api-key --project my-app --set routine
+
 # Start the proxy
 wispkey serve
 ```
@@ -130,8 +133,10 @@ printf '%s' "$DB_PASSWORD" | wispkey add "db-password" --type api_key --value-fi
 printf '%s' "$DATABASE_URL" | wispkey add "db-url" --type api_key --value-file - --tags "database"
 wispkey add "ssh-private-key" --type api_key --value-file ~/.ssh/id_ed25519 --partition "ssh-keys"
 wispkey add "service-account-json" --type api_key --value-file ./service-account.json --tags "gcp"
-printf '%s' "$BASIC_AUTH_VALUE" | wispkey add "basic-auth-api" --type basic_auth --value-file - --hosts "api.example.com"
+printf '%s' "$BASIC_AUTH_VALUE" | wispkey add "basic-auth-api" --ring routine --type basic_auth --value-file - --hosts "api.example.com"
 ```
+
+The proxy, MCP and `exec`/`run`/`inject` release only credentials in the `routine` access ring. A credential without a ring is `restricted`. Set the ring with `add --ring` or `wispkey ring <name> --set routine`. See [access rings](docs/access-rings.md).
 
 ## Secret Injection (`wispkey exec`, `wispkey run`, `wispkey inject`)
 
@@ -154,6 +159,12 @@ At least one channel is required: `--stdin`, `--env <VAR>`, or `--askpass`. Chan
 `--stdin` writes the secret followed by one newline and closes the child's stdin. Commands that also need interactive stdin should use `--env` or `--askpass` instead.
 
 `exec` is a deliberate, owner-only plaintext-egress path for tools that cannot use the WispKey proxy. It is audited with `CredentialExec` events, but the audit row contains only the credential name, child program name, channel summary, project, and exit status. WispKey does not put the plaintext value in argv, the parent environment, WispKey stdout/stderr, tracing logs, or audit fields. The hidden askpass helper is not a standalone secret oracle: `exec --askpass` creates a per-exec owner-only handoff file and passes its path through `WISPKEY_ASKPASS_HANDOFF`; the helper refuses to run without a valid handoff from that child launch.
+
+Before a child receives credentials or an output write starts, `exec`, `run` and
+`inject` require a committed `CredentialExecAttempted`, `CredentialRunAttempted`
+or `CredentialInjectAttempted` event. Audit failure blocks release. An attempt
+does not prove that the child started or that output completed; completion events
+retain their existing meaning.
 
 For tools that need multiple child-only environment variables, `wispkey run` reads a TOML manifest and resolves every `cred:<name>` reference before spawning the child:
 
@@ -294,7 +305,7 @@ printf '%s' "$BOOTSTRAP_TOKEN" | wispkey instance join --token-file - --name wor
 
 Remote first-contact self-enrollment can use `POST /api/instances/join`; that endpoint is authenticated by the bootstrap token and does not require a management token or existing instance identity.
 
-Unix domain socket, Linux vsock, Firecracker vsock, and non-loopback TCP listeners require instance identity by default. Loopback TCP keeps the original trusted-local behavior unless `--require-identity` is set. For Windows or another server, keep WispKey on loopback and reach it through an SSH tunnel, or use an identity-required host-only TCP network. Credential selectors and approvals bind to the resolved credential ID rather than its project-local display name. Out-of-scope vault-token use returns `403 out_of_scope`, queues an access request, and can be approved by the host; env-sideload tokens are always out of scope for authenticated instances:
+Unix domain socket, Linux vsock, Firecracker vsock, and non-loopback TCP listeners require instance identity by default. Loopback TCP keeps the original trusted-local behavior unless `--require-identity` is set. For Windows or another server, keep WispKey on loopback and reach it through an SSH tunnel, or use an identity-required host-only TCP network. Credential selectors and approvals bind to the resolved credential ID rather than its project-local display name. For a routine credential that passes lifecycle checks, out-of-scope vault-token use returns `403 out_of_scope`, queues an access request, and can be approved by the host; env-sideload tokens are always out of scope for authenticated instances:
 
 ```bash
 wispkey instance requests --pending
@@ -346,13 +357,13 @@ wispkey policy list     # Show loaded policies
 wispkey policy check    # Validate policy file
 ```
 
-Agent-scoped policies fail closed when the requester agent identity is unavailable. The proxy does not currently have a trusted agent identity source, so a policy with an `agent = "..."` scope still applies to proxy requests.
+Agent-scoped policies fail closed when requester identity is unavailable. Instance-authenticated proxy requests use the stable `instance:<UUID>` principal. Unauthenticated local requests have no trusted agent identity.
 
 ## Project Scoping
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 Each project gets its own `personal` partition, so partition names are project-scoped.
-Credential names are unique within a project, not across the whole vault. The same credential name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve against the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v11 automatically.
+Credential names are unique within a project, not across the whole vault. The same credential name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve against the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v17 automatically.
 
 For `.env` attachment, the WispKey project represents the source project and the filename maps to an environment partition: `.env` becomes `default`, while `.env.production` becomes `production`. Organization/account scope remains external to the local vault.
 
@@ -381,7 +392,8 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey unlock [--timeout N] [--remember] [--protector-timeout N] [--password-file PATH\|-]` | Unlock vault for the current session; `--remember` stores a password-free re-unlock protector |
 | `wispkey lock [--forget]` | Revoke the current session; `--forget` also deletes the remembered protector |
 | `wispkey tray [--ipc-only]` | Start authenticated owner IPC; optionally spawn the tray GUI |
-| `wispkey add <name> [--type TYPE] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P]` | Store a credential |
+| `wispkey add <name> [--type TYPE] [--value-file PATH|-] [--hosts H] [--tags T] [--partition P] [--project P] [--ring R]` | Store a credential; `--ring` sets its access ring |
+| `wispkey ring <name> [--project P] [--set routine\|restricted\|critical]` | Show or set the access ring; broadening asks for the owner password |
 | `wispkey list [--partition P] [--project P] [--all-projects]` | List credentials |
 | `wispkey get <name> [--show-token]` | Show credential metadata and wisp token |
 | `wispkey remove <name>` | Delete a credential |
@@ -414,14 +426,14 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey instance rotate-secret <name> [--if-older-than 30d] [--grace 10m]` | Schedule-safe instance-secret rotation with bounded overlap |
 | `wispkey instance bootstrap create/list/revoke` | Manage scoped, atomic bootstrap tokens for fleet self-enrollment |
 | `wispkey instance join [<bootstrap-token>] [--token-file <path|->] --name <instance-name>` | Redeem a bootstrap token; prefer `--token-file -` to avoid argv exposure |
-| `wispkey cloud status/login/logout` | Manage local Cloud session groundwork |
+| `wispkey cloud status/login/logout` | Manage the local Cloud session |
 | `wispkey cloud push/pull/sync` | Conditional encrypted partition sync; requires a bundle passphrase |
 | `wispkey cloud resolve/recover` | Explicit conflict choice and encrypted local recovery |
 | `wispkey mcp serve` | Start the MCP server over stdio |
 
 ## Tray GUI
 
-The optional `wispkey-tray` binary is a desktop extension of the CLI. Start owner IPC with `wispkey tray` (or `wispkey tray --ipc-only` for tests), then add single credentials or the OVH API template from a native dialog. Secrets stay off argv and never pass through an unauthenticated localhost form. Closing a dialog leaves the tray running. See [`docs/tray.md`](docs/tray.md).
+The optional `wispkey-tray` binary is a desktop extension of the CLI. Start owner IPC with `wispkey tray` (or `wispkey tray --ipc-only` for tests), then add credentials or import local sources from the composed popout. Secrets stay off argv and never pass through an unauthenticated localhost form. Dismissing the popout leaves the tray running. See [`docs/tray.md`](docs/tray.md).
 
 ## Partition Bundles
 
@@ -586,3 +598,7 @@ Apache-2.0 -- see [LICENSE](LICENSE) for details.
 ### Authentication registry and reusable bundles
 
 Opt existing credentials into explicit provider expiry, local use deadlines and local revocation with `wispkey auth register`. Use `auth list` for metadata-only inventory and `auth bundle` for explicitly chosen account/project-scoped alternatives. See [the auth registry guide](docs/auth-registry.md) for safe registration, atomic encrypted recovery and the boundaries of this foundation. OAuth refresh, browser-session reuse and cloud credential execution are not included.
+
+### Shared development environments across worktrees
+
+Bind a repository once with `wispkey env bind --project P --environment development --manifest wispkey.toml`, then use `wispkey run -- <command>` from its registered worktrees. Credentials stay in the vault; worktree-specific port, origin and relative database settings have an explicit allowlist. See [worktree environments](docs/worktree-environments.md) for setup, precedence and isolation guarantees.

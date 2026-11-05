@@ -73,6 +73,66 @@ pub struct RestoreReport {
     pub recovery_limits: Vec<String>,
 }
 
+#[derive(Debug)]
+enum RestoreFailure {
+    Clean(VaultError),
+    RecoveryRequired(VaultError),
+}
+
+impl From<VaultError> for RestoreFailure {
+    fn from(error: VaultError) -> Self {
+        Self::Clean(error)
+    }
+}
+
+type RestoreResult<T> = std::result::Result<T, RestoreFailure>;
+
+/// Own one exclusive stage and remove it only when no recovery files are needed.
+fn with_restore_staging<T>(
+    target: &Path,
+    restore: impl FnOnce(&Path) -> RestoreResult<T>,
+) -> Result<T> {
+    let staging = target.join(format!(".wk-restore-{}", Uuid::new_v4()));
+    fs::create_dir(&staging)?;
+    let result = match restore(&staging) {
+        Err(RestoreFailure::RecoveryRequired(error)) => return Err(error),
+        Err(RestoreFailure::Clean(error)) => Err(error),
+        Ok(value) => Ok(value),
+    };
+    if let Err(cleanup_error) = fs::remove_dir_all(&staging) {
+        let outcome = match &result {
+            Ok(_) => "restore completed".to_string(),
+            Err(error) => error.to_string(),
+        };
+        return Err(VaultError::Backup(format!(
+            "{outcome}; staging cleanup failed at {}: {cleanup_error}",
+            staging.display()
+        )));
+    }
+    result
+}
+
+/// A crash after this point must block future opens until owner recovery.
+/// The marker lives with the existing rollback files, outside restored payload.
+fn mark_restore_in_progress(staging: &Path) -> Result<()> {
+    let marker = staging.join("restore-in-progress");
+    if !secure_files::create_private_in_existing_directory(&marker, b"")? {
+        return Err(VaultError::Backup("restore marker already exists".into()));
+    }
+    fs::OpenOptions::new()
+        .write(true)
+        .open(marker)?
+        .sync_all()?;
+    #[cfg(unix)]
+    {
+        fs::File::open(staging)?.sync_all()?;
+        if let Some(target) = staging.parent() {
+            fs::File::open(target)?.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
 /// Restores an encrypted vault backup into `options.target_dir`.
 pub fn restore_backup(
     path: &str,
@@ -90,6 +150,7 @@ pub fn restore_backup(
     schema_compatibility(&payload.source_schema_version)?;
 
     let target = options.target_dir;
+    let _lifecycle_lease = crate::core::restore_lifecycle_lease(target, options.dry_run)?;
     let existing = dest_has_vault(target);
     let replace = options.replace || !existing;
     if existing && !options.replace && password_hash_mismatch(target, &payload)? {
@@ -98,11 +159,30 @@ pub fn restore_backup(
         ));
     }
 
-    if replace {
+    let dry_run = options.dry_run;
+    let report = if replace {
         restore_replace(&payload, options)
     } else {
         restore_merge(&payload, options)
+    }?;
+    // Keep the existing best-effort completion event inside admission so a
+    // second restore cannot replace the database before this write finishes.
+    if !dry_run && let Ok(db) = Connection::open(target.join("vault.db")) {
+        crate::audit::log_event(
+            &db,
+            "VaultBackupRestored",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
     }
+    Ok(report)
 }
 
 fn restore_replace(
@@ -140,18 +220,11 @@ fn restore_replace(
     }
 
     secure_files::ensure_private_directory(options.target_dir)?;
-    let staging = options
-        .target_dir
-        .join(format!(".wk-restore-{}", Uuid::new_v4()));
-    let restore_result = restore_replace_into_staging(payload, &staging)
-        .and_then(|()| commit_restored_files(&staging, options.target_dir));
-    match restore_result {
-        Ok(()) => {
-            let _ = fs::remove_dir_all(&staging);
-            Ok(report)
-        }
-        Err(error) => Err(error),
-    }
+    with_restore_staging(options.target_dir, |staging| {
+        restore_replace_into_staging(payload, staging)?;
+        commit_restored_files(staging, options.target_dir)?;
+        Ok(report)
+    })
 }
 
 fn restore_replace_into_staging(payload: &VaultBackupPayload, staging: &Path) -> Result<()> {
@@ -193,13 +266,22 @@ fn restore_merge(
         return Ok(merge_report(payload, &options, &plan));
     }
 
-    let staging = options
-        .target_dir
-        .join(format!(".wk-restore-{}", Uuid::new_v4()));
-    stage_merge_sidecars(&staging, payload)?;
+    with_restore_staging(options.target_dir, |staging| {
+        restore_merge_from_staging(payload, &options, staging)
+    })
+}
 
-    let db = Connection::open(&db_path)?;
-    db.execute_batch("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE TRANSACTION")?;
+fn restore_merge_from_staging(
+    payload: &VaultBackupPayload,
+    options: &RestoreOptions<'_>,
+    staging: &Path,
+) -> RestoreResult<RestoreReport> {
+    stage_merge_sidecars(staging, payload)?;
+    mark_restore_in_progress(staging)?;
+
+    let db = Connection::open(options.target_dir.join("vault.db")).map_err(VaultError::from)?;
+    db.execute_batch("PRAGMA foreign_keys = ON; BEGIN IMMEDIATE TRANSACTION")
+        .map_err(VaultError::from)?;
     let mut created_sidecars = Vec::new();
     let result = (|| {
         Vault::migrate_schema(&db)?;
@@ -213,14 +295,14 @@ fn restore_merge(
             )));
         }
 
-        let report = merge_report(payload, &options, &plan);
+        let report = merge_report(payload, options, &plan);
         let instance_ids = inserted_row_ids(&payload.contents.instances, &plan.skip.instances);
         let bootstrap_ids =
             inserted_row_ids(&payload.contents.bootstrap_tokens, &plan.skip.bootstrap);
         insert_payload_tables(&db, payload, &plan.skip)?;
         apply_staged_sidecars(
             options.target_dir,
-            &staging,
+            staging,
             options.on_conflict,
             &mut created_sidecars,
         )?;
@@ -235,20 +317,19 @@ fn restore_merge(
     })();
 
     match result {
-        Ok(report) => {
-            let _ = fs::remove_dir_all(&staging);
-            Ok(report)
-        }
+        Ok(report) => Ok(report),
         Err(error) => {
             let db_rollback = db.execute_batch("ROLLBACK");
             let sidecar_rollback = remove_created_sidecars(&created_sidecars);
             if db_rollback.is_err() || sidecar_rollback.is_err() {
-                return Err(VaultError::Backup(format!(
-                    "merge failed and rollback was incomplete; recovery files retained at {}",
-                    staging.display()
+                return Err(RestoreFailure::RecoveryRequired(VaultError::Backup(
+                    format!(
+                        "merge failed and rollback was incomplete; recovery files retained at {}",
+                        staging.display()
+                    ),
                 )));
             }
-            Err(error)
+            Err(RestoreFailure::Clean(error))
         }
     }
 }
@@ -1388,7 +1469,10 @@ fn apply_staged_sidecars(
         }
         let contents = fs::read(&path)?;
         match secure_files::create_private(&dest, &contents) {
-            Ok(true) => created.push(dest.clone()),
+            Ok(true) => {
+                created.push(dest.clone());
+                fs::OpenOptions::new().write(true).open(&dest)?.sync_all()?;
+            }
             Ok(false) if policy == ConflictPolicy::Skip => {}
             Ok(false) => {
                 return Err(VaultError::Backup(format!(
@@ -1404,6 +1488,8 @@ fn apply_staged_sidecars(
             }
         }
     }
+    #[cfg(unix)]
+    fs::File::open(target)?.sync_all()?;
     Ok(())
 }
 
@@ -1491,10 +1577,11 @@ fn inserted_row_ids(rows: &[Map<String, Value>], skipped: &HashSet<String>) -> V
         .collect()
 }
 
-fn commit_restored_files(staging: &Path, target: &Path) -> Result<()> {
+fn commit_restored_files(staging: &Path, target: &Path) -> RestoreResult<()> {
     secure_files::ensure_private_directory(target)?;
+    mark_restore_in_progress(staging)?;
     let backup_dir = staging.join("replaced");
-    fs::create_dir_all(&backup_dir)?;
+    fs::create_dir_all(&backup_dir).map_err(VaultError::from)?;
     let mut swapped: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
     for path in restore_sidecar_paths(staging) {
         let result = (|| {
@@ -1514,11 +1601,16 @@ fn commit_restored_files(staging: &Path, target: &Path) -> Result<()> {
             };
             swapped.push((dest.clone(), replaced));
             fs::rename(&path, &dest)?;
+            fs::OpenOptions::new().write(true).open(&dest)?.sync_all()?;
             Ok(())
         })();
         if let Err(error) = result {
             return rollback_commit_error(error, staging, &swapped);
         }
+    }
+    #[cfg(unix)]
+    if let Err(error) = fs::File::open(target).and_then(|directory| directory.sync_all()) {
+        return rollback_commit_error(error.into(), staging, &swapped);
     }
     Ok(())
 }
@@ -1527,14 +1619,16 @@ fn rollback_commit_error(
     error: VaultError,
     staging: &Path,
     swapped: &[(PathBuf, Option<PathBuf>)],
-) -> Result<()> {
+) -> RestoreResult<()> {
     if let Err(rollback_error) = rollback_swaps(swapped) {
-        return Err(VaultError::Backup(format!(
-            "restore commit failed: {error}; rollback failed: {rollback_error}; recovery files retained at {}",
-            staging.display()
+        return Err(RestoreFailure::RecoveryRequired(VaultError::Backup(
+            format!(
+                "restore commit failed: {error}; rollback failed: {rollback_error}; recovery files retained at {}",
+                staging.display()
+            ),
         )));
     }
-    Err(error)
+    Err(RestoreFailure::Clean(error))
 }
 
 fn rollback_swaps(swapped: &[(PathBuf, Option<PathBuf>)]) -> Result<()> {
@@ -1646,6 +1740,9 @@ fn rows_equivalent(left: &Map<String, Value>, right: &Map<String, Value>) -> boo
 fn comparable_row(row: &Map<String, Value>) -> Map<String, Value> {
     row.iter()
         .filter(|(key, _)| !matches!(key.as_str(), "updated_at" | "last_used_at" | "last_seen_at"))
+        // Schema 17 adds NULL for an unclassified legacy credential.
+        // An explicit classification must still compare exactly.
+        .filter(|(key, value)| key.as_str() != "access_ring" || !value.is_null())
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect()
 }
@@ -1775,21 +1872,39 @@ mod tests {
             TABLE_AUTH_REGISTRY,
             TABLE_AUTH_BUNDLES,
             TABLE_SIGNUP_PROFILES,
-            TABLE_AUDIT_LOG,
         ] {
             assert!(
                 after[table] == before[table],
                 "existing rows changed in {table}"
             );
         }
+        let audit_rows = after[TABLE_AUDIT_LOG].as_array().unwrap();
+        let existing_audits: Vec<_> = audit_rows
+            .iter()
+            .filter(|row| row["event_type"] != "VaultBackupRestored")
+            .cloned()
+            .collect();
+        assert_eq!(
+            &existing_audits,
+            before[TABLE_AUDIT_LOG].as_array().unwrap()
+        );
+        assert_eq!(
+            audit_rows
+                .iter()
+                .filter(|row| row["event_type"] == "VaultBackupRestored")
+                .count(),
+            1
+        );
         let existing = after[TABLE_CREDENTIALS]
             .as_array()
             .unwrap()
             .iter()
             .find(|r| r["id"] == "credential-auth")
             .unwrap();
+        let mut existing = existing.as_object().unwrap().clone();
+        assert_eq!(existing.remove("access_ring"), Some(Value::Null));
         assert!(
-            existing == &before[TABLE_CREDENTIALS][0],
+            Value::Object(existing) == before[TABLE_CREDENTIALS][0],
             "existing credential changed"
         );
         let mut request = after["browser_fill_requests"][0]
@@ -1878,6 +1993,13 @@ mod tests {
         let plan = plan_merge(&db, target.path(), &payload).unwrap();
         assert_eq!(plan.skipped.auth_records, 1);
         assert_eq!(plan.skipped.auth_bundles, 1);
+        for ring in ["routine", "restricted", "critical"] {
+            db.execute("UPDATE credentials SET access_ring=?1", [ring])
+                .unwrap();
+            assert!(plan_merge(&db, target.path(), &payload).is_err());
+        }
+        db.execute("UPDATE credentials SET access_ring=NULL", [])
+            .unwrap();
         let original_metadata = &payload.contents.auth_registry[0]["metadata_json"];
         db.execute("UPDATE auth_registry SET metadata_json = '{}'", [])
             .unwrap();
@@ -1955,8 +2077,9 @@ mod tests {
         assert!(validate_operation_audits(&[invalid]).is_err());
     }
 
+    #[cfg(unix)]
     #[test]
-    fn failed_commit_leaves_original_vault() {
+    fn commit_replaces_dangling_destination_without_following_it() {
         let target = tempfile::tempdir().expect("target");
         let staging = tempfile::tempdir().expect("staging");
         fs::write(target.path().join("vault.db"), b"OLD").expect("old vault");
@@ -1964,31 +2087,107 @@ mod tests {
         fs::write(staging.path().join(SIDECAR_POLICIES), b"[policy]").expect("policies");
         fs::create_dir_all(target.path().join("blocked")).expect("blocked dir");
         let policies_dest = target.path().join(SIDECAR_POLICIES);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::symlink;
-            symlink(
-                target.path().join("blocked").join("missing"),
-                &policies_dest,
-            )
-            .expect("dangling dest symlink");
-            let result = commit_restored_files(staging.path(), target.path());
-            let original = fs::read(target.path().join("vault.db")).unwrap_or_else(|_| {
-                fs::read(staging.path().join("replaced").join("vault.db")).unwrap_or_default()
-            });
+        std::os::unix::fs::symlink(
+            target.path().join("blocked").join("missing"),
+            &policies_dest,
+        )
+        .expect("dangling dest symlink");
+        commit_restored_files(staging.path(), target.path()).expect("replace dangling destination");
+        assert_eq!(fs::read(target.path().join("vault.db")).unwrap(), b"NEW");
+        assert!(fs::symlink_metadata(&policies_dest).unwrap().is_file());
+        assert_eq!(fs::read(&policies_dest).unwrap(), b"[policy]");
+        assert!(!target.path().join("blocked").join("missing").exists());
+    }
+
+    #[test]
+    fn failed_sidecar_staging_removes_only_the_owned_restore_stage() {
+        for replace in [false, true] {
+            let target = tempfile::tempdir().unwrap();
+            let foreign = target.path().join(".wk-restore-foreign-fixture");
+            fs::create_dir(&foreign).unwrap();
+            fs::write(foreign.join("recovery"), b"FOREIGN").unwrap();
+            let mut payload = super::super::tests::auth_payload();
+            payload.scope.policies = true;
+            payload.scope.audits = true;
+            payload.sidecars.policies_toml = Some("# staged private policy\n".into());
+            payload.sidecars.audit_fingerprint_key_b64 = Some("invalid-base64!".into());
+            let options = RestoreOptions {
+                target_dir: target.path(),
+                dry_run: false,
+                replace,
+                on_conflict: ConflictPolicy::Fail,
+            };
+            let result = if replace {
+                restore_replace(&payload, options)
+            } else {
+                restore_merge(&payload, options)
+            };
             assert!(
-                result.is_err() || original == b"NEW" || original == b"OLD",
-                "commit should either fail closed or complete"
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid sidecar encoding")
             );
-            if result.is_err() {
-                let restored = fs::read(target.path().join("vault.db")).expect("read vault");
-                assert_eq!(restored, b"OLD");
-            }
+            let entries = fs::read_dir(target.path()).unwrap().collect::<Vec<_>>();
+            assert_eq!(
+                entries.len(),
+                1,
+                "failed staging left operation-owned files"
+            );
+            assert_eq!(fs::read(foreign.join("recovery")).unwrap(), b"FOREIGN");
         }
-        #[cfg(not(unix))]
-        {
-            let _ = (policies_dest, commit_restored_files);
-        }
+    }
+
+    #[test]
+    fn incomplete_commit_rollback_retains_owned_recovery_stage() {
+        let target = tempfile::tempdir().unwrap();
+        let result = with_restore_staging(target.path(), |staging| {
+            mark_restore_in_progress(staging)?;
+            let backup = staging.join("replaced").join("vault.db");
+            fs::create_dir_all(backup.parent().unwrap()).map_err(VaultError::from)?;
+            fs::write(&backup, b"RECOVERY").map_err(VaultError::from)?;
+            let blocked = target.path().join("blocked");
+            fs::create_dir(&blocked).map_err(VaultError::from)?;
+            rollback_commit_error(
+                VaultError::Backup("synthetic commit failure".into()),
+                staging,
+                &[(blocked, Some(backup))],
+            )
+        });
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("recovery files retained")
+        );
+        let stages = fs::read_dir(target.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".wk-restore-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(stages.len(), 1);
+        assert!(stages[0].join("restore-in-progress").exists());
+        assert_eq!(
+            fs::read(stages[0].join("replaced").join("vault.db")).unwrap(),
+            b"RECOVERY"
+        );
+    }
+
+    #[test]
+    fn staging_cleanup_failure_reports_the_original_restore_failure() {
+        let target = tempfile::tempdir().unwrap();
+        let result = with_restore_staging::<()>(target.path(), |staging| {
+            fs::remove_dir(staging).map_err(VaultError::from)?;
+            Err(VaultError::Backup("synthetic restore failure".into()).into())
+        });
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("synthetic restore failure"));
+        assert!(error.contains("staging cleanup failed"));
     }
 
     #[test]

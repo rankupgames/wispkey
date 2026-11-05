@@ -428,6 +428,12 @@ fn try_resolve_exact_token_for_request(
         Err(crate::core::VaultError::CredentialNotFound(_)) => {
             try_resolve_env_token_for_request(Some(vault), token, context)
         }
+        Err(crate::core::VaultError::AuthRejected(reason))
+            if reason.starts_with("access ring ") =>
+        {
+            audit_denial(vault, "CredentialDenied", None, token, context, reason);
+            TokenResolution::Denied(Box::new(error_response(StatusCode::FORBIDDEN, reason)))
+        }
         Err(_) => {
             let reason = "credential unavailable or auth use denied";
             audit_denial(vault, "CredentialDenied", None, token, context, reason);

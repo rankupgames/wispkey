@@ -80,6 +80,22 @@ struct AddArgs {
     /// Project override (default: active project)
     #[arg(long)]
     project: Option<String>,
+
+    /// Access ring for the new credential (default: unclassified, which is restricted)
+    #[arg(long, value_parser = ["routine", "restricted", "critical"])]
+    ring: Option<String>,
+}
+
+#[derive(Args)]
+struct RingArgs {
+    /// Credential name
+    name: String,
+    /// Project override (default: active project)
+    #[arg(long)]
+    project: Option<String>,
+    /// New ring
+    #[arg(long, value_parser = ["routine", "restricted", "critical"])]
+    set: Option<String>,
 }
 
 #[derive(Args)]
@@ -232,6 +248,9 @@ enum Commands {
         name: String,
     },
 
+    /// Show or set a credential's access ring; broadening asks for the owner password
+    Ring(RingArgs),
+
     /// Run a child process with a credential injected through controlled channels
     Exec(ExecArgs),
 
@@ -243,11 +262,14 @@ enum Commands {
 
     /// Run a child process with manifest-defined child-only environment variables
     Run {
-        /// Manifest path (default: wispkey.toml in the current directory)
+        /// Override a declared worktree setting (NAME=VALUE); repeat as needed
+        #[arg(long = "env")]
+        overrides: Vec<String>,
+        /// Explicit manifest; otherwise discover the repository binding (or local manifest outside Git)
         #[arg(long)]
         manifest: Option<String>,
 
-        /// Project override (default: active project)
+        /// Project (must match binding; explicit manifests default to active project)
         #[arg(long)]
         project: Option<String>,
 
@@ -488,6 +510,20 @@ enum OperationCommands {
 
 #[derive(Subcommand)]
 enum EnvCommands {
+    /// Bind this Git repository and all registered worktrees to a development environment
+    Bind {
+        #[arg(long)]
+        project: String,
+        /// Existing development partition (development, dev, local, or test)
+        #[arg(long)]
+        environment: String,
+        /// Manifest containing credential references, nonsecret defaults and override allowlist
+        #[arg(long)]
+        manifest: String,
+        /// Explicitly replace an existing binding
+        #[arg(long)]
+        replace: bool,
+    },
     /// Recursively list attachable .env files without reading their contents
     List {
         /// Directory to scan (default: current directory)
@@ -564,6 +600,15 @@ fn read_bootstrap_token_source(
 
 #[derive(Subcommand)]
 enum AuditCommands {
+    /// Write a protected sanitized copy of an offline legacy fallback JSONL file
+    RemediateFallback {
+        /// Owner-only source snapshot (preserved unchanged; maximum 16 MiB)
+        #[arg(long)]
+        input: std::path::PathBuf,
+        /// New output file in an existing owner-only directory (never overwritten)
+        #[arg(long)]
+        output: std::path::PathBuf,
+    },
     /// Export all matching audit events
     Export {
         /// Include events at or after this timestamp or date
@@ -1278,12 +1323,20 @@ async fn main() {
         )
         .init();
 
-    if cli::askpass_mode_enabled() {
-        cli::handle_askpass().await;
-        return;
-    }
-
-    let parsed = Cli::parse();
+    let parsed = match Cli::try_parse() {
+        Ok(parsed) => parsed,
+        Err(error)
+            if cli::askpass_mode_enabled()
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+        {
+            cli::handle_askpass().await;
+            return;
+        }
+        Err(error) => error.exit(),
+    };
     cli::set_json_output(matches!(parsed.output_format, OutputFormat::Json));
 
     match parsed.command {
@@ -1316,6 +1369,7 @@ async fn main() {
             param_name,
             partition,
             project,
+            ring,
         }) => {
             let resolved_value = match (&value, &value_file) {
                 (Some(_), Some(_)) => {
@@ -1359,6 +1413,7 @@ async fn main() {
                 param_name: param_name.as_deref(),
                 partition: partition.as_deref(),
                 project: project.as_deref(),
+                ring: ring.as_deref(),
             })
             .await;
         }
@@ -1385,6 +1440,9 @@ async fn main() {
         }
         Commands::Rotate { name } => {
             cli::handle_rotate(&name).await;
+        }
+        Commands::Ring(RingArgs { name, project, set }) => {
+            cli::handle_ring(&name, project.as_deref(), set.as_deref());
         }
         Commands::Exec(ExecArgs {
             credential,
@@ -1434,11 +1492,13 @@ async fn main() {
             }
         },
         Commands::Run {
+            overrides,
             manifest,
             project,
             command,
         } => {
             cli::handle_run(cli::RunArgs {
+                overrides: &overrides,
                 manifest: manifest.as_deref(),
                 project: project.as_deref(),
                 command: &command,
@@ -1497,6 +1557,14 @@ async fn main() {
             .await;
         }
         Commands::Env { command } => match command {
+            EnvCommands::Bind {
+                project,
+                environment,
+                manifest,
+                replace,
+            } => {
+                cli::handle_env_bind(&project, &environment, &manifest, replace);
+            }
             EnvCommands::List { directory } => cli::handle_env_list(&directory).await,
             EnvCommands::Attach {
                 path,
@@ -1541,6 +1609,18 @@ async fn main() {
             cli::handle_log(last, credential.as_deref(), since.as_deref()).await;
         }
         Commands::Audit { command } => match command {
+            AuditCommands::RemediateFallback { input, output } => {
+                match wispkey::audit::remediation::remediate_fallback(&input, &output) {
+                    Ok(report) => println!(
+                        "{}",
+                        serde_json::to_string(&report).expect("report serialization")
+                    ),
+                    Err(error) => {
+                        eprintln!("Error: {error}");
+                        std::process::exit(1);
+                    }
+                }
+            }
             AuditCommands::Export {
                 since,
                 until,

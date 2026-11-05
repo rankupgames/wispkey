@@ -129,6 +129,7 @@ fn fixture() -> tempfile::TempDir {
     dir
 }
 fn assert_stored_pair(dir: &Path, password: &str) {
+    classify_routine(dir, "entry");
     // Existing owner egress is used only to verify a disposable fixture. Never print the captured payload.
     let template = dir.join("template");
     std::fs::write(&template, "{{ cred:entry }}").unwrap();
@@ -357,7 +358,7 @@ fn concurrent_writes_rename_remove_scope_move_and_aba_invalidate_input() {
     }
 }
 #[test]
-fn parallel_create_and_update_each_have_one_winner() {
+fn stale_create_and_update_each_have_one_winner() {
     let dir = tempfile::tempdir().unwrap();
     let dir = dir.path();
     init_vault(dir);

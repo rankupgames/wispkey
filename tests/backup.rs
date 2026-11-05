@@ -11,6 +11,8 @@ fn add_named_secret(vault_dir: &std::path::Path, name: &str, value: &str) {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             name,
             "--type",
             "api_key",
@@ -177,6 +179,173 @@ fn backup_roundtrip_to_separate_vault_preserves_token_and_secret() {
 }
 
 #[test]
+fn restore_refuses_an_open_vault_and_exclusive_lease_blocks_new_opens() {
+    use std::process::Stdio;
+    use std::time::Duration;
+
+    let source = tempfile::tempdir().expect("source");
+    let target = tempfile::tempdir().expect("target");
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let base = artifacts.path().join("base.wkbackup");
+    let updated = artifacts.path().join("updated.wkbackup");
+    init_vault(source.path());
+    add_named_secret(source.path(), "base-key", "fixture-base-secret");
+    create_backup(source.path(), base.to_str().expect("base path"));
+    run_wispkey_bundle_json(
+        source.path(),
+        &[
+            "--format",
+            "json",
+            "backup",
+            "restore",
+            base.to_str().expect("base path"),
+            "--target",
+            target.path().to_str().expect("target path"),
+        ],
+    );
+    unlock_vault(target.path());
+    add_named_secret(source.path(), "later-key", "fixture-later-secret");
+    create_backup(source.path(), updated.to_str().expect("updated path"));
+
+    // The production proxy owns a real Vault for its full serving lifetime.
+    let mut proxy = ChildGuard(
+        wispkey_bin()
+            .args(["serve", "--random-port"])
+            .env("WISPKEY_VAULT_PATH", target.path())
+            .env("WISPKEY_PASSWORD", "test-password")
+            .env("WISPKEY_PROTECTOR", "file")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("start fixture proxy"),
+    );
+    wait_for_proxy_info(target.path());
+    let args = [
+        "--format",
+        "json",
+        "backup",
+        "restore",
+        updated.to_str().expect("updated path"),
+        "--target",
+        target.path().to_str().expect("target path"),
+        "--on-conflict",
+        "skip",
+    ];
+    let mut dry_run_args = args.to_vec();
+    dry_run_args.push("--dry-run");
+    let planned = run_wispkey_bundle_json(source.path(), &dry_run_args);
+    assert_eq!(planned["dry_run"], true);
+    assert_eq!(planned["mode"], "merge");
+    let refused = run_wispkey_bundle(source.path(), &args);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("vault lifecycle is busy"), "{stderr}");
+    let db = Connection::open(target.path().join("vault.db")).expect("target db");
+    let later_keys: i64 = db
+        .query_row(
+            "SELECT COUNT(*) FROM credentials WHERE name='later-key'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("later key count");
+    assert_eq!(later_keys, 0);
+    drop(db);
+    let stopped = run_wispkey(target.path(), &["proxy", "stop"]);
+    assert!(
+        stopped.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stopped.stderr)
+    );
+    assert!(wait_for_child_exit(&mut proxy.0, Duration::from_secs(10)).is_some());
+    let restored = run_wispkey_bundle_json(source.path(), &args);
+    assert_eq!(restored["mode"], "merge");
+
+    let lease = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(target.path().join("lifecycle.lock"))
+        .expect("lifecycle lock");
+    fs2::FileExt::try_lock_exclusive(&lease).expect("no remaining Vault lease");
+    let refused = run_wispkey(target.path(), &["list"]);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("vault lifecycle is busy"));
+    let logout = run_wispkey(target.path(), &["cloud", "logout"]);
+    assert!(
+        !logout.status.success(),
+        "Cloud sidecar writers must join restore admission"
+    );
+    assert!(!target.path().join("cloud.json").exists());
+    drop(lease);
+    let listed = run_wispkey_json(target.path(), &["--format", "json", "list"]);
+    assert!(credential_names(&listed).contains(&"later-key".to_string()));
+}
+
+#[test]
+fn unfinished_restore_marker_blocks_open_and_restore_without_removing_foreign_stage() {
+    let source = tempfile::tempdir().expect("source");
+    let target = tempfile::tempdir().expect("target");
+    let artifacts = tempfile::tempdir().expect("artifacts");
+    let archive = artifacts.path().join("fixture.wkbackup");
+    init_vault(source.path());
+    create_backup(source.path(), archive.to_str().expect("archive path"));
+    init_vault(target.path());
+    let foreign = target.path().join(".wk-restore-foreign");
+    std::fs::create_dir(&foreign).expect("foreign stage");
+    std::fs::write(foreign.join("owner-note"), "preserve fixture").expect("foreign note");
+    assert!(run_wispkey(target.path(), &["list"]).status.success());
+    let stage = target
+        .path()
+        .join(format!(".wk-restore-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir(&stage).expect("incomplete stage");
+    let marker = stage.join("restore-in-progress");
+    write_private_test_file(&marker, "");
+    let original = std::fs::read(target.path().join("vault.db")).expect("original db");
+    let original_archive = std::fs::read(&archive).expect("original archive");
+    for args in [&["list"][..], &["init"][..]] {
+        let refused = run_wispkey(target.path(), args);
+        assert!(!refused.status.success());
+        let stderr = String::from_utf8_lossy(&refused.stderr);
+        assert!(
+            stderr.contains("unfinished vault restore requires owner recovery"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(stage.to_str().expect("stage path")),
+            "{stderr}"
+        );
+    }
+    let refused = run_wispkey_bundle(
+        source.path(),
+        &[
+            "backup",
+            "restore",
+            archive.to_str().expect("archive path"),
+            "--target",
+            target.path().to_str().expect("target path"),
+            "--dry-run",
+        ],
+    );
+    assert!(!refused.status.success());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("unfinished vault restore requires owner recovery")
+    );
+    assert_eq!(
+        std::fs::read(target.path().join("vault.db")).expect("unchanged db"),
+        original
+    );
+    assert_eq!(
+        std::fs::read(&archive).expect("unchanged archive"),
+        original_archive
+    );
+    assert!(marker.exists());
+    assert_eq!(
+        std::fs::read_to_string(foreign.join("owner-note")).expect("foreign note"),
+        "preserve fixture"
+    );
+}
+
+#[test]
 fn backup_wrong_passphrase_and_corrupt_archive_fail_closed() {
     let source = tempfile::tempdir().expect("source");
     let bundle_dir = tempfile::tempdir().expect("bundle");
@@ -274,6 +443,11 @@ fn backup_dry_run_does_not_write_and_conflicts_do_not_overwrite() {
 
     init_vault(source.path());
     add_named_secret(source.path(), "backup-key", "source-secret");
+    std::fs::write(
+        source.path().join("policies.toml"),
+        "# staged policy fixture\n",
+    )
+    .expect("source policies");
     create_backup(source.path(), &backup);
 
     let dry = run_wispkey_bundle_json(
@@ -294,6 +468,10 @@ fn backup_dry_run_does_not_write_and_conflicts_do_not_overwrite() {
 
     init_vault(dest.path());
     add_named_secret(dest.path(), "backup-key", "dest-secret");
+    match_password_hash(source.path(), dest.path());
+    let leftover = dest.path().join(".wk-restore-interrupted");
+    std::fs::create_dir_all(&leftover).expect("leftover staging");
+    std::fs::write(leftover.join("vault.db"), b"partial").expect("partial staging db");
     let dest_before = run_wispkey_json(
         dest.path(),
         &["--format", "json", "get", "backup-key", "--show-token"],
@@ -312,15 +490,33 @@ fn backup_dry_run_does_not_write_and_conflicts_do_not_overwrite() {
         "merge into a populated vault should fail without --replace\n{}",
         String::from_utf8_lossy(&conflicted.stderr)
     );
+    assert!(String::from_utf8_lossy(&conflicted.stderr).contains("restore conflict"));
+    let staging = std::fs::read_dir(dest.path())
+        .expect("destination entries")
+        .map(|entry| entry.expect("destination entry").path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".wk-restore-")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        staging,
+        vec![leftover.clone()],
+        "clean failure must remove only its stage"
+    );
+    assert_eq!(
+        std::fs::read(leftover.join("vault.db")).expect("foreign stage"),
+        b"partial"
+    );
+    assert!(!dest.path().join("policies.toml").exists());
     let dest_after = run_wispkey_json(
         dest.path(),
         &["--format", "json", "get", "backup-key", "--show-token"],
     );
     assert_eq!(dest_after["credential"]["wisp_token"], dest_token);
 
-    let leftover = dest.path().join(".wk-restore-interrupted");
-    std::fs::create_dir_all(&leftover).expect("leftover staging");
-    std::fs::write(leftover.join("vault.db"), b"partial").expect("partial staging db");
     let locked = run_wispkey_json(dest.path(), &["--format", "json", "lock", "--forget"]);
     assert_eq!(locked["locked"], true);
 

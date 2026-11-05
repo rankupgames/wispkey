@@ -218,7 +218,7 @@ async fn emit<W: AsyncWrite + Unpin>(
 #[cfg(unix)]
 fn kill_group(child: &mut tokio::process::Child) {
     if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
-        // SAFETY: this helper starts the child in its own session, so -pid is
+        // SAFETY: this helper starts the child in its own process group, so -pid is
         // its process group. ESRCH means it has already exited.
         unsafe {
             libc::kill(-pid, libc::SIGKILL);
@@ -499,6 +499,19 @@ mod tests {
     const CHANNEL_CANARY: &str = "synthetic-helper-channel-canary";
 
     #[cfg(unix)]
+    fn synthetic_output_representations(input: &[u8]) -> Vec<String> {
+        let text = String::from_utf8(input.to_vec()).unwrap();
+        vec![
+            text.clone(),
+            STANDARD.encode(input),
+            input.iter().map(|byte| format!("%{byte:02X}")).collect(),
+            input.iter().map(|byte| format!("\\u{byte:04x}")).collect(),
+            format!("+ child --value '{text}'"),
+            serde_json::json!({"error": {"detail": text}}).to_string(),
+        ]
+    }
+
+    #[cfg(unix)]
     #[test]
     #[ignore = "launched only by stdin_only_child_keeps_canaries_out_of_output_and_store"]
     fn channel_probe_child() {
@@ -533,7 +546,14 @@ mod tests {
             std::io::stdout().flush().unwrap();
             std::io::stderr().write_all(chunk).unwrap();
         }
-        eprintln!("{}", STANDARD.encode(&input));
+        for representation in synthetic_output_representations(&input) {
+            for chunk in representation.as_bytes().chunks(2) {
+                std::io::stdout().write_all(chunk).unwrap();
+                std::io::stdout().flush().unwrap();
+                std::io::stderr().write_all(chunk).unwrap();
+                std::io::stderr().flush().unwrap();
+            }
+        }
         std::process::exit(42);
     }
 
@@ -541,11 +561,12 @@ mod tests {
     #[tokio::test]
     async fn stdin_only_child_keeps_canaries_out_of_output_and_store() {
         let (dir, mut config, store) = fixture();
-        config.program = std::env::current_exe()
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
+        // Jenkins build paths can contain characters the fixed-program policy rejects.
+        // Keep the executable's compiled canary separate from the output/store fixture.
+        let probe_dir = tempfile::tempdir().unwrap();
+        let probe_program = probe_dir.path().join("channel-probe");
+        std::fs::copy(std::env::current_exe().unwrap(), &probe_program).unwrap();
+        config.program = probe_program.to_str().unwrap().to_owned();
         config.args = vec![
             "--exact".into(),
             "operations::helper::tests::channel_probe_child".into(),
@@ -584,7 +605,7 @@ mod tests {
         // argv and environment-isolation assertions actually ran successfully.
         assert_eq!(completion["exit_code"], 42);
         assert_eq!(completion["outcome"], "failed_child");
-        for forbidden in [CHANNEL_CANARY.to_owned(), STANDARD.encode(CHANNEL_CANARY)] {
+        for forbidden in synthetic_output_representations(CHANNEL_CANARY.as_bytes()) {
             assert!(!ready.contains(&forbidden) && !output.contains(&forbidden));
             for entry in std::fs::read_dir(dir.path()).unwrap() {
                 let bytes = std::fs::read(entry.unwrap().path()).unwrap();
@@ -770,9 +791,32 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn timeout_kills_child_group_and_persists_uncertain_outcome() {
+        use std::ffi::CString;
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::OpenOptionsExt;
+
         const ID: &str = "726f3ec9-e50d-4bd4-a59c-944a76f713c6";
-        let (_dir, config, store) = fixture();
-        std::fs::write(&config.program, b"#!/bin/sh\n/bin/sleep 5\n").unwrap();
+        let (dir, mut config, store) = fixture();
+        let started = dir.path().join("child-started");
+        let fifo = dir.path().join("descendant-lifetime");
+        let fifo_name = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: fifo_name is a valid NUL-terminated path in this test's directory.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let mut lifetime = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+            .unwrap();
+        config.args = vec![
+            started.to_str().unwrap().to_owned(),
+            fifo.to_str().unwrap().to_owned(),
+        ];
+        std::fs::write(
+            &config.program,
+            b"#!/bin/sh\nexec 3>\"$2\"\n/bin/sleep 30 &\nprintf started > \"$1\"\nwait\n",
+        )
+        .unwrap();
         let (caller, helper) = tokio::io::duplex(4096);
         let (helper_input, helper_output) = tokio::io::split(helper);
         let task = tokio::spawn({
@@ -782,7 +826,7 @@ mod tests {
         let (caller_input, mut caller_output) = tokio::io::split(caller);
         let mut caller_input = BufReader::new(caller_input);
         caller_output
-            .write_all(hello(ID, 150).as_bytes())
+            .write_all(hello(ID, 5000).as_bytes())
             .await
             .unwrap();
         let mut ready = String::new();
@@ -794,12 +838,39 @@ mod tests {
         );
         caller_output.write_all(delivery.as_bytes()).await.unwrap();
         let mut result = String::new();
-        tokio::time::timeout(Duration::from_secs(2), caller_input.read_line(&mut result))
+        tokio::time::timeout(Duration::from_secs(10), caller_input.read_line(&mut result))
             .await
             .unwrap()
             .unwrap();
-        assert!(result.is_empty() || result.contains("\"outcome_unknown\""));
+        if !result.is_empty() {
+            let completion: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(completion["version"], 1);
+            assert_eq!(completion["attempt_id"], ID);
+            assert_eq!(completion["outcome"], "outcome_unknown");
+            assert_eq!(completion["count"], 0);
+            assert_eq!(completion["exit_code"], serde_json::Value::Null);
+        }
         assert_eq!(task.await.unwrap(), 1);
+        // The timeout must exercise a dispatched child, not an expired handshake.
+        // A 150 ms whole-handshake budget raced fixture setup on busy CI runners.
+        assert_eq!(std::fs::read(&started).unwrap(), b"started");
+        // Both shell and descendant inherit fd 3. Killing only the direct
+        // child leaves the FIFO open even when that child has been reaped.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut retry = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                match lifetime.read(&mut [0u8; 1]) {
+                    Ok(0) => break,
+                    Ok(_) => panic!("lifetime FIFO must not carry data"),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        retry.tick().await;
+                    }
+                    Err(error) => panic!("read descendant lifetime FIFO: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("a descendant kept the inherited FIFO open after helper timeout");
         let db = Connection::open(&store).unwrap();
         let state: String = db
             .query_row(

@@ -220,7 +220,7 @@ fn check_live(vault: &Vault, binding: &StoredBinding) -> Result<()> {
         return Err("receiver target changed");
     }
     vault
-        .ensure_auth_usable(&credential.id, true, Some(&binding.origin))
+        .ensure_owner_approved_release(&credential.id, Some(&binding.origin))
         .map_err(|_| "receiver authorization unavailable")
 }
 
@@ -635,18 +635,13 @@ fn bound_request(vault: &Vault, request: &FillRequest) -> Result<(StoredBinding,
     }
     Ok((binding, State::parse(&state)?))
 }
-pub(super) fn release_guard(
-    vault: &Vault,
-    request: &FillRequest,
-) -> Result<session_store::SessionGuard> {
-    let store = session_store::session_store();
-    let guard = store.lock().map_err(|_| "receiver session unavailable")?;
+pub(super) fn validate_release(vault: &Vault, request: &FillRequest) -> Result<()> {
     let (binding, state) = bound_request(vault, request)?;
     if state != State::Queued {
         return Err("receiver release already decided");
     }
     check_live(vault, &binding)?;
-    Ok(guard)
+    Ok(())
 }
 pub(super) fn released(vault: &Vault, request: &FillRequest) -> Result<()> {
     let (binding, state) = bound_request(vault, request)?;

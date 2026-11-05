@@ -172,6 +172,85 @@ fn env_attach_creates_project_environment_and_only_tokenizes_selected_keys() {
 }
 
 #[test]
+fn env_attach_insert_failure_rolls_back_new_scope_and_credentials_before_retry() {
+    let vault_dir = tempfile::tempdir().expect("temp vault");
+    let workspace = tempfile::tempdir().expect("temp workspace");
+    init_vault(vault_dir.path());
+    let env_path = workspace.path().join(".env.production");
+    let original = "FIRST_TOKEN=fixture-first\nSECOND_TOKEN=fixture-second\n";
+
+    for (project, already_exists) in [
+        ("new-attach-project", false),
+        ("existing-attach-project", true),
+    ] {
+        if already_exists {
+            assert!(
+                run_wispkey(vault_dir.path(), &["project", "create", project])
+                    .status
+                    .success()
+            );
+        }
+        fs::write(&env_path, original).expect("write fixture env");
+        let db =
+            rusqlite::Connection::open(vault_dir.path().join("vault.db")).expect("open vault db");
+        db.execute_batch(
+            "CREATE TRIGGER reject_second_attachment BEFORE INSERT ON credentials
+             WHEN NEW.name = 'production-second-token'
+             BEGIN SELECT RAISE(ABORT, 'fixture credential refusal'); END;",
+        )
+        .expect("reject second credential");
+        let args = [
+            "env",
+            "attach",
+            env_path.to_str().expect("env path"),
+            "--project",
+            project,
+            "--key",
+            "FIRST_TOKEN",
+            "--key",
+            "SECOND_TOKEN",
+            "--hosts",
+            "api.example.com",
+            "--format",
+            "json",
+        ];
+        let output = run_wispkey(vault_dir.path(), &args);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("fixture-first"));
+        assert!(!stderr.contains("fixture-second"));
+        assert_eq!(
+            fs::read_to_string(&env_path).expect("unchanged env"),
+            original
+        );
+        let project_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM projects WHERE name=?1",
+                [project],
+                |row| row.get(0),
+            )
+            .expect("project count");
+        assert_eq!(project_count, i64::from(already_exists));
+        let partition_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM partitions p JOIN projects pr ON p.project_id=pr.id WHERE pr.name=?1 AND p.name='production'",
+            [project], |row| row.get(0),
+        ).expect("environment count");
+        assert_eq!(partition_count, 0);
+        let credential_count: i64 = db.query_row(
+            "SELECT COUNT(*) FROM credentials c JOIN partitions p ON c.partition_id=p.id JOIN projects pr ON p.project_id=pr.id WHERE pr.name=?1",
+            [project], |row| row.get(0),
+        ).expect("credential count");
+        assert_eq!(credential_count, 0);
+        db.execute_batch("DROP TRIGGER reject_second_attachment")
+            .expect("remove fixture trigger");
+        let retried = run_wispkey_json(vault_dir.path(), &args);
+        assert_eq!(retried["imported"], 2);
+        assert_eq!(retried["updated"], 2);
+    }
+}
+
+#[test]
 fn env_attach_requires_hosts_before_mutating_vault_or_file() {
     let vault_dir = tempfile::tempdir().expect("temp vault");
     let workspace = tempfile::tempdir().expect("temp workspace");

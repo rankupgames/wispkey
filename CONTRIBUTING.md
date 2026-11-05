@@ -37,7 +37,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). CI keeps this default matrix and separately checks Linux AF_VSOCK and the optional `wispkey-tray` on Linux, macOS, and Windows. GUI dependencies remain optional for CLI development. To reproduce the native tray job on Debian/Ubuntu:
+Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). The legacy cross-platform workflows are manual-only during the Jenkins cutover. Jenkins owns admission and Linux results; these do not establish Windows or macOS coverage. GUI dependencies remain optional for CLI development. To reproduce the native tray checks on Debian/Ubuntu:
 
 ```bash
 sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev
@@ -69,6 +69,8 @@ test the unsupported-feature error, and Unix tests cover the separate
 Firecracker UDS bridge.
 
 See [`docs/tray.md`](docs/tray.md) for owner IPC and tray usage.
+
+`Jenkinsfile` defines the Linux gates, one lane per job: `bash ci/jenkins/check.sh rust|tray|browser|postgres|cross-node`. The lanes check exact tool versions and fail when a worker tool is missing; they do not install worker packages. `python3 ci/jenkins/request.py --branch <branch> --source-sha <sha> --lane <lane>` prints the typed dispatch request and never submits a build. These Linux lanes do not provide Windows-native or macOS evidence. Preserve legacy required checks until replacement acceptance and an authorized cutover.
 
 4. Open a PR against `main`
 

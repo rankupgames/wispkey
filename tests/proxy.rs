@@ -21,6 +21,67 @@ fn start_proxy(vault_dir: &std::path::Path) -> (ChildGuard, u16) {
 }
 
 #[test]
+fn lock_during_upload_prevents_forward_and_reverse_substitution() {
+    use std::io::{BufRead, BufReader};
+    use std::time::Duration;
+    for reverse in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        init_vault(dir.path());
+        let credential = run_wispkey_json(
+            dir.path(),
+            &[
+                "--format",
+                "json",
+                "add",
+                "upload",
+                "--ring",
+                "routine",
+                "--value",
+                "synthetic-upload-secret",
+                "--hosts",
+                "127.0.0.1",
+            ],
+        );
+        let token = credential["credential"]["wisp_token"].as_str().unwrap();
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        upstream.set_nonblocking(true).unwrap();
+        let target = format!("http://{}/upload", upstream.local_addr().unwrap());
+        let (_proxy, port) = start_proxy(dir.path());
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let destination = if reverse { "/upload" } else { &target };
+        let target_header = if reverse {
+            format!("X-Target-Url: {target}\r\n")
+        } else {
+            String::new()
+        };
+        let head = format!(
+            "POST {destination} HTTP/1.1\r\nHost: 127.0.0.1\r\n{target_header}Content-Type: text/plain\r\nContent-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+            token.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "HTTP/1.1 100 Continue\r\n");
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(line, "\r\n");
+        assert!(run_wispkey(dir.path(), &["lock"]).status.success());
+        stream.write_all(token.as_bytes()).unwrap();
+        let mut response = String::new();
+        reader.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 403 Forbidden"), "{response}");
+        assert_eq!(
+            upstream.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}
+
+#[test]
 fn proxy_refuses_generic_website_login_token_substitution() {
     let vault_dir = tempfile::tempdir().expect("temp vault dir");
     init_vault(vault_dir.path());
@@ -41,6 +102,7 @@ fn proxy_refuses_generic_website_login_token_substitution() {
     let token = generated["credential"]["wisp_token"]
         .as_str()
         .expect("wisp token");
+    classify_routine(vault_dir.path(), "blocked-login");
     let (_guard, proxy_port) = start_proxy(vault_dir.path());
     let request = format!(
         "POST http://example.com/login HTTP/1.1\r\n\
@@ -85,6 +147,8 @@ fn bundle_passphrase_file_roundtrips_multiline_secret_through_proxy() {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "ssh-key",
             "--type",
             "api_key",
@@ -212,6 +276,8 @@ fn proxy_swaps_wisp_token_before_local_upstream_receives_request() {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "proxy-key",
             "--type",
             "bearer_token",
@@ -251,6 +317,64 @@ fn proxy_swaps_wisp_token_before_local_upstream_receives_request() {
 }
 
 #[test]
+fn proxy_denies_critical_ring_token_before_upstream() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    init_vault(vault_dir.path());
+    let upstream = TcpListener::bind("127.0.0.1:0").expect("bind upstream");
+    upstream
+        .set_nonblocking(true)
+        .expect("nonblocking upstream");
+    let upstream_port = upstream.local_addr().expect("upstream address").port();
+    let added = run_wispkey_json(
+        vault_dir.path(),
+        &[
+            "--format",
+            "json",
+            "add",
+            "--ring",
+            "critical",
+            "vaulted-key",
+            "--type",
+            "bearer_token",
+            "--value",
+            "real-secret",
+            "--hosts",
+            "127.0.0.1",
+        ],
+    );
+    let token = added["credential"]["wisp_token"]
+        .as_str()
+        .expect("wisp token")
+        .to_string();
+
+    let (_guard, proxy_port) = start_proxy(vault_dir.path());
+    let mut proxy_stream = TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect to proxy");
+    let request = format!(
+        "GET http://127.0.0.1:{upstream_port}/test HTTP/1.1\r\n\
+         Host: 127.0.0.1:{upstream_port}\r\n\
+         Authorization: Bearer {token}\r\n\
+         Connection: close\r\n\r\n"
+    );
+    proxy_stream
+        .write_all(request.as_bytes())
+        .expect("write proxy request");
+    let mut response = String::new();
+    proxy_stream
+        .read_to_string(&mut response)
+        .expect("read proxy response");
+    assert!(
+        response.starts_with("HTTP/1.1 403 Forbidden"),
+        "expected ring denial, got:\n{response}"
+    );
+    assert!(response.contains("access ring critical"));
+    assert!(!response.contains("real-secret"));
+    assert_eq!(
+        upstream.accept().map(|_| ()).unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
 fn proxy_resolves_token_adjacent_to_lowercase_suffix() {
     let vault_dir = tempfile::tempdir().expect("temp vault dir");
     init_vault(vault_dir.path());
@@ -261,6 +385,8 @@ fn proxy_resolves_token_adjacent_to_lowercase_suffix() {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "adjacent-key",
             "--type",
             "api_key",
@@ -329,6 +455,8 @@ fn proxy_does_not_rewrite_tokens_embedded_in_injected_secret() {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "secondary-key",
             "--type",
             "api_key",
@@ -349,6 +477,8 @@ fn proxy_does_not_rewrite_tokens_embedded_in_injected_secret() {
             "--format",
             "json",
             "add",
+            "--ring",
+            "routine",
             "primary-key",
             "--type",
             "api_key",

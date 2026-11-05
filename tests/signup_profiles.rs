@@ -78,6 +78,20 @@ fn mcp(path: &Path, name: &str, args: Value) -> Value {
     redact(&String::from_utf8_lossy(&out.stderr));
     serde_json::from_slice(&out.stdout).unwrap()
 }
+fn mcp_payload(response: &Value) -> Value {
+    assert!(response.get("error").is_none());
+    assert!(matches!(
+        response["result"].get("isError"),
+        None | Some(Value::Bool(false))
+    ));
+    assert_eq!(response["result"]["content"][0]["type"], "text");
+    serde_json::from_str(
+        response["result"]["content"][0]["text"]
+            .as_str()
+            .expect("successful MCP result must contain metadata JSON"),
+    )
+    .unwrap()
+}
 #[test]
 fn signup_cli_setup_redaction_revision_conflicts_and_mcp_selection() {
     let temp = tempfile::tempdir().unwrap();
@@ -107,7 +121,7 @@ fn signup_cli_setup_redaction_revision_conflicts_and_mcp_selection() {
         "wispkey_signup_profile_list",
         json!({"project":"default","partition":"personal"}),
     );
-    assert!(!list["result"]["isError"].as_bool().unwrap_or(false));
+    assert_eq!(mcp_payload(&list), json!({"profiles":[p.clone()]}));
     let missing = mcp(
         path,
         "wispkey_signup_profile_list",
@@ -116,7 +130,37 @@ fn signup_cli_setup_redaction_revision_conflicts_and_mcp_selection() {
     assert_eq!(missing["result"]["isError"], true);
     let args = json!({"name":"second","profile":p["id"],"profile_revision":p["revision"],"project":"default","partition":"personal","url":"https://signup.example.test"});
     let result = mcp(path, "wispkey_generate_login", args.clone());
-    assert!(!result["result"]["isError"].as_bool().unwrap_or(false));
+    let created = mcp_payload(&result);
+    assert_eq!(created["action"], "created");
+    assert_eq!(created["name"], "second");
+    assert_eq!(created["type"], "website_login");
+    assert_eq!(created["origin"], "https://signup.example.test");
+    assert_eq!(created["project"], "default");
+    assert_eq!(created["lifecycle_state"], "pending");
+    let logins = run_wispkey_json(
+        path,
+        &["--format", "json", "login", "list", "--project", "default"],
+    );
+    let stored = logins["logins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|login| login["name"] == "second")
+        .expect("MCP generation must store the requested login");
+    assert_eq!(stored["type"], created["type"]);
+    assert_eq!(stored["origin"], created["origin"]);
+    let db = rusqlite::Connection::open(path.join("vault.db")).unwrap();
+    let partition: String = db
+        .query_row(
+            "SELECT name FROM partitions WHERE id=?1",
+            [stored["partition_id"].as_str().unwrap()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(partition, "personal");
+    assert_eq!(stored["lifecycle_state"], created["lifecycle_state"]);
+    assert_eq!(stored["review_at"], created["review_at"]);
+    redact(&logins.to_string());
     for change in 0..4 {
         let mut invalid = args.clone();
         invalid["name"] = json!("invalid");
@@ -418,6 +462,7 @@ fn signup_structured_errors_and_audit_never_contain_stored_identity_or_password(
     let temp = tempfile::tempdir().unwrap();
     let p = setup(temp.path());
     assert!(generate(temp.path(), &p, "saved").status.success());
+    classify_routine(temp.path(), "saved");
     // Read only this synthetic fixture through the existing owner-only export
     // path so the canary assertion uses the actual generated password.
     let template = temp.path().join("synthetic-login.template");

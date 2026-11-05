@@ -55,8 +55,8 @@ type NativeRootsLoader = fn() -> NativeRootsResult;
 type ProxyActionResult<T> = Result<T, Box<Response<Full<Bytes>>>>;
 
 const MAX_PROXY_BODY_BYTES: usize = 10 * 1024 * 1024;
-const INSTANCE_ID_HEADER: &str = "x-wispkey-instance-id";
-const INSTANCE_SECRET_HEADER: &str = "x-wispkey-instance-secret";
+pub(crate) const INSTANCE_ID_HEADER: &str = "x-wispkey-instance-id";
+pub(crate) const INSTANCE_SECRET_HEADER: &str = "x-wispkey-instance-secret";
 
 #[derive(Debug, Clone)]
 pub enum StartProxyOutcome {
@@ -357,6 +357,14 @@ async fn handle_request(
                 &body,
             ));
         }
+        if uri.path() == crate::webhooks::VERIFY_PATH {
+            // Instance-authenticated requester API: no management token, no CORS.
+            return Ok(Box::pin(crate::webhooks::handle_verify_request(
+                req,
+                runtime.project_scope.as_ref().clone(),
+            ))
+            .await);
+        }
         if method == Method::OPTIONS {
             return Ok(cors_preflight());
         }
@@ -422,13 +430,13 @@ async fn handle_request(
 
     let target_host = extract_target_host(&uri, &headers);
 
-    let vault = Vault::open_with_session().ok();
-
     let (parts, body) = req.into_parts();
     let body_bytes = match collect_limited_body(body).await {
         Ok(bytes) => bytes,
         Err(response) => return Ok(*response),
     };
+    // Upload can outlive the session that admitted the request.
+    let vault = Vault::open_with_session().ok();
 
     let mut new_headers = parts.headers.clone();
     let mut new_body = body_bytes.to_vec();
@@ -651,13 +659,12 @@ async fn handle_reverse_proxy(
 
     let target_host = target_uri.host().unwrap_or("unknown").to_string();
 
-    let vault = Vault::open_with_session().ok();
-
     let (parts, body) = req.into_parts();
     let body_bytes = match collect_limited_body(body).await {
         Ok(bytes) => bytes,
         Err(response) => return *response,
     };
+    let vault = Vault::open_with_session().ok();
 
     let mut new_headers = parts.headers.clone();
     new_headers.remove("x-target-url");

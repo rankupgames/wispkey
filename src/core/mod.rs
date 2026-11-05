@@ -21,11 +21,13 @@ use uuid::Uuid;
 
 use crate::secure_files;
 
+pub mod access_ring;
 pub mod auth;
 pub(crate) mod cloud_sync;
 mod crypto;
 mod existing_login;
 mod instances;
+mod local_import;
 pub(crate) mod operation_grants;
 mod operation_session;
 mod protector;
@@ -36,12 +38,16 @@ pub use existing_login::{
 mod value_update;
 pub use value_update::{MAX_REPLACEMENT_VALUE_BYTES, PreparedValueUpdate};
 mod schema;
+pub(crate) use schema::{
+    ensure_no_incomplete_restore, restore_lifecycle_lease, shared_lifecycle_lease,
+};
 mod session;
 mod session_store;
 pub mod signup;
 mod templates;
 #[cfg(test)]
 mod tests;
+pub(crate) mod webhook_signing;
 
 pub use instances::{
     AccessRequest, BootstrapJoinResult, BootstrapToken, CreateBootstrapTokenResult,
@@ -62,7 +68,7 @@ pub const DEFAULT_PARTITION_NAME: &str = "personal";
 /// Default project name for new vaults and implicit project context (`default`).
 pub const DEFAULT_PROJECT_NAME: &str = "default";
 /// Current on-disk SQLite schema version written to `vault_meta`.
-pub const CURRENT_SCHEMA_VERSION: &str = "16";
+pub const CURRENT_SCHEMA_VERSION: &str = "17";
 
 pub mod browser;
 pub mod browser_receiver;
@@ -377,6 +383,9 @@ pub struct Vault {
     db: Connection,
     master_key: Option<[u8; 32]>,
     session_timeout_override: Option<i64>,
+    // Declared after db so the connection closes before restore can acquire
+    // exclusive access. Unbacked internal fixtures do not need a file lease.
+    _lifecycle_lease: Option<fs::File>,
 }
 
 impl Vault {
@@ -402,7 +411,17 @@ impl Vault {
 
     /// Inserts a new credential (encrypted secret, wisp token, optional description/hosts/tags/partition).
     pub fn add_credential(&self, request: AddCredentialRequest<'_>) -> Result<Credential> {
-        self.add_credentials_atomic(&[request])?
+        self.add_classified_credential(request, None)
+    }
+
+    /// Inserts one credential and, when given, its owner access ring in the same
+    /// transaction. Without a ring the row is unclassified (restricted).
+    pub fn add_classified_credential(
+        &self,
+        request: AddCredentialRequest<'_>,
+        ring: Option<access_ring::AccessRing>,
+    ) -> Result<Credential> {
+        self.insert_credentials(&[request], ring)?
             .pop()
             .ok_or_else(|| VaultError::Encryption("credential insert produced no row".into()))
     }
@@ -411,6 +430,14 @@ impl Vault {
     pub fn add_credentials_atomic(
         &self,
         requests: &[AddCredentialRequest<'_>],
+    ) -> Result<Vec<Credential>> {
+        self.insert_credentials(requests, None)
+    }
+
+    fn insert_credentials(
+        &self,
+        requests: &[AddCredentialRequest<'_>],
+        ring: Option<access_ring::AccessRing>,
     ) -> Result<Vec<Credential>> {
         if requests.is_empty() {
             return Err(VaultError::InvalidCredentialTemplate(
@@ -431,7 +458,15 @@ impl Vault {
         let inserted = (|| {
             let mut created = Vec::with_capacity(requests.len());
             for request in requests {
-                created.push(self.insert_credential_row(key, request)?);
+                let credential = self.insert_credential_row(key, request)?;
+                if let Some(ring) = ring {
+                    let project = request
+                        .project
+                        .map(String::from)
+                        .unwrap_or_else(resolve_active_project);
+                    self.classify_new_credential(&credential, ring, &project)?;
+                }
+                created.push(credential);
             }
             Ok(created)
         })();
@@ -941,7 +976,7 @@ impl Vault {
         project_name: &str,
         name: &str,
     ) -> Result<String> {
-        self.decrypt_credential_for_use(project_name, name, false)
+        self.decrypt_credential_for_use(project_name, name, false, false)
     }
 
     pub(crate) fn decrypt_credential_for_delegated_use(
@@ -949,7 +984,17 @@ impl Vault {
         project_name: &str,
         name: &str,
     ) -> Result<String> {
-        self.decrypt_credential_for_use(project_name, name, true)
+        self.decrypt_credential_for_use(project_name, name, true, false)
+    }
+
+    /// Owner CLI plaintext egress (exec, run, inject). A cached unlock is not
+    /// step-up, so only routine credentials leave the vault this way.
+    pub(crate) fn decrypt_credential_for_owner_egress(
+        &self,
+        project_name: &str,
+        name: &str,
+    ) -> Result<String> {
+        self.decrypt_credential_for_use(project_name, name, false, true)
     }
 
     fn decrypt_credential_for_use(
@@ -957,6 +1002,7 @@ impl Vault {
         project_name: &str,
         name: &str,
         delegated: bool,
+        owner_egress: bool,
     ) -> Result<String> {
         let transaction = if self.db.is_autocommit() {
             Some(self.db.unchecked_transaction()?)
@@ -964,9 +1010,16 @@ impl Vault {
             None
         };
         let credential = self.get_credential_in_project(project_name, name)?;
-        self.ensure_auth_usable(&credential.id, delegated, None)?;
+        let ensure_release = || -> Result<()> {
+            self.ensure_auth_usable(&credential.id, delegated, None)?;
+            if owner_egress {
+                self.ensure_access_ring(&credential.id, access_ring::RingRelease::Unattended)?;
+            }
+            Ok(())
+        };
+        ensure_release()?;
         let value = self.decrypt_credential_for_transfer(project_name, name)?;
-        self.ensure_auth_usable(&credential.id, delegated, None)?;
+        ensure_release()?;
         if let Some(transaction) = transaction {
             transaction.commit()?;
         }
@@ -1039,20 +1092,14 @@ impl Vault {
         let _ = self.ensure_unlocked()?;
         let project_id = self.resolve_project_id(project_name)?;
 
-        let exists: bool = self.db.query_row(
-            "SELECT COUNT(*) > 0 FROM credentials c JOIN partitions p ON c.partition_id = p.id WHERE p.project_id = ?1 AND c.name = ?2",
-            params![project_id, name],
-            |row| row.get(0),
-        )?;
-        if !exists {
-            return Err(VaultError::CredentialNotFound(name.to_string()));
-        }
-
         let new_token = self.generate_wisp_token(name)?;
-        self.db.execute(
+        let changed = self.db.execute(
             "UPDATE credentials SET wisp_token = ?1, updated_at = ?2 WHERE name = ?3 AND partition_id IN (SELECT id FROM partitions WHERE project_id = ?4)",
             params![new_token, Utc::now().to_rfc3339(), name, project_id],
         )?;
+        if changed != 1 {
+            return Err(VaultError::CredentialNotFound(name.to_string()));
+        }
         Ok(new_token)
     }
 
@@ -1069,7 +1116,10 @@ impl Vault {
     ) -> Result<(Credential, String)> {
         let key = self.ensure_unlocked()?;
         let transaction = if self.db.is_autocommit() {
-            Some(self.db.unchecked_transaction()?)
+            Some(rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?)
         } else {
             None
         };
@@ -1105,6 +1155,11 @@ impl Vault {
     /// Creates a new project with the given name and description.
     pub fn create_project(&self, name: &str, description: &str) -> Result<Project> {
         let _ = self.ensure_unlocked()?;
+        let transaction = if self.db.is_autocommit() {
+            Some(self.db.unchecked_transaction()?)
+        } else {
+            None
+        };
 
         let exists: bool = self.db.query_row(
             "SELECT COUNT(*) > 0 FROM projects WHERE name = ?1",
@@ -1132,7 +1187,11 @@ impl Vault {
             ],
         )?;
 
-        self.get_project(name)
+        let project = self.get_project(name)?;
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+        Ok(project)
     }
 
     /// Lists all projects, sorted by name.
@@ -1362,8 +1421,7 @@ pub fn resolve_active_project() -> String {
 pub fn set_active_project(name: &str) -> Result<()> {
     let vault_dir = Vault::vault_dir();
     secure_files::ensure_private_directory(&vault_dir)?;
-    fs::write(vault_dir.join("active_project"), name)?;
-    Ok(())
+    secure_files::replace_private(&vault_dir.join("active_project"), name.as_bytes())
 }
 
 /// Returns the exact HTTPS origin (`https://host[:port]`) for website-login policy binding.

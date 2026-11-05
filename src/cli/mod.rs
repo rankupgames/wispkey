@@ -18,6 +18,7 @@ pub use existing_login::handle_existing_login;
 mod value_update;
 pub use value_update::handle_replace_value;
 mod doctor;
+mod egress;
 mod env;
 mod exec;
 mod guard;
@@ -33,6 +34,8 @@ mod policy;
 mod projects;
 mod proxy;
 mod run;
+mod worktree;
+pub use worktree::handle_env_bind;
 mod shared;
 mod signup;
 pub use signup::handle_signup;
@@ -57,7 +60,7 @@ pub use cloud::{
 pub use credential_sharing::{handle_credential_export, handle_credential_import};
 pub use credentials::{
     AddCredentialArgs, handle_add, handle_get, handle_import, handle_list, handle_remove,
-    handle_rotate,
+    handle_ring, handle_rotate,
 };
 pub use doctor::handle_doctor;
 pub use env::{handle_env_attach, handle_env_list};

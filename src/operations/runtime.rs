@@ -92,7 +92,7 @@ pub(crate) fn authorize(
     seconds: u32,
     reviewed_revision: Option<&str>,
 ) -> Result<grants::GrantStatus> {
-    let (_, binding) = load_operation(&catalog_path(), operation)?;
+    let (entry, binding) = load_operation(&catalog_path(), operation)?;
     if reviewed_revision.is_some_and(|revision| revision != binding.catalog_revision) {
         return Err("catalog changed during owner approval");
     }
@@ -102,6 +102,26 @@ pub(crate) fn authorize(
     let expires = Utc::now()
         .checked_add_signed(chrono::Duration::seconds(i64::from(seconds)))
         .ok_or("invalid grant lifetime")?;
+    if !matches!(
+        &entry.kind,
+        catalog::OperationKind::KubernetesSecret(target)
+            if target.action == environment::KubernetesAction::Revoke
+    ) {
+        vault
+            .ensure_owner_approved_release(&binding.credential_id, None)
+            .map_err(|_| "auth unavailable")?;
+    }
+    for credential in [
+        binding.provider_credential_id.as_deref(),
+        binding.old_password_credential_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        vault
+            .ensure_owner_approved_release(credential, None)
+            .map_err(|_| "auth unavailable")?;
+    }
     grants::issue_grant(vault, &binding, expires)
 }
 
@@ -342,6 +362,180 @@ mod tests {
     use std::sync::atomic::Ordering;
     const CANARY: &str = "synthetic-runtime-credential-canary";
 
+    fn private_fixture_file(path: &Path, bytes: &[u8]) {
+        crate::secure_files::write_private(path, bytes).unwrap();
+        #[cfg(windows)]
+        {
+            let principal = identity::current_principal().unwrap();
+            let sid = principal.strip_prefix("windows-sid:").unwrap();
+            assert!(
+                std::process::Command::new("icacls")
+                    .arg(path)
+                    .args(["/setowner", &format!("*{sid}")])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    fn assert_authorization_eligibility(vault: &Vault, requester: &str, selected: &str) {
+        use crate::core::{AddCredentialRequest, CredentialType, access_ring::AccessRing};
+        use base64::{Engine, engine::general_purpose::STANDARD_NO_PAD};
+        use ring::signature::{Ed25519KeyPair, KeyPair};
+
+        let password = "synthetic-test-master-password";
+        let provider = vault
+            .add_credential(AddCredentialRequest::new(
+                "eligibility-provider",
+                CredentialType::ApiKey,
+                "synthetic-provider",
+            ))
+            .unwrap();
+        let previous = vault
+            .add_credential(AddCredentialRequest::new(
+                "eligibility-previous",
+                CredentialType::ApiKey,
+                "synthetic-previous",
+            ))
+            .unwrap();
+        let root = Vault::vault_dir();
+        let ca_file = root.join("eligibility-ca.pem");
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let ca = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .self_signed(&ca_key)
+            .unwrap()
+            .pem();
+        private_fixture_file(&ca_file, ca.as_bytes());
+        let posture_file = root.join("eligibility-posture.json");
+        let rng = ring::rand::SystemRandom::new();
+        let signing_key =
+            Ed25519KeyPair::from_pkcs8(Ed25519KeyPair::generate_pkcs8(&rng).unwrap().as_ref())
+                .unwrap();
+        let namespace_uid = uuid::Uuid::new_v4().to_string();
+        let secret_uid = uuid::Uuid::new_v4().to_string();
+        let now = Utc::now();
+        let payload = serde_json::to_vec(&json!({
+            "endpoint":"https://127.0.0.1:1", "ca_sha256":STANDARD_NO_PAD.encode(
+                ring::digest::digest(&ring::digest::SHA256, ca.as_bytes()).as_ref()),
+            "cluster_id":"fixture", "context":"fixture", "environment_id":"test",
+            "namespace_uid":namespace_uid, "secret_uid":secret_uid,
+            "environment_owner":"owner", "consumer_id":"consumer", "issuer_id":"issuer",
+            "encryption_config_revision":"fixture", "issued_at":now-chrono::Duration::minutes(1),
+            "expires_at":now+chrono::Duration::minutes(30)
+        }))
+        .unwrap();
+        private_fixture_file(
+            &posture_file,
+            &serde_json::to_vec(&json!({
+                "payload":STANDARD_NO_PAD.encode(&payload),
+                "signature":STANDARD_NO_PAD.encode(signing_key.sign(&payload).as_ref())
+            }))
+            .unwrap(),
+        );
+        let kubernetes = json!({
+            "endpoint":"https://127.0.0.1:1", "cluster_id":"fixture", "context":"fixture",
+            "environment_id":"test", "environment_owner":"owner", "consumer_id":"consumer",
+            "issuer_id":"issuer", "namespace":"fixture", "namespace_uid":namespace_uid,
+            "secret_name":"fixture", "secret_uid":secret_uid, "data_key":"password",
+            "ca_file":ca_file, "provider_credential_id":provider.id, "posture_file":posture_file,
+            "posture_public_key":STANDARD_NO_PAD.encode(signing_key.public_key().as_ref()),
+            "encryption_config_revision":"fixture", "action":"deliver"
+        });
+        let postgres = json!({
+            "endpoint":"postgresql://127.0.0.1:1", "environment_id":"test", "environment_owner":"owner",
+            "database":"fixture", "issuer_username":"issuer", "app_username":"app",
+            "provider_credential_id":provider.id, "previous_credential_id":previous.id,
+            "ca_file":ca_file, "function_schema":"fixture", "function_name":"rotate",
+            "function_oid":1, "function_owner":"owner",
+            "function_definition_sha256":STANDARD_NO_PAD.encode([1u8;32])
+        });
+        let count_grants = || {
+            vault
+                .db()
+                .query_row("SELECT COUNT(*) FROM operation_grants", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        let roles = [selected, provider.id.as_str(), previous.id.as_str()];
+        for (kind, action, denied_role) in [
+            ("kubernetes-secret", "deliver", 0),
+            ("kubernetes-secret", "deliver", 1),
+            ("kubernetes-secret", "revoke", 1),
+            ("postgres-password", "", 0),
+            ("postgres-password", "", 1),
+            ("postgres-password", "", 2),
+            ("kubernetes-secret", "revoke", 0),
+        ] {
+            for (index, credential) in roles.iter().enumerate() {
+                let name: String = vault
+                    .db()
+                    .query_row(
+                        "SELECT name FROM credentials WHERE id=?1",
+                        [credential],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                vault
+                    .set_access_ring(
+                        "default",
+                        &name,
+                        if index == denied_role {
+                            AccessRing::Critical
+                        } else {
+                            AccessRing::Restricted
+                        },
+                        Some(password),
+                    )
+                    .unwrap();
+            }
+            let mut operation = json!({
+                "id":"eligibility", "kind":kind, "project_id":"default", "credential_id":selected,
+                "requester_principal":format!("instance:{requester}"), "environment_id":"test",
+                "target_id":"fixture", "expires_at":"2099-01-01T00:00:00Z",
+                "max_grant_seconds":300, "max_runtime_seconds":30, "connect_timeout_seconds":5,
+                "max_concurrency":1
+            });
+            if kind == "kubernetes-secret" {
+                operation["kubernetes"] = kubernetes.clone();
+                operation["kubernetes"]["action"] = json!(action);
+            } else {
+                operation["postgres"] = postgres.clone();
+            }
+            private_fixture_file(
+                &catalog_path(),
+                toml::to_string(&json!({"version":2,"operation":[operation]}))
+                    .unwrap()
+                    .as_bytes(),
+            );
+            let before = count_grants();
+            let result = authorize(vault, "eligibility", 60, None);
+            if action == "revoke" && denied_role == 0 {
+                let grant = result.unwrap();
+                assert_eq!(grant.state, GrantState::Pending);
+                assert_eq!(count_grants(), before + 1);
+            } else {
+                assert_eq!(result.err(), Some("auth unavailable"));
+                assert_eq!(count_grants(), before);
+            }
+        }
+        let name: String = vault
+            .db()
+            .query_row(
+                "SELECT name FROM credentials WHERE id=?1",
+                [selected],
+                |row| row.get(0),
+            )
+            .unwrap();
+        vault
+            .set_access_ring("default", &name, AccessRing::Restricted, Some(password))
+            .unwrap();
+    }
+
     #[test]
     fn isolated_grant_to_ssh_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
@@ -378,6 +572,7 @@ mod tests {
                 "runtime-fixture", crate::core::CredentialType::ApiKey, CANARY)).unwrap();
             let worker = vault.enroll_instance("runtime-worker", "fixture", &[]).unwrap();
             let other = vault.enroll_instance("other-worker", "fixture", &[]).unwrap();
+            assert_authorization_eligibility(&vault, &worker.instance.id, &credential.id);
             let server = ssh::tests::spawn_success_fixture(CANARY.as_bytes().to_vec()).await;
             let target = server.target.clone();
             #[cfg(windows)]
@@ -393,19 +588,14 @@ mod tests {
                 "max_grant_seconds":300, "max_runtime_seconds":30,"connect_timeout_seconds":5,"max_concurrency":1,
                 "ssh":target
             }]})).unwrap();
-            let path = catalog_path();
-            std::fs::write(&path, raw).unwrap();
-            #[cfg(unix)] {
-                use std::os::unix::fs::PermissionsExt;
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-            }
-            #[cfg(windows)] {
-                crate::secure_files::harden_existing_file(&path).unwrap();
-                let principal = identity::current_principal().unwrap();
-                let sid = principal.strip_prefix("windows-sid:").unwrap();
-                assert!(std::process::Command::new("icacls").arg(&path).args(["/setowner", &format!("*{sid}")])
-                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap().success());
-            }
+            private_fixture_file(&catalog_path(), raw.as_bytes());
+            vault.set_access_ring("default", "runtime-fixture", crate::core::access_ring::AccessRing::Critical,
+                Some("synthetic-test-master-password")).unwrap();
+            let before: i64 = vault.db().query_row("SELECT COUNT(*) FROM operation_grants", [], |row| row.get(0)).unwrap();
+            assert_eq!(authorize(&vault, "maintenance", 60, None).err(), Some("auth unavailable"));
+            assert_eq!(vault.db().query_row("SELECT COUNT(*) FROM operation_grants", [], |row| row.get::<_,i64>(0)).unwrap(), before);
+            vault.set_access_ring("default", "runtime-fixture", crate::core::access_ring::AccessRing::Restricted,
+                Some("synthetic-test-master-password")).unwrap();
             let grant = authorize(&vault, "maintenance", 60, None).unwrap();
             let route = format!("/api/operations/grants/{}/execute", grant.grant_id);
             assert_eq!(handle_api("POST", &route, &other.instance.id, &other.secret).await.0, 403);

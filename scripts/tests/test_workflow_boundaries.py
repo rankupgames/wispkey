@@ -81,7 +81,7 @@ class WorkflowBoundaryTests(unittest.TestCase):
         text = (ROOT / ".github/workflows/ci.yml").read_text()
         for before, after in [
             ("contents: read", "contents: write"),
-            ("  pull_request:", "  pull_request_target:"),
+            ("  workflow_dispatch:", "  pull_request_target:"),
             ("path: browser-extension/dist/", "path: ."),
             ("shared-key: native-tray", "shared-key: release-verify"),
         ]:
