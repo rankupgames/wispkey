@@ -18,6 +18,10 @@ def suites(root=ROOT):
     browser = root / "browser-extension"
     tray = root / "crates/wispkey-tray/ui"
     tray_build = [(tray, ["npm", "ci"]), (tray, ["npm", "run", "build"])]
+    tray_checks = [
+        (root, ["cargo", "clippy", "--locked", "-p", "wispkey-tray", "--all-targets", "--", "-D", "warnings"]),
+        (root, ["cargo", "test", "--locked", "-p", "wispkey-tray"]),
+    ]
     return {
         "cli": [
             (root, ["cargo", "fmt", "--all", "--", "--check"]),
@@ -42,10 +46,18 @@ def suites(root=ROOT):
             (root, ["cargo", "test", "--locked", "--test", "browser_handoff"]),
             (root, [sys.executable, "-m", "unittest", "discover", "-s", "scripts/tests", "-p", "test_browser_host_macos.py", "-v"]),
         ],
-        "tray": [*tray_build,
-            (root, ["cargo", "clippy", "--locked", "-p", "wispkey-tray", "--all-targets", "--", "-D", "warnings"]),
-            (root, ["cargo", "test", "--locked", "-p", "wispkey-tray"]),
+        "tray": [*tray_build, *tray_checks,
             (root, ["cargo", "build", "--locked", "-p", "wispkey-tray"]),
+        ],
+        # Opens the built UI in isolated browser contexts, never the desktop tray.
+        # Picker/clipboard replies are synthetic; owner IPC runs separately for real.
+        "tray-simulated": [*tray_build,
+            (browser, ["npm", "ci"]),
+            (browser, ["npx", "--no-install", "playwright", "install", "chromium", "firefox"]),
+            (root, ["cargo", "test", "--locked", "--lib", "owner_ipc"]),
+            (root, ["cargo", "test", "--locked", "--test", "owner_ipc", "--test", "owner_ipc_diagnostics"]),
+            *tray_checks,
+            (browser, ["npm", "run", "test:browser", "--", "tests/browser/tray.spec.mjs"]),
         ],
         "offline": [(root, [sys.executable, "scripts/verify_personal_offline.py"])],
         "postgres": [(root, ["bash", "tests/support/postgres_operation_fixture.sh"])],
@@ -89,7 +101,7 @@ def main(argv=None):
     catalog = suites()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--suite", action="append", choices=catalog, help="repeat to combine; defaults to cli")
-    parser.add_argument("--all", action="store_true", help="cli, browser and automation; optional native tray/PostgreSQL/cross-node require explicit --suite")
+    parser.add_argument("--all", action="store_true", help="cli, browser and automation; optional suites require explicit --suite")
     parser.add_argument("--dry-run", action="store_true", help="print commands without executing or claiming a pass")
     args = parser.parse_args(argv)
     selected = (["cli", "browser", "automation"] if args.all else []) + (args.suite or [])

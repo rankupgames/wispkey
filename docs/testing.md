@@ -38,6 +38,9 @@ python scripts/verify.py --suite offline
 # Native tray: OS GUI libraries, plus the Rust and Node prerequisites above.
 python scripts/verify.py --suite tray
 
+# Automatic popout interactions with a simulated native bridge; no desktop clicks.
+python scripts/verify.py --suite tray-simulated
+
 # Native-host protocol/approval state machine and macOS installer fixtures.
 # Compiles the real backend on macOS; never opens an OS verification prompt.
 python scripts/verify.py --suite native-host
@@ -53,9 +56,11 @@ python scripts/verify.py --suite cross-node
 
 The native tray build on Debian/Ubuntu needs `libgtk-3-dev`,
 `libwebkit2gtk-4.1-dev`, `libayatana-appindicator3-dev`, and `libxdo-dev`.
-The native tray crate currently has no Rust unit tests: its `cargo test` step
-checks test-mode compilation, not GUI behavior. Browser fixtures cover the UI;
-the actual system tray, autostart, and OS consent dialogs still need acceptance.
+The native tray crate has bridge, queue and placement unit tests. The
+`tray-simulated` suite combines these with real owner IPC tests and the built
+popout in headless Chromium/Firefox. Picker and clipboard results are synthetic;
+the actual system tray, autostart, clipboard delivery and OS dialogs still need
+platform acceptance. No controls for the test runner ship in the application.
 Linux `--all-features` compiles AF_VSOCK but a host
 without a usable vsock device cannot establish guest/host connectivity.
 

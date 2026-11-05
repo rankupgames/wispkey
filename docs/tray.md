@@ -125,6 +125,25 @@ cargo build -p wispkey-tray
 
 Default `cargo test` does not build the GUI crate.
 
+## Simulated desktop checks
+
+```sh
+python scripts/verify.py --suite tray-simulated
+```
+
+This command opens the built popout automatically in headless Chromium and
+Firefox, performs the UI actions, and closes the isolated browser contexts.
+It covers entry, destination confirmation, picker selection/cancellation,
+clipboard import/copy requests, blur, lock, stale replies and closing the popout.
+No taskbar clicks, File Explorer access, real vault or system clipboard are used.
+
+The suite also runs native bridge/queue/placement unit tests and real owner IPC
+integration tests with disposable vaults. It uses the committed npm lockfiles and
+the existing browser fixtures; no test endpoint or startup flag enters the app.
+The browser bridge supplies synthetic picker and clipboard results. This proves
+the simulated interactions and the separate native/IPC boundaries, not actual
+OS dialog behavior, clipboard delivery or system-tray menu clicks.
+
 ## IPC troubleshooting
 
 Windows owner IPC calls allow five seconds each for connection and request writing, then 30 seconds for the response. A timeout does not cancel admitted owner work; check the result before retrying. Timeout messages identify the phase and prior phase durations without request contents. Server logs include request-handling duration and success status. If a launcher captures stderr, it must continuously drain the pipe; an unread log pipe can stall request handling. The integration harness drains logs while retaining at most 256 KiB, and tests log pressure and concurrent clients without automatic retries.

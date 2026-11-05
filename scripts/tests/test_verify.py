@@ -53,6 +53,25 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(output.count("PLANNED"), 1)
         self.assertNotIn("PASSED", output)
 
+        with tempfile.TemporaryDirectory(prefix="wispkey simulation caller ") as caller:
+            result = subprocess.run(
+                [sys.executable, str(verify.ROOT / "scripts/verify.py"),
+                 "--suite", "tray-simulated", "--dry-run"],
+                cwd=caller, capture_output=True, text=True, check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for command in [
+            "npm run build",
+            "cargo test --locked --lib owner_ipc",
+            "cargo test --locked --test owner_ipc --test owner_ipc_diagnostics",
+            "cargo test --locked -p wispkey-tray",
+            "npm run test:browser -- tests/browser/tray.spec.mjs",
+        ]:
+            self.assertIn(command, result.stdout)
+        self.assertLess(result.stdout.index("npm run build"), result.stdout.index("npm run test:browser"))
+        self.assertIn("PLANNED (not executed)", result.stdout)
+        self.assertNotIn("PASSED", result.stdout)
+
     def test_real_subprocess_uses_exact_working_directory_and_exit_status(self):
         with tempfile.TemporaryDirectory(prefix="wispkey runner ") as root:
             path = Path(root)
