@@ -1110,7 +1110,10 @@ impl Vault {
     ) -> Result<(Credential, String)> {
         let key = self.ensure_unlocked()?;
         let transaction = if self.db.is_autocommit() {
-            Some(self.db.unchecked_transaction()?)
+            Some(rusqlite::Transaction::new_unchecked(
+                &self.db,
+                rusqlite::TransactionBehavior::Immediate,
+            )?)
         } else {
             None
         };

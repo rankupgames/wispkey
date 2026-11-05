@@ -204,6 +204,94 @@ fn lookup_by_wisp_token_decrypts() {
     assert_eq!(value, "the-real-secret");
 }
 
+/// Release a real competing writer only when SQLite asks the caller to wait.
+/// A deferred read-to-write upgrade bypasses this callback and returns BUSY.
+fn with_reserved_writer<T>(
+    vault: &Vault,
+    before_commit: impl FnOnce() + Send + 'static,
+    action: impl FnOnce() -> T,
+) -> (T, bool) {
+    use std::cell::RefCell;
+    use std::sync::mpsc::{Receiver, Sender, channel};
+    use std::time::Duration;
+
+    struct WriterRelease {
+        release: Sender<()>,
+        committed: Receiver<()>,
+    }
+    thread_local! {
+        static WRITER_RELEASE: RefCell<Option<WriterRelease>> = const { RefCell::new(None) };
+    }
+    fn release_writer(_: i32) -> bool {
+        WRITER_RELEASE.with(|state| {
+            let Some(writer) = state.borrow_mut().take() else {
+                return false;
+            };
+            writer.release.send(()).is_ok()
+                && writer
+                    .committed
+                    .recv_timeout(Duration::from_secs(10))
+                    .is_ok()
+        })
+    }
+
+    let path = vault.db.path().expect("file-backed fixture").to_string();
+    let (ready_tx, ready_rx) = channel();
+    let (release_tx, release_rx) = channel();
+    let (committed_tx, committed_rx) = channel();
+    let writer = std::thread::spawn(move || {
+        let db = Connection::open(path).unwrap();
+        db.execute_batch("BEGIN IMMEDIATE").unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        before_commit();
+        db.execute_batch("COMMIT").unwrap();
+        let _ = committed_tx.send(());
+    });
+    ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    WRITER_RELEASE.with(|state| {
+        *state.borrow_mut() = Some(WriterRelease {
+            release: release_tx.clone(),
+            committed: committed_rx,
+        });
+    });
+    vault.db.busy_handler(Some(release_writer)).unwrap();
+    let result = action();
+    vault.db.busy_handler(None).unwrap();
+    let waited = WRITER_RELEASE.with(|state| state.borrow_mut().take().is_none());
+    // Also release the writer when old behavior returned BUSY without waiting.
+    let _ = release_tx.send(());
+    writer.join().unwrap();
+    (result, waited)
+}
+
+#[test]
+fn token_lookup_waits_for_writer_before_reading_and_updates_last_use() {
+    let vault = test_vault("pw");
+    let credential = vault
+        .add_credential(
+            AddCredentialRequest::new("contended-token", CredentialType::ApiKey, "fixture-value")
+                .project(Some("default")),
+        )
+        .unwrap();
+    let (result, waited) = with_reserved_writer(
+        &vault,
+        || {},
+        || vault.lookup_by_wisp_token(&credential.wisp_token),
+    );
+    assert!(waited, "writer admission must invoke the busy handler");
+    let (found, plaintext) = result.unwrap();
+    assert_eq!(found.id, credential.id);
+    assert_eq!(plaintext, "fixture-value");
+    assert!(
+        vault
+            .get_credential_in_project("default", "contended-token")
+            .unwrap()
+            .last_used_at
+            .is_some()
+    );
+}
+
 #[test]
 fn partitions_crud() {
     let vault = test_vault("pw");
