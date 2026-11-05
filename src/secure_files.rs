@@ -53,6 +53,34 @@ pub(crate) fn create_private(path: &Path, bytes: &[u8]) -> Result<bool> {
     create_private_in_existing_directory(path, bytes)
 }
 
+/// Publishes a complete private file without replacing a concurrent winner.
+/// The existing parent keeps its permissions; unsupported hard links fail closed.
+pub(crate) fn publish_private(path: &Path, bytes: &[u8]) -> Result<bool> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let staged = parent.join(format!(".wk-publish-{}", uuid::Uuid::new_v4()));
+    if !create_private_in_existing_directory(&staged, bytes)? {
+        return Err(VaultError::Io(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "publication staging exists",
+        )));
+    }
+    let result = (|| {
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&staged)?
+            .sync_all()?;
+        match fs::hard_link(&staged, path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    })();
+    if staged.exists() {
+        fs::remove_file(&staged)?;
+    }
+    result
+}
+
 /// Atomically replaces a small private state file with a complete payload.
 pub(crate) fn replace_private(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path

@@ -107,6 +107,13 @@ pub fn remediate_fallback(input: &Path, output: &Path) -> Result<RemediationRepo
     let after = file
         .metadata()
         .map_err(|_| "cannot recheck input snapshot")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if after.nlink() != 1 {
+            return Err("input gained hard links while reading; use an offline snapshot".into());
+        }
+    }
     if after.len() != opened.len()
         || bytes.len() as u64 != opened.len()
         || after.modified().ok() != opened.modified().ok()

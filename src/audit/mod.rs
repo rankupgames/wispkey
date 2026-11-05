@@ -92,7 +92,11 @@ fn fallback_fingerprint_key() -> Option<Vec<u8>> {
         tracing::error!("Failed to generate audit fingerprint key: {error}");
         return None;
     }
-    match secure_files::create_private(&path, &key) {
+    if let Err(error) = secure_files::ensure_private_directory(&Vault::vault_dir()) {
+        tracing::error!("Failed to prepare audit fingerprint directory: {error}");
+        return None;
+    }
+    match secure_files::publish_private(&path, &key) {
         Ok(true) => Some(key),
         Ok(false) => match fs::read(&path) {
             Ok(winning_key) if winning_key.len() == AUDIT_FINGERPRINT_KEY_LEN => Some(winning_key),
@@ -455,7 +459,7 @@ pub fn query_log(
 
     if let Some(since_date) = since {
         query.push_str(" AND timestamp >= ?");
-        param_values.push(Box::new(since_lower_bound(since_date)));
+        param_values.push(Box::new(lower_bound(since_date)));
     }
 
     query.push_str(" ORDER BY id DESC LIMIT ?");
@@ -472,51 +476,7 @@ pub fn query_log(
         }
     };
 
-    let rows = match stmt.query_map(params_ref.as_slice(), |row| {
-        Ok(AuditEntry {
-            id: row.get(0)?,
-            timestamp: redact_required(&row.get::<_, String>(1)?),
-            event_type: redact_required(&row.get::<_, String>(2)?),
-            credential_name: redact_capabilities(row.get::<_, Option<String>>(3)?.as_deref()),
-            token_fingerprint: stored_token_fingerprint(row.get(4)?),
-            target_host: redact_capabilities(row.get::<_, Option<String>>(5)?.as_deref()),
-            target_path: redact_capabilities(row.get::<_, Option<String>>(6)?.as_deref()),
-            http_method: redact_capabilities(row.get::<_, Option<String>>(7)?.as_deref()),
-            response_status: row
-                .get::<_, Option<i64>>(8)?
-                .map(u16::try_from)
-                .transpose()
-                .map_err(|error| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        8,
-                        rusqlite::types::Type::Integer,
-                        Box::new(error),
-                    )
-                })?,
-            denied: row.get::<_, i32>(9)? != 0,
-            deny_reason: redact_capabilities(row.get::<_, Option<String>>(10)?.as_deref()),
-            project_name: redact_capabilities(row.get::<_, Option<String>>(11)?.as_deref()),
-            source: "vault".to_string(),
-        })
-    }) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::error!("Failed to query audit log: {}", e);
-            return Vec::new();
-        }
-    };
-
-    let mut entries = Vec::new();
-    for row in rows {
-        match row {
-            Ok(entry) => entries.push(entry),
-            Err(e) => {
-                tracing::error!("Failed to read audit log row: {}", e);
-                return Vec::new();
-            }
-        }
-    }
-    entries
+    read_audit_rows(&mut stmt, params_ref.as_slice())
 }
 
 /// Queries the audit log with optional credential and timestamp range filters, without a row limit.
@@ -772,10 +732,6 @@ fn sideload_env_key_filter(credential: &str) -> Option<String> {
         return None;
     }
     crate::env_sideload::env_key_for_name(credential)
-}
-
-fn since_lower_bound(since: &str) -> String {
-    lower_bound(since)
 }
 
 fn lower_bound(value: &str) -> String {

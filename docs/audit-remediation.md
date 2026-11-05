@@ -55,7 +55,8 @@ credential, or rotates a token. It works without an initialized or unlocked vaul
   than making an unverified protection claim.
 - UTF-8, JSONL records, and RFC3339 timestamps are validated before creating output.
   Any malformed nonblank record rejects the whole migration. Observed input length
-  or modification-time changes also reject the snapshot. Errors report line
+  or modification-time changes also reject the snapshot; Unix rechecks that the
+  input still has exactly one hard link. Errors report line
   numbers, never parser diagnostics, file paths, event contents, or raw tokens.
 - Only the known fallback schema is written. Unknown fields and arbitrary source
   labels are discarded, all recognized string fields are capability-redacted,
@@ -66,6 +67,8 @@ credential, or rotates a token. It works without an initialized or unlocked vaul
 - Reprocessing a sanitized copy produces the same event bytes. Reusing an output
   filename fails; this prevents accidental replacement of evidence. An I/O failure
   while writing or syncing can leave a partial protected copy; no success is reported.
+  On Windows, a failed post-create safety check can leave an empty protected copy;
+  the error reports that possibility.
 
 Successful stdout is a JSON summary with `records_written`,
 `legacy_token_fields_removed`, and `source_preserved`. It contains no event data.

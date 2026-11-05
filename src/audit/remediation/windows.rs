@@ -188,12 +188,14 @@ impl PinnedParent {
             CREATE_NEW,
             Some(&descriptor),
         )?;
-        let info = information(&file, false)?;
+        let info = information(&file, false)
+            .map_err(|_| "cannot inspect output; an empty protected copy may remain")?;
         if info.nNumberOfLinks != 1 {
-            return Err("unsafe output file".into());
+            return Err("unsafe output file; an empty protected copy may remain".into());
         }
-        windows_private::verify_acl(&file)
-            .map_err(|_| "cannot verify private output protection")?;
+        windows_private::verify_acl(&file).map_err(
+            |_| "cannot verify private output protection; an empty protected copy may remain",
+        )?;
         file.write_all(bytes)
             .and_then(|()| file.sync_all())
             .map_err(|_| "cannot complete output; a partial protected copy may remain")?;
