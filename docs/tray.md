@@ -158,13 +158,10 @@ suite exercises the production bundle in Chromium and Firefox with synthetic
 owner IPC, including an external-asset-blocked bootstrap check. Native webview
 and human OS-consent acceptance still require the platform-specific checks.
 
-The October 2026 frontend migration uses Vite 8.3.0, Svelte 5.57.1 and
-`@sveltejs/vite-plugin-svelte` 7.3.1. Vite 8.3.1 is the newer registry stable
-release, published September 24 at 12:26:19.940 UTC; it becomes eligible under
-the development machine's seven-day npm release-age policy on October 1 at
-12:26:19.940 UTC. The committed lockfile intentionally retains 8.3.0 until that
-window has elapsed and a fresh tested update is prepared. No release-age or
-peer-dependency checks are bypassed.
+The committed npm lockfile owns the reviewed toolchain versions. Keep Vite and
+its source-map tooling on patched releases that satisfy the seven-day npm
+release-age gate. Rebuild and test the single-file bundle after toolchain
+updates; do not bypass release-age or peer-dependency checks.
 
 The [Vite 7 migration](https://v7.vite.dev/guide/migration) and
 [Vite 8 migration](https://vite.dev/guide/migration) change bundlers and default
