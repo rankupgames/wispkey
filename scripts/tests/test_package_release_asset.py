@@ -2,7 +2,9 @@
 
 from pathlib import Path
 import os
+import shutil
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -11,6 +13,9 @@ import zipfile
 
 SCRIPT = Path(__file__).resolve().parents[1] / "package-release-asset.sh"
 COMMIT = "1" * 40
+# Windows resolves bare `bash` to its WSL launcher before searching PATH.
+BASH = (Path(shutil.which("git")).parent.parent / "bin/bash.exe"
+        if os.name == "nt" else "bash")
 
 
 class ReleaseArchiveTests(unittest.TestCase):
@@ -18,15 +23,15 @@ class ReleaseArchiveTests(unittest.TestCase):
         root = Path(directory)
         binary = root / binary_name
         binary.write_bytes(b"synthetic binary\x00\xff")
-        (root / "LICENSE").write_text("synthetic license\n")
-        (root / "README.md").write_text("synthetic readme\n")
+        (root / "LICENSE").write_bytes(b"synthetic license\n")
+        (root / "README.md").write_bytes(b"synthetic readme\n")
         result = subprocess.run(
-            ["bash", str(SCRIPT), "--target", target, "--binary", str(binary),
+            [str(BASH), str(SCRIPT), "--target", target, "--binary", str(binary),
              "--version", "0.4.0", "--commit", COMMIT,
              "--license", str(root / "LICENSE"), "--readme", str(root / "README.md"),
              "--out-dir", str(root / "output with spaces")],
             # macOS metadata sidecars are host-specific, not release payloads.
-            env={**os.environ, "COPYFILE_DISABLE": "1"},
+            env={**os.environ, "COPYFILE_DISABLE": "1", "PYTHON": sys.executable},
             capture_output=True, text=True,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
