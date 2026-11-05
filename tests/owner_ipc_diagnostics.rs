@@ -91,15 +91,15 @@ async fn stalled_peer_timeout_has_fixed_method_and_phase_without_private_input()
             drop(reader);
         });
         let started = Instant::now();
-        let result = tokio::time::timeout(Duration::from_secs(7), wispkey::owner_ipc::call(&path,
+        let result = tokio::time::timeout(Duration::from_secs(35), wispkey::owner_ipc::call(&path,
             json!({"id":"private-id-canary", "method":method, "params":{"value":"secret-value-canary"}}))).await;
         peer.abort();
         let diagnostic = result
-            .expect("five-second client deadline did not fire")
+            .expect("30-second response deadline did not fire")
             .unwrap_err()
             .to_string();
-        assert!(started.elapsed() >= Duration::from_secs(5));
-        assert!(diagnostic.contains("response_read phase timed out after 5000 ms"));
+        assert!(started.elapsed() >= Duration::from_secs(30));
+        assert!(diagnostic.contains("response_read phase timed out after 30000 ms"));
         assert!(diagnostic.contains(&format!("method={expected}")));
         for forbidden in [
             "private-method-canary",

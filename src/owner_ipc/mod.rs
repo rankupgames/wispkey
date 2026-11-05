@@ -1097,20 +1097,54 @@ mod windows {
         let written_ms = started.elapsed().as_millis();
         let mut reader = BufReader::new(client);
         let mut line = String::new();
-        // Initial vault creation performs password hashing and session setup.
-        // Match the tray's owner-operation budget instead of timing out a
-        // successful initialization while it is still running.
-        let response_timeout =
-            if request.get("method").and_then(Value::as_str) == Some("initialize") {
-                Duration::from_secs(30)
-            } else {
-                Duration::from_secs(5)
-            };
+        // Password hashing and import commits can outlast connection setup.
+        // Match the GUI operation allowance; timing out does not cancel work
+        // already admitted by the owner and must never trigger an auto-retry.
+        let response_timeout = Duration::from_secs(30);
         tokio::time::timeout(response_timeout, reader.read_line(&mut line))
             .await
             .map_err(|_| OwnerIpcError::Protocol(format!("response_read phase timed out after {} ms (method={method}; connection: {connected_ms} ms; request write: {} ms)", response_timeout.as_millis(), written_ms - connected_ms)))??;
         serde_json::from_str(line.trim())
             .map_err(|error| OwnerIpcError::Protocol(error.to_string()))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn completed_owner_work_can_reply_after_the_old_five_second_deadline() {
+            for method in ["unlock", "import_commit"] {
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("owner.sock");
+                let server = create_server(&pipe_name(&path), true).unwrap();
+                let client =
+                    super::super::call(&path, serde_json::json!({"id":"held", "method":method}));
+                let serve = async {
+                    server.connect().await.unwrap();
+                    let mut reader = BufReader::new(server);
+                    let mut request = String::new();
+                    reader.read_line(&mut request).await.unwrap();
+                    // This is the response deadline boundary under test. Hold
+                    // completion until beyond the old budget, observing EOF if
+                    // the real client abandons its pending result too early.
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(6), reader.fill_buf())
+                            .await
+                            .is_err(),
+                        "client abandoned completed {method} work before its owner-operation budget"
+                    );
+                    write_line(
+                        reader.get_mut(),
+                        &serde_json::json!({"id":"held", "ok":true, "result":{"completed":true}}),
+                    )
+                    .await
+                    .unwrap();
+                };
+                let (response, ()) = tokio::join!(client, serve);
+                assert_eq!(response.unwrap()["result"]["completed"], true);
+            }
+        }
     }
 }
 
