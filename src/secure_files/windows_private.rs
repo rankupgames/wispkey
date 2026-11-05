@@ -15,10 +15,12 @@ use windows_sys::Win32::Security::{
     IsValidSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, TOKEN_QUERY, TOKEN_USER,
     TokenUser,
 };
-use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
+};
 
-struct Token(HANDLE);
-impl Drop for Token {
+struct Handle(HANDLE);
+impl Drop for Handle {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.0) };
     }
@@ -32,11 +34,15 @@ impl<T> Drop for Local<T> {
 }
 
 fn current_sid() -> Result<(Vec<usize>, PSID), &'static str> {
+    process_sid(unsafe { GetCurrentProcess() })
+}
+
+fn process_sid(process: HANDLE) -> Result<(Vec<usize>, PSID), &'static str> {
     let mut raw_token = null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut raw_token) } == 0 {
+    if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut raw_token) } == 0 {
         return Err("local OS principal is unavailable");
     }
-    let token = Token(raw_token);
+    let token = Handle(raw_token);
     let mut needed = 0;
     unsafe { GetTokenInformation(token.0, TokenUser, null_mut(), 0, &mut needed) };
     if needed < size_of::<TOKEN_USER>() as u32 || needed > 64 * 1024 {
@@ -63,6 +69,21 @@ fn current_sid() -> Result<(Vec<usize>, PSID), &'static str> {
         return Err("local OS principal is unavailable");
     }
     Ok((buffer, sid))
+}
+
+/// Verifies the OS process principal, rather than a caller-supplied identity.
+pub(crate) fn verify_process_owner(process_id: u32) -> Result<(), &'static str> {
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, process_id) };
+    if process.is_null() {
+        return Err("peer OS principal is unavailable");
+    }
+    let process = Handle(process);
+    let (_peer_buffer, peer_sid) = process_sid(process.0)?;
+    let (_owner_buffer, owner_sid) = current_sid()?;
+    if unsafe { EqualSid(peer_sid, owner_sid) } == 0 {
+        return Err("peer OS principal does not match the owner");
+    }
+    Ok(())
 }
 
 pub(crate) fn current_sid_string() -> Result<String, &'static str> {
@@ -177,4 +198,14 @@ pub(crate) fn verify_acl(file: &File) -> Result<(), &'static str> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn process_owner_check_requires_an_accessible_owner_token() {
+        assert!(super::verify_process_owner(std::process::id()).is_ok());
+        // PID zero is the OS idle process and cannot be opened for a token.
+        assert!(super::verify_process_owner(0).is_err());
+    }
 }

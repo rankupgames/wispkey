@@ -37,6 +37,9 @@ pub(super) fn clear_imports() {
 pub(super) fn expire_imports() {
     if let Ok(mut session) = imports() {
         session.expire();
+        if session.has_plans() && Vault::session_metadata().is_err() {
+            session.clear();
+        }
     }
 }
 

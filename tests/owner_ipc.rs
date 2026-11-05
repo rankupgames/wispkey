@@ -142,6 +142,190 @@ async fn owner_call(vault_dir: &std::path::Path, request: serde_json::Value) -> 
         })
 }
 
+async fn raw_owner_connection(
+    vault_dir: &std::path::Path,
+) -> impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin {
+    #[cfg(unix)]
+    {
+        tokio::net::UnixStream::connect(vault_dir.join("owner.sock"))
+            .await
+            .expect("connect raw owner client")
+    }
+    #[cfg(windows)]
+    {
+        use tokio::net::windows::named_pipe::ClientOptions;
+        use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+
+        let metadata: owner_ipc::OwnerEndpoint = serde_json::from_slice(
+            &std::fs::read(vault_dir.join("owner.json")).expect("owner metadata"),
+        )
+        .expect("decode owner metadata");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut retry = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                retry.tick().await;
+                match ClientOptions::new().open(&metadata.endpoint) {
+                    Ok(client) => return client,
+                    Err(error) if error.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) => {}
+                    Err(error) => panic!("connect raw owner client: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("raw owner connection deadline")
+    }
+}
+
+async fn abandon_owner_response(vault_dir: &std::path::Path, mut request: serde_json::Value) {
+    use tokio::io::AsyncWriteExt;
+
+    // The echoed ID exceeds transport buffers, so receipt cannot complete before
+    // this client closes without reading. No handler delay or test hook is used.
+    request["id"] = json!("x".repeat(2 * 1024 * 1024));
+    let mut encoded = serde_json::to_vec(&request).expect("encode raw request");
+    encoded.push(b'\n');
+    let mut client = raw_owner_connection(vault_dir).await;
+    tokio::time::timeout(Duration::from_secs(5), client.write_all(&encoded))
+        .await
+        .expect("raw request write deadline")
+        .expect("write raw request");
+    drop(client);
+}
+
+#[tokio::test]
+async fn abandoned_response_keeps_the_server_and_completed_mutation() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    init_vault(dir.path());
+    let mut server = start_owner_ipc(dir.path());
+    abandon_owner_response(
+        dir.path(),
+        json!({"method":"create_project","params":{
+            "name":"abandoned-response-fixture","destination_confirmed":true
+        }}),
+    )
+    .await;
+    let listed = tokio::time::timeout(
+        Duration::from_secs(7),
+        owner_call(dir.path(), json!({"method":"list_projects"})),
+    )
+    .await
+    .expect("owner server did not accept a client after a dropped response");
+    assert_eq!(listed["ok"], true, "{listed}");
+    assert!(
+        listed["result"]["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|project| project["name"] == "abandoned-response-fixture")
+    );
+    assert!(server.child.0.try_wait().expect("server state").is_none());
+    assert!(
+        server
+            .captured_logs()
+            .contains("owner ipc response delivery failed")
+    );
+}
+
+#[tokio::test]
+async fn abandoned_shutdown_response_still_exits_successfully() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    let mut server = start_owner_ipc(dir.path());
+    abandon_owner_response(dir.path(), json!({"method":"shutdown"})).await;
+    let status = tokio::time::timeout(Duration::from_secs(7), async {
+        let mut poll = tokio::time::interval(Duration::from_millis(10));
+        loop {
+            poll.tick().await;
+            if let Some(status) = server.child.0.try_wait().expect("server state") {
+                return status;
+            }
+        }
+    })
+    .await
+    .expect("shutdown did not stop the server after its client disconnected");
+    assert!(status.success(), "shutdown exit status: {status}");
+    assert!(!dir.path().join("owner.json").exists());
+    assert!(
+        server
+            .captured_logs()
+            .contains("owner ipc response delivery failed")
+    );
+}
+
+#[tokio::test]
+async fn partial_request_times_out_and_releases_the_serial_listener() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let dir = tempfile::tempdir().expect("vault dir");
+    let _server = start_owner_ipc(dir.path());
+    let mut client = raw_owner_connection(dir.path()).await;
+    client
+        .write_all(b"{\"method\":")
+        .await
+        .expect("partial request");
+    let closed = tokio::time::timeout(Duration::from_secs(12), client.read(&mut [0u8; 1]))
+        .await
+        .expect("partial owner request kept the serial listener beyond its deadline");
+    match closed {
+        Ok(bytes) => assert_eq!(bytes, 0, "timed-out connection must close"),
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe),
+    }
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(7),
+            owner_call(dir.path(), json!({"method":"status"})),
+        )
+        .await
+        .expect("listener did not recover after closing a partial request")["ok"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn external_lock_discards_staged_imports_without_status_polling() {
+    let dir = tempfile::tempdir().expect("vault dir");
+    init_vault(dir.path());
+    let _server = start_owner_ipc(dir.path());
+    let source = dir.path().join(".env.external-lock-fixture");
+    write_private_test_file(&source, "FIXTURE_API_KEY=external-lock-staged-value\n");
+    let mut plans = Vec::new();
+    for _ in 0..4 {
+        let preview = owner_call(
+            dir.path(),
+            json!({"method":"import_preview","params":{
+                "paths":[source],"project":"external-lock-fixture"
+            }}),
+        )
+        .await;
+        assert_eq!(preview["ok"], true, "{preview}");
+        plans.push(preview["result"]["plan_id"].clone());
+    }
+    assert!(run_wispkey(dir.path(), &["lock"]).status.success());
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
+    let mut discarded = false;
+    for plan in plans {
+        interval.tick().await;
+        // Cancellation runs without opening the vault or consulting session
+        // validity, so only housekeeping can have removed this untouched plan.
+        let response = owner_call(
+            dir.path(),
+            json!({"method":"import_cancel","params":{
+                "plan_id":plan
+            }}),
+        )
+        .await;
+        if response["error"]["code"] == "plan_unavailable" {
+            discarded = true;
+        } else {
+            assert!(!discarded, "housekeeping must discard every staged plan");
+            assert_eq!(response["result"]["cancelled"], true, "{response}");
+        }
+    }
+    assert!(
+        discarded,
+        "external lock left staged plans available for every bounded probe"
+    );
+}
+
 #[tokio::test]
 async fn desktop_initializes_once_and_shares_cli_lock_state() {
     let dir = tempfile::tempdir().expect("vault dir");

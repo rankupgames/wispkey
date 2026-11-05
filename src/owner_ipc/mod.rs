@@ -31,6 +31,7 @@ const PROTOCOL_VERSION: u8 = 1;
 const OWNER_SOCK_NAME: &str = "owner.sock";
 const OWNER_META_NAME: &str = "owner.json";
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const REQUEST_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const SECRET_FIELD_NAMES: &[&str] = &[
     "value",
     "password",
@@ -80,7 +81,8 @@ pub fn authorize_peer_uid(peer_uid: Option<u32>, expected_uid: u32) -> bool {
     peer_uid == Some(expected_uid)
 }
 
-/// Redacts known secret fields from JSON values before logging.
+/// Public redaction utility retained for external callers. Owner IPC transport
+/// does not log request payloads and does not rely on this helper for protection.
 #[must_use]
 pub fn redact_json(value: &Value) -> Value {
     match value {
@@ -105,19 +107,21 @@ pub async fn serve() -> Result<(), OwnerIpcError> {
     serve_at(&socket_path()).await
 }
 
-/// Serves owner IPC on an explicit socket path (used by tests).
+/// Serves owner IPC on an explicit socket path until shutdown or listener failure.
 pub async fn serve_at(path: &Path) -> Result<(), OwnerIpcError> {
     let _lease = acquire_server_lease(path)?;
     cleanup_endpoint(path);
-    let expiry = tokio::spawn(async {
+    let expiry = async {
         let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
         loop {
             tick.tick().await;
             desktop::expire_imports();
         }
-    });
-    let result = serve_platform(path).await;
-    expiry.abort();
+    };
+    let result = tokio::select! {
+        result = serve_platform(path) => result,
+        () = expiry => unreachable!("import expiry runs until the server stops"),
+    };
     cleanup_endpoint(path);
     result
 }
@@ -382,6 +386,12 @@ fn list_credentials_response(params: &Value) -> Result<Value, Value> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .unwrap_or_else(core::resolve_active_project);
+    // Keep scope labels and credentials in the same SQLite read snapshot.
+    let snapshot = vault
+        .db()
+        .unchecked_transaction()
+        .map_err(VaultError::from)
+        .map_err(vault_error)?;
     let credentials = if all_projects {
         vault.list_credentials().map_err(vault_error)?
     } else {
@@ -391,6 +401,10 @@ fn list_credentials_response(params: &Value) -> Result<Value, Value> {
     };
     let partitions = vault.list_partitions().map_err(vault_error)?;
     let projects = vault.list_projects().map_err(vault_error)?;
+    snapshot
+        .commit()
+        .map_err(VaultError::from)
+        .map_err(vault_error)?;
     Ok(json!({
         "project": if all_projects { "*".to_string() } else { project.clone() },
         "credentials": credentials.iter().map(|credential| {
@@ -765,15 +779,30 @@ async fn write_line<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+// A client that stops receiving must not take down the listener after a handler
+// has already completed. Shutdown is handled independently by the caller.
+async fn write_response<W: AsyncWriteExt + Unpin>(writer: &mut W, response: &Value) -> bool {
+    if write_line(writer, response).await.is_err() {
+        tracing::warn!("owner ipc response delivery failed");
+        return false;
+    }
+    true
+}
+
 async fn read_request_line<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> std::io::Result<Option<zeroize::Zeroizing<Vec<u8>>>> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let mut encoded = zeroize::Zeroizing::new(Vec::new());
-    let read = reader
-        .take(MAX_REQUEST_BYTES as u64 + 1)
-        .read_until(b'\n', &mut encoded)
-        .await?;
+    let mut bounded = reader.take(MAX_REQUEST_BYTES as u64 + 1);
+    let read = tokio::time::timeout(
+        REQUEST_READ_TIMEOUT,
+        bounded.read_until(b'\n', &mut encoded),
+    )
+    .await
+    .map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::TimedOut, "owner request read timed out")
+    })??;
     if encoded.len() > MAX_REQUEST_BYTES {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -815,8 +844,8 @@ mod unix {
     use tokio::net::{UnixListener, UnixStream};
 
     use super::{
-        OwnerIpcError, authorize_peer_uid, cleanup_endpoint, current_uid, handle_request,
-        read_request_line, write_line, write_metadata,
+        OwnerIpcError, authorize_peer_uid, current_uid, handle_request, read_request_line,
+        write_metadata, write_response,
     };
 
     pub(super) async fn serve(path: &Path) -> Result<(), OwnerIpcError> {
@@ -841,8 +870,9 @@ mod unix {
                 let line = match read_request_line(&mut reader).await {
                     Ok(Some(line)) => line,
                     Ok(None) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::TimedOut => break,
                     Err(_) => {
-                        write_line(&mut writer, &serde_json::json!({"ok":false,"error":{"code":"invalid_input","message":"owner request is invalid or exceeds the size limit"}})).await?;
+                        write_response(&mut writer, &serde_json::json!({"ok":false,"error":{"code":"invalid_input","message":"owner request is invalid or exceeds the size limit"}})).await;
                         break;
                     }
                 };
@@ -852,23 +882,27 @@ mod unix {
                 let request = match serde_json::from_slice::<Value>(&line) {
                     Ok(request) => request,
                     Err(_) => {
-                        write_line(
+                        if !write_response(
                             &mut writer,
                             &serde_json::json!({
                                 "ok": false,
                                 "error": { "code": "invalid_input", "message": "owner request is invalid" }
                             }),
                         )
-                        .await?;
+                        .await {
+                            break;
+                        }
                         continue;
                     }
                 };
                 let shutdown = request.get("method").and_then(Value::as_str) == Some("shutdown");
                 let response = handle_request(request);
-                write_line(&mut writer, &response).await?;
+                let delivered = write_response(&mut writer, &response).await;
                 if shutdown {
-                    cleanup_endpoint(path);
                     return Ok(());
+                }
+                if !delivered {
+                    break;
                 }
             }
         }
@@ -883,6 +917,7 @@ mod unix {
 #[cfg(windows)]
 mod windows {
     use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
     use std::path::Path;
     use std::time::Duration;
 
@@ -891,11 +926,12 @@ mod windows {
     use tokio::net::windows::named_pipe::{ClientOptions, ServerOptions};
     use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::System::Pipes::GetNamedPipeServerProcessId;
 
     use super::diagnostics::{Method, Phase, Phases};
     use super::{
-        OwnerIpcError, cleanup_endpoint, handle_request, read_request_line, write_line,
-        write_metadata,
+        OwnerIpcError, handle_request, read_request_line, write_line, write_metadata,
+        write_response,
     };
 
     pub(super) fn pipe_name(path: &Path) -> String {
@@ -926,6 +962,28 @@ mod windows {
         Ok(server)
     }
 
+    fn replace_instance(
+        name: &str,
+        current: BufReader<tokio::net::windows::named_pipe::NamedPipeServer>,
+    ) -> Result<tokio::net::windows::named_pipe::NamedPipeServer, OwnerIpcError> {
+        // Retain the current instance until its replacement owns the pipe name.
+        let next = create_server(name, false)?;
+        drop(current);
+        Ok(next)
+    }
+
+    fn authorize_server(
+        client: &tokio::net::windows::named_pipe::NamedPipeClient,
+    ) -> Result<(), OwnerIpcError> {
+        let mut process_id = 0;
+        // SAFETY: client owns the connected pipe handle and process_id is writable.
+        if unsafe { GetNamedPipeServerProcessId(client.as_raw_handle(), &mut process_id) } == 0 {
+            return Err(OwnerIpcError::Unauthorized);
+        }
+        crate::secure_files::windows_private::verify_process_owner(process_id)
+            .map_err(|_| OwnerIpcError::Unauthorized)
+    }
+
     pub(super) async fn serve(path: &Path) -> Result<(), OwnerIpcError> {
         let name = pipe_name(path);
         let mut server = create_server(&name, true)?;
@@ -941,11 +999,15 @@ mod windows {
             phases.record(Method::Pending, Phase::ReadWait);
             let line = match read_request_line(&mut reader).await {
                 Ok(line) => line,
+                Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                    server = replace_instance(&name, reader)?;
+                    phases.record(Method::Pending, Phase::InstanceReady);
+                    continue;
+                }
                 Err(_) => {
                     phases.record(Method::Unknown, Phase::InvalidRequest);
-                    write_line(reader.get_mut(), &serde_json::json!({"ok":false,"error":{"code":"invalid_input","message":"owner request is invalid or exceeds the size limit"}})).await?;
-                    drop(reader);
-                    server = create_server(&name, false)?;
+                    write_response(reader.get_mut(), &serde_json::json!({"ok":false,"error":{"code":"invalid_input","message":"owner request is invalid or exceeds the size limit"}})).await;
+                    server = replace_instance(&name, reader)?;
                     phases.record(Method::Pending, Phase::InstanceReady);
                     continue;
                 }
@@ -953,8 +1015,7 @@ mod windows {
             phases.record(Method::Pending, Phase::ReadComplete);
             let Some(line) = line else {
                 phases.record(Method::Pending, Phase::ReadEmpty);
-                drop(reader);
-                server = create_server(&name, false)?;
+                server = replace_instance(&name, reader)?;
                 phases.record(Method::Pending, Phase::InstanceReady);
                 continue;
             };
@@ -963,17 +1024,17 @@ mod windows {
                 Err(_) => {
                     phases.record(Method::Unknown, Phase::InvalidRequest);
                     phases.record(Method::Unknown, Phase::WriteStart);
-                    write_line(
+                    if write_response(
                         reader.get_mut(),
                         &serde_json::json!({
                             "ok": false,
                             "error": { "code": "invalid_input", "message": "owner request is invalid" }
                         }),
                     )
-                    .await?;
-                    phases.record(Method::Unknown, Phase::WriteAccepted);
-                    drop(reader);
-                    server = create_server(&name, false)?;
+                    .await {
+                        phases.record(Method::Unknown, Phase::WriteAccepted);
+                    }
+                    server = replace_instance(&name, reader)?;
                     phases.record(Method::Pending, Phase::InstanceReady);
                     continue;
                 }
@@ -984,14 +1045,13 @@ mod windows {
             let response = handle_request(request);
             phases.record(method, Phase::HandlerComplete);
             phases.record(method, Phase::WriteStart);
-            write_line(reader.get_mut(), &response).await?;
-            phases.record(method, Phase::WriteAccepted);
+            if write_response(reader.get_mut(), &response).await {
+                phases.record(method, Phase::WriteAccepted);
+            }
             if shutdown {
-                cleanup_endpoint(path);
                 return Ok(());
             }
-            drop(reader);
-            server = create_server(&name, false)?;
+            server = replace_instance(&name, reader)?;
             phases.record(Method::Pending, Phase::InstanceReady);
         }
     }
@@ -1019,6 +1079,7 @@ mod windows {
                 Err(error) => return Err(error.into()),
             }
         };
+        authorize_server(&client)?;
         let connected_ms = started.elapsed().as_millis();
         tokio::time::timeout(Duration::from_secs(5), write_line(&mut client, request))
             .await
@@ -1030,9 +1091,18 @@ mod windows {
         let written_ms = started.elapsed().as_millis();
         let mut reader = BufReader::new(client);
         let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line))
+        // Initial vault creation performs password hashing and session setup.
+        // Match the tray's owner-operation budget instead of timing out a
+        // successful initialization while it is still running.
+        let response_timeout =
+            if request.get("method").and_then(Value::as_str) == Some("initialize") {
+                Duration::from_secs(30)
+            } else {
+                Duration::from_secs(5)
+            };
+        tokio::time::timeout(response_timeout, reader.read_line(&mut line))
             .await
-            .map_err(|_| OwnerIpcError::Protocol(format!("response_read phase timed out after 5000 ms (method={method}; connection: {connected_ms} ms; request write: {} ms)", written_ms - connected_ms)))??;
+            .map_err(|_| OwnerIpcError::Protocol(format!("response_read phase timed out after {} ms (method={method}; connection: {connected_ms} ms; request write: {} ms)", response_timeout.as_millis(), written_ms - connected_ms)))??;
         serde_json::from_str(line.trim())
             .map_err(|error| OwnerIpcError::Protocol(error.to_string()))
     }
