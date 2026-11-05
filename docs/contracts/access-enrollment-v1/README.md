@@ -88,10 +88,12 @@ mapped to a permissive default. Ring labels never authenticate a caller.
 
 Rights are independent sets, not ranks. Discovery does not imply request,
 replication or use; replication does not grant a WispKey execution capability.
-Plugin identity/consent is distinct from its transport device and account session.
+Device grant rights are intersected with the approved enrollment rights. A grant
+cannot add a right outside that enrollment. Plugin identity/consent is distinct
+from its transport device and account session.
 
 Effective permission is the intersection of authenticated endpoint/account,
-portable vault/project/partition identity, approved device and exact key versions,
+portable vault/project/partition identity, approved device, enrollment rights and exact key versions,
 plugin principal if applicable, owner grant, current classification, resource and
 credential revision, exact origin, operation, existing host/path/method policy,
 auth lifecycle, finite session/grant/enrollment expiry, current epoch/policy,
@@ -237,7 +239,7 @@ cannot mint or refresh it. A frozen server-signed timestamp is insufficient.
 Accept only a verified reply matching the currently outstanding challenge and
 binding, in the same process/clock epoch, with trusted clock state and
 `dispatch <= receipt < deadline <= dispatch + 30`. At the exact deadline deny.
-Atomically consume the challenge and store the accepted head/lease; a repeated
+Atomically consume the challenge and store the accepted sequence/hash and lease; a repeated
 reply cannot consume it again or extend the deadline. A delayed reply arriving
 at dispatch + 29 has at most one second left, not a fresh 30-second lease.
 An adapter must persist the returned state atomically; replaying an earlier copy
@@ -247,6 +249,8 @@ not establish database CAS behavior or cryptographic verification.
 At use/import recheck `receipt <= now_monotonic < original_deadline`, unchanged
 binding/clock epoch, consumed challenge, verified proof, trusted clock state and
 signed head expiry. Wall time must not precede receipt or signed issue time.
+Snapshot acceptance reads its required sequence/hash from that accepted context.
+There is no independently supplied head that can replace the verified response.
 The earliest head, grant, enrollment and local-session expiry always wins.
 Restart creates a new non-restored clock epoch and clears outstanding challenges
 and leases. Clock uncertainty/rollback, missing protected checkpoint, logout,
@@ -350,7 +354,7 @@ python3 -B -m unittest discover -s docs/contracts/access-enrollment-v1 -v
 No setup credentials, environment variables, vault initialization, Cargo build,
 service, browser, network or filesystem data beyond these source fixtures are
 needed. Tests use reserved `.test` endpoints and symbolic public-key/hash IDs;
-**these are policy vectors, not valid crypto material**. `vectors.json` has 52 decision cases and 19 freshness-response cases applied to the fixture in `test_policy_model.py`.
-The 22 test methods also enumerate independent right subsets, exact scope/key
+**these are policy vectors, not valid crypto material**. `vectors.json` has 55 decision cases and 27 freshness-response cases applied to the fixture in `test_policy_model.py`.
+The 24 test methods also enumerate independent right subsets, exact scope/key
 binding, state transitions, release-time changes and snapshot ordering. See
 [the adversarial/integration plan](TEST-PLAN.md) for unimplemented checks.

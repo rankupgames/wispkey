@@ -10,7 +10,7 @@ production Clerk, Cloudflare resources, live grants or personal OS key entries.
 |---|---|
 | Disabled until explicitly enabled | Default `Context.enabled` and enrollment default gate |
 | All scopes and keys bound | Each endpoint/account/vault/project/partition and device/recipient/auth/root/epoch/policy field mutated |
-| Separate rights | All 16 subsets of four rights against all four requested rights |
+| Separate rights | All 16 subsets of four grant rights against all four requested rights; device grants cannot exceed enrollment rights |
 | Unknown classification restricted | Null, empty, unknown, case mismatch and higher classes never replicate |
 | Sign-in is insufficient | Missing identity proof, owner grant, approval state, local unlock or plugin consent denied |
 | Independent plugin boundary | Device approval alone insufficient; only separately authorized metadata/request; hosted kind rejected |
@@ -18,7 +18,7 @@ production Clerk, Cloudflare resources, live grants or personal OS key entries.
 | Last-moment changes | Re-evaluation after revocation, lock, cancel, ring/revision change, lease expiry |
 | Enrollment substitution | Altered request ID, nonce, keys, account, scope, description, rights or expiry rejected |
 | Enrollment race/replay | Both cancel/approve serializations, repeated approve, terminal-state revival, stale CAS revision |
-| Snapshot integrity prerequisites | Signature/hash/decrypted scope/head each independently required |
+| Snapshot integrity prerequisites | Signature/hash/decrypted scope each required; snapshot sequence/hash must match the consumed freshness response |
 | Replay/rollback/downgrade | Lower sequence, same sequence/different hash, unsupported envelope/payload version |
 | Idempotency | Exact same verified current head returns checkpoint unchanged |
 | Rotation/recovery | New key/root/epoch and restored context cannot reuse old authority |
@@ -26,7 +26,7 @@ production Clerk, Cloudflare resources, live grants or personal OS key entries.
 | Legacy compatibility | Old project/partition/share/account-only route inputs denied |
 
 Run `python3 -B -m unittest discover -s docs/contracts/access-enrollment-v1 -v`.
-Expected: 22 methods, 52 decision vectors and 19 freshness-response vectors, plus enumerated subcases. Under one
+Expected: 24 methods, 55 decision vectors and 27 freshness-response vectors, plus enumerated subcases. Under one
 second on the inspected host. Test count is not a cryptographic assurance measure.
 
 ## Required before runtime integration

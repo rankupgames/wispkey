@@ -21,6 +21,7 @@ def fixture():
                       'https://api.example.test', 'read', 'routine', 110,
                       enabled=True, identity_verified=True, owner_grant_verified=True,
                       enrollment_state='approved', enrollment_expires_at=400,
+                      enrollment_rights=frozenset({'discover', 'replicate'}),
                       session_expires_at=400, unlocked=True, existing_policy_allows=True,
                       resource_active=True, exportable=True, dedicated_partition=True,
                       entire_partition_routine=True, fresh_owner_response_verified=True,
@@ -29,7 +30,8 @@ def fixture():
                       freshness_deadline_monotonic=40,
                       freshness_challenge=FreshnessChallenge(binding, 'nonce-head', 'boot-1', 10, 40, False),
                       clock_epoch='boot-1', clock_certain=True,
-                      head_issued_at=100, head_expires_at=400, head_received_at=110)
+                      head_issued_at=100, head_expires_at=400, head_received_at=110,
+                      accepted_head_sequence=2, accepted_head_hash='hash-b')
     return binding, grant, context
 
 
@@ -53,7 +55,10 @@ class PolicyTests(unittest.TestCase):
                 if 'rights' in g:
                     g['rights'] = frozenset(g['rights'])
                 grant = replace(grant, **g)
-                context = replace(context, **vector.get('context', {}))
+                c = vector.get('context', {}).copy()
+                if 'enrollment_rights' in c:
+                    c['enrollment_rights'] = frozenset(c['enrollment_rights'])
+                context = replace(context, **c)
                 if 'challenge' in vector:
                     context = replace(context, freshness_challenge=replace(
                         context.freshness_challenge, **vector['challenge']))
@@ -84,6 +89,7 @@ class PolicyTests(unittest.TestCase):
     def test_rights_never_imply_other_rights(self):
         _, grant, context = fixture()
         rights = ('discover', 'replicate', 'request', 'use')
+        context = replace(context, enrollment_rights=frozenset(rights))
         for mask in itertools.product((False, True), repeat=4):
             selected = frozenset(r for r, include in zip(rights, mask) if include)
             for right in rights:
@@ -95,6 +101,15 @@ class PolicyTests(unittest.TestCase):
                         self.assertEqual(outcome, 'use_not_in_slice')
                     else:
                         self.assertEqual(outcome, 'allow')
+
+    def test_device_grant_cannot_exceed_approved_enrollment_rights(self):
+        _, grant, context = fixture()
+        grant = replace(grant, rights=frozenset({'discover', 'replicate', 'request'}))
+        self.assertEqual(decide(grant, context, 'request'), 'right_denied')
+        for rights in (frozenset(), frozenset({'discover'})):
+            with self.subTest(rights=rights):
+                self.assertEqual(decide(grant, replace(context, enrollment_rights=rights), 'replicate'), 'right_denied')
+        self.assertEqual(decide(grant, context, 'replicate'), 'allow')
 
     def test_unclassified_and_future_rings_cannot_replicate(self):
         _, grant, context = fixture()
@@ -197,7 +212,7 @@ class FreshnessTests(unittest.TestCase):
                 context = replace(context, **vector.get('context', {}))
                 grant = replace(grant, **vector.get('grant', {}))
                 args = dict(nonce='nonce-head', binding=binding, issued_at=100,
-                            expires_at=400, signature_verified=True)
+                            expires_at=400, head_sequence=2, head_hash='hash-b', signature_verified=True)
                 args.update(vector.get('response', {}))
                 if vector['expect'] == 'allow':
                     accepted = accept_freshness(grant, context, **args)
@@ -213,7 +228,7 @@ class FreshnessTests(unittest.TestCase):
         context = replace(context, now_monotonic=39,
                           freshness_challenge=replace(context.freshness_challenge, outstanding=True))
         args = dict(nonce='nonce-head', binding=binding, issued_at=100,
-                    expires_at=400, signature_verified=True)
+                    expires_at=400, head_sequence=2, head_hash='hash-b', signature_verified=True)
         accepted = accept_freshness(grant, context, **args)
         self.assertEqual(accepted.freshness_received_monotonic, 39)
         self.assertEqual(accepted.freshness_deadline_monotonic, 40)
@@ -228,7 +243,7 @@ class FreshnessTests(unittest.TestCase):
     def test_wrong_binding_and_missing_challenge(self):
         binding, grant, context = fixture()
         args = dict(nonce='nonce-head', binding=replace(binding, root='wrong-root'),
-                    issued_at=100, expires_at=400, signature_verified=True)
+                    issued_at=100, expires_at=400, head_sequence=2, head_hash='hash-b', signature_verified=True)
         context = replace(context, freshness_challenge=replace(context.freshness_challenge, outstanding=True))
         with self.assertRaisesRegex(Denied, '^freshness_proof_required$'):
             accept_freshness(grant, context, **args)
@@ -242,7 +257,7 @@ class SnapshotTests(unittest.TestCase):
         self.snapshot = Snapshot(binding, 2, 'hash-b')
         self.checkpoint = Checkpoint(binding, 1, 'hash-a')
         self.proofs = dict(signature_verified=True, ciphertext_hash_verified=True,
-                           payload_scope_verified=True, current_head=(2, 'hash-b'))
+                           payload_scope_verified=True)
 
     def accept(self, snapshot=None, checkpoint=None, context=None, **proofs):
         return accept_snapshot(snapshot or self.snapshot, checkpoint or self.checkpoint,
@@ -254,10 +269,9 @@ class SnapshotTests(unittest.TestCase):
         self.assertEqual(self.accept(checkpoint=checkpoint), checkpoint)
         self.assertEqual(self.checkpoint.sequence, 1)
 
-    def test_signature_hash_scope_and_head_are_all_required(self):
+    def test_signature_hash_and_scope_are_all_required(self):
         for change in ({'signature_verified': False}, {'ciphertext_hash_verified': False},
-                       {'payload_scope_verified': False}, {'current_head': None},
-                       {'current_head': (3, 'hash-c')}):
+                       {'payload_scope_verified': False}):
             with self.subTest(change=change), self.assertRaises(Denied):
                 self.accept(**change)
 
@@ -266,7 +280,22 @@ class SnapshotTests(unittest.TestCase):
                        {'version': 'legacy-wkcs'}, {'payload_version': 0}, {'payload_version': 2}):
             snapshot = replace(self.snapshot, **change)
             with self.subTest(change=change), self.assertRaises(Denied):
-                self.accept(snapshot=snapshot, current_head=(snapshot.sequence, snapshot.ciphertext_hash))
+                self.accept(snapshot=snapshot, context=replace(
+                    self.context, accepted_head_sequence=snapshot.sequence,
+                    accepted_head_hash=snapshot.ciphertext_hash))
+
+    def test_snapshot_must_match_consumed_freshness_head(self):
+        context = replace(self.context, freshness_challenge=replace(
+            self.context.freshness_challenge, outstanding=True))
+        context = accept_freshness(self.grant, context, nonce='nonce-head', binding=context.binding,
+                                   issued_at=100, expires_at=400, head_sequence=3,
+                                   head_hash='hash-c', signature_verified=True)
+        self.assertEqual((context.accepted_head_sequence, context.accepted_head_hash), (3, 'hash-c'))
+        for snapshot in (self.snapshot, replace(self.snapshot, sequence=3)):
+            with self.subTest(snapshot=snapshot), self.assertRaisesRegex(Denied, '^not_current_head$'):
+                self.accept(snapshot=snapshot, context=context)
+        self.assertEqual(self.accept(snapshot=replace(self.snapshot, sequence=3, ciphertext_hash='hash-c'),
+                                     context=context).sequence, 3)
 
     def test_rotation_restoration_and_late_revocation_require_new_authority(self):
         for field, value in [('epoch', 2), ('root', 'new-root'), ('recipient_key', 'new-key')]:

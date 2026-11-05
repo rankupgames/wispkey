@@ -137,6 +137,7 @@ class Context:
     identity_verified: bool = False
     owner_grant_verified: bool = False
     enrollment_state: str = 'pending'
+    enrollment_rights: frozenset[str] = frozenset()
     enrollment_expires_at: int = 0
     session_expires_at: int = 0
     unlocked: bool = False
@@ -159,6 +160,8 @@ class Context:
     head_issued_at: int = 0
     head_expires_at: int = 0
     head_received_at: int = 0
+    accepted_head_sequence: int = 0
+    accepted_head_hash: str = ''
     grant_revoked: bool = False
     plugin_grant_verified: bool = False
     restored: bool = False
@@ -177,10 +180,13 @@ def freshness_valid(c):
                 <= q.dispatched_monotonic + 30
                 and c.freshness_deadline_monotonic == q.deadline_monotonic
                 and c.head_issued_at <= c.head_received_at <= c.now
-                < c.head_expires_at)
+                < c.head_expires_at
+                and type(c.accepted_head_sequence) is int and c.accepted_head_sequence >= 1
+                and isinstance(c.accepted_head_hash, str) and bool(c.accepted_head_hash))
 
 
 def accept_freshness(grant, context, *, nonce, binding, issued_at, expires_at,
+                     head_sequence, head_hash,
                      signature_verified=False):
     """Consume the authoritative outstanding challenge; never extend its deadline.
 
@@ -204,7 +210,8 @@ def accept_freshness(grant, context, *, nonce, binding, issued_at, expires_at,
                         freshness_received_monotonic=c.now_monotonic,
                         freshness_deadline_monotonic=q.deadline_monotonic,
                         head_issued_at=issued_at, head_expires_at=expires_at,
-                        head_received_at=c.now)
+                        head_received_at=c.now, accepted_head_sequence=head_sequence,
+                        accepted_head_hash=head_hash)
     if grant.binding != c.binding or not freshness_valid(candidate):
         raise Denied('stale_policy')
     if not (grant.issued_at <= c.now < min(grant.expires_at, c.enrollment_expires_at,
@@ -243,7 +250,8 @@ def decide(grant, context, right):
         return 'resource_mismatch'
     if not (c.existing_policy_allows and c.resource_active):
         return 'existing_policy_denied'
-    if right not in RIGHTS or right not in grant.rights:
+    effective_rights = grant.rights & c.enrollment_rights if c.kind == 'device' else grant.rights
+    if right not in RIGHTS or right not in effective_rights:
         return 'right_denied'
     if classify(grant.ring) != classify(c.ring):
         return 'ring_changed'
@@ -277,11 +285,10 @@ class Checkpoint:
 
 
 def accept_snapshot(snapshot, checkpoint, grant, context, *, signature_verified=False,
-                    ciphertext_hash_verified=False, payload_scope_verified=False,
-                    current_head=None):
+                    ciphertext_hash_verified=False, payload_scope_verified=False):
     """Returns a new checkpoint after all checks, or raises without changing state.
 
-    current_head is the tuple from the nonce-bound owner freshness response.
+    The accepted context binds the nonce-bound owner head sequence and hash.
     Real adapters MUST atomically commit payload + checkpoint + revisions.
     """
     verdict = decide(grant, context, 'replicate')
@@ -293,7 +300,7 @@ def accept_snapshot(snapshot, checkpoint, grant, context, *, signature_verified=
         raise Denied('snapshot_binding_mismatch')
     if not (signature_verified and ciphertext_hash_verified and payload_scope_verified):
         raise Denied('snapshot_verification_required')
-    if current_head != (snapshot.sequence, snapshot.ciphertext_hash):
+    if (context.accepted_head_sequence, context.accepted_head_hash) != (snapshot.sequence, snapshot.ciphertext_hash):
         raise Denied('not_current_head')
     if snapshot.sequence < 1 or snapshot.sequence < checkpoint.sequence:
         raise Denied('rollback')

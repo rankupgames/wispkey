@@ -362,7 +362,11 @@
     {
       "id": "use-is-never-enabled-in-slice",
       "right": "use",
-      "context": {},
+      "context": {
+        "enrollment_rights": [
+          "use"
+        ]
+      },
       "grant": {
         "rights": [
           "use"
@@ -472,6 +476,33 @@
       "right": "replicate",
       "challenge": {
         "outstanding": true
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "grant-request-exceeds-enrollment",
+      "right": "request",
+      "grant": {
+        "rights": [
+          "request"
+        ]
+      },
+      "expect": "right_denied"
+    },
+    {
+      "id": "empty-enrollment-rights",
+      "right": "replicate",
+      "context": {
+        "enrollment_rights": []
+      },
+      "expect": "right_denied"
+    },
+    {
+      "id": "no-accepted-head",
+      "right": "replicate",
+      "context": {
+        "accepted_head_sequence": 0,
+        "accepted_head_hash": ""
       },
       "expect": "stale_policy"
     }
@@ -606,6 +637,62 @@
         "enabled": false
       },
       "expect": "disabled"
+    },
+    {
+      "id": "head-sequence-zero",
+      "response": {
+        "head_sequence": 0
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "head-sequence-negative",
+      "response": {
+        "head_sequence": -1
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "head-sequence-null",
+      "response": {
+        "head_sequence": null
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "head-sequence-boolean",
+      "response": {
+        "head_sequence": true
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "head-sequence-string",
+      "response": {
+        "head_sequence": "2"
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "head-hash-empty",
+      "response": {
+        "head_hash": ""
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "head-hash-null",
+      "response": {
+        "head_hash": null
+      },
+      "expect": "stale_policy"
+    },
+    {
+      "id": "head-hash-number",
+      "response": {
+        "head_hash": 2
+      },
+      "expect": "stale_policy"
     }
   ]
 }
