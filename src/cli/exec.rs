@@ -65,6 +65,16 @@ pub async fn handle_exec(args: ExecArgs<'_>) {
         command.env(env_name, &secret);
     }
 
+    super::egress::require_attempt(
+        &vault,
+        "CredentialExecAttempted",
+        args.credential,
+        Some(&args.command[0]),
+        Some(&channel_summary(&args)),
+        "exec",
+        &project,
+    );
+
     let askpass_handoff = if args.askpass {
         Some(configure_askpass_env(
             &mut command,
@@ -160,6 +170,15 @@ pub async fn handle_askpass() {
             }
         };
 
+    super::egress::require_attempt(
+        &vault,
+        "CredentialExecAttempted",
+        &handoff.credential,
+        Some("askpass"),
+        Some("askpass"),
+        "exec",
+        &handoff.project,
+    );
     audit_credential_exec(
         &vault,
         &handoff.credential,
@@ -241,7 +260,7 @@ fn read_askpass_handoff() -> Result<AskpassHandoff, String> {
     };
     let raw = secure_files::read_private_string(&path, ASKPASS_HANDOFF_MAX_BYTES)
         .map_err(|error| format!("invalid askpass handoff: {error}"))?;
-    let _ = fs::remove_file(&path);
+    fs::remove_file(&path).map_err(|error| format!("cannot consume askpass handoff: {error}"))?;
     let handoff = serde_json::from_str::<AskpassHandoff>(&raw)
         .map_err(|error| format!("invalid askpass handoff: {error}"))?;
     if handoff.capability.len() != 32 || handoff.credential.is_empty() || handoff.project.is_empty()

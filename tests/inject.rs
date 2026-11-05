@@ -142,3 +142,100 @@ fn inject_refuses_unclassified_credential_without_writing_output() {
     assert!(!stderr.contains(INJECT_SECRET_ONE_VALUE));
     assert!(!output.exists(), "output should not have been written");
 }
+
+#[test]
+fn inject_audit_failure_blocks_stdout_and_preserves_existing_output_file() {
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    let template_dir = tempfile::tempdir().expect("template dir");
+    init_vault(vault_dir.path());
+    add_inject_secrets(vault_dir.path());
+    let input = template_dir.path().join("template.txt");
+    let output = template_dir.path().join("rendered.env");
+    std::fs::write(&input, "secret={{cred:inject-secret-one}}").expect("write template");
+    write_private_test_file(&output, "existing output");
+    let db = rusqlite::Connection::open(vault_dir.path().join("vault.db")).expect("open vault db");
+    db.execute_batch(
+        "CREATE TRIGGER reject_inject_audit BEFORE INSERT ON audit_log
+         WHEN NEW.event_type LIKE 'CredentialInject%'
+         BEGIN SELECT RAISE(FAIL, 'synthetic audit failure'); END;",
+    )
+    .expect("reject inject audit inserts");
+
+    for destination in [
+        vec!["--stdout"],
+        vec!["-o", output.to_str().expect("output path")],
+    ] {
+        let mut args = vec!["inject", "-i", input.to_str().expect("input path")];
+        args.extend(destination);
+        let result = run_wispkey(vault_dir.path(), &args);
+        assert!(!result.status.success());
+        assert!(result.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(
+            stderr.contains("cannot record owner egress attempt"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains(INJECT_SECRET_ONE_VALUE));
+        assert_eq!(
+            std::fs::read_to_string(&output).expect("existing output"),
+            "existing output"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inject_stdout_write_failure_records_attempt_without_completion() {
+    use std::process::Stdio;
+
+    let vault_dir = tempfile::tempdir().expect("temp vault dir");
+    let template_dir = tempfile::tempdir().expect("template dir");
+    init_vault(vault_dir.path());
+    add_inject_secrets(vault_dir.path());
+    let input = template_dir.path().join("template.txt");
+    std::fs::write(&input, "{{cred:inject-secret-one}}").expect("write template");
+    let full = std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("open /dev/full");
+    let output = wispkey_bin()
+        .args([
+            "inject",
+            "-i",
+            input.to_str().expect("input path"),
+            "--stdout",
+        ])
+        .env("WISPKEY_VAULT_PATH", vault_dir.path())
+        .env("WISPKEY_PASSWORD", "test-password")
+        .env("WISPKEY_PROTECTOR", "file")
+        .stdout(Stdio::from(full))
+        .output()
+        .expect("run inject with failing stdout");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("failed to write rendered template to stdout"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(INJECT_SECRET_ONE_VALUE));
+    let log = run_wispkey_json(
+        vault_dir.path(),
+        &["--format", "json", "log", "--last", "10"],
+    );
+    let entries = log["entries"].as_array().expect("entries array");
+    let attempts: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry["event_type"] == "CredentialInjectAttempted")
+        .collect();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0]["credential_name"], INJECT_SECRET_ONE_NAME);
+    assert_eq!(attempts[0]["target_path"], "stdout");
+    assert_eq!(attempts[0]["http_method"], "inject");
+    assert!(attempts[0]["response_status"].is_null());
+    assert!(
+        !entries
+            .iter()
+            .any(|entry| entry["event_type"] == "CredentialInject")
+    );
+    assert!(!log.to_string().contains(INJECT_SECRET_ONE_VALUE));
+}

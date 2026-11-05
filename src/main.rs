@@ -1323,12 +1323,20 @@ async fn main() {
         )
         .init();
 
-    if cli::askpass_mode_enabled() {
-        cli::handle_askpass().await;
-        return;
-    }
-
-    let parsed = Cli::parse();
+    let parsed = match Cli::try_parse() {
+        Ok(parsed) => parsed,
+        Err(error)
+            if cli::askpass_mode_enabled()
+                && !matches!(
+                    error.kind(),
+                    clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
+                ) =>
+        {
+            cli::handle_askpass().await;
+            return;
+        }
+        Err(error) => error.exit(),
+    };
     cli::set_json_output(matches!(parsed.output_format, OutputFormat::Json));
 
     match parsed.command {

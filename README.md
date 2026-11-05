@@ -157,6 +157,12 @@ At least one channel is required: `--stdin`, `--env <VAR>`, or `--askpass`. Chan
 
 `exec` is a deliberate, owner-only plaintext-egress path for tools that cannot use the WispKey proxy. It is audited with `CredentialExec` events, but the audit row contains only the credential name, child program name, channel summary, project, and exit status. WispKey does not put the plaintext value in argv, the parent environment, WispKey stdout/stderr, tracing logs, or audit fields. The hidden askpass helper is not a standalone secret oracle: `exec --askpass` creates a per-exec owner-only handoff file and passes its path through `WISPKEY_ASKPASS_HANDOFF`; the helper refuses to run without a valid handoff from that child launch.
 
+Before a child receives credentials or an output write starts, `exec`, `run` and
+`inject` require a committed `CredentialExecAttempted`, `CredentialRunAttempted`
+or `CredentialInjectAttempted` event. Audit failure blocks release. An attempt
+does not prove that the child started or that output completed; completion events
+retain their existing meaning.
+
 For tools that need multiple child-only environment variables, `wispkey run` reads a TOML manifest and resolves every `cred:<name>` reference before spawning the child:
 
 ```toml

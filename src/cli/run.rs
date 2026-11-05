@@ -60,6 +60,16 @@ pub async fn handle_run(args: RunArgs<'_>) {
         command.env(name, value);
     }
 
+    super::egress::require_attempt(
+        &vault,
+        "CredentialRunAttempted",
+        &credential_names.join(","),
+        Some(&args.command[0]),
+        None,
+        "run",
+        &project,
+    );
+
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(e) => {

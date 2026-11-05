@@ -18,6 +18,7 @@ pub use existing_login::handle_existing_login;
 mod value_update;
 pub use value_update::handle_replace_value;
 mod doctor;
+mod egress;
 mod env;
 mod exec;
 mod guard;
