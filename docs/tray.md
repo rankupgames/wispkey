@@ -46,7 +46,7 @@ no login-startup registration is created.
 
 The owner has one command dispatcher in `src/owner_ipc/dispatch.rs`. Import plan ownership and wire projections live in `imports.rs`; headless preferences and autostart registration live in `settings.rs`. The facade keeps authentication, framing and platform transport. Private protocol helpers are shared without command modules depending on the dispatcher.
 
-The native tray composes `bridge.rs` (renderer commands and clipboard), `owner_client.rs` (serial owner queue) and `popout.rs` (window lifetime and placement).
+The native tray composes `bridge.rs` (renderer commands and clipboard), `owner_client.rs` (serial owner queue) and `popout.rs` (window lifetime and placement). In the renderer, session/privacy coordination is shared; inventory filters, credential destinations and import destinations have separate owners. See [design.md](design.md) for edit locations.
 
 The server listens on an owner-only Unix socket (`~/.wispkey/owner.sock`, or `$WISPKEY_VAULT_PATH/owner.sock`) and writes `owner.json` for discovery. Unix connections must present the same UID as the server. Socket and metadata files are mode `0600`.
 

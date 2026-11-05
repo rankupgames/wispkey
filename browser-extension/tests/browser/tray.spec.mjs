@@ -40,9 +40,9 @@ async function fixture(page, view = "intake", options = {}) {
       } else if (method === "lock") {
         window.fixtureState.session_active = false;
         result = { session_active: false };
-      } else if (method === "list_projects") result = { projects: [{ name: "synthetic-project", active: true }] };
+      } else if (method === "list_projects") result = { projects: options.projects || [{ name: "synthetic-project", active: true }] };
       else if (method === "list_partitions") result = { partitions: [{ name: "default" }] };
-      else if (method === "list_credentials") result = { credentials: options.credentials || [] };
+      else if (method === "list_credentials") result = { credentials: (options.credentials || []).filter((credential) => request.params.all_projects || credential.project === request.params.project) };
       else if (method === "get_settings") result = { start_at_login: false, start_at_login_supported: false };
       else if (method === "choose_import_files") result = { paths: ["/synthetic/project/.env"], cancelled: false };
       else if (method === "choose_import_directory") result = { paths: ["/synthetic/project"], cancelled: options.cancelPicker === true };
@@ -296,6 +296,42 @@ test("credential actions use native token copy and reviewed rotation and removal
   expect((await operations(page, "remove_credential"))[0].params).toEqual({ name: "synthetic-key", project: scope, destination_confirmed: true });
 });
 
+
+test("inventory project selection preserves the add and import destinations", async ({ page }) => {
+  const otherProject = "synthetic-secondary-project";
+  await fixture(page, "list", {
+    projects: [{ name: scope, active: true }, { name: otherProject, active: false }],
+    credentials: [
+      { id: "synthetic-primary-id", name: "synthetic-primary-key", project: scope, partition: "default", type: "api_key" },
+      { id: "synthetic-secondary-id", name: "synthetic-secondary-key", project: otherProject, partition: "default", type: "api_key" },
+    ],
+  });
+  await page.getByRole("button", { name: "By project", exact: true }).click();
+  await page.getByLabel("Project", { exact: true }).selectOption(otherProject);
+  await expect(page.getByRole("button", { name: "Copy token for synthetic-secondary-key", exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Copy token for synthetic-primary-key", exact: true })).toHaveCount(0);
+  expect((await operations(page, "list_credentials")).at(-1).params).toEqual({ project: otherProject });
+
+  await page.getByRole("button", { name: "Navigation", exact: true }).focus();
+  await page.getByRole("navigation").getByRole("button", { name: "Add credential", exact: true }).click();
+  await expect(page.getByLabel("Project", { exact: true })).toHaveValue(scope);
+  await completeManual(page);
+  await page.getByRole("checkbox", { name: /^Save to/ }).check();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByRole("status")).toHaveText("Saved");
+  expect((await operations(page, "add_credential"))[0].params).toMatchObject({ project: scope, partition: "default", destination_confirmed: true });
+
+  await page.getByRole("button", { name: "Navigation", exact: true }).focus();
+  await page.getByRole("navigation").getByRole("button", { name: "Intake", exact: true }).click();
+  await page.getByRole("button", { name: "Choose files to import" }).click();
+  await expect(page.getByLabel("Project", { exact: true })).toHaveValue(scope);
+  expect((await operations(page, "import_preview"))[0].params.project).toBe(scope);
+  await page.getByLabel("Allowed hosts for API_KEY").fill("api.example.test");
+  await page.getByRole("checkbox", { name: /^Save to/ }).check();
+  await page.getByRole("button", { name: "Import 1", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "1 credential stored" })).toBeVisible();
+  expect((await operations(page, "import_commit"))[0].params).toMatchObject({ project: scope, environment: "default", destination_confirmed: true });
+});
 
 test("bare clipboard imports request only an explicit name before metadata review", async ({ page }) => {
   await fixture(page, "intake", { bareClipboard: true });
