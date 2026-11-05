@@ -87,6 +87,7 @@ wispkey env attach .env.production \
   --key OPENAI_API_KEY \
   --hosts api.openai.com
 wispkey project use client-alpha
+wispkey ring production-openai-api-key --project client-alpha --set routine
 ```
 
 Attachment rewrites the same file atomically with owner-only permissions. Re-attaching matching values or tokens is idempotent. A credential with a different stored value or environment fails closed without changing the `.env` file.
@@ -107,7 +108,7 @@ wispkey serve --listen unix:/run/wispkey/proxy.sock
 wispkey serve --listen firecracker-vsock:/run/wispkey/worker.vsock:7700
 ```
 
-Instances authenticate every proxied request with `x-wispkey-instance-id` and `x-wispkey-instance-secret`. Credential selectors and approvals bind to the resolved credential ID, so same-named credentials in other projects remain out of scope. Out-of-scope vault-token use returns `403 out_of_scope`, queues or reuses an access request, and requires host approval with `wispkey instance approve <request-id>` before retry. Env-sideload credentials have no enrollable credential ID and are denied for instance-authenticated requests.
+Instances authenticate every proxied request with `x-wispkey-instance-id` and `x-wispkey-instance-secret`. Credential selectors and approvals bind to the resolved credential ID, so same-named credentials in other projects remain out of scope. For a routine credential that passes lifecycle checks, out-of-scope vault-token use returns `403 out_of_scope`, queues or reuses an access request, and requires host approval with `wispkey instance approve <request-id>` before retry. Env-sideload credentials have no enrollable credential ID and are denied for instance-authenticated requests.
 
 Rotate instance secrets from a protected scheduler path with `wispkey --format json instance rotate-secret <name> --if-older-than 30d --grace 15m`. Treat stdout as a one-time secret channel. The old secret remains valid only for the grace window and is retired early after the new secret first authenticates.
 

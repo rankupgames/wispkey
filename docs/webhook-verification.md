@@ -75,7 +75,7 @@ required header exactly once.
 | 200 | `{"result":"stale"}` | The timestamp is outside the tolerance |
 | 400 | `{"error":"malformed verification request"}` | Missing, duplicate, unsupported or malformed input |
 | 401 | `{"error":"instance authentication failed"}` | Unknown, revoked or wrong instance identity |
-| 403 | `{"error":"credential not permitted"}` | Credential absent, out of scope, not an `api_key`, auth registration revoked or expired, or invalid signing-key encoding for a fresh timestamp |
+| 403 | `{"error":"credential not permitted"}` | Credential absent, out of scope, outside the routine ring, not an `api_key`, auth registration revoked or expired, or invalid signing-key encoding for a fresh timestamp |
 | 405 | `{"error":"method not allowed"}` | Method is not `POST` |
 | 408 | `{"error":"webhook body timed out"}` | Body not received within 5 seconds |
 | 413 | `{"error":"webhook body too large"}` | Declared or streamed body over 1 MiB |
@@ -94,7 +94,8 @@ again. The caller must deduplicate by `webhook-id` before it starts any work.
 
 The verifier never falls back from one credential to another. To rotate:
 
-1. Store the new secret as a second credential and add it to the instance scope
+1. Store the new secret as a second `api_key` credential with `--ring routine`
+   (use `--value-file` for the secret), then add it to the instance scope
    with `wispkey instance scope add billing-receiver --credential <new name>`.
 2. During the provider's overlap period, the delivery carries signatures from
    both secrets. Verify against the credential ID that the receiver selects. Each

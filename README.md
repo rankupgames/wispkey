@@ -32,6 +32,9 @@ wispkey env list .
 wispkey env attach .env --project my-app --key OPENAI_API_KEY --hosts api.openai.com
 wispkey project use my-app
 
+# In a terminal, approve routine release with your owner password
+wispkey ring default-openai-api-key --project my-app --set routine
+
 # Start the proxy
 wispkey serve
 ```
@@ -302,7 +305,7 @@ printf '%s' "$BOOTSTRAP_TOKEN" | wispkey instance join --token-file - --name wor
 
 Remote first-contact self-enrollment can use `POST /api/instances/join`; that endpoint is authenticated by the bootstrap token and does not require a management token or existing instance identity.
 
-Unix domain socket, Linux vsock, Firecracker vsock, and non-loopback TCP listeners require instance identity by default. Loopback TCP keeps the original trusted-local behavior unless `--require-identity` is set. For Windows or another server, keep WispKey on loopback and reach it through an SSH tunnel, or use an identity-required host-only TCP network. Credential selectors and approvals bind to the resolved credential ID rather than its project-local display name. Out-of-scope vault-token use returns `403 out_of_scope`, queues an access request, and can be approved by the host; env-sideload tokens are always out of scope for authenticated instances:
+Unix domain socket, Linux vsock, Firecracker vsock, and non-loopback TCP listeners require instance identity by default. Loopback TCP keeps the original trusted-local behavior unless `--require-identity` is set. For Windows or another server, keep WispKey on loopback and reach it through an SSH tunnel, or use an identity-required host-only TCP network. Credential selectors and approvals bind to the resolved credential ID rather than its project-local display name. For a routine credential that passes lifecycle checks, out-of-scope vault-token use returns `403 out_of_scope`, queues an access request, and can be approved by the host; env-sideload tokens are always out of scope for authenticated instances:
 
 ```bash
 wispkey instance requests --pending
@@ -354,13 +357,13 @@ wispkey policy list     # Show loaded policies
 wispkey policy check    # Validate policy file
 ```
 
-Agent-scoped policies fail closed when the requester agent identity is unavailable. The proxy does not currently have a trusted agent identity source, so a policy with an `agent = "..."` scope still applies to proxy requests.
+Agent-scoped policies fail closed when requester identity is unavailable. Instance-authenticated proxy requests use the stable `instance:<UUID>` principal. Unauthenticated local requests have no trusted agent identity.
 
 ## Project Scoping
 
 Credentials are isolated by project. Each project contains partitions, which contain credentials.
 Each project gets its own `personal` partition, so partition names are project-scoped.
-Credential names are unique within a project, not across the whole vault. The same credential name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve against the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v11 automatically.
+Credential names are unique within a project, not across the whole vault. The same credential name can exist in different projects. CLI name lookups such as `get`, `remove`, and `rotate` resolve against the active project; API lookups can use an explicit `?project=` scope. Existing vaults migrate to schema v17 automatically.
 
 For `.env` attachment, the WispKey project represents the source project and the filename maps to an environment partition: `.env` becomes `default`, while `.env.production` becomes `production`. Organization/account scope remains external to the local vault.
 
@@ -423,7 +426,7 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 | `wispkey instance rotate-secret <name> [--if-older-than 30d] [--grace 10m]` | Schedule-safe instance-secret rotation with bounded overlap |
 | `wispkey instance bootstrap create/list/revoke` | Manage scoped, atomic bootstrap tokens for fleet self-enrollment |
 | `wispkey instance join [<bootstrap-token>] [--token-file <path|->] --name <instance-name>` | Redeem a bootstrap token; prefer `--token-file -` to avoid argv exposure |
-| `wispkey cloud status/login/logout` | Manage local Cloud session groundwork |
+| `wispkey cloud status/login/logout` | Manage the local Cloud session |
 | `wispkey cloud push/pull/sync` | Conditional encrypted partition sync; requires a bundle passphrase |
 | `wispkey cloud resolve/recover` | Explicit conflict choice and encrypted local recovery |
 | `wispkey mcp serve` | Start the MCP server over stdio |
