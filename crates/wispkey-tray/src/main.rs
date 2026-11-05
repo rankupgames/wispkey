@@ -9,7 +9,7 @@
 
 use std::path::PathBuf;
 use std::sync::mpsc::{self, SyncSender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tao::dpi::{LogicalSize, PhysicalPosition};
@@ -26,12 +26,15 @@ const WIDTH: f64 = 460.0;
 const MIN_HEIGHT: f64 = 300.0;
 const MAX_HEIGHT: f64 = 820.0;
 const MAX_RENDERER_BYTES: usize = 1024 * 1024;
+// Reject unstarted work before the renderer's 30-second response deadline.
+const OWNER_QUEUE_TTL: Duration = Duration::from_secs(29);
 
 struct Popout {
     // Drop the webview before its native parent.
     webview: wry::WebView,
     window: Window,
     returning_from_picker: bool,
+    activity: u64,
 }
 
 enum UserEvent {
@@ -46,7 +49,9 @@ enum UserEvent {
         id: Value,
         response: Value,
         copy_token: bool,
+        activity: u64,
     },
+    MenuLock(Value),
     Files {
         window_id: WindowId,
         paths: Vec<PathBuf>,
@@ -61,6 +66,14 @@ struct OwnerJob {
     window_id: WindowId,
     request: Value,
     copy_token: bool,
+    activity: u64,
+    deadline: Instant,
+    destination: ResponseDestination,
+}
+
+enum ResponseDestination {
+    Renderer,
+    MenuLock,
 }
 
 #[derive(Clone, Copy)]
@@ -151,8 +164,14 @@ fn main() {
             }
             Event::UserEvent(UserEvent::Menu(id)) if id == lock_id => {
                 dismiss(&mut popout, &jobs);
-                if let Some(window) = &keepalive {
-                    queue(&jobs, window.id(), json!({"id":"menu-lock", "method":"lock"}), false);
+                if let Some(window) = &keepalive
+                    && !enqueue(&jobs, OwnerJob {
+                        window_id: window.id(), request: json!({"method":"lock"}), copy_token: false,
+                        activity: 0, deadline: Instant::now() + OWNER_QUEUE_TTL,
+                        destination: ResponseDestination::MenuLock,
+                    }) {
+                        lock.set_text("Lock failed: desktop busy; retry");
+                        let _ = tray.set_tooltip(Some("WispKey: lock failed; desktop busy"));
                 }
             }
             Event::UserEvent(UserEvent::Menu(id)) if id == quit_id => {
@@ -201,7 +220,7 @@ fn main() {
                                 Ok(preview) => {
                                     clear_json(&mut request);
                                     request = json!({"id": id, "method":"import_preview", "params":preview});
-                                    if !queue(&jobs, window_id, request, false) { deliver(dialog, &id, &failure("busy", "desktop is busy; try again")); }
+                                    if !queue(&jobs, window_id, request, false, dialog.activity) { deliver(dialog, &id, &failure("busy", "desktop is busy; try again")); }
                                 }
                                 Err(error) => deliver(dialog, &id, &error),
                             },
@@ -210,28 +229,27 @@ fn main() {
                     }
                     "copy_token" => {
                         request["method"] = json!("get_token");
-                        if !queue(&jobs, window_id, request, true) { deliver(dialog, &id, &failure("busy", "desktop is busy; try again")); }
+                        if !queue(&jobs, window_id, request, true, dialog.activity) { deliver(dialog, &id, &failure("busy", "desktop is busy; try again")); }
                     }
                     method if owner_method_allowed(method) => {
-                        if !queue(&jobs, window_id, request, false) { deliver(dialog, &id, &failure("busy", "desktop is busy; try again")); }
+                        if !queue(&jobs, window_id, request, false, dialog.activity) { deliver(dialog, &id, &failure("busy", "desktop is busy; try again")); }
                     }
                     _ => deliver(dialog, &id, &failure("invalid_input", "desktop action is unavailable")),
                 }
             }
-            Event::UserEvent(UserEvent::Response { window_id, id, mut response, copy_token }) => {
+            Event::UserEvent(UserEvent::MenuLock(response)) => {
+                let succeeded = response["ok"] == true && response["result"]["session_active"] == false;
+                lock.set_text(if succeeded { "Lock vault" } else { "Lock failed; retry" });
+                let _ = tray.set_tooltip(Some(if succeeded { "WispKey: locked" } else { "WispKey: lock failed; check the vault and retry" }));
+            }
+            Event::UserEvent(UserEvent::Response { window_id, id, mut response, copy_token, activity }) => {
                 if response["result"]["session_active"].is_boolean() {
                     let text = if response["result"]["session_active"] == true { "WispKey — unlocked" } else { "WispKey — locked" };
                     let _ = tray.set_tooltip(Some(text));
                 }
                 if let Some(dialog) = popout.as_ref().filter(|dialog| dialog.window.id() == window_id) {
                     if copy_token && response["ok"] == true {
-                        let copied = response["result"]["token"].as_str()
-                            .filter(|token| token.starts_with("wk_"))
-                            .ok_or_else(|| failure("invalid_response", "credential token is unavailable"))
-                            .and_then(|token| clipboard_mut(&mut clipboard)?.set_text(token.to_owned())
-                                .map_err(|_| failure("clipboard_unavailable", "could not copy the token")));
-                        clear_json(&mut response);
-                        response = copied.map_or_else(|error| error, |_| json!({"ok":true,"result":{"copied":true}}));
+                        copy_token_response(&mut response, &mut clipboard, activity == dialog.activity);
                     }
                     deliver(dialog, &id, &response);
                 }
@@ -254,8 +272,9 @@ fn main() {
                         WindowEvent::CloseRequested => dismiss(&mut popout, &jobs),
                         WindowEvent::Focused(true) => dialog.returning_from_picker = false,
                         WindowEvent::Focused(false) if !dialog.returning_from_picker => {
+                            dialog.activity = dialog.activity.wrapping_add(1);
                             let _ = dialog.webview.evaluate_script("window.__wispkeyBlur?.();");
-                            queue(&jobs, window_id, json!({"id":"blur", "method":"import_cancel"}), false);
+                            queue(&jobs, window_id, json!({"id":"blur", "method":"import_cancel"}), false, dialog.activity);
                         }
                         _ => {}
                     }
@@ -363,6 +382,7 @@ fn open_popout(
         webview,
         window,
         returning_from_picker: false,
+        activity: 0,
     })
 }
 
@@ -439,6 +459,7 @@ fn dismiss(popout: &mut Option<Popout>, jobs: &SyncSender<OwnerJob>) {
             dialog.window.id(),
             json!({"id":"dismiss", "method":"import_cancel"}),
             false,
+            dialog.activity,
         );
     }
 }
@@ -448,16 +469,18 @@ fn owner_worker(proxy: EventLoopProxy<UserEvent>) -> SyncSender<OwnerJob> {
     std::thread::spawn(move || {
         for job in receiver {
             let id = job.request.get("id").cloned().unwrap_or(Value::Null);
-            let response = call_owner(job.request);
-            if proxy
-                .send_event(UserEvent::Response {
+            let response = dispatch_owner(job.request, job.deadline);
+            let event = match job.destination {
+                ResponseDestination::MenuLock => UserEvent::MenuLock(response),
+                ResponseDestination::Renderer => UserEvent::Response {
                     window_id: job.window_id,
                     id,
                     response,
                     copy_token: job.copy_token,
-                })
-                .is_err()
-            {
+                    activity: job.activity,
+                },
+            };
+            if proxy.send_event(event).is_err() {
                 break;
             }
         }
@@ -470,18 +493,40 @@ fn queue(
     window_id: WindowId,
     request: Value,
     copy_token: bool,
+    activity: u64,
 ) -> bool {
-    match jobs.try_send(OwnerJob {
-        window_id,
-        request,
-        copy_token,
-    }) {
+    enqueue(
+        jobs,
+        OwnerJob {
+            window_id,
+            request,
+            copy_token,
+            activity,
+            deadline: Instant::now() + OWNER_QUEUE_TTL,
+            destination: ResponseDestination::Renderer,
+        },
+    )
+}
+
+fn enqueue(jobs: &SyncSender<OwnerJob>, job: OwnerJob) -> bool {
+    match jobs.try_send(job) {
         Ok(()) => true,
         Err(mpsc::TrySendError::Full(mut job) | mpsc::TrySendError::Disconnected(mut job)) => {
             clear_json(&mut job.request);
             false
         }
     }
+}
+
+fn dispatch_owner(mut request: Value, deadline: Instant) -> Value {
+    if Instant::now() >= deadline {
+        clear_json(&mut request);
+        return failure(
+            "timeout",
+            "operation expired before starting; no request was sent",
+        );
+    }
+    call_owner(request)
 }
 
 fn clipboard_mut(
@@ -496,6 +541,31 @@ fn clipboard_mut(
     clipboard
         .as_mut()
         .ok_or_else(|| failure("clipboard_unavailable", "clipboard is unavailable"))
+}
+
+fn copy_token_response(
+    response: &mut Value,
+    clipboard: &mut Option<arboard::Clipboard>,
+    active: bool,
+) {
+    let copied = if !active {
+        Err(failure("cancelled", "token copy was cancelled"))
+    } else {
+        response["result"]["token"]
+            .as_str()
+            .filter(|token| token.starts_with("wk_"))
+            .ok_or_else(|| failure("invalid_response", "credential token is unavailable"))
+            .and_then(|token| {
+                clipboard_mut(clipboard)?
+                    .set_text(token.to_owned())
+                    .map_err(|_| failure("clipboard_unavailable", "could not copy the token"))
+            })
+    };
+    clear_json(response);
+    *response = copied.map_or_else(
+        |error| error,
+        |_| json!({"ok":true,"result":{"copied":true}}),
+    );
 }
 
 fn clipboard_preview(content: &str, params: &Value) -> Result<Value, Value> {
@@ -649,6 +719,28 @@ fn tray_icon_image() -> Icon {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_queued_request_is_rejected_before_owner_dispatch() {
+        let response = dispatch_owner(
+            json!({"method":"synthetic_expired", "params":{"value":"synthetic-secret"}}),
+            Instant::now(),
+        );
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "timeout");
+        assert!(!response.to_string().contains("synthetic-secret"));
+    }
+
+    #[test]
+    fn obsolete_token_copy_never_opens_the_clipboard_or_retains_the_token() {
+        let mut clipboard = None;
+        let mut response = json!({"ok":true,"result":{"token":"wk_synthetic_token"}});
+        copy_token_response(&mut response, &mut clipboard, false);
+        assert!(clipboard.is_none());
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "cancelled");
+        assert!(!response.to_string().contains("wk_synthetic_token"));
+    }
 
     #[test]
     fn tray_placement_keeps_top_and_bottom_popouts_on_the_selected_monitor() {

@@ -10,6 +10,14 @@ async function fixture(page, view = "intake", options = {}) {
   await page.addInitScript(({ view, options }) => {
     window.__WISPKEY_VIEW = view;
     window.calls = [];
+    window.heldReplies = [];
+    window.releaseReply = (method, index = 0) => {
+      const matches = window.heldReplies.filter((reply) => reply.method === method);
+      const reply = matches[index];
+      if (!reply) throw new Error(`No held ${method} reply`);
+      window.heldReplies.splice(window.heldReplies.indexOf(reply), 1);
+      window.__wispkeyResolve(reply.id, reply.response);
+    };
     window.fixtureState = {
       initialized: options.initialized !== false,
       session_active: !["unlock"].includes(view),
@@ -43,7 +51,9 @@ async function fixture(page, view = "intake", options = {}) {
       };
       else if (method === "import_commit") result = { imported: 1, reused: 0, skipped: 0, credentials: [], files: [{ path: ".env", status: options.sourceFailure ? "failed" : request.params.rewrite_http ? "updated" : "unchanged", ...(options.sourceFailure ? { message: "Synthetic source is read-only" } : {}) }] };
       else if (method === "copy_token") result = { copied: true };
-      queueMicrotask(() => window.__wispkeyResolve(request.id, error ? { ok: false, error } : { ok: true, result }));
+      const response = error ? { ok: false, error } : { ok: true, result };
+      if (options.holdMethods?.includes(method)) window.heldReplies.push({ method, id: request.id, response });
+      else queueMicrotask(() => window.__wispkeyResolve(request.id, response));
     } };
   }, { view, options });
   await page.route("https://tray.test/**", (route) => route.fulfill({ contentType: "text/html", body: html.replaceAll("WISPKEY_INITIAL_VIEW", view) }));
@@ -133,12 +143,16 @@ for (const transport of ["missing", "throws"]) {
     await fixture(page, "unlock");
     await page.getByLabel("Master password", { exact: true }).fill("synthetic-master-password");
     await page.evaluate((transport) => {
+      window.fixtureTransport = window.ipc;
       window.ipc = transport === "missing" ? undefined : { postMessage() { throw new Error("Synthetic disconnected transport"); } };
     }, transport);
     await page.getByRole("button", { name: "Unlock", exact: true }).click();
     await expect(page.getByRole("alert")).toHaveText("IPC unavailable");
     await expect(page.getByLabel("Master password", { exact: true })).toHaveValue("");
-    expect(await page.evaluate(() => Object.keys(window.__wispkeyPending))).toEqual([]);
+    await page.evaluate(() => { window.ipc = window.fixtureTransport; delete window.fixtureTransport; });
+    await page.getByLabel("Master password", { exact: true }).fill("synthetic-master-password");
+    await page.getByRole("button", { name: "Unlock", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Choose files to import" })).toBeVisible();
   });
 }
 
@@ -359,4 +373,91 @@ test("scope conflicts offer only skip or destination review", async ({ page }) =
   await page.getByRole("button", { name: "Import 1", exact: true }).click();
   await expect.poll(async () => (await operations(page, "import_commit")).length).toBe(1);
   expect((await operations(page, "import_commit"))[0].params.items).toEqual([{ id: "synthetic-item", selected: false, hosts: "", action: "skip", environment: "default" }, { id: "synthetic-db-item", selected: true, hosts: "", action: "keep", environment: "default" }]);
+});
+
+test("external unlock opens intake and loads the active scope", async ({ page }) => {
+  await page.clock.install();
+  await fixture(page, "unlock");
+  await expect(page.getByLabel("Master password", { exact: true })).toBeVisible();
+  await page.evaluate(() => { window.fixtureState.session_active = true; });
+  await page.clock.runFor(2100);
+  await expect(page.getByRole("button", { name: "Choose files to import" })).toBeVisible();
+  expect(await operations(page, "list_projects")).toHaveLength(1);
+  expect((await operations(page, "list_partitions"))[0].params).toEqual({ project: scope });
+});
+
+test("late partition autofill requires destination confirmation again", async ({ page }) => {
+  await fixture(page, "add", { holdMethods: ["list_partitions"] });
+  await page.getByLabel("Name", { exact: true }).fill("synthetic-key");
+  await page.getByLabel("Allowed hosts", { exact: true }).fill("api.example.test");
+  await page.getByLabel("Secret", { exact: true }).fill("synthetic-secret");
+  await page.getByRole("checkbox", { name: /^Save to/ }).check();
+  await expect(page.getByLabel("Partition", { exact: true })).toHaveValue("");
+  await expect.poll(async () => (await operations(page, "list_partitions")).length).toBeGreaterThan(0);
+  await page.evaluate(() => window.releaseReply("list_partitions"));
+  await expect(page.getByLabel("Partition", { exact: true })).toHaveValue("default");
+  await expect(page.getByRole("checkbox", { name: /^Save to/ })).not.toBeChecked();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect(page.getByRole("alert")).toHaveText("Confirm the destination before saving");
+  expect(await operations(page, "add_credential")).toHaveLength(0);
+});
+
+test("abandoned preview cancels its late plan without replacing navigation", async ({ page }) => {
+  await fixture(page, "intake", { holdMethods: ["import_preview"] });
+  await page.getByRole("button", { name: "Choose files to import" }).click();
+  await expect(page.getByRole("heading", { name: "Scanning local sources" })).toBeVisible();
+  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Settings", exact: true })).toBeVisible();
+  await page.evaluate(() => window.releaseReply("import_preview"));
+  await expect.poll(async () => (await operations(page, "import_cancel")).length).toBe(1);
+  await expect(page.getByRole("heading", { name: "Settings", exact: true })).toBeVisible();
+  expect((await operations(page, "import_cancel"))[0].params).toEqual({ plan_id: "synthetic-plan" });
+});
+
+test("a save stays busy across blur and preserves newly entered fields", async ({ page }) => {
+  await fixture(page, "add", { holdMethods: ["add_credential"] });
+  await completeManual(page);
+  await page.getByRole("checkbox", { name: /^Save to/ }).check();
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(async () => (await operations(page, "add_credential")).length).toBe(1);
+  await page.evaluate(() => window.__wispkeyBlur());
+  await expect(page.getByRole("button", { name: "Choose files to import" })).toBeDisabled();
+  await page.getByRole("button", { name: "Navigation", exact: true }).focus();
+  await page.getByRole("navigation").getByRole("button", { name: "Add credential", exact: true }).click();
+  await completeManual(page);
+  await page.getByRole("checkbox", { name: /^Save to/ }).check();
+  await expect(page.getByRole("button", { name: "Save", exact: true })).toBeDisabled();
+  expect(await operations(page, "add_credential")).toHaveLength(1);
+  await page.evaluate(() => window.releaseReply("add_credential"));
+  await expect(page.getByRole("status")).toHaveText("Saved");
+  await expect(page.getByRole("button", { name: "Save", exact: true })).toBeEnabled();
+  await expect(page.getByLabel("Secret", { exact: true })).toHaveValue("synthetic-secret");
+  await page.getByRole("button", { name: "Save", exact: true }).click();
+  await expect.poll(async () => (await operations(page, "add_credential")).length).toBe(2);
+  await page.evaluate(() => window.releaseReply("add_credential"));
+  await expect(page.getByRole("button", { name: "Save", exact: true })).toBeEnabled();
+  await expect(page.getByLabel("Secret", { exact: true })).toHaveValue("");
+  await page.evaluate(() => window.__wispkeyBlur());
+  await expect(page.getByRole("status")).toHaveText("Saved");
+});
+
+test("an import reply after blur retains counts and source warning without private metadata", async ({ page }) => {
+  await fixture(page, "intake", { holdMethods: ["import_commit"], sourceFailure: true });
+  await page.getByRole("button", { name: "Choose files to import" }).click();
+  await page.getByLabel("Allowed hosts for API_KEY").fill("api.example.test");
+  await page.getByRole("checkbox", { name: /^Save to/ }).check();
+  await page.getByRole("button", { name: "Import 1", exact: true }).click();
+  await expect.poll(async () => (await operations(page, "import_commit")).length).toBe(1);
+  await page.evaluate(() => window.__wispkeyBlur());
+  await expect(page.locator(".content")).toHaveAttribute("aria-busy", "true");
+  await expect(page.getByRole("button", { name: "Choose files to import" })).toBeDisabled();
+  await page.evaluate(() => window.releaseReply("import_commit"));
+  await expect(page.locator(".content")).toHaveAttribute("aria-busy", "false");
+  await expect(page.getByRole("heading", { name: "1 credential stored" })).toBeVisible();
+  await expect(page.getByText("Credentials were saved. Review the source files before retrying.", { exact: true })).toBeVisible();
+  await expect(page.getByText(".env", { exact: true })).toHaveCount(0);
+  await expect(page.getByText("Synthetic source is read-only", { exact: true })).toHaveCount(0);
+  await page.evaluate(() => window.__wispkeyBlur());
+  await expect(page.getByRole("heading", { name: "1 credential stored" })).toBeVisible();
+  await expect(page.getByText("Credentials were saved. Review the source files before retrying.", { exact: true })).toBeVisible();
 });

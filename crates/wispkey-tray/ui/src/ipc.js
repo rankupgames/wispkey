@@ -2,7 +2,6 @@
 const pending = {};
 const unavailable = { ok: false, error: { code: "unavailable", message: "IPC unavailable" } };
 
-window.__wispkeyPending = pending;
 window.__wispkeyResolve = (id, response) => pending[id]?.(response);
 
 export function request(method, params = {}) {

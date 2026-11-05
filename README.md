@@ -430,7 +430,7 @@ The proxy management API also honors project scope for `GET /api/credentials`, `
 
 ## Tray GUI
 
-The optional `wispkey-tray` binary is a desktop extension of the CLI. Start owner IPC with `wispkey tray` (or `wispkey tray --ipc-only` for tests), then add single credentials or the OVH API template from a native dialog. Secrets stay off argv and never pass through an unauthenticated localhost form. Closing a dialog leaves the tray running. See [`docs/tray.md`](docs/tray.md).
+The optional `wispkey-tray` binary is a desktop extension of the CLI. Start owner IPC with `wispkey tray` (or `wispkey tray --ipc-only` for tests), then add credentials or import local sources from the composed popout. Secrets stay off argv and never pass through an unauthenticated localhost form. Dismissing the popout leaves the tray running. See [`docs/tray.md`](docs/tray.md).
 
 ## Partition Bundles
 

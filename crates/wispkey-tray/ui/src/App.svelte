@@ -10,7 +10,9 @@
   let vault = $state(null);
   let message = $state("");
   let notice = $state("");
-  let busy = $state(false);
+  let mutationNotice = "";
+  let operation = $state(null);
+  const busy = $derived(operation !== null);
   let menuOpen = $state(false);
   let dragging = $state(false);
   let root;
@@ -40,6 +42,7 @@
   let startAtLogin = $state(false);
   let autostartSupported = $state(false);
   let generation = 0;
+  let previewGeneration = 0;
   let idleTimer;
 
   const unlocked = $derived(vault?.initialized === true && vault?.session_active === true);
@@ -76,10 +79,10 @@
   }
 
   function discardPlan() {
+    previewGeneration += 1;
     const id = plan?.plan_id;
     plan = null;
     importItems = [];
-    outcome = null;
     previewSource = null;
     rewriteHttp = false;
     if (id) void request("import_cancel", { plan_id: id });
@@ -89,17 +92,42 @@
     generation += 1;
     clearSecrets();
     discardPlan();
+    if (view === "scanning") operation = null;
+    if (outcome) outcome = redactedOutcome(outcome);
     removeTarget = null;
     rotateTarget = null;
     credentials = [];
     menuOpen = false;
   }
 
+  function beginOperation() {
+    const owner = Symbol();
+    operation = owner;
+    return owner;
+  }
+
+  function redactedOutcome(result) {
+    return { imported: result.imported, reused: result.reused, skipped: result.skipped, sourceFailed: result.sourceFailed || result.files.some((file) => file.status === "failed"), files: [] };
+  }
+
+  function finishOperation(owner) {
+    if (operation === owner) operation = null;
+  }
+
+  function privateView() {
+    return unlocked ? outcome ? "import_done" : "intake" : "unlock";
+  }
+
+  async function enterUnlocked() {
+    view = "intake";
+    await loadScope();
+  }
+
   function resetIdle() {
     clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       clearPrivateState();
-      view = unlocked ? "intake" : "unlock";
+      view = privateView();
       notice = "Entered secrets cleared after inactivity";
     }, 120000);
   }
@@ -133,6 +161,7 @@
       project = next.active_project;
       form.project = project;
     }
+    if (!wasUnlocked && unlocked && view === "unlock") await enterUnlocked();
   }
 
   async function loadScope() {
@@ -145,19 +174,28 @@
 
   async function loadPartitions(name) {
     if (!name) { partitions = []; return; }
+    const epoch = generation;
     const response = await request("list_partitions", { project: name });
+    if (epoch !== generation || (view === "add" && name !== form.project)) return;
     if (!response.ok) { partitions = []; failure(response); return; }
     if (!Array.isArray(response.result.partitions)) { message = "Invalid environment list"; return; }
     partitions = response.result.partitions;
-    if (!form.partition && partitions.length === 1) form.partition = partitions[0].name;
+    if (view === "add" && name === form.project && !form.partition && partitions.length === 1) {
+      form.partition = partitions[0].name;
+      destinationConfirmed = false;
+    }
   }
 
   async function navigate(next) {
+    generation += 1;
     menuOpen = false;
     message = "";
     notice = "";
+    mutationNotice = "";
     clearSecrets();
-    if (plan) discardPlan();
+    if (view === "scanning") operation = null;
+    discardPlan();
+    outcome = null;
     view = next;
     if (next === "credentials") await loadCredentials();
     if (next === "add") {
@@ -176,24 +214,24 @@
       clearSecrets();
       return;
     }
-    busy = true;
+    const owner = beginOperation();
+    const epoch = generation;
     const response = await request(vault.initialized ? "unlock" : "initialize", vault.initialized
       ? { password, remember }
       : { password, password_confirmation: confirmation });
-    clearSecrets();
-    busy = false;
+    if (epoch === generation) clearSecrets();
+    finishOperation(owner);
     if (!response.ok) { failure(response); return; }
     await refreshStatus();
     if (!unlocked) { message = "The vault is still locked"; return; }
-    view = "intake";
-    await loadScope();
+    if (view === "unlock") await enterUnlocked();
   }
 
   async function lockVault() {
     clearPrivateState();
-    busy = true;
+    const owner = beginOperation();
     const response = await request("lock");
-    busy = false;
+    finishOperation(owner);
     if (!response.ok) { failure(response); return; }
     vault = { ...vault, session_active: false };
     view = "unlock";
@@ -213,15 +251,20 @@
   }
 
   async function credentialAction(method, credential) {
+    if (busy) return;
     message = "";
-    busy = true;
+    const owner = beginOperation();
+    const epoch = generation;
     const response = await request(method, { name: credential.name, project: credential.project || project, ...(["remove_credential", "rotate_credential"].includes(method) ? { destination_confirmed: true } : {}) });
-    busy = false;
-    removeTarget = null;
-    rotateTarget = null;
-    if (!response.ok) { failure(response); return; }
+    finishOperation(owner);
+    if (epoch === generation) {
+      removeTarget = null;
+      rotateTarget = null;
+    }
+    if (!response.ok) { if (epoch === generation) failure(response); else message = "The credential operation failed. Check its result before retrying."; return; }
     notice = method === "copy_token" ? "Token copied" : method === "rotate_credential" ? "Token rotated" : "Credential removed";
-    if (method !== "copy_token") await loadCredentials();
+    if (method !== "copy_token") mutationNotice = notice;
+    if (method !== "copy_token" && epoch === generation) await loadCredentials();
   }
 
   async function createScope(kind) {
@@ -232,15 +275,18 @@
     await loadScope();
     await loadPartitions(form.project);
     notice = kind === "project" ? "Project created" : "Environment created";
+    mutationNotice = notice;
   }
 
   async function saveCredential(event) {
     event.preventDefault();
+    if (busy) return;
     message = "";
     notice = "";
     if (!destinationConfirmed || !form.project || !form.partition) { message = "Confirm the destination before saving"; return; }
     if ((mode === "ovh_api" || (mode === "single" && form.type !== "api_key")) && !meaningfulHosts(form.hosts)) { message = "Enter a hostname or a bounded host pattern"; return; }
-    busy = true;
+    const owner = beginOperation();
+    const savedLogin = mode === "website_login";
     let method;
     let params;
     if (mode === "website_login") {
@@ -255,24 +301,25 @@
     }
     const epoch = generation;
     const response = await request(method, params);
-    clearSecrets();
-    busy = false;
-    if (epoch !== generation) return;
-    if (!response.ok) { failure(response); return; }
-    notice = mode === "website_login" ? "Login saved" : "Saved";
+    if (epoch === generation) clearSecrets();
+    finishOperation(owner);
+    if (!response.ok) { if (epoch === generation) failure(response); else message = "The save failed. Check its result before retrying."; return; }
+    notice = savedLogin ? "Login saved" : "Saved";
+    mutationNotice = notice;
   }
 
   async function previewImport(params, method = "import_preview") {
     if (!unlocked || busy) return;
     discardPlan();
+    outcome = null;
     message = "";
     notice = "";
-    busy = true;
+    const owner = beginOperation();
     view = "scanning";
-    const epoch = generation;
+    const epoch = previewGeneration;
     const response = await request(method, { ...params, project });
-    busy = false;
-    if (epoch !== generation) {
+    finishOperation(owner);
+    if (epoch !== previewGeneration) {
       if (response.ok && response.result.plan_id) void request("import_cancel", { plan_id: response.result.plan_id });
       return;
     }
@@ -312,7 +359,9 @@
 
   async function chooseSource(directory) {
     message = "";
+    const epoch = previewGeneration;
     const response = await request(directory ? "choose_import_directory" : "choose_import_files");
+    if (epoch !== previewGeneration) return;
     if (!response.ok) { failure(response); return; }
     if (response.result.cancelled === true) return;
     if (!Array.isArray(response.result.paths) || !response.result.paths.length) { message = "No source was selected"; return; }
@@ -322,20 +371,21 @@
   async function commitImport(event) {
     event.preventDefault();
     if (!plan || busy || !destinationConfirmed || !project || (!environment && !mixedEnvironments) || !selectedItems.length || unresolved.length) return;
-    busy = true;
+    const owner = beginOperation();
     message = "";
     const epoch = generation;
     const response = await request("import_commit", { plan_id: plan.plan_id, project, environment, items: importItems.map(({ id, selected, hosts, action, environment }) => ({ id, selected, hosts, action, environment })), rewrite_http: rewriteHttp && canRewrite, destination_confirmed: true });
-    busy = false;
-    destinationConfirmed = false;
-    if (epoch !== generation) return;
-    if (!response.ok) { failure(response); return; }
+    finishOperation(owner);
+    if (epoch === generation) destinationConfirmed = false;
+    if (!response.ok) { if (epoch === generation) failure(response); else message = "The import failed. Check its result before retrying."; return; }
     const result = response.result;
     if (!Number.isInteger(result.imported) || !Array.isArray(result.files)) { message = "Invalid import result. Check the vault before retrying."; return; }
-    outcome = result;
-    plan = null;
-    importItems = [];
-    view = "import_done";
+    outcome = epoch === generation ? result : redactedOutcome(result);
+    if (epoch === generation || (!busy && view === "intake")) {
+      plan = null;
+      importItems = [];
+      view = "import_done";
+    }
   }
 
   async function loadSettings() {
@@ -391,16 +441,15 @@
     window.__wispkeyDrag = (active) => { dragging = active === true; };
     window.__wispkeyBlur = () => {
       clearPrivateState();
-      busy = false;
       dragging = false;
-      view = unlocked ? "intake" : "unlock";
+      view = privateView();
       message = "";
-      notice = "";
+      notice = mutationNotice;
     };
     const hidden = () => {
       if (!document.hidden) { void refreshStatus(); return; }
       clearPrivateState();
-      view = "intake";
+      view = privateView();
     };
     document.addEventListener("visibilitychange", hidden);
     let previousHeight = 0;
@@ -432,7 +481,7 @@
 <main bind:this={root}>
   <header>
     {#if unlocked}
-      <div class="navigation" onpointerleave={() => (menuOpen = false)}>
+      <div class="navigation" role="group" onpointerleave={() => (menuOpen = false)}>
         <button class="icon-button menu-button" aria-label="Navigation" aria-expanded={menuOpen} aria-controls="navigation-menu" onpointerenter={() => (menuOpen = true)} onfocus={() => (menuOpen = true)} onclick={() => (menuOpen = true)}><Icon name="menu" /></button>
         {#if menuOpen}
           <nav id="navigation-menu" aria-label="Local navigation">
@@ -538,9 +587,9 @@
         <div class="actions"><span class="warning-text grow">{unresolved.length ? `Resolve ${unresolved.length} items to import` : ""}</span><button type="button" disabled={busy} onclick={() => navigate("intake")}>Cancel</button><button class="primary" type="submit" disabled={busy || !destinationConfirmed || !selectedItems.length || !!unresolved.length}>Import {selectedItems.length}</button></div>
       </form>
     {:else if view === "import_done" && outcome}
-      <div class="completion"><span class:warning-icon={outcome.files.some((file) => file.status === "failed")} class="completion-icon"><Icon name={outcome.files.some((file) => file.status === "failed") ? "alert" : "check"} size={22} /></span><h1>{outcome.imported} {outcome.imported === 1 ? "credential" : "credentials"} stored</h1></div>
+      <div class="completion"><span class:warning-icon={outcome.sourceFailed || outcome.files.some((file) => file.status === "failed")} class="completion-icon"><Icon name={outcome.sourceFailed || outcome.files.some((file) => file.status === "failed") ? "alert" : "check"} size={22} /></span><h1>{outcome.imported} {outcome.imported === 1 ? "credential" : "credentials"} stored</h1></div>
       <ul class="result-list">{#each outcome.files as file}<li><span class="mono grow">{file.path}</span><span class:error-text={file.status === "failed"} class="muted">{file.status === "updated" ? "Tokens written" : file.status === "failed" ? "Not changed" : "Unchanged"}</span>{#if file.message}<p class="error-text">{file.message}</p>{/if}</li>{/each}</ul>
-      {#if outcome.files.some((file) => file.status === "failed")}<p class="warning">Credentials were saved. Review the source files before retrying.</p>{/if}
+      {#if outcome.sourceFailed || outcome.files.some((file) => file.status === "failed")}<p class="warning">Credentials were saved. Review the source files before retrying.</p>{/if}
       <div class="actions"><button onclick={() => navigate("credentials")}>View in Credentials</button><button class="primary" onclick={() => navigate("intake")}>Done</button></div>
     {/if}
     {#if message && (unlocked || view === "settings" || !vault)}<p class="error-text feedback" role="alert">{message}</p>{/if}
