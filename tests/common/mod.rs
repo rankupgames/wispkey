@@ -10,7 +10,11 @@ use serde_json::Value;
 pub const TEST_BUNDLE_PASSPHRASE: &str = "test-bundle-passphrase";
 
 pub fn wispkey_bin() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_wispkey"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_wispkey"));
+    command
+        .env_remove("WISPKEY_PROJECT")
+        .env_remove("WISPKEY_SESSION_TIMEOUT");
+    command
 }
 
 /// Ensures spawned proxy processes are stopped even when a test assertion fails.
@@ -160,6 +164,7 @@ pub fn wait_for_child_exit(
 }
 
 pub fn write_private_test_file(path: &Path, contents: &str) {
+    #[cfg(not(windows))]
     std::fs::write(path, contents).expect("write private test file");
     #[cfg(unix)]
     {
@@ -167,6 +172,76 @@ pub fn write_private_test_file(path: &Path, contents: &str) {
 
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
             .expect("restrict private test file");
+    }
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        use windows_sys::Win32::Storage::FileSystem::{
+            CREATE_ALWAYS, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        };
+
+        let identity = run_wispkey_json(
+            path.parent().expect("fixture directory"),
+            &["--format", "json", "operation", "identity"],
+        );
+        let sid = identity["principal"]
+            .as_str()
+            .unwrap()
+            .strip_prefix("windows-sid:")
+            .unwrap();
+        let sddl: Vec<u16> = format!("O:{sid}D:P(A;;FA;;;{sid})")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut descriptor = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut descriptor,
+                    std::ptr::null_mut(),
+                )
+            },
+            0,
+            "fixture security descriptor"
+        );
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                &attributes,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            LocalFree(descriptor.cast());
+        }
+        assert_ne!(
+            handle, INVALID_HANDLE_VALUE,
+            "create private fixture: {error}"
+        );
+        let mut file = unsafe { std::fs::File::from_raw_handle(handle) };
+        file.write_all(contents.as_bytes())
+            .expect("write private fixture");
     }
 }
 

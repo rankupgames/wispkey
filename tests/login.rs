@@ -213,7 +213,15 @@ fn login_archive_restore_and_due_list_never_delete() {
             "1s",
         ],
     );
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    let db = rusqlite::Connection::open(vault_dir.path().join("vault.db")).unwrap();
+    assert_eq!(
+        db.execute(
+            "UPDATE credentials SET review_at='2000-01-01T00:00:00Z' WHERE name='review-login'",
+            []
+        )
+        .unwrap(),
+        1
+    );
     let due = run_wispkey_json(
         vault_dir.path(),
         &["--format", "json", "login", "list", "--due"],

@@ -299,7 +299,7 @@ fn intervening_concurrent_mutations_including_aba_are_rejected() {
 }
 
 #[test]
-fn concurrent_replacements_only_one_wins() {
+fn stale_replacements_only_one_wins() {
     let dir = fixture();
     let dir = dir.path();
     let first = Pending::begin(dir);

@@ -276,6 +276,7 @@ fn parse_reply(raw: Vec<u8>) -> Reply {
 }
 
 fn assert_reply(port: u16, label: &str, delivery: &Delivery, status: u16, body: &str) -> Reply {
+    eprintln!("verifier case: {label}");
     let reply = send(port, delivery);
     assert_eq!(
         (reply.status, reply.body.as_str()),
