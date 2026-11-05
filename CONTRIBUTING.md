@@ -37,7 +37,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). CI keeps this default matrix and separately checks Linux AF_VSOCK and the optional `wispkey-tray` on Linux, macOS, and Windows. GUI dependencies remain optional for CLI development. To reproduce the native tray job on Debian/Ubuntu:
+Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). The legacy cross-platform workflows are manual-only during the Jenkins cutover. Jenkins owns admission and Linux results; these do not establish Windows or macOS coverage. GUI dependencies remain optional for CLI development. To reproduce the native tray checks on Debian/Ubuntu:
 
 ```bash
 sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev
