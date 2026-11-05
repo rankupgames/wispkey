@@ -6079,7 +6079,6 @@ name = "wispkey-tray"
 version = "0.4.0"
 dependencies = [
  "arboard",
- "dirs",
  "rfd",
  "rustls",
  "serde_json",
