@@ -64,7 +64,10 @@ class WorkflowBoundaryTests(unittest.TestCase):
             text = path.read_text()
             with self.subTest(workflow=path.name):
                 for action in re.findall(r"(?m)^\s*(?:- )?uses: (\S+)", text):
-                    self.assertRegex(action, r"^[\w./-]+@[0-9a-f]{40}$")
+                    if action == './.github/workflows/jenkins-submit.yml':
+                        self.assertEqual(path.name, 'jenkins.yml')
+                    else:
+                        self.assertRegex(action, r"^[\w./-]+@[0-9a-f]{40}$")
                 self.assertNotRegex(text, r"(?m)^\s*(pull_request_target|workflow_run):")
                 self.assertNotIn("allow-unsafe-pr-checkout:", text)
 

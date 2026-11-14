@@ -70,7 +70,26 @@ Firecracker UDS bridge.
 
 See [`docs/tray.md`](docs/tray.md) for owner IPC and tray usage.
 
-`Jenkinsfile` defines the Linux gates, one lane per job: `bash ci/jenkins/check.sh rust|tray|browser|postgres|cross-node`. The lanes check exact tool versions and fail when a worker tool is missing; they do not install worker packages. `python3 ci/jenkins/request.py --branch <branch> --source-sha <sha> --lane <lane>` prints the typed dispatch request and never submits a build. These Linux lanes do not provide Windows-native or macOS evidence. Preserve legacy required checks until replacement acceptance and an authorized cutover.
+`.github/workflows/jenkins.yml` owns the Linux CI contract and status names.
+Each lane calls the local generic `jenkins-submit.yml`, which submits metadata only.
+Jenkins reads the exact committed workflow and source before execution.
+Rust, tray, and browser use local-first execution. PostgreSQL and cross-node wait
+for the existing local worker. A started failure never moves to another runner.
+Worker toolchains, credential references, capacity, and trust policy stay private.
+Unsupported profiles or resources fail explicitly.
+
+Run `bash ci/jenkins/check.sh rust|tray|browser|postgres|cross-node` on a prepared
+Linux worker. Local checks in `docs/testing.md` do not require Jenkins admission.
+The browser lane archives `target/jenkins/artifacts/wispkey-browser-extensions.tar`
+and checks its unpacked contents. These checks do not publish packages.
+Release assets, attestations, native test artifacts, and registry publication keep
+their separate workflow gates. Linux results do not establish Windows or macOS coverage.
+
+During bootstrap, retain `Jenkinsfile`, `ci/jenkins/request.py`, and paused manual
+workflows. Delete the replaced loader and request emitter after ordinary committed
+PR/default-branch submissions prove the trusted pending-to-terminal status, native
+build URL, actual route, artifact retention, and owned-resource cleanup.
+Keep existing required checks until that acceptance and an authorized cutover.
 
 4. Open a PR against `main`
 
