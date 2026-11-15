@@ -22,6 +22,11 @@ env:
             "profile": "small-web"
           },
           "execution": "local-first",
+          "resources": {
+            "vcpus": 8,
+            "memoryMiB": 16384,
+            "diskGiB": 40
+          },
           "pullRequests": "same-repository",
           "timeoutMinutes": 60,
           "command": "bash ci/jenkins/check.sh rust",
@@ -35,6 +40,11 @@ env:
             "profile": "small-web"
           },
           "execution": "local-first",
+          "resources": {
+            "vcpus": 8,
+            "memoryMiB": 16384,
+            "diskGiB": 40
+          },
           "pullRequests": "same-repository",
           "timeoutMinutes": 60,
           "command": "bash ci/jenkins/check.sh tray",
@@ -48,6 +58,11 @@ env:
             "profile": "small-web"
           },
           "execution": "local-first",
+          "resources": {
+            "vcpus": 8,
+            "memoryMiB": 16384,
+            "diskGiB": 40
+          },
           "pullRequests": "same-repository",
           "timeoutMinutes": 60,
           "command": "bash ci/jenkins/check.sh browser",
