@@ -16,11 +16,23 @@ spec.loader.exec_module(request)
 
 
 class CiContractTests(unittest.TestCase):
-    def test_paused_workflows_remain_dispatch_only(self):
+    def test_bootstrap_workflows_preserve_automatic_coverage(self):
         for name in ('ci', 'automation-tests', 'owner-ipc-contention', 'cross-node-acceptance'):
             with self.subTest(workflow=name):
                 text = (ROOT / f'.github/workflows/{name}.yml').read_text()
-                self.assertEqual(blocks(text, 'on'), ['on:\n  workflow_dispatch:'])
+                events = blocks(text, 'on')[0]
+                self.assertIn('  pull_request:', events)
+                self.assertIn('  workflow_dispatch:', events)
+                if name in ('ci', 'automation-tests'):
+                    self.assertIn('  push:', events)
+                if name == 'owner-ipc-contention':
+                    self.assertIn('  schedule:', events)
+        native = (ROOT / '.github/workflows/ci.yml').read_text()
+        self.assertEqual(native.count('os: [ubuntu-latest, macos-latest, windows-latest]'), 2)
+        self.assertIn('macOS native-host installer and ACL fixtures', native)
+        contention = (ROOT / '.github/workflows/owner-ipc-contention.yml').read_text()
+        self.assertIn('runs-on: windows-latest', contention)
+        self.assertIn('run: ./scripts/test-owner-ipc-contention.ps1', contention)
 
     def test_dispatch_lanes_match_jenkins_jobs_and_check_arms(self):
         pipeline = (ROOT / 'Jenkinsfile').read_text()

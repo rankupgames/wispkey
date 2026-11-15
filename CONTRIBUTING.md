@@ -37,7 +37,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). The legacy cross-platform workflows are manual-only during the Jenkins cutover. Jenkins owns admission and Linux results; these do not establish Windows or macOS coverage. GUI dependencies remain optional for CLI development. To reproduce the native tray checks on Debian/Ubuntu:
+Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). Bootstrap workflows keep their prior automatic triggers and Linux, Windows, and macOS matrices until matching Jenkins lanes prove parity. Linux Jenkins results do not establish Windows or macOS coverage. GUI dependencies remain optional for CLI development. To reproduce the native tray checks on Debian/Ubuntu:
 
 ```bash
 sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev
@@ -85,8 +85,9 @@ and checks its unpacked contents. These checks do not publish packages.
 Release assets, attestations, native test artifacts, and registry publication keep
 their separate workflow gates. Linux results do not establish Windows or macOS coverage.
 
-During bootstrap, retain `Jenkinsfile`, `ci/jenkins/request.py`, and paused manual
-workflows. Delete the replaced loader and request emitter after ordinary committed
+During bootstrap, retain `Jenkinsfile`, `ci/jenkins/request.py`, and automatic
+bootstrap workflows. Remove bootstrap checks only after matching lane and native
+OS coverage is proven in Jenkins. Delete the replaced loader and request emitter after ordinary committed
 PR/default-branch submissions prove the trusted pending-to-terminal status, native
 build URL, actual route, artifact retention, and owned-resource cleanup.
 Keep existing required checks until that acceptance and an authorized cutover.
