@@ -1,0 +1,166 @@
+# Jenkins executes the committed contract. Actions submits metadata only.
+name: Jenkins
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions: {}
+
+env:
+  JENKINS_CI: |
+    {
+      "schemaVersion": 1,
+      "project": "wispkey",
+      "lanes": {
+        "rust": {
+          "status": "jenkins/wispkey/rust",
+          "runner": {
+            "os": "linux",
+            "profile": "small-web"
+          },
+          "execution": "local-first",
+          "resources": {
+            "vcpus": 8,
+            "memoryMiB": 16384,
+            "diskGiB": 40
+          },
+          "pullRequests": "same-repository",
+          "timeoutMinutes": 60,
+          "command": "bash ci/jenkins/check.sh rust",
+          "cleanup": "",
+          "artifacts": ""
+        },
+        "tray": {
+          "status": "jenkins/wispkey/tray",
+          "runner": {
+            "os": "linux",
+            "profile": "small-web"
+          },
+          "execution": "local-first",
+          "resources": {
+            "vcpus": 8,
+            "memoryMiB": 16384,
+            "diskGiB": 40
+          },
+          "pullRequests": "same-repository",
+          "timeoutMinutes": 60,
+          "command": "bash ci/jenkins/check.sh tray",
+          "cleanup": "",
+          "artifacts": ""
+        },
+        "browser": {
+          "status": "jenkins/wispkey/browser",
+          "runner": {
+            "os": "linux",
+            "profile": "small-web"
+          },
+          "execution": "local-first",
+          "resources": {
+            "vcpus": 8,
+            "memoryMiB": 16384,
+            "diskGiB": 40
+          },
+          "pullRequests": "same-repository",
+          "timeoutMinutes": 60,
+          "command": "bash ci/jenkins/check.sh browser",
+          "cleanup": "",
+          "artifacts": "target/jenkins/artifacts/wispkey-browser-extensions.tar"
+        },
+        "postgres": {
+          "status": "jenkins/wispkey/postgres",
+          "runner": {
+            "os": "linux",
+            "profile": "default-4"
+          },
+          "execution": "jenkins-only",
+          "pullRequests": "same-repository",
+          "timeoutMinutes": 60,
+          "command": "bash ci/jenkins/check.sh postgres",
+          "cleanup": "",
+          "artifacts": ""
+        },
+        "cross-node": {
+          "status": "jenkins/wispkey/cross-node",
+          "runner": {
+            "os": "linux",
+            "profile": "default-4"
+          },
+          "execution": "jenkins-only",
+          "pullRequests": "same-repository",
+          "timeoutMinutes": 60,
+          "command": "bash ci/jenkins/check.sh cross-node",
+          "cleanup": "",
+          "artifacts": ""
+        }
+      }
+    }
+
+jobs:
+  rust:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/jenkins-submit.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+      branch: ${{ github.head_ref || github.ref_name }}
+      check-type: rust
+      pr-number: ${{ github.event.pull_request.number && format('{0}', github.event.pull_request.number) || '' }}
+    secrets:
+      JENKINS_TRIGGER_USER: ${{ secrets.JENKINS_TRIGGER_USER }}
+      JENKINS_TRIGGER_TOKEN: ${{ secrets.JENKINS_TRIGGER_TOKEN }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+  tray:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/jenkins-submit.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+      branch: ${{ github.head_ref || github.ref_name }}
+      check-type: tray
+      pr-number: ${{ github.event.pull_request.number && format('{0}', github.event.pull_request.number) || '' }}
+    secrets:
+      JENKINS_TRIGGER_USER: ${{ secrets.JENKINS_TRIGGER_USER }}
+      JENKINS_TRIGGER_TOKEN: ${{ secrets.JENKINS_TRIGGER_TOKEN }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+  browser:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/jenkins-submit.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+      branch: ${{ github.head_ref || github.ref_name }}
+      check-type: browser
+      pr-number: ${{ github.event.pull_request.number && format('{0}', github.event.pull_request.number) || '' }}
+    secrets:
+      JENKINS_TRIGGER_USER: ${{ secrets.JENKINS_TRIGGER_USER }}
+      JENKINS_TRIGGER_TOKEN: ${{ secrets.JENKINS_TRIGGER_TOKEN }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+  postgres:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/jenkins-submit.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+      branch: ${{ github.head_ref || github.ref_name }}
+      check-type: postgres
+      pr-number: ${{ github.event.pull_request.number && format('{0}', github.event.pull_request.number) || '' }}
+    secrets:
+      JENKINS_TRIGGER_USER: ${{ secrets.JENKINS_TRIGGER_USER }}
+      JENKINS_TRIGGER_TOKEN: ${{ secrets.JENKINS_TRIGGER_TOKEN }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}
+  cross-node:
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/jenkins-submit.yml
+    with:
+      source-sha: ${{ github.event.pull_request.head.sha || github.sha }}
+      branch: ${{ github.head_ref || github.ref_name }}
+      check-type: cross-node
+      pr-number: ${{ github.event.pull_request.number && format('{0}', github.event.pull_request.number) || '' }}
+    secrets:
+      JENKINS_TRIGGER_USER: ${{ secrets.JENKINS_TRIGGER_USER }}
+      JENKINS_TRIGGER_TOKEN: ${{ secrets.JENKINS_TRIGGER_TOKEN }}
+      CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}
+      CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}

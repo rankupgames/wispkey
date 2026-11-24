@@ -134,7 +134,7 @@
   },
   "automation-tests.yml": {
     "events": [
-      "on:\n  workflow_dispatch:"
+      "on:\n  pull_request:\n    branches: [main, development, release]\n  push:\n    branches: [main, development, release]\n  workflow_dispatch:"
     ],
     "permissions": [
       "permissions:\n  contents: read"
@@ -150,7 +150,7 @@
   },
   "owner-ipc-contention.yml": {
     "events": [
-      "on:\n  workflow_dispatch:"
+      "on:\n  workflow_dispatch:\n  pull_request:\n    branches-ignore: ['0.7']\n    paths:\n      - 'src/owner_ipc/**'\n      - 'src/core/**'\n      - 'tests/owner_ipc.rs'\n      - 'tests/owner_ipc_diagnostics.rs'\n      - 'tests/common/**'\n      - 'scripts/test-owner-ipc-contention.ps1'\n      - '.github/workflows/owner-ipc-contention.yml'\n  schedule:\n    - cron: '37 8 * * 1'"
     ],
     "permissions": [
       "permissions:\n  contents: read"
@@ -172,7 +172,7 @@
   },
   "cross-node-acceptance.yml": {
     "events": [
-      "on:\n  workflow_dispatch:"
+      "on:\n  workflow_dispatch:\n  pull_request:\n    branches: [main, development]\n    paths:\n      - 'src/operations/**'\n      - 'tests/support/cross_node_fixture.py'\n      - '.github/workflows/cross-node-acceptance.yml'"
     ],
     "permissions": [
       "permissions:\n  contents: read"
@@ -213,7 +213,7 @@
   },
   "ci.yml": {
     "events": [
-      "on:\n  workflow_dispatch:"
+      "on:\n  push:\n    branches: [development, main]\n  pull_request:\n    branches: [development, main, release]\n  workflow_dispatch:"
     ],
     "permissions": [
       "permissions:\n  contents: read"
@@ -491,5 +491,37 @@
         ]
       ]
     ]
+  },
+  "jenkins.yml": {
+    "events": [
+      "on:\n  push:\n    branches: [main]\n  pull_request:\n    branches: [main]"
+    ],
+    "permissions": [
+      "permissions: {}"
+    ],
+    "environment": [
+      "env:\n  JENKINS_CI: |\n    {\n      \"schemaVersion\": 1,\n      \"project\": \"wispkey\",\n      \"lanes\": {\n        \"rust\": {\n          \"status\": \"jenkins/wispkey/rust\",\n          \"runner\": {\n            \"os\": \"linux\",\n            \"profile\": \"small-web\"\n          },\n          \"execution\": \"local-first\",\n          \"resources\": {\n            \"vcpus\": 8,\n            \"memoryMiB\": 16384,\n            \"diskGiB\": 40\n          },\n          \"pullRequests\": \"same-repository\",\n          \"timeoutMinutes\": 60,\n          \"command\": \"bash ci/jenkins/check.sh rust\",\n          \"cleanup\": \"\",\n          \"artifacts\": \"\"\n        },\n        \"tray\": {\n          \"status\": \"jenkins/wispkey/tray\",\n          \"runner\": {\n            \"os\": \"linux\",\n            \"profile\": \"small-web\"\n          },\n          \"execution\": \"local-first\",\n          \"resources\": {\n            \"vcpus\": 8,\n            \"memoryMiB\": 16384,\n            \"diskGiB\": 40\n          },\n          \"pullRequests\": \"same-repository\",\n          \"timeoutMinutes\": 60,\n          \"command\": \"bash ci/jenkins/check.sh tray\",\n          \"cleanup\": \"\",\n          \"artifacts\": \"\"\n        },\n        \"browser\": {\n          \"status\": \"jenkins/wispkey/browser\",\n          \"runner\": {\n            \"os\": \"linux\",\n            \"profile\": \"small-web\"\n          },\n          \"execution\": \"local-first\",\n          \"resources\": {\n            \"vcpus\": 8,\n            \"memoryMiB\": 16384,\n            \"diskGiB\": 40\n          },\n          \"pullRequests\": \"same-repository\",\n          \"timeoutMinutes\": 60,\n          \"command\": \"bash ci/jenkins/check.sh browser\",\n          \"cleanup\": \"\",\n          \"artifacts\": \"target/jenkins/artifacts/wispkey-browser-extensions.tar\"\n        },\n        \"postgres\": {\n          \"status\": \"jenkins/wispkey/postgres\",\n          \"runner\": {\n            \"os\": \"linux\",\n            \"profile\": \"default-4\"\n          },\n          \"execution\": \"jenkins-only\",\n          \"pullRequests\": \"same-repository\",\n          \"timeoutMinutes\": 60,\n          \"command\": \"bash ci/jenkins/check.sh postgres\",\n          \"cleanup\": \"\",\n          \"artifacts\": \"\"\n        },\n        \"cross-node\": {\n          \"status\": \"jenkins/wispkey/cross-node\",\n          \"runner\": {\n            \"os\": \"linux\",\n            \"profile\": \"default-4\"\n          },\n          \"execution\": \"jenkins-only\",\n          \"pullRequests\": \"same-repository\",\n          \"timeoutMinutes\": 60,\n          \"command\": \"bash ci/jenkins/check.sh cross-node\",\n          \"cleanup\": \"\",\n          \"artifacts\": \"\"\n        }\n      }\n    }"
+    ],
+    "job_gates": [
+      "    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
+      "    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
+      "    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
+      "    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
+      "    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository"
+    ],
+    "action_inputs": []
+  },
+  "jenkins-submit.yml": {
+    "events": [
+      "on:\n  workflow_call:\n    inputs:\n      source-sha: {required: true, type: string}\n      branch: {required: true, type: string}\n      check-type: {required: true, type: string}\n      machine: {required: false, type: string, default: ''}\n      pr-number: {required: false, type: string, default: ''}\n    secrets:\n      JENKINS_TRIGGER_USER: {required: true}\n      JENKINS_TRIGGER_TOKEN: {required: true}\n      CF_ACCESS_CLIENT_ID: {required: true}\n      CF_ACCESS_CLIENT_SECRET: {required: true}"
+    ],
+    "permissions": [
+      "permissions: {}"
+    ],
+    "environment": [
+      "env:\n  JENKINS_URL: ${{ vars.HOMELAB_JENKINS_URL }}\n  JENKINS_USER: ${{ secrets.JENKINS_TRIGGER_USER }}\n  JENKINS_TOKEN: ${{ secrets.JENKINS_TRIGGER_TOKEN }}\n  CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ACCESS_CLIENT_ID }}\n  CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ACCESS_CLIENT_SECRET }}\n  REPOSITORY: ${{ github.repository }}\n  SOURCE_SHA: ${{ inputs.source-sha }}\n  SOURCE_BRANCH: ${{ inputs.branch }}\n  CHECK_TYPE: ${{ inputs.check-type }}\n  MACHINE_CONFIG: ${{ inputs.machine }}\n  PULL_REQUEST: ${{ inputs.pr-number }}"
+    ],
+    "job_gates": [],
+    "action_inputs": []
   }
 }

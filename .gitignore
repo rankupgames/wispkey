@@ -17,6 +17,10 @@ _docs/
 # Node (plugin dev tooling)
 node_modules/
 
+# Installed Impeccable platform binaries
+/.agents/skills/impeccable/scripts/bin/
+/.claude/skills/impeccable/scripts/bin/
+
 # IDE
 .idea/
 .vscode/

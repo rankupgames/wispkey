@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run one Linux lane of the committed CI gates, in order. Do not install or replace worker tools.
+# Run one Linux lane. Worker toolchain versions come from private runtime policy.
 set -euo pipefail
 
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
@@ -7,15 +7,15 @@ lane="${1:?usage: check.sh rust|tray|browser|postgres|cross-node}"
 lane_root="$PWD/target/jenkins"
 
 need_rust() {
-    export PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN=stable RUSTC_WRAPPER='' CARGO_TERM_COLOR=never
-    test "$(rustc --version | cut -d' ' -f1-2)" = 'rustc 1.99.0'
-    test "$(cargo --version | cut -d' ' -f1-2)" = 'cargo 1.99.0'
+    export PATH="$HOME/.cargo/bin:$PATH" RUSTC_WRAPPER='' CARGO_TERM_COLOR=never
+    rustc --version
+    cargo --version
     test -f Cargo.lock
 }
 
 need_node() {
-    test "$(node --version)" = 'v24.21.0'
-    test "$(npm --version)" = '11.19.0'
+    node --version
+    npm --version
     test "$(npm config get min-release-age)" = '7'
     test -f browser-extension/package-lock.json
     test -f crates/wispkey-tray/ui/package-lock.json
@@ -28,7 +28,7 @@ build_tray_ui() {
 case "$lane" in
 rust)
     need_rust
-    test "$(python3 --version)" = 'Python 3.12.3'
+    python3 --version
     command -v strace >/dev/null || { echo 'strace is required' >&2; exit 1; }
     # Keep compilation off the mounted source drive and inside this lane's budget.
     cargo_target="$(mktemp -d /tmp/wispkey-rust.XXXXXXXX)"
@@ -60,14 +60,14 @@ tray)
     cargo test --locked -p wispkey-tray
     ;;
 postgres)
-    # The registry declares this exact name as the lane's only owned container.
+    # The fixture tracks its created container ID and removes it on exit.
     need_rust
     export CARGO_BUILD_JOBS=1 CARGO_PROFILE_DEV_DEBUG=0
     WISPKEY_CONTAINER_ENGINE=docker WISPKEY_FIXTURE_CONTAINER_NAME=wispkey-postgres-fixture \
         bash tests/support/postgres_operation_fixture.sh
     ;;
 cross-node)
-    # The registry declares wk-ssh-jenkins and wk-accept-jenkins-control-plane as owned containers.
+    # The fixture owns and cleans its SSH container and kind cluster.
     need_rust
     for tool in docker ssh ssh-keygen curl sha256sum; do
         command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 1; }
@@ -83,7 +83,7 @@ cross-node)
     ;;
 browser)
     need_node
-    test "$(python3 --version)" = 'Python 3.12.3'
+    python3 --version
     export PLAYWRIGHT_BROWSERS_PATH="$lane_root/ms-playwright"
     (cd browser-extension && npm ci && npm test && npm run build)
     build_tray_ui

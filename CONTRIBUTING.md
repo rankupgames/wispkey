@@ -37,7 +37,7 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-features
 ```
 
-Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). The legacy cross-platform workflows are manual-only during the Jenkins cutover. Jenkins owns admission and Linux results; these do not establish Windows or macOS coverage. GUI dependencies remain optional for CLI development. To reproduce the native tray checks on Debian/Ubuntu:
+Default `cargo test` and `cargo clippy` build the CLI crate only (`default-members = ["."]`). Bootstrap workflows keep their prior automatic triggers and Linux, Windows, and macOS matrices until matching Jenkins lanes prove parity. Linux Jenkins results do not establish Windows or macOS coverage. GUI dependencies remain optional for CLI development. To reproduce the native tray checks on Debian/Ubuntu:
 
 ```bash
 sudo apt install libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev libxdo-dev
@@ -70,7 +70,38 @@ Firecracker UDS bridge.
 
 See [`docs/tray.md`](docs/tray.md) for owner IPC and tray usage.
 
-`Jenkinsfile` defines the Linux gates, one lane per job: `bash ci/jenkins/check.sh rust|tray|browser|postgres|cross-node`. The lanes check exact tool versions and fail when a worker tool is missing; they do not install worker packages. `python3 ci/jenkins/request.py --branch <branch> --source-sha <sha> --lane <lane>` prints the typed dispatch request and never submits a build. These Linux lanes do not provide Windows-native or macOS evidence. Preserve legacy required checks until replacement acceptance and an authorized cutover.
+`.github/workflows/jenkins.yml` owns the Linux CI contract and status names.
+Each lane calls the local generic `jenkins-submit.yml`, which submits metadata only.
+Jenkins reads the exact committed workflow and source before execution.
+Rust, tray, and browser use local-first execution. PostgreSQL and cross-node wait
+for the existing local worker. A started failure never moves to another runner.
+Worker toolchains, credential references, capacity, and trust policy stay private.
+Unsupported profiles or resources fail explicitly.
+
+Run `bash ci/jenkins/check.sh rust|tray|browser|postgres|cross-node` on a prepared
+Linux worker. Local checks in `docs/testing.md` do not require Jenkins admission.
+The browser lane archives `target/jenkins/artifacts/wispkey-browser-extensions.tar`
+and checks its unpacked contents. These checks do not publish packages.
+Release assets, attestations, native test artifacts, and registry publication keep
+their separate workflow gates. Linux results do not establish Windows or macOS coverage.
+
+During bootstrap, retain `Jenkinsfile`, `ci/jenkins/request.py`, and automatic
+bootstrap workflows. The additive bootstrap can merge under the existing hosted
+required checks before its first default-branch Jenkins job exists. The ordinary
+default-branch submission creates that job after integration. This bootstrap merge
+does not establish native parity.
+
+Remove bootstrap checks only after matching lane and native OS coverage is proven
+in Jenkins. Delete the replaced loader and request emitter after ordinary committed
+PR and post-merge default-branch submissions prove the trusted pending-to-terminal
+status, native build URL, exact source, actual route, artifact retention, and
+owned-resource cleanup. Keep existing required checks until that acceptance and
+an authorized cutover.
+
+Size each lane from full-build CPU, aggregate memory, filesystem and temporary-data
+measurements, including toolchain, browser and artifact growth with the required
+free-space floor. Cache footprints alone do not establish those requirements.
+Unsupported requests remain blocked until the owning runtime policy supports them.
 
 4. Open a PR against `main`
 
