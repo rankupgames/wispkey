@@ -687,6 +687,7 @@ impl CloudClient {
                     }
                 }
             };
+            let mut acknowledged = false;
             let conflict = if action == "push" {
                 remote_changed
             } else {
@@ -738,14 +739,34 @@ impl CloudClient {
                 }
                 // A failed explicit resolution must not erase an uncertain prior upload.
             } else if conflict {
-                state.conflict_revision = Some(revision.unwrap_or("absent").to_owned());
-                return Err(CloudError::SyncConflict(
-                    state.partition.clone(),
-                    "inspect cloud status --remote; resolve explicitly with the observed revision"
-                        .into(),
-                ));
+                // Bidirectional sync may see both sides changed only by a
+                // serialization upgrade. Verify the remote snapshot in-process
+                // and acknowledge it only when it equals the local partition.
+                if matches!(mode, SyncMode::Sync)
+                    && state.revision.is_some()
+                    && self
+                        .acknowledge_equivalent(
+                            vault,
+                            state,
+                            remote.as_ref(),
+                            local_hash.as_deref(),
+                            password,
+                            guard,
+                        )
+                        .await
+                {
+                    acknowledged = true;
+                } else {
+                    guard()?;
+                    state.conflict_revision = Some(revision.unwrap_or("absent").to_owned());
+                    return Err(CloudError::SyncConflict(
+                        state.partition.clone(),
+                        "inspect cloud status --remote; resolve explicitly with the observed revision"
+                            .into(),
+                    ));
+                }
             }
-            if action == "push" {
+            if !acknowledged && action == "push" {
                 let local = local
                     .as_ref()
                     .ok_or_else(|| invalid("local_partition_missing"))?;
@@ -776,7 +797,7 @@ impl CloudClient {
                     self.send_pending(vault, state, guard).await?;
                     outcome = "uploaded";
                 }
-            } else {
+            } else if !acknowledged {
                 let remote = remote.ok_or_else(|| invalid("remote_partition_missing"))?;
                 if remote_changed || resolution.is_some() || state.last_success.is_none() {
                     let (snapshot, _) = self
@@ -839,6 +860,54 @@ impl CloudClient {
             local_changes_pending: current_hash != state.local_hash,
             recovery_path,
         })
+    }
+
+    /// True only after the authenticated remote snapshot hashes equal to the
+    /// local partition and the journal advanced under a local recheck. Any
+    /// error or difference leaves the state untouched for conflict handling.
+    async fn acknowledge_equivalent(
+        &self,
+        vault: &Vault,
+        state: &mut PartitionState,
+        remote: Option<&RemotePartition>,
+        local_hash: Option<&str>,
+        password: &str,
+        guard: &dyn Fn() -> crate::core::Result<()>,
+    ) -> bool {
+        let (Some(remote), Some(local_hash)) = (remote, local_hash) else {
+            return false;
+        };
+        let attempt = async {
+            let (snapshot, _) = self
+                .download(remote, password, &state.project, &state.partition, guard)
+                .await?;
+            if vault.cloud_snapshot_hash(&snapshot)? != local_hash {
+                return Ok(None);
+            }
+            let mut committed = state.clone();
+            committed.revision = Some(remote.revision.clone());
+            committed.local_hash = Some(local_hash.to_owned());
+            committed.last_success = Some(chrono::Utc::now().to_rfc3339());
+            committed.last_error = None;
+            committed.conflict_revision = None;
+            committed.pending = None;
+            vault.cloud_acknowledge_guarded(
+                &state.project,
+                &state.partition,
+                local_hash,
+                &self.state_key(&state.remote_id)?,
+                serde_json::to_value(&committed).map_err(|_| invalid("invalid_sync_state"))?,
+                guard,
+            )?;
+            Ok::<_, CloudError>(Some(committed))
+        };
+        match attempt.await {
+            Ok(Some(committed)) => {
+                *state = committed;
+                true
+            }
+            _ => false,
+        }
     }
 
     pub async fn sync_status(&self, vault: &Vault, remote: bool) -> CloudResult<serde_json::Value> {

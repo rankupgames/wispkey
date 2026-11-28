@@ -211,6 +211,37 @@ impl Vault {
         Ok(BASE64.encode(hmac::sign(&key, &bytes).as_ref()))
     }
 
+    /// Record a sync journal entry for a verified remote snapshot whose keyed
+    /// hash equals the local partition, without rewriting any rows. The local
+    /// hash is rechecked under SQLite's write lock so a concurrent local edit is
+    /// never acknowledged as synced.
+    pub(crate) fn cloud_acknowledge_guarded(
+        &self,
+        project: &str,
+        partition: &str,
+        expected_hash: &str,
+        state_key: &str,
+        state: serde_json::Value,
+        guard: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        guard()?;
+        let tx = Transaction::new_unchecked(&self.db, TransactionBehavior::Immediate)?;
+        let current = self.cloud_snapshot(project, partition)?;
+        let hash = current
+            .as_ref()
+            .map(|value| self.cloud_snapshot_hash(value))
+            .transpose()?;
+        if hash.as_deref() != Some(expected_hash) {
+            return Err(VaultError::InvalidBundle(
+                "local partition changed during sync".into(),
+            ));
+        }
+        self.db.execute("INSERT INTO vault_meta(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", params![state_key, state.to_string()])?;
+        guard()?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// The caller holds the cloud process lock. Local credential writers are
     /// checked again under SQLite's write lock immediately before replacement.
     pub(crate) fn cloud_apply(

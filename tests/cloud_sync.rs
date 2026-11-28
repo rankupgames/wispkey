@@ -610,6 +610,80 @@ fn divergent_edits_conflict_and_explicit_remote_resolution_keeps_encrypted_recov
 }
 
 #[test]
+fn bidirectional_sync_acknowledges_only_identical_divergent_snapshots() {
+    let server = Server::new();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    for dir in [&first, &second] {
+        init_vault(dir.path());
+        server.configure(dir.path());
+    }
+    add(first.path(), "base-key", SECRET, "personal");
+    transfer(first.path(), "push");
+    transfer(second.path(), "pull");
+    for dir in [&first, &second] {
+        run_wispkey_json(
+            dir.path(),
+            &[
+                "--format",
+                "json",
+                "ring",
+                "base-key",
+                "--set",
+                "restricted",
+            ],
+        );
+    }
+    transfer(first.path(), "push");
+    let uploads = server.state.lock().unwrap().uploads.len();
+    // Manual pull keeps its explicit conflict even for identical content.
+    assert!(
+        !run_wispkey_bundle(second.path(), &["cloud", "pull", "personal"])
+            .status
+            .success()
+    );
+    assert_eq!(status(second.path())["partitions"][0]["conflict"], true);
+    assert!(
+        !run_wispkey_with_bundle_passphrase(
+            second.path(),
+            &["cloud", "sync"],
+            "wrong-passphrase-here"
+        )
+        .status
+        .success()
+    );
+    assert_eq!(status(second.path())["partitions"][0]["conflict"], true);
+    let synced = run_wispkey_bundle_json(second.path(), &["--format", "json", "cloud", "sync"]);
+    assert_eq!(synced["partitions"][0]["outcome"], "unchanged");
+    assert_eq!(synced["partitions"][0]["local_changes_pending"], false);
+    assert_eq!(server.state.lock().unwrap().uploads.len(), uploads);
+    let report = status(second.path());
+    assert_eq!(report["partitions"][0]["conflict"], false);
+    assert_eq!(report["partitions"][0]["remote_changes_pending"], false);
+    assert_eq!(report["partitions"][0]["local_changes_pending"], false);
+
+    // Any real difference, including only the access ring, still conflicts.
+    run_wispkey_json(
+        first.path(),
+        &["--format", "json", "ring", "base-key", "--set", "critical"],
+    );
+    transfer(first.path(), "push");
+    add(
+        second.path(),
+        "local-change",
+        "synthetic-local-change",
+        "personal",
+    );
+    assert!(
+        !run_wispkey_bundle(second.path(), &["cloud", "sync"])
+            .status
+            .success()
+    );
+    assert_eq!(status(second.path())["partitions"][0]["conflict"], true);
+    verify_secret(second.path(), "local-change", "synthetic-local-change");
+}
+
+#[test]
 fn local_change_during_download_is_not_overwritten() {
     let server = Server::new();
     let first = tempfile::tempdir().unwrap();
