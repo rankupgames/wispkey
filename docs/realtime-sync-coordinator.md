@@ -3,7 +3,7 @@
 This scheduling foundation has fail-closed admission states for access policy
 and device identity; it does not implement device enrollment.
 The coordinator itself is a metadata-only module behind `--features experimental-sync`;
-default builds exclude it. The separately documented foreground watch is its first
+standard builds include it. The separately documented foreground watch is its first
 CLI caller. Compiling the feature does not start a daemon, enable network activity
 or authorize any device. Enrolled-device background synchronization remains unimplemented.
 

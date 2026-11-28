@@ -216,15 +216,13 @@ The backend's separate fixtures exercise real local D1/R2 concurrency and the
 existing-schema migration. These tests do not log into production Clerk or deploy
 a Worker.
 
-## Realtime coordinator foundation
+## Automatic sync while signed in
 
-The optional `experimental-sync` feature compiles a metadata-only scheduler contract.
-It does not enable automatic sync or enroll devices. See
-[the contract and remaining activation gates](realtime-sync-coordinator.md).
-
-Experimental builds can opt into a time-bounded owner-run polling session with
-[`cloud watch`](foreground-sync-watch.md) after manual pairing. This is distinct
-from device enrollment and is unavailable in default builds.
+After pairing each device, use [`cloud watch`](foreground-sync-watch.md) to sync
+saves in explicitly selected partitions. Watch is available in standard builds.
+It runs in the foreground and stops when the selected vault or Cloud session
+ends. The [realtime coordinator contract](realtime-sync-coordinator.md) describes
+device enrollment and background authorization.
 
 ## Browser login
 

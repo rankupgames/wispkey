@@ -1,10 +1,12 @@
-//! Bounded foreground polling under the existing manual owner/passphrase model.
+//! Owner-started foreground sync for manually paired encrypted partitions.
 //! This is not device enrollment or ring authorization and creates no grants.
 use super::coordinator::{Admission, Attempt, Binding, Coordinator, Reconciliation};
-use super::{CloudClient, CloudError, CloudResult, SyncManifest, SyncMode, load_config};
+use super::{CloudClient, CloudError, CloudResult, SyncManifest, SyncMode, load_config, oauth};
 use crate::core::{Vault, VaultError, resolve_active_project};
 use serde::Serialize;
 use std::time::{Duration, Instant};
+
+const REMOTE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Serialize)]
 pub struct WatchReport {
@@ -22,15 +24,24 @@ fn stopped(code: &'static str) -> VaultError {
 
 struct WatchDeadline {
     at: Instant,
-    session_limited: bool,
+    end: WatchEnd,
+}
+
+#[derive(Clone, Copy)]
+enum WatchEnd {
+    Requested,
+    VaultSession,
+    CloudSession,
 }
 
 impl WatchDeadline {
     fn error(&self) -> VaultError {
-        if self.session_limited {
-            VaultError::SessionExpired
-        } else {
-            VaultError::WatchDurationElapsed
+        match self.end {
+            WatchEnd::Requested => VaultError::WatchDurationElapsed,
+            WatchEnd::VaultSession => VaultError::SessionExpired,
+            WatchEnd::CloudSession => {
+                VaultError::AuthRejected("cloud session expired; run wispkey cloud login")
+            }
         }
     }
 
@@ -73,10 +84,19 @@ fn record_transfer(
     }
 }
 
+/// Watch a single paired partition for a bounded duration.
 pub async fn watch_partition(
     partition: &str,
     passphrase: &str,
     seconds: u64,
+) -> CloudResult<WatchReport> {
+    watch_partitions(&[partition.to_owned()], passphrase, Some(seconds)).await
+}
+
+pub async fn watch_partitions(
+    partitions: &[String],
+    passphrase: &str,
+    seconds: Option<u64>,
 ) -> CloudResult<WatchReport> {
     let mut report = WatchReport {
         stopped: "duration",
@@ -85,7 +105,7 @@ pub async fn watch_partition(
         last: None,
     };
     finish_watch(
-        watch_partition_inner(partition, passphrase, seconds, &mut report).await,
+        watch_partitions_inner(partitions, passphrase, seconds, &mut report).await,
         report,
     )
 }
@@ -97,37 +117,64 @@ fn finish_watch(result: CloudResult<()>, report: WatchReport) -> CloudResult<Wat
     }
 }
 
-async fn watch_partition_inner(
-    partition: &str,
+async fn watch_partitions_inner(
+    partitions: &[String],
     passphrase: &str,
-    seconds: u64,
+    seconds: Option<u64>,
     report: &mut WatchReport,
 ) -> CloudResult<()> {
-    if !(1..=3600).contains(&seconds) {
+    if seconds.is_some_and(|seconds| !(1..=3600).contains(&seconds)) {
         return Err(CloudError::ApiError(
             "watch_duration_must_be_1_to_3600_seconds".into(),
         ));
+    }
+    if !(1..=10).contains(&partitions.len()) {
+        return Err(stopped("watch_requires_1_to_10_partitions").into());
     }
     let vault = Vault::open_with_session()?; // Never unlock or renew from environment/protector.
     let session = vault.operation_session_binding()?;
     let project = resolve_active_project();
     let project_id = vault.get_project(&project)?.id;
-    let partition_id = vault.get_partition_in_project(&project, partition)?.id;
+    let mut scope = Vec::with_capacity(partitions.len());
+    for name in partitions {
+        let id = vault.get_partition_in_project(&project, name)?.id;
+        if scope.iter().any(|(_, selected_id)| selected_id == &id) {
+            return Err(stopped("watch_duplicate_partition").into());
+        }
+        scope.push((name, id));
+    }
     let config = load_config()?;
+    oauth::ensure_session(&config)?;
     let account = config
         .user_id
         .clone()
         .filter(|id| !id.is_empty())
         .ok_or_else(|| CloudError::ApiError("watch_missing_account".into()))?;
-    let remaining = (session.expires_at - chrono::Utc::now())
+    let now = chrono::Utc::now();
+    let vault_remaining = (session.expires_at - now)
         .to_std()
         .map_err(|_| stopped("watch_session_expired"))?;
-    let requested = Duration::from_secs(seconds);
-    let duration = requested.min(remaining);
+    let cloud_expiry = config
+        .oauth_session
+        .as_ref()
+        .and_then(|session| chrono::DateTime::from_timestamp(session.expires_at, 0))
+        .ok_or_else(|| stopped("watch_missing_cloud_expiry"))?;
+    let cloud_remaining = (cloud_expiry - now)
+        .to_std()
+        .map_err(|_| stopped("watch_cloud_session_expired"))?;
+    let (duration, end) = if vault_remaining <= cloud_remaining {
+        (vault_remaining, WatchEnd::VaultSession)
+    } else {
+        (cloud_remaining, WatchEnd::CloudSession)
+    };
+    let (duration, end) = match seconds.map(Duration::from_secs) {
+        Some(requested) if requested < duration => (requested, WatchEnd::Requested),
+        _ => (duration, end),
+    };
     let started = Instant::now();
     let deadline = WatchDeadline {
         at: started + duration,
-        session_limited: remaining <= requested,
+        end,
     };
     let guard = || -> crate::core::Result<()> {
         deadline.check(Instant::now())?;
@@ -137,11 +184,13 @@ async fn watch_partition_inner(
         if load_config().ok().as_ref() != Some(&config) {
             return Err(stopped("watch_cloud_config_changed"));
         }
-        if resolve_active_project() != project
-            || vault.get_project(&project)?.id != project_id
-            || vault.get_partition_in_project(&project, partition)?.id != partition_id
-        {
+        if resolve_active_project() != project || vault.get_project(&project)?.id != project_id {
             return Err(stopped("watch_scope_changed"));
+        }
+        for (name, id) in &scope {
+            if vault.get_partition_in_project(&project, name)?.id != *id {
+                return Err(stopped("watch_scope_changed"));
+            }
         }
         Ok(())
     };
@@ -158,49 +207,68 @@ async fn watch_partition_inner(
     if client.config().user_id.as_deref() != Some(&account) {
         return Err(stopped("watch_account_mismatch").into());
     }
-    if !client.watch_has_acknowledgement(&vault, &project, partition)? {
-        return Err(stopped(
-            "watch_requires_acknowledged_partition; complete manual push/pull first",
-        )
-        .into());
-    }
-    let binding = Binding {
-        endpoint: config.api_url.clone(),
-        account,
-        // An owner-session binding, explicitly not a cryptographically enrolled device.
-        device: "manual-owner-session".into(),
-        project: project.clone(),
-        partition: partition.into(),
-    };
-    let mut coordinator =
-        Coordinator::restore(binding, None).map_err(|_| stopped("watch_invalid_coordinator"))?;
-    coordinator.set_admission(Admission::Ready);
-    loop {
-        if Instant::now() >= deadline.at {
-            return Err(deadline.error().into());
+    let mut coordinators = Vec::with_capacity(scope.len());
+    for (name, _) in &scope {
+        if !client.watch_has_acknowledgement(&vault, &project, name)? {
+            return Err(stopped(
+                "watch_requires_acknowledged_partition; complete manual push/pull first",
+            )
+            .into());
         }
+        let binding = Binding {
+            endpoint: config.api_url.clone(),
+            account: account.clone(),
+            // An owner-session binding, explicitly not a cryptographically enrolled device.
+            device: "manual-owner-session".into(),
+            project: project.clone(),
+            partition: (*name).clone(),
+        };
+        let mut coordinator = Coordinator::restore(binding, None)
+            .map_err(|_| stopped("watch_invalid_coordinator"))?;
+        coordinator.set_admission(Admission::Ready);
+        coordinators.push(coordinator);
+    }
+    let mut observed_version = None;
+    let mut next_remote_check = started;
+    loop {
         guard()?;
-        coordinator.request_reconciliation();
-        if let Some(attempt) = coordinator.begin(started.elapsed().as_secs()) {
-            let transfer = client.synchronize_scoped(
-                &vault,
-                &project,
-                partition,
-                passphrase,
-                SyncMode::Sync,
-                None,
-                &guard,
-            );
-            let result = tokio::select! {
-                result = transfer => result,
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.at)) => return Err(deadline.error().into()),
-                result = tokio::signal::ctrl_c() => {
-                    result.map_err(|_| stopped("watch_signal_unavailable"))?;
-                    report.stopped = "cancelled";
-                    return Ok(());
-                }
-            };
-            record_transfer(result, attempt, started.elapsed().as_secs(), &guard, report)?;
+        // The same SQLite connection sees other processes' saves without decrypting
+        // every selected partition or querying Cloud on each local poll.
+        let data_version: i64 = vault
+            .db()
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(VaultError::from)?;
+        let now = Instant::now();
+        let remote_due = now >= next_remote_check;
+        let local_changed = observed_version.replace(data_version) != Some(data_version);
+        if remote_due {
+            next_remote_check = now + REMOTE_POLL_INTERVAL;
+        }
+        for ((partition, _), coordinator) in scope.iter().zip(&mut coordinators) {
+            if remote_due || local_changed {
+                coordinator.request_reconciliation();
+            }
+            if let Some(attempt) = coordinator.begin(started.elapsed().as_secs()) {
+                let transfer = client.synchronize_scoped(
+                    &vault,
+                    &project,
+                    partition,
+                    passphrase,
+                    SyncMode::Sync,
+                    None,
+                    &guard,
+                );
+                let result = tokio::select! {
+                    result = transfer => result,
+                    _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.at)) => return Err(deadline.error().into()),
+                    result = tokio::signal::ctrl_c() => {
+                        result.map_err(|_| stopped("watch_signal_unavailable"))?;
+                        report.stopped = "cancelled";
+                        return Ok(());
+                    }
+                };
+                record_transfer(result, attempt, started.elapsed().as_secs(), &guard, report)?;
+            }
         }
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(1)) => {},
@@ -259,7 +327,11 @@ mod tests {
             for before_transfer in [false, true] {
                 let deadline = WatchDeadline {
                     at,
-                    session_limited,
+                    end: if session_limited {
+                        WatchEnd::VaultSession
+                    } else {
+                        WatchEnd::Requested
+                    },
                 };
                 assert!(deadline.check(at - Duration::from_nanos(1)).is_ok());
                 let mut coordinator = Coordinator::restore(

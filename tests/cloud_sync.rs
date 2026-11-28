@@ -1354,6 +1354,90 @@ mod foreground_watch {
     }
 
     #[test]
+    fn session_watch_autosyncs_only_selected_partitions_and_stops_on_lock() {
+        let (server, first, _second) = tracked_pair();
+        for partition in ["shared", "excluded"] {
+            assert_success(
+                &command(first.path(), &["partition", "create", partition])
+                    .output()
+                    .unwrap(),
+            );
+            add(first.path(), partition, SECRET, partition);
+            run_wispkey_bundle_json(
+                first.path(),
+                &["--format", "json", "cloud", "push", partition],
+            );
+        }
+        let before = server.state.lock().unwrap().requests.len();
+        let mut watcher = ChildGuard(
+            command(
+                first.path(),
+                &[
+                    "cloud",
+                    "watch",
+                    "personal",
+                    "shared",
+                    "--bundle-passphrase-file",
+                    first.path().join("watch-passphrase").to_str().unwrap(),
+                ],
+            )
+            .spawn()
+            .unwrap(),
+        );
+        let startup = Instant::now() + Duration::from_secs(10);
+        while server.state.lock().unwrap().requests[before..]
+            .iter()
+            .filter(|(method, path)| method == "GET" && path.starts_with("/api/v1/partitions/"))
+            .count()
+            < 2
+        {
+            assert!(
+                Instant::now() < startup,
+                "selected scopes never started polling"
+            );
+            assert!(
+                watcher.0.try_wait().unwrap().is_none(),
+                "watch exited at startup"
+            );
+            thread::sleep(Duration::from_millis(25));
+        }
+        for partition in ["personal", "shared", "excluded"] {
+            add(
+                first.path(),
+                &format!("{partition}-saved"),
+                SECRET,
+                partition,
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let report = status(first.path());
+            let partitions = report["partitions"].as_array().unwrap();
+            assert_eq!(partitions.len(), 3);
+            if partitions.iter().all(|row| {
+                row["local_changes_pending"] == (row["partition"] == "excluded")
+                    && row["remote_changes_pending"] == false
+            }) {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "selected saves never reached Cloud"
+            );
+            assert!(
+                watcher.0.try_wait().unwrap().is_none(),
+                "watch exited before saves"
+            );
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_success(&command(first.path(), &["lock"]).output().unwrap());
+        let output = finish(&mut watcher);
+        assert!(!output.status.success());
+        assert_redacted(&output);
+        assert_eq!(server.state.lock().unwrap().uploads.len(), 5);
+    }
+
+    #[test]
     fn locked_watch_never_uses_password_environment_to_unlock_or_contact_cloud() {
         let (server, first, _second) = tracked_pair();
         assert_success(&command(first.path(), &["lock"]).output().unwrap());
@@ -1688,19 +1772,28 @@ mod foreground_watch {
             "synthetic-local-edit",
             "personal",
         );
-        let upload_accepted = Arc::new(AtomicBool::new(false));
-        let callback_marker = upload_accepted.clone();
+        let (accepted, upload_started) = std::sync::mpsc::sync_channel(1);
+        let (release, blocked) = std::sync::mpsc::sync_channel(1);
         server.state.lock().unwrap().before_upload_ack = Some(Box::new(move || {
-            callback_marker.store(true, Ordering::SeqCst);
-            thread::sleep(Duration::from_secs(6));
+            accepted
+                .send(())
+                .expect("watch test must observe the upload");
+            blocked
+                .recv_timeout(Duration::from_secs(25))
+                .expect("watch test must release the acknowledgement after the deadline");
         }));
         let before = journal(first.path());
-        let stopped = watch(first.path());
+        // Allow time for debug-build encryption, then keep the real acknowledgement
+        // blocked until the CLI reaches its deadline.
+        let mut child = ChildGuard(watch_command(first.path(), "15").spawn().unwrap());
+        upload_started
+            .recv_timeout(Duration::from_secs(20))
+            .expect("deadline test did not submit a real upload");
+        let stopped = finish(&mut child);
+        release
+            .send(())
+            .expect("watch must finish while its upload acknowledgement is held");
         assert_success(&stopped);
-        assert!(
-            upload_accepted.load(Ordering::SeqCst),
-            "deadline did not interrupt a real upload"
-        );
         let report: Value = serde_json::from_slice(&stopped.stdout).unwrap();
         assert_eq!(report["watch"]["stopped"], "duration");
         assert_eq!(report["watch"]["reconciliation_required"], true);

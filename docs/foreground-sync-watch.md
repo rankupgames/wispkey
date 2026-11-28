@@ -1,10 +1,10 @@
-# Experimental foreground encrypted sync watch
+# Automatic encrypted sync while signed in
 
-Build with `--features experimental-sync` to use this bounded, explicitly invoked
-owner workflow. Default builds do not include `cloud watch`. The command polls
-existing conditional encrypted snapshot APIs; it does not need a new server feed.
+Standard builds include `cloud watch`. Start it with the partitions you want to
+sync in the active project. It detects saves from other WispKey processes and
+uses the existing conditional encrypted snapshot API.
 
-## Pair manually, then opt in for one bounded run
+## Pair each device, then start watch
 
 First complete a successful manual `cloud push`/`cloud pull` on each owner's vault
 using the same separate bundle passphrase, as described in [cloud sync](cloud-sync.md).
@@ -13,9 +13,8 @@ a real acknowledged revision, local fingerprint and successful sync timestamp,
 with no pending upload or unresolved conflict at startup.
 
 ```sh
-wispkey cloud watch personal \
-  --bundle-passphrase-file /private/cloud.pass \
-  --for-seconds 300
+wispkey cloud watch work infrastructure \
+  --bundle-passphrase-file /private/cloud.pass
 ```
 
 `--bundle-passphrase-file` is required and uses the existing bounded owner-private
@@ -25,8 +24,10 @@ passphrase must contain at least 12 characters and is held in zeroizing buffers
 for the run. It is never sent to Cloud or printed. Protect the source file with
 owner-only permissions and retain it only under your own chosen storage policy.
 
-The duration is 1–3600 seconds (default 300), further bounded by the current finite
-vault session's expiry. Watch never unlocks or renews a session from
+Select one to ten unique partitions that use the same bundle passphrase. All
+must be paired before the first transfer. Watch runs until the current vault or
+Cloud session expires, whichever comes first. Use `--for-seconds 1–3600` to end
+it sooner. Watch never unlocks or renews a session from
 `WISPKEY_PASSWORD`, a password file or a remembered protector. Run a normal owner
 unlock separately when needed. Zero-timeout/unbounded vault sessions cannot start
 watch. Every invocation is a fresh process-local opt-in; no daemon, startup entry,
@@ -43,7 +44,8 @@ decryption, upload journaling, upload acknowledgement and atomic import commit.
 The import commit check is inside the SQLite write transaction so a denial rolls
 back both credentials and acknowledgement.
 
-Polling is at most once per second after each completed attempt. Transport,
+Watch checks for local vault writes once per second and checks for remote changes
+every five seconds while idle. Transport,
 timeout, and HTTP 500/502/503/504 failures use the coordinator's bounded
 exponential backoff (2–300 seconds). Authentication, rate limits, corruption,
 protocol, policy/import errors and revision conflicts stop the command; it never
@@ -96,4 +98,4 @@ credentials or journal state. Deterministic watch unit tests inject exact-bounda
 time before transfer and before acknowledgment, verify session expiry stays an
 error, and retain network backoff without advancing the cursor. Run the full
 existing default/all-feature suites to check compatibility of the shared manual
-sync/import path; watch is excluded from default builds.
+sync/import path and the default-build watch.

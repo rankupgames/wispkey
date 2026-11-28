@@ -23,8 +23,8 @@ name = "wispkey"
 path = "src/lib.rs"
 
 [features]
-default = []
-# Scheduling contract only; no background worker or device/key enrollment.
+default = ["experimental-sync"]
+# Includes owner-started foreground encrypted sync. No device/key enrollment.
 experimental-sync = []
 # Local bridge only; no shipping ingress, device enrollment or transport activation.
 experimental-browser-receiver = []
